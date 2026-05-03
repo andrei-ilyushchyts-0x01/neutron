@@ -48,10 +48,10 @@ will credit the reporter (with consent) in `CHANGELOG.md`.
 
 ## Supported versions
 
-| Version         | Status        | Notes                                  |
-|-----------------|---------------|----------------------------------------|
-| `0.1.x-legacy`  | Maintenance   | Bug fixes and rules only.              |
-| `1.x`           | Not yet released | CO-RE / kernel 5.10+ port.          |
+| Version    | Status     | Notes                                                       |
+|------------|------------|-------------------------------------------------------------|
+| `1.0.x`    | Supported  | Current line. Aya 0.13, kernel 6.1+ aarch64, BTF + CO-RE.   |
+| `< 1.0`    | Unsupported | Pre-public development versions.                            |
 
 ## Out of scope
 

@@ -3,9 +3,7 @@
 ## Status
 
 `v1.0.0` is the current line. It targets Pixel 8 Pro on kernel 6.1.x via
-Aya 0.13, BTF + CO-RE, and BPF ring buffer. The pre-V1 kernel-4.14 line
-(`v0.1.0-legacy`) lives on the `legacy` branch and is no longer
-maintained.
+Aya 0.13, BTF + CO-RE, and BPF ring buffer.
 
 ## Done in 1.0.0
 
@@ -19,28 +17,15 @@ maintained.
 - Stack symbolization upgraded: ELF symbol resolution via `goblin`,
   `/proc/kallsyms` for kernel frames, ART JIT region tagging
   (`<JIT>+0xN`).
-- Default detector pack grew from 15 to 19 rules; T016–T019 use
-  `stack_contains` / `stack_not_contains`.
-- Stack-aware rules now actually receive the `"stack"` field — pre-1.0
-  this never fired because resolution happened after `engine.feed`.
+- Default detector pack ships 19 rules (`T001`–`T022`), with
+  T016–T019 using `stack_contains` / `stack_not_contains`.
+- Stack-aware rules receive the resolved `"stack"` field before the
+  rule engine runs.
 
 ## V1.x backlog
 
 Things that would be nice to have without rethinking the architecture:
 
-- **Extend `syscall_name` table for kernel 6.1+ aarch64 numbers**. The
-  Pixel-4a-era table (`src/decode/syscalls.rs`) leaves several modern
-  syscalls decoded as `"unknown"`. Add at minimum: `io_setup` (0),
-  `io_destroy` (1), `io_submit` (2), `io_cancel` (3), `io_getevents` (4),
-  `setxattr` (5), `lgetxattr` (9), `faccessat2` (439), `openat2` (437),
-  `close_range` (436), `pidfd_open` (434), `pidfd_send_signal` (424),
-  `statx` (already there at 291 — verify), `epoll_pwait2` (441).
-- **T020 candidate: syscall from anonymous executable memory.** Anti-tamper
-  probes on hardened apps frequently issue `/proc/self/maps` and
-  `/proc/self/status` reads from a `[anon:<id>]+0xN` mapping (a packed or
-  decrypted native module). A rule of `stack_contains: ["[anon:"]` +
-  `syscall_in: [56, 78, 79]` is a high-signal indicator of obfuscated
-  anti-tamper code paths.
 - **`bpf_d_path` for fd-to-path resolution**. Requires BPF LSM hooks
   (`CONFIG_BPF_LSM`), which are not enabled on the verified husky kernel.
   Track downstream GKI configs and adopt opportunistically. Until then,

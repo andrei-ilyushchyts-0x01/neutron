@@ -86,8 +86,7 @@ userspace:
 | mmap / mprotect                        | `[0]` = RWX marker byte                            |
 
 On kernel 6.1+, `bpf_probe_read_user_*` reads userspace memory directly —
-there is no PAN restriction to work around. The 0.1.0 `process_vm_readv`
-fallback inside the BPF program is gone.
+there is no PAN restriction to work around.
 
 The userspace `--resolve-paths` flag is still useful as a safety net:
 
@@ -213,11 +212,10 @@ Enable with `--capture-reads`. When the target process calls `openat` on
 a path under `/proc/` or `/sys/`, neutron records the returned fd in the
 `WATCH_FDS` BPF map (key = `pid << 32 | fd`).
 
-Note: in V1, `--capture-reads` still tracks fds, but the legacy
-`process_vm_readv` content peek that read buffer bytes back into the
-event has been removed. The current behaviour is fd-tracking only —
-follow-up work could repurpose `bpf_probe_read_user_buf` to capture
-buffer bytes directly into `data[..]`. See `src/main.rs` for the TODO.
+Note: `--capture-reads` is fd-tracking only — buffer-content readback
+is not implemented. Follow-up work could repurpose
+`bpf_probe_read_user_buf` to capture buffer bytes directly into
+`data[..]`.
 
 ## Excluding Noise
 

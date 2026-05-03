@@ -16,11 +16,10 @@ labels: enhancement
 
 ## Scope
 
-- [ ] Targets the legacy line (kernel 4.14 / current architecture)
-- [ ] Targets the future v1 line (CO-RE / kernel 5.10+)
-- [ ] Touches the BPF programs
-- [ ] Touches the userspace loader
-- [ ] Touches the rule engine
+- [ ] Touches the BPF programs (`neutron-ebpf`)
+- [ ] Touches the userspace loader (`src/`)
+- [ ] Touches the rule engine (`neutron-rules`)
+- [ ] Adds a new detector rule
 - [ ] Documentation only
 
 ## Alternatives considered

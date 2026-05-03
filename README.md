@@ -93,9 +93,6 @@ documented on-device transcript in `docs/devices/pixel8pro.md`. We do
 deliberately deferred until the rule pack and capture-health story are
 mature.
 
-The earlier kernel-4.14 / Pixel 4a reference implementation lives on the
-`legacy` branch, tagged `v0.1.0-legacy`. It is no longer maintained.
-
 ## Disclosure surface
 
 What neutron does **not** hide:

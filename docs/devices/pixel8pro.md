@@ -1,8 +1,8 @@
-# Pixel 8 Pro — Device Profile (CORE V1 reference)
+# Pixel 8 Pro — Device Profile
 
-This is the **primary and only** target device for neutron CORE V1.
-Pixel 4a (kernel 4.14) is no longer supported — its support code has been
-moved to the `legacy` branch.
+This is the primary and only target device for neutron 1.0. Any Android
+14+ device with kernel 6.1+, BTF, and root access should work, but the
+verified baseline below is what we test against.
 
 ## Build identity
 
@@ -154,6 +154,6 @@ bits drive `pid_matches`.
 
 Local variable names in BPF have been chosen to be self-documenting:
 `userspace_pid` (= kernel `tgid`) is the match key, `userspace_tid` (= kernel
-`pid`) goes into `SyscallEvent.tgid` for per-thread debugging. Wire field
-names (`pid`, `tgid`) are inverted for historical compatibility with the
-v0.1.0 NDJSON format and are not flipped without a coordinated wire bump.
+`pid`) goes into `SyscallEvent.tgid` for per-thread debugging. The wire
+field names (`pid`, `tgid`) are inverted relative to kernel terminology
+and are not flipped without a coordinated wire-format bump.

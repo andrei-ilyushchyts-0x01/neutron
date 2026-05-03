@@ -184,8 +184,7 @@ SyscallEvent → JSON line → neutron_rules::Event::parse_line → view → eng
 The JSON line is always built (cheap) — it is the canonical input to the
 rule engine. The `--stacks`-resolved frames are injected into the JSON as a
 top-level `"stack"` field **before** `engine.feed`, so `stack_contains` /
-`stack_not_contains` rules see them. (Pre-1.0 this was a bug: stack
-resolution happened later, so stack-aware rules would never match.)
+`stack_not_contains` rules see them.
 
 `engine.flush_all()` runs at shutdown to emit any frequency / aggregate
 findings still pending in their windows.
@@ -261,10 +260,9 @@ config.
   = true` in the release profile of `neutron-ebpf`).
 - **JIT mandatory** (`BPF_JIT_ALWAYS_ON=y`).
 - **No PAN restriction**: `bpf_probe_read_user_*` reads userspace memory
-  directly. The 0.1.0 PAN-fallback path (`process_vm_readv` from
-  userspace) is gone from the BPF programs. The userspace `--resolve-paths`
-  fallback (`/proc/<pid>/fd/<fd>` readlink, `/proc/net/tcp*`) remains as a
-  belt-and-braces option for cases where the in-kernel read returned a
+  directly from the BPF programs. The userspace `--resolve-paths`
+  fallback (`/proc/<pid>/fd/<fd>` readlink, `/proc/net/tcp*`) remains as
+  a belt-and-braces option for cases where the in-kernel read returned a
   truncated buffer or a closed fd.
 - **RingBuf available** (kernel 5.8+). `BPF_MAP_TYPE_RINGBUF` is the
   output channel. The CLI `--pages` flag is accepted for backward
