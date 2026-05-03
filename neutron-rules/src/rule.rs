@@ -52,7 +52,7 @@ pub struct FrequencySpec {
 }
 
 /// How matches are aggregated into findings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregateMode {
     /// Emit one finding per matching event. High-noise — use only for rare
@@ -60,16 +60,11 @@ pub enum AggregateMode {
     EveryEvent,
     /// Emit once per `(rule, pid)`. Subsequent matches update `last_seen` and
     /// `count` and are folded into the same finding.
+    #[default]
     PerProcess,
     /// Emit once per `(rule, pid, target)` where `target` is the first matched
     /// path or data string. Useful for rules that probe many distinct paths.
     PerTarget,
-}
-
-impl Default for AggregateMode {
-    fn default() -> Self {
-        AggregateMode::PerProcess
-    }
 }
 
 /// Number of evidence events kept per finding. Cheap upper bound on memory.

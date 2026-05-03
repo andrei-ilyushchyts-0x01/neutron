@@ -155,7 +155,7 @@ impl MatchCondition {
             }
         }
         if let Some(v) = self.ret_lt {
-            if !(ev.ret < v) {
+            if ev.ret >= v {
                 return false;
             }
         }
