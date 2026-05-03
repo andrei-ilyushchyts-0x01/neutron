@@ -8,14 +8,22 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # The repo's rust-toolchain.toml pins nightly and lists `bpfel-unknown-none`
+  # as a required target. That target has no prebuilt rust-std and breaks
+  # rustup auto-install. The host CI jobs below only build host crates and
+  # don't need that target — set RUSTUP_TOOLCHAIN per-job so rustup ignores
+  # rust-toolchain.toml entirely.
 
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    env:
+      # Match the nightly rustfmt the project develops against.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -23,13 +31,15 @@ jobs:
   test:
     name: test (host crates)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Host-only crates: rule engine. The loader and BPF programs require
+      # Host-only crate: rule engine. The loader and BPF programs require
       # an aarch64 cross-toolchain and a real device; we exercise them on
       # a separate workflow when one is available.
       - run: cargo test -p neutron-rules
@@ -38,6 +48,8 @@ jobs:
   rules-lint:
     name: rules YAML lint
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
