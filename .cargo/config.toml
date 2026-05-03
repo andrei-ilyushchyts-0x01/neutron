@@ -1,0 +1,7 @@
+[alias]
+xtask = "run --package xtask --"
+
+# Cross-compile the main neutron binary for the Pixel 4a (aarch64 musl).
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-static-libgcc"]

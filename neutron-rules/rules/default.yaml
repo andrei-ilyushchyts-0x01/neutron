@@ -1,0 +1,478 @@
+# neutron — default detector pack
+#
+# Patterns synthesized from observed runtime behavior of hardened Android
+# applications. Each rule maps a recognizable anti-tamper / root-detection /
+# network-recon technique to a concrete syscall fingerprint.
+#
+# Rule IDs follow the convention "T<NNN>_<short_slug>". The numbers are local
+# to this project and do NOT correspond to MITRE ATT&CK technique IDs.
+#
+# Schema reference: docs/rules/reference.md
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Root / Magisk / Frida detection (the app inspecting itself)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: T001_proc_self_maps_polling
+  name: Periodic /proc/self/maps inspection
+  description: >-
+    Process repeatedly opens its own memory map. Almost universally used by
+    anti-tamper SDKs (RootBeer, custom checks) to scan loaded modules for
+    Frida / Magisk / Xposed signatures. Polling cadence is the diagnostic.
+  severity: medium
+  category: root_detection
+  behavior: proc_self_maps_polling
+  interpretation:
+    - possible anti-instrumentation / loaded-library scan
+    - possible memory-layout self-inspection
+  confidence: 0.85
+  false_positives:
+    - native crash reporters and unwinders walk /proc/self/maps on init
+    - profilers and JIT diagnostic tools poll the map periodically
+    - some allocators read /proc/self/maps once on startup (low frequency)
+  references:
+    - "https://attack.mitre.org/techniques/T1518/"
+    - "RootBeer: https://github.com/scottyab/rootbeer"
+  conditions:
+    - syscall_in: [56]              # openat
+    - path_prefix: /proc/self/maps
+  frequency:
+    window_ms: 15000
+    min_count: 2
+  aggregate: per_process
+
+- id: T002_mountinfo_magisk_check
+  name: Mount table inspection (Magisk overlay detection)
+  description: >-
+    Process reads /proc/self/mountinfo, /proc/mounts, or /proc/<pid>/mountinfo.
+    Magisk's hide mechanism leaves traces in the mount namespace; reading these
+    is the canonical "is_magisk_by_mount" check.
+  severity: medium
+  category: root_detection
+  conditions:
+    - syscall_in: [56]
+    - data_any:
+        - /proc/self/mountinfo
+        - /proc/mounts
+        - /proc/self/mounts
+  aggregate: per_process
+
+- id: T003_proc_status_tracerpid_scrape
+  name: /proc/self/status read (TracerPid / debugger probe)
+  description: >-
+    Reading /proc/self/status is the standard way to probe for ptrace-based
+    debuggers via the TracerPid line. Not a vulnerability — but a strong
+    signal that anti-debug logic is active.
+  severity: low
+  category: antitamper
+  conditions:
+    - syscall_in: [56]
+    - data_any:
+        - /proc/self/status
+        - /proc/self/stat
+  aggregate: per_process
+
+- id: T004_su_binary_probe
+  name: Probe for su binary
+  description: >-
+    Process checks for the presence of a su binary in any of the well-known
+    paths. Hits via faccessat/openat/stat/statfs indicate a root-detection
+    routine.
+  severity: high
+  category: root_detection
+  references:
+    - "RootBeer.checkForBinary()"
+  conditions:
+    - syscall_in: [56, 48, 79, 78, 43]   # openat, faccessat, fstatat, readlinkat, statfs
+    - data_any:
+        - /system/bin/su
+        - /system/xbin/su
+        - /sbin/su
+        - /su/bin/su
+        - /data/local/su
+        - /data/local/xbin/su
+        - /data/local/bin/su
+        - /system/sd/xbin/su
+        - /system/bin/failsafe/su
+  aggregate: per_target
+
+- id: T005_magisk_path_probe
+  name: Probe for Magisk artifacts
+  description: >-
+    Path access containing "magisk" or known Magisk locations. Direct evidence
+    of Magisk-specific detection.
+  severity: high
+  category: root_detection
+  references:
+    - "Magisk: https://github.com/topjohnwu/Magisk"
+  conditions:
+    - syscall_in: [56, 48, 79, 78, 35, 36]
+    - data_any:
+        - magisk
+        - /sbin/.magisk
+        - /cache/.disable_magisk
+        - /data/adb/magisk
+        - topjohnwu
+  aggregate: per_target
+
+- id: T006_frida_artifact_probe
+  name: Probe for Frida artifacts
+  description: >-
+    Path access naming Frida server, gum loop, or known injection artifacts.
+    Frida runs an agent in the target process — typical detection looks for
+    dropped files or specific thread/library names.
+  severity: high
+  category: antitamper
+  references:
+    - "https://frida.re"
+  conditions:
+    - syscall_in: [56, 48, 79, 78]
+    - data_any:
+        - frida
+        - re.frida.server
+        - linjector
+        - gum-js-loop
+        - gmain
+        - /data/local/tmp/re.frida
+  aggregate: per_target
+
+- id: T007_xposed_artifact_probe
+  name: Probe for Xposed / EdXposed artifacts
+  description: >-
+    Path access containing Xposed or EdXposed identifiers. Less common in
+    modern apps but still routinely included in detection bundles.
+  severity: high
+  category: antitamper
+  conditions:
+    - syscall_in: [56, 48, 79, 78]
+    - data_any:
+        - xposed
+        - de.robv.android.xposed
+        - EdXposed
+        - meowcat.edxposed
+        - /system/framework/XposedBridge.jar
+  aggregate: per_target
+
+- id: T008_runtime_exec_root_command
+  name: Runtime command execution suggestive of root probing
+  description: >-
+    execve/execveat with arguments referencing su, mount, getprop, which, or
+    busybox. Often produced by Runtime.exec("su") or ProcessBuilder probing.
+  severity: critical
+  category: root_detection
+  conditions:
+    - syscall_in: [221, 281]         # execve, execveat
+    - data_any:
+        - "/su"
+        - "/system/xbin/which"
+        - "/system/bin/mount"
+        - "/system/bin/getprop"
+        - busybox
+  aggregate: per_process
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anti-debug / ptrace / properties
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: T009_ptrace_self_or_remote
+  name: ptrace syscall observed
+  description: >-
+    Any ptrace call is notable in an app process. Often used either as a
+    self-debug-attach guard (PTRACE_TRACEME) or to scan for debuggers.
+  severity: medium
+  category: antitamper
+  conditions:
+    - syscall_in: [117]              # ptrace (aarch64)
+  aggregate: per_process
+
+- id: T010_prctl_dumpable_check
+  name: prctl(PR_GET_DUMPABLE) / prctl(PR_SET_DUMPABLE)
+  description: >-
+    Process queries or modifies its dumpability state. Common anti-debug
+    self-hardening: setting PR_SET_DUMPABLE=0 prevents core dumps and ptrace
+    by non-root processes.
+  severity: low
+  category: antitamper
+  conditions:
+    - syscall_in: [167]              # prctl
+    - arg0_in: [3, 4]                # PR_GET_DUMPABLE=3, PR_SET_DUMPABLE=4
+  aggregate: per_process
+
+- id: T011_rwx_memory_allocation
+  name: RWX or W^X-violating memory mapping
+  description: >-
+    mmap or mprotect produced a region with PROT_EXEC plus PROT_WRITE. In a
+    well-behaved Android app, JIT regions transition W -> X without the
+    overlap. RWX allocations are legitimate in some scenarios (custom JITs)
+    but always worth recording as evidence.
+  severity: high
+  category: memory
+  behavior: rwx_or_wx_memory_mapping
+  interpretation:
+    - possible custom JIT or runtime code generation
+    - possible packed/decrypted code unpacking stage
+    - possible exploit primitive setup
+  confidence: 0.7
+  false_positives:
+    - custom managed runtimes (Hermes, V8 embedders, custom JIT engines)
+      legitimately need PROT_WRITE|PROT_EXEC pages
+    - some emulators and instrumentation libraries map RWX regions
+    - "TODO: split into anon vs file-backed vs memfd sub-rules — requires
+       FD graph (P0.4) and condition support for args[3] flags"
+  conditions:
+    - syscall_in: [222, 226]         # mmap, mprotect
+    - rwx_alert_in: ["RWX", "WX"]
+  aggregate: every_event
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reconnaissance / properties / SELinux
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: T012_proc_net_enumeration
+  name: Local socket / port enumeration
+  description: >-
+    Process reads /proc/net/tcp* or /proc/net/unix. A common Frida-detection
+    path is to scan for the default Frida server port (27042) by walking
+    /proc/net/tcp.
+  severity: medium
+  category: network_recon
+  conditions:
+    - syscall_in: [56]
+    - data_any:
+        - /proc/net/tcp
+        - /proc/net/tcp6
+        - /proc/net/udp
+        - /proc/net/unix
+  aggregate: per_process
+
+- id: T013_selinux_status_check
+  name: SELinux enforcement state probe
+  description: >-
+    Reading /sys/fs/selinux/enforce or /proc/self/attr/current is used to
+    detect a permissive bootloader / unlocked device or to derive runtime
+    integrity verdicts.
+  severity: low
+  category: antitamper
+  conditions:
+    - syscall_in: [56]
+    - data_any:
+        - /sys/fs/selinux/enforce
+        - /sys/fs/selinux/policy
+        - /proc/self/attr/current
+  aggregate: per_process
+
+- id: T014_property_service_query
+  name: Android property service access (build / debuggable probes)
+  description: >-
+    Access to /dev/__properties__ or the property_service socket. Apps use
+    this to read ro.debuggable, ro.build.tags, ro.boot.verifiedbootstate, and
+    other tamper-relevant flags. Heavy access from a non-system process is a
+    strong signal of integrity logic running.
+  severity: low
+  category: antitamper
+  conditions:
+    - syscall_in: [56, 198, 203]     # openat, socket, connect
+    - data_any:
+        - /dev/__properties__
+        - /dev/socket/property_service
+  aggregate: per_process
+
+- id: T015_cross_process_proc_inspection
+  name: Cross-process /proc inspection
+  description: >-
+    Process opens /proc/<other_pid>/{maps,cmdline,exe} — i.e. inspects another
+    PID. Useful for finding injected helpers, related anti-tamper daemons, or
+    to enumerate the device process list. Self-references (/proc/self/) are
+    excluded so this rule does not duplicate T001/T002.
+  severity: medium
+  category: recon
+  conditions:
+    - syscall_in: [56]
+    - path_prefix: /proc/
+    - data_any:
+        - /maps
+        - /cmdline
+        - /exe
+    - path_not_contains:
+        - /proc/self/
+        - /proc/thread-self/
+    - comm_not_contains:
+        - RenderThread
+        - FrameMetricsAgg
+  aggregate: per_target
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stack-aware rules (D.4) — pattern-match against resolved stack frames
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: T016_native_root_check_via_libc
+  name: Native root-binary probe via libc
+  description: >-
+    fstatat()/newfstatat() on a known root-binary path with libc on the call
+    stack. Combines the path-based T004 fingerprint with stack evidence that
+    the call originated from native code (typical for hardened SDKs with
+    obfuscated checks rather than Java-side File APIs).
+  severity: high
+  category: root_detection
+  conditions:
+    - syscall_in: [79]                # newfstatat
+    - path_in:
+        - /system/xbin/su
+        - /system/bin/su
+        - /sbin/su
+        - /vendor/bin/su
+        - /system/sbin/su
+    - stack_contains:
+        - libc
+  frequency:
+    window_ms: 5000
+    min_count: 1
+  aggregate: per_process
+
+- id: T017_jit_cache_syscall
+  name: Syscall originating from ART JIT code cache
+  description: >-
+    A syscall whose user stack top frame lives inside [anon:dalvik-jit-code-cache].
+    Most Android apps make all syscalls via libc trampolines, so a frequent JIT
+    origin is suspicious — typical of dynamically-loaded integrity / checksum
+    code planted by anti-tamper SDKs.
+  severity: low
+  category: antitamper
+  behavior: syscall_from_jit_code_cache
+  interpretation:
+    - possible packed/JIT-emitted anti-tamper or integrity check
+    - possible JNI bridge from Java to a generated native trampoline
+  confidence: 0.55
+  false_positives:
+    - the legitimate ART JIT compiler's own internal callbacks can fire
+      from this region during compilation
+    - JNI critical-call trampolines that ART emits inline
+    - kernel-level profilers that sample stacks while ART is mid-JIT
+  conditions:
+    - stack_contains:
+        - "<JIT>"
+  frequency:
+    window_ms: 10000
+    min_count: 5
+  aggregate: per_process
+
+- id: T018_anti_debug_via_kernel_ptrace
+  name: ptrace from native code (anti-debug)
+  description: >-
+    A ptrace() syscall that resolved to sys_ptrace on the kernel stack and to
+    a libc / libnative-* frame on the user stack. This is the classic
+    "PTRACE_TRACEME-from-self" anti-debug check that hardened apps use to
+    detect attached debuggers.
+  severity: medium
+  category: antitamper
+  conditions:
+    - syscall_in: [117]               # ptrace
+    - stack_contains:
+        - sys_ptrace
+        - ptrace
+  aggregate: per_process
+
+- id: T019_native_lib_path_inspection
+  name: Native shared-library path probing (excluding RenderScript)
+  description: >-
+    openat() on /system/lib64/* with a non-RenderScript stack. Anti-tamper
+    SDKs frequently iterate /system/lib64 looking for hooking frameworks
+    (substrate, frida-gadget, libxhook). RenderScript and Skia legitimately
+    walk this directory at startup, so we exclude them.
+  severity: low
+  category: recon
+  behavior: system_lib_path_probing
+  interpretation:
+    - possible hooking-framework probe (substrate, frida-gadget, libxhook)
+    - possible library-presence enumeration during anti-tamper init
+  confidence: 0.5
+  false_positives:
+    - the dynamic linker (linker64) walks /system/lib64 every process
+    - WebView / Chromium loads many libraries from /system/lib64 at startup
+    - vendor / OEM components and graphics stacks (Vulkan, Skia, RenderScript)
+      iterate the directory on first use
+    - "TODO: add allowlist-based attribution and frequency floor — current
+       stack_not_contains list is incomplete"
+  conditions:
+    - syscall_in: [56]
+    - path_prefix: /system/lib64/
+    - stack_not_contains:
+        - RenderScript
+        - libRS
+        - libskia
+  aggregate: per_process
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stack-origin rules (V1.x)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: T020_native_check_from_anon_mapping
+  name: Process introspection from anonymous executable memory
+  description: >-
+    Process opens /proc/self/{maps,status,cmdline,mountinfo} from a stack frame
+    inside an anonymous r-xp mapping ([anon:NNNN]+0xN). This is the classic
+    fingerprint of a packed / decrypted native anti-tamper module: code that
+    cannot be located by Frida's library-name hooks because its mapping has
+    no file backing. Covers what T001/T002/T003 already detect, but at higher
+    severity when the call origin is anonymous (the mapping origin IS the
+    indicator, not the path being read).
+  severity: high
+  category: antitamper
+  references:
+    - "https://attack.mitre.org/techniques/T1027/002/"
+  conditions:
+    - syscall_in: [56]                # openat
+    - path_in:
+        - /proc/self/maps
+        - /proc/self/status
+        - /proc/self/cmdline
+        - /proc/self/mountinfo
+        - /proc/self/mounts
+    - stack_contains:
+        - "[anon:"
+  aggregate: per_process
+
+- id: T021_frida_thread_comm_scan
+  name: Thread-comm enumeration (/proc/self/task/<TID>/comm)
+  description: >-
+    Process repeatedly opens /proc/self/task/<TID>/comm. The canonical
+    Frida-thread-detection pattern: walk all threads in /proc/self/task/ and
+    read each thread's comm to look for Frida's named threads
+    (gum-js-loop, gmain, gdbus, pool-frida, frida-helper). Library-name
+    independent — works against frida-gadget injected as a generic .so.
+  severity: medium
+  category: antitamper
+  references:
+    - "https://frida.re/docs/javascript-api/#thread"
+  conditions:
+    - syscall_in: [56]
+    - path_prefix: /proc/self/task/
+    - path_contains: /comm
+  frequency:
+    window_ms: 30000
+    min_count: 5
+  aggregate: per_process
+
+- id: T022_unexpected_bpf_syscall
+  name: bpf(2) syscall from a non-system process
+  description: >-
+    A plain Android app should never call bpf(2) directly — only system
+    services (netd, surfaceflinger debug paths) and explicit tracers do.
+    Detecting bpf() in an app process indicates either a debugging build,
+    a sophisticated anti-tamper / anti-rootkit module, or an attempt to
+    plant a tracer that pretends to be the app. Any of those is worth
+    surfacing.
+  severity: high
+  category: antitamper
+  references:
+    - "https://man7.org/linux/man-pages/man2/bpf.2.html"
+  conditions:
+    - syscall_in: [280]               # bpf
+    - comm_not_contains:
+        - netd
+        - traced
+        - traced_probes
+        - logd
+        - surfaceflinger
+        - neutron               # avoid self-loops
+  aggregate: per_process

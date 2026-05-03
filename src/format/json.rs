@@ -1,0 +1,475 @@
+//! NDJSON rendering of `SyscallEvent`s.
+
+use crate::decode::{
+    compute_latency_us, format_binder_event_json, format_comm, format_data_field,
+    lookup_socket_by_inode, read_socket_inode, resolve_path_from_fd, syscall_name,
+};
+use crate::fdgraph::FdKind;
+use neutron_common::SyscallEvent;
+
+/// Pre-resolved fd reference for an event, computed by the caller from the
+/// userspace [`crate::fdgraph::FdGraph`]. Carried into the JSON line as
+/// `"fd_kind"` + `"fd_path"` when present.
+#[derive(Debug, Clone)]
+pub struct FdHint {
+    pub kind: FdKind,
+    pub path: String,
+}
+
+/// Render a `SyscallEvent` as a single NDJSON line.
+///
+/// Equivalent to `format_event_json_with_stack(ev, resolve_paths, None)`.
+pub fn format_event_json(ev: &SyscallEvent, resolve_paths: bool) -> String {
+    format_event_json_full(ev, resolve_paths, None, None)
+}
+
+/// Render a `SyscallEvent` as a single NDJSON line, optionally embedding a
+/// resolved stack trace as `"stack":"…"`. The stack must be pre-rendered by
+/// the caller (the formatter has no access to BPF maps or ELF symbol
+/// tables).
+pub fn format_event_json_with_stack(
+    ev: &SyscallEvent,
+    resolve_paths: bool,
+    stack: Option<&str>,
+) -> String {
+    format_event_json_full(ev, resolve_paths, stack, None)
+}
+
+/// Render a `SyscallEvent` as a single NDJSON line, with both an optional
+/// resolved stack and an optional fd-graph enrichment.
+pub fn format_event_json_full(
+    ev: &SyscallEvent,
+    resolve_paths: bool,
+    stack: Option<&str>,
+    fd_hint: Option<&FdHint>,
+) -> String {
+    let syscall_nr = { ev.syscall_nr };
+
+    // Binder events have their own JSON formatter
+    if syscall_nr == -1 {
+        let mut line = format_binder_event_json(ev);
+        if let Some(s) = stack {
+            inject_stack_field(&mut line, s);
+        }
+        return line;
+    }
+
+    let ts_ns = { ev.timestamp_ns };
+    let pid = { ev.pid };
+    let tid = { ev.tgid }; // kernel tgid field holds Linux TID
+    let uid = { ev.uid };
+    let is_enter = { ev.is_enter };
+    let ret = { ev.ret };
+    let args = { ev.args };
+    let comm = format_comm(&{ ev.comm });
+    let name = syscall_name(syscall_nr);
+    let mut data_info = format_data_field(ev);
+
+    // Userspace fallbacks on exit when in-kernel capture failed:
+    // openat → /proc/<pid>/fd/<fd> readlink, connect → /proc/net/tcp*.
+    if resolve_paths && data_info.is_none() && is_enter == 0 {
+        if syscall_nr == 56 && ret >= 0 {
+            data_info = resolve_path_from_fd(pid, ret);
+        } else if (syscall_nr == 203 || syscall_nr == 294) && ret >= 0 {
+            let sock_fd = args[0] as i64;
+            data_info = read_socket_inode(pid, sock_fd)
+                .and_then(|inode| lookup_socket_by_inode(pid, inode));
+        }
+    }
+
+    // Build data field for JSON
+    let data_json = match &data_info {
+        Some(d) if d == "[!RWX]" || d == "[!WX]" => String::new(), // handled below
+        Some(d) => {
+            let escaped = d.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(r#","data":"{}""#, escaped)
+        }
+        None => String::new(),
+    };
+
+    // FD-graph enrichment: when the event takes a fd argument and the
+    // userspace FD graph knows what it points to, emit `"fd_kind"` and
+    // `"fd_path"` so ioctl/read/write/mmap/close events become attributable.
+    let fd_json = match fd_hint {
+        Some(h) => {
+            let escaped = h.path.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(r#","fd_kind":"{}","fd_path":"{}""#, h.kind.as_str(), escaped)
+        }
+        None => String::new(),
+    };
+
+    // RWX alert flag
+    let rwx_json = {
+        let d = { ev.data };
+        match (syscall_nr, d[0]) {
+            (222 | 226, 1) => r#","rwx_alert":"RWX""#,
+            (222 | 226, 2) => r#","rwx_alert":"WX""#,
+            _ => "",
+        }
+    };
+
+    // Stack IDs
+    let kernel_stackid = { ev.kernel_stackid };
+    let user_stackid = { ev.user_stackid };
+    let stack_json = if kernel_stackid >= 0 || user_stackid >= 0 {
+        format!(
+            r#","kernel_stackid":{},"user_stackid":{}"#,
+            kernel_stackid, user_stackid
+        )
+    } else {
+        String::new()
+    };
+
+    // Latency (exit events only) and the raw enter timestamp it was derived
+    // from. The enter timestamp is exposed so offline analysis (timeline,
+    // diff) can align events without recomputing it.
+    let latency_json = match compute_latency_us(ev) {
+        Some(us) => format!(r#","latency_us":{}"#, us),
+        None => String::new(),
+    };
+    let enter_ts_ns = { ev.enter_timestamp_ns };
+    let enter_ts_json = if is_enter == 0 && enter_ts_ns != 0 {
+        format!(r#","enter_ts_ns":{}"#, enter_ts_ns)
+    } else {
+        String::new()
+    };
+
+    let stack_field_json = match stack {
+        Some(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(r#","stack":"{}""#, escaped)
+        }
+        None => String::new(),
+    };
+
+    format!(
+        r#"{{"ts_ns":{},"pid":{},"tid":{},"uid":{},"nr":{},"name":"{}","comm":"{}","enter":{},"ret":{},"args":[{},{},{},{},{},{}]{}{}{}{}{}{}{}}}"#,
+        ts_ns,
+        pid,
+        tid,
+        uid,
+        syscall_nr,
+        name,
+        comm,
+        is_enter == 1,
+        ret,
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+        data_json,
+        fd_json,
+        rwx_json,
+        stack_json,
+        latency_json,
+        enter_ts_json,
+        stack_field_json,
+    )
+}
+
+/// Inject `"stack":"<escaped>"` just before the trailing `}` of an
+/// already-rendered JSON object. Used for the binder-event branch where we
+/// re-use the binder formatter and don't want to duplicate its logic.
+fn inject_stack_field(line: &mut String, stack: &str) {
+    if !line.ends_with('}') {
+        return;
+    }
+    line.pop();
+    let escaped = stack.replace('\\', "\\\\").replace('"', "\\\"");
+    line.push_str(&format!(r#","stack":"{}""#, escaped));
+    line.push('}');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comm_bytes(name: &str) -> [u8; 16] {
+        let mut c = [0u8; 16];
+        let n = name.len().min(16);
+        c[..n].copy_from_slice(&name.as_bytes()[..n]);
+        c
+    }
+
+    fn data_path(path: &[u8]) -> [u8; 128] {
+        let mut data = [0u8; 128];
+        let n = path.len().min(data.len());
+        data[..n].copy_from_slice(&path[..n]);
+        data
+    }
+
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{s}"))
+    }
+
+    #[test]
+    fn format_event_json_required_keys_present() {
+        let ev = SyscallEvent {
+            timestamp_ns: 100,
+            pid: 42,
+            tgid: 42,
+            uid: 1000,
+            syscall_nr: 56,
+            args: [(-100i64) as u64, 0, 0, 0, 0, 0],
+            is_enter: 1,
+            comm: comm_bytes("probe"),
+            data: data_path(b"/proc/self/maps\0"),
+            kernel_stackid: -1,
+            user_stackid: -1,
+            ..SyscallEvent::default()
+        };
+        let s = format_event_json(&ev, false);
+        let v = parse(&s);
+        let obj = v.as_object().expect("object");
+        for k in [
+            "ts_ns", "pid", "tid", "uid", "nr", "name", "comm", "enter", "ret", "args",
+        ] {
+            assert!(obj.contains_key(k), "missing key {k}");
+        }
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("openat"));
+        assert_eq!(obj.get("nr").and_then(|v| v.as_i64()), Some(56));
+        assert_eq!(obj.get("enter").and_then(|v| v.as_bool()), Some(true));
+        let args = obj.get("args").and_then(|v| v.as_array()).expect("args array");
+        assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn format_event_json_includes_data_for_path_syscall() {
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            is_enter: 1,
+            data: data_path(b"/proc/self/maps\0"),
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(
+            v.get("data").and_then(|x| x.as_str()),
+            Some("/proc/self/maps")
+        );
+    }
+
+    #[test]
+    fn format_event_json_omits_data_when_empty() {
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            is_enter: 1,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert!(
+            v.as_object().unwrap().get("data").is_none(),
+            "expected no data field, got {v}"
+        );
+    }
+
+    #[test]
+    fn format_event_json_includes_latency_on_exit() {
+        let ev = SyscallEvent {
+            timestamp_ns: 2_000_000,
+            enter_timestamp_ns: 1_500_000,
+            syscall_nr: 56,
+            ret: 4,
+            is_enter: 0,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("latency_us").and_then(|x| x.as_u64()), Some(500));
+        assert_eq!(v.get("enter_ts_ns").and_then(|x| x.as_u64()), Some(1_500_000));
+    }
+
+    #[test]
+    fn format_event_json_omits_enter_ts_for_enter_events() {
+        let ev = SyscallEvent {
+            timestamp_ns: 1_500_000,
+            enter_timestamp_ns: 1_500_000,
+            syscall_nr: 56,
+            is_enter: 1,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert!(
+            v.as_object().unwrap().get("enter_ts_ns").is_none(),
+            "expected no enter_ts_ns field on enter event"
+        );
+    }
+
+    #[test]
+    fn format_event_json_includes_stack_ids_when_present() {
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            kernel_stackid: 12,
+            user_stackid: 34,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("kernel_stackid").and_then(|x| x.as_i64()), Some(12));
+        assert_eq!(v.get("user_stackid").and_then(|x| x.as_i64()), Some(34));
+    }
+
+    #[test]
+    fn format_event_json_omits_stack_ids_when_negative() {
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            kernel_stackid: -1,
+            user_stackid: -1,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("kernel_stackid"));
+        assert!(!obj.contains_key("user_stackid"));
+    }
+
+    #[test]
+    fn format_event_json_includes_rwx_alert_for_mmap_rwx() {
+        let mut data = [0u8; 128];
+        data[0] = 1; // RWX marker
+        let ev = SyscallEvent {
+            syscall_nr: 222,
+            is_enter: 1,
+            data,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("rwx_alert").and_then(|x| x.as_str()), Some("RWX"));
+    }
+
+    #[test]
+    fn format_event_json_includes_rwx_alert_for_wx() {
+        let mut data = [0u8; 128];
+        data[0] = 2; // WX marker
+        let ev = SyscallEvent {
+            syscall_nr: 226,
+            is_enter: 1,
+            data,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("rwx_alert").and_then(|x| x.as_str()), Some("WX"));
+    }
+
+    #[test]
+    fn format_event_json_routes_binder() {
+        let ev = SyscallEvent {
+            syscall_nr: -1,
+            timestamp_ns: 1_000_000,
+            args: [1, 0, 0, 0, 0, 0],
+            comm: comm_bytes("svc"),
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("binder"));
+    }
+
+    #[test]
+    fn format_event_json_with_stack_embeds_stack_field() {
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            is_enter: 1,
+            data: data_path(b"/proc/self/maps\0"),
+            ..SyscallEvent::default()
+        };
+        let line = format_event_json_with_stack(&ev, false, Some("libc.so:malloc+0x12 <- main+0x40"));
+        let v = parse(&line);
+        assert_eq!(
+            v.get("stack").and_then(|x| x.as_str()),
+            Some("libc.so:malloc+0x12 <- main+0x40")
+        );
+    }
+
+    #[test]
+    fn format_event_json_with_stack_escapes_quotes() {
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            is_enter: 1,
+            ..SyscallEvent::default()
+        };
+        // Embed a quote — must still parse as JSON.
+        let line = format_event_json_with_stack(&ev, false, Some(r#"weird"frame"#));
+        let v = parse(&line);
+        assert_eq!(v.get("stack").and_then(|x| x.as_str()), Some(r#"weird"frame"#));
+    }
+
+    #[test]
+    fn format_event_json_with_stack_routes_binder() {
+        let ev = SyscallEvent {
+            syscall_nr: -1,
+            timestamp_ns: 1_000_000,
+            args: [1, 0, 0, 0, 0, 0],
+            comm: comm_bytes("svc"),
+            ..SyscallEvent::default()
+        };
+        let line = format_event_json_with_stack(&ev, false, Some("frame_a <- frame_b"));
+        let v = parse(&line);
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("binder"));
+        assert_eq!(
+            v.get("stack").and_then(|x| x.as_str()),
+            Some("frame_a <- frame_b")
+        );
+    }
+
+    #[test]
+    fn format_event_json_data_field_escapes_quotes() {
+        // path containing a quote is unusual, but we test the escape logic
+        let mut data = [0u8; 128];
+        let s = b"/tmp/with\"quote\0";
+        data[..s.len()].copy_from_slice(s);
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            is_enter: 1,
+            data,
+            ..SyscallEvent::default()
+        };
+        // Must still parse as valid JSON.
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(
+            v.get("data").and_then(|x| x.as_str()),
+            Some("/tmp/with\"quote")
+        );
+    }
+
+    #[test]
+    fn format_event_json_full_emits_fd_kind_and_path_when_hint_provided() {
+        // ioctl with fd_hint resolved to /dev/binder
+        let mut ev = SyscallEvent {
+            syscall_nr: 29,
+            is_enter: 1,
+            ..SyscallEvent::default()
+        };
+        ev.args[0] = 12;
+        let hint = FdHint { kind: FdKind::Binder, path: "/dev/binder".into() };
+        let line = format_event_json_full(&ev, false, None, Some(&hint));
+        let v = parse(&line);
+        assert_eq!(v.get("fd_kind").and_then(|x| x.as_str()), Some("binder"));
+        assert_eq!(v.get("fd_path").and_then(|x| x.as_str()), Some("/dev/binder"));
+    }
+
+    #[test]
+    fn format_event_json_full_omits_fd_fields_when_no_hint() {
+        let ev = SyscallEvent {
+            syscall_nr: 29,
+            is_enter: 1,
+            ..SyscallEvent::default()
+        };
+        let line = format_event_json_full(&ev, false, None, None);
+        let v = parse(&line);
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("fd_kind"));
+        assert!(!obj.contains_key("fd_path"));
+    }
+
+    #[test]
+    fn format_event_json_full_escapes_fd_path_quotes() {
+        let ev = SyscallEvent {
+            syscall_nr: 64,
+            is_enter: 1,
+            ..SyscallEvent::default()
+        };
+        let hint = FdHint { kind: FdKind::File, path: r#"/tmp/wei"rd"#.into() };
+        let line = format_event_json_full(&ev, false, None, Some(&hint));
+        let v = parse(&line);
+        assert_eq!(v.get("fd_path").and_then(|x| x.as_str()), Some(r#"/tmp/wei"rd"#));
+    }
+}

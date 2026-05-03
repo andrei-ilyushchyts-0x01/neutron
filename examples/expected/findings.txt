@@ -1,0 +1,38 @@
+# Expected findings from running `demo-target` under `neutron`.
+#
+# This list is deterministic: every line is a rule ID that the demo target
+# guarantees to fire on a Pixel 8 Pro / Android 14 / kernel 6.1+ device with
+# `neutron --pid <DEMO_PID>` (no extra flags required for these rules — none
+# of them depend on stack symbolization).
+#
+# Format: <rule_id> <one-line note>
+# Comparison is line-set equality after sorting both sides.
+#
+# To generate the actual list from a captured trace:
+#   adb shell su -c '/data/local/tmp/neutron --pid <DEMO_PID> --json' \
+#       | grep -F '"rule_id"' \
+#       | jq -r '.rule_id' \
+#       | sort -u
+
+T001_proc_self_maps_polling          # Phase 1
+T002_mountinfo_magisk_check          # Phase 2
+T003_proc_status_tracerpid_scrape    # Phase 3
+T004_su_binary_probe                 # Phase 4
+T005_magisk_path_probe               # Phase 5
+T006_frida_artifact_probe            # Phase 6
+T007_xposed_artifact_probe           # Phase 7
+T008_runtime_exec_root_command       # Phase 8 — fires on execve("su")
+T009_ptrace_self_or_remote           # Phase 9
+T010_prctl_dumpable_check            # Phase 10
+T011_rwx_memory_allocation           # Phase 11
+T012_proc_net_enumeration            # Phase 12
+T013_selinux_status_check            # Phase 13
+T014_property_service_query          # Phase 14
+T015_cross_process_proc_inspection   # Phase 15 — /proc/1/cmdline
+T021_frida_thread_comm_scan          # Phase 16 — 6 reads in 30 s window
+T022_unexpected_bpf_syscall          # Phase 17 — bpf() from `demo-target` comm
+
+# Stack-aware rules (T016, T017, T018, T019, T020) are NOT fired by the
+# demo target. They depend on per-device stack symbolization that varies
+# across Android builds and ART JIT cache state, so they cannot be made
+# deterministic for golden comparison.

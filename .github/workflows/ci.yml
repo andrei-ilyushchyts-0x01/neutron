@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: test (host crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Host-only crates: rule engine. The loader and BPF programs require
+      # an aarch64 cross-toolchain and a real device; we exercise them on
+      # a separate workflow when one is available.
+      - run: cargo test -p neutron-rules
+      - run: cargo clippy -p neutron-rules --no-deps -- -D warnings
+
+  rules-lint:
+    name: rules YAML lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Loading the default ruleset through the engine validates schema and
+      # per-rule structural constraints (non-empty conditions, sane window
+      # parameters, etc.).
+      - run: cargo test -p neutron-rules --test engine default_ruleset_loads

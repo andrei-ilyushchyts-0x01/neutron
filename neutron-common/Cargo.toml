@@ -1,0 +1,17 @@
+[package]
+name = "neutron-common"
+description = "Shared no_std types for the neutron syscall tracer (kernel + userspace)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# no_std so this crate can be used from both the BPF kernel side and userspace.
+[features]
+default = []
+# Enables derives that require std (Debug, etc.) — only for userspace.
+user = []
+
+[dependencies]

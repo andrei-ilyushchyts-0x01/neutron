@@ -1,0 +1,611 @@
+.\" Manpage for neutron.
+.\" To preview locally:
+.\"   man -l man/man1/neutron.1
+.\" To install system-wide:
+.\"   sudo install -m 0644 man/man1/neutron.1 /usr/local/share/man/man1/
+.\"   sudo mandb        # rebuild the man index
+.\"
+.TH NEUTRON 1 "2026-04-29" "neutron 1.0.0" "User Commands"
+.\" -----------------------------------------------------------------
+.SH NAME
+neutron \- low-intrusion eBPF syscall tracer for authorized Android
+security assessment
+.\" -----------------------------------------------------------------
+.SH SYNOPSIS
+.B neutron
+.RB [ \-\-pid
+.IR PID ]
+.RB [ \-\-profile
+.IR NAME ]
+.RB [ \-\-stacks ]
+.RB [ \-\-binder ]
+.RB [ \-\-resolve\-paths ]
+.RB [ \-\-rules
+.IR FILE ]
+.RB [ \-\-json ]
+.RB [ \-\-raw ]
+.RI [ OTHER\ OPTIONS ]
+.PP
+.B neutron doctor
+.\" -----------------------------------------------------------------
+.SH DESCRIPTION
+.B neutron
+is a low-intrusion observer for Android applications.
+It loads a small set of eBPF programs into the kernel via the Aya runtime,
+watches the syscalls a target process makes, and either emits raw events or
+runs them through a rule engine that produces high-level
+.I findings
+(for example "this app polled
+.IR /proc/self/maps
+every 2 seconds",
+"this app probed
+.IR /system/xbin/su
+from a libc-rooted call stack",
+or "this app allocated RWX memory") instead of dumping multi-megabyte raw
+event logs.
+.PP
+The tracer does not attach with
+.BR ptrace (2),
+inject libraries, or modify the target's mount namespace, so it avoids many
+common user-space debugger and instrumentation checks (TracerPid, loaded-library
+scans, mount-table inspection).
+It does
+.B not
+hide the presence of root, the BPF programs themselves, the kernel BPF
+subsystem, or the SELinux domain of the calling process.
+See the
+.B DISCLOSURE SURFACE
+section.
+.PP
+.B neutron
+is intentionally
+.I not
+a general-purpose Android profiler (use Perfetto, systrace, simpleperf, or
+Android Studio profiler for that) and not a one-click vulnerability scanner.
+It is meant for security researchers, reverse engineers, RASP engineers, and
+mobile platform specialists who need to understand how a protected Android
+application interacts with the OS at runtime.
+.\" -----------------------------------------------------------------
+.SH SUBCOMMANDS
+.TP
+.B doctor
+Run preflight environment checks and exit.
+Validates: privilege (euid 0 or
+.B CAP_BPF
++
+.BR CAP_SYS_ADMIN ),
+architecture (must be aarch64), kernel version (\(>= 6.1), BTF availability
+.RI ( /sys/kernel/btf/vmlinux ),
+.B tracefs
+mount, BPF filesystem mount, BPF ringbuf support, the
+.IR raw_syscalls/sys_enter
+and
+.IR raw_syscalls/sys_exit
+tracepoints, the
+.IR binder/binder_transaction
+tracepoint (warning if missing), kallsyms readability, and SELinux mode.
+Each check reports
+.BR PASS ", " WARN ", or " FAIL ;
+the command exits non-zero if any check is
+.BR FAIL .
+.PP
+When no subcommand is given,
+.B neutron
+runs in the default trace mode described under
+.BR OPTIONS .
+.\" -----------------------------------------------------------------
+.SH OPTIONS
+.SS Target selection
+.TP
+.BI \-\-pid " PID"
+Trace the process whose userspace PID equals
+.IR PID
+(equivalent to the kernel
+.BR tgid ;
+all threads of the target are captured).
+.IR PID =0
+(the default) means trace every process \(em useful but generates large
+volumes; pair with
+.BR \-\-exclude\-comm .
+.TP
+.B \-\-follow\-children
+On
+.BR clone (2),
+add the new child PID to the per-CPU whitelist so it is also traced.
+Combine with
+.B \-\-pid
+.IR <parent> .
+.SS Output
+.TP
+.BI \-\-output " FILE"
+Write the event/finding stream to
+.I FILE
+instead of standard output.
+The capture summary still goes to standard error.
+.TP
+.B \-\-json
+Emit events as NDJSON (one JSON object per line).
+This is the canonical machine-readable format and what the rule engine
+consumes internally.
+See the
+.B OUTPUT FORMATS
+section for the schema.
+.TP
+.B \-\-raw
+Emit per-event lines in addition to (or instead of) findings.
+By default
+.B neutron
+emits only rule-engine findings.
+.TP
+.B \-\-no\-findings
+Suppress findings.
+Useful with
+.B \-\-raw
+to reproduce the legacy per-event behaviour of pre-rule-engine versions.
+.TP
+.B \-v ", " \-\-verbose
+Print extra diagnostic context to standard error during attach and at exit.
+.SS Profiles
+.TP
+.BI \-\-profile " NAME"
+Apply a named profile.
+Currently only the
+.B security
+profile is recognised; it pre-populates
+.B \-\-exclude\-comm
+with a small set of high-volume Android system threads
+.RI ( "RenderThread, FrameMetricsAgg, PerfStat, Profile Saver, Jit thread pool" )
+that drown the trace in idle noise but never carry security-relevant signal.
+Future versions will add
+.BR runtime ", " ipc ", " drivers ", " memory ", and " raw
+profiles \(em see
+.IR docs/ROADMAP.md .
+.TP
+.BI \-\-exclude\-comm " LIST"
+Comma-separated substring matches; any event whose
+.B comm
+field contains one of these is suppressed userspace-side (the BPF program
+still observes it).
+Example:
+.B \-\-exclude\-comm
+.IR "RenderThread,Jit thread pool" .
+.SS Capture
+.TP
+.B \-\-binder
+Attach the
+.I binder/binder_transaction
+tracepoint program in addition to
+.IR raw_syscalls/sys_{enter,exit} .
+Binder events are emitted with
+.B nr=\-1
+as a sentinel and decoded by the userspace
+.I src/decode/binder.rs
+formatter.
+.TP
+.B \-\-stacks
+Resolve kernel and user stacks for every event via the BPF
+.B STACK_TRACES
+map.
+Native ELF symbols are read with
+.BR goblin ;
+.IR /proc/kallsyms
+provides kernel frames; ART JIT regions render as
+\fB<JIT>+0xN\fR.
+Required for stack-aware rules (T016\(enT020).
+.TP
+.B \-\-resolve\-paths
+On
+.BR openat (2)
+exit events whose in-kernel path capture failed, fall back to a
+.IR /proc/<pid>/fd/<fd>
+readlink to recover the path.
+On
+.BR connect (2),
+fall back to a
+.IR /proc/<pid>/net/tcp*
+inode lookup.
+Also enables FD-graph
+.IR /proc -based
+backfill (see
+.BR FD\-GRAPH ).
+.TP
+.B \-\-alert\-rwx
+Suppress every event except
+.BR mmap (2)
+and
+.BR mprotect (2)
+calls that produce an RWX or W^X region.
+Useful for surfacing memory-protection anomalies in a noisy trace.
+.TP
+.B \-\-capture\-reads
+On
+.BR read (2) " / " write (2)
+to a watched fd
+.RI ( /proc/* " or " /sys/* ),
+record the buffer pointer in the event's
+.B ptr_hint
+field for downstream tooling.
+The buffer contents themselves are
+.B not
+captured
+.RI ( "post-PAN, the userspace " process_vm_readv " peek was removed" ).
+.SS Rule engine
+.TP
+.BI \-\-rules " FILE"
+Path to a custom YAML rule file.
+Defaults to the bundled detector pack
+(22 starter rules \(em see
+.IR docs/guides/writing-rules.md ).
+.TP
+.BI \-\-findings\-drain\-interval " N"
+Print drained findings every
+.I N
+events.
+Default
+.BR 256 .
+Lower values surface findings sooner at the cost of more wakeups.
+.SS Build artefacts
+.TP
+.BI \-\-object " PATH"
+Path to the compiled BPF ELF object.
+Default
+.IR /data/local/tmp/neutron.bpf.elf
+\(em the location
+.B "build.sh"
+and
+.B "cargo xtask deploy"
+push to.
+.TP
+.BI \-\-pages " N"
+.B Deprecated
+as of 1.0.0 and silently ignored.
+Kept for backward compatibility with scripts that still pass the old
+PerfEventArray page count.
+The kernel
+.B RingBuf
+size is fixed in the BPF object.
+.\" -----------------------------------------------------------------
+.SH OUTPUT FORMATS
+.SS Text (default)
+One line per event, columns
+.RI [ ts_ms ]
+.IR pid / tid
+.I comm
+.RB ( -> | <- )
+.IR syscall ( decoded\ args ).
+Findings render as multi-line blocks prefixed
+.BR [FINDING] .
+.SS NDJSON ( \fB--json\fR )
+One JSON object per line.
+Stable fields per event:
+.IP
+.EX
+{
+  "ts_ns":         u64,
+  "pid":           u32,    // userspace PID (kernel tgid)
+  "tid":           u32,    // userspace TID (kernel pid)
+  "uid":           u32,
+  "nr":            i32,    // -1 sentinel for binder events
+  "name":          str,    // e.g. "openat"
+  "comm":          str,
+  "enter":         bool,
+  "ret":           i64,
+  "args":          [u64; 6],
+  "data":          ?str,   // decoded path / sockaddr / ioctl payload
+  "fd_kind":       ?str,   // file/device/socket/binder/... when graph hit
+  "fd_path":       ?str,   // resolved fd target
+  "rwx_alert":     ?str,   // "RWX" | "WX"
+  "kernel_stackid":?i32,
+  "user_stackid":  ?i32,
+  "stack":         ?str,   // present when --stacks
+  "latency_us":    ?u64,   // exit events only
+  "enter_ts_ns":   ?u64    // exit events only
+}
+.EE
+.IP
+Findings have a separate object schema; see
+.IR neutron-rules/src/finding.rs .
+Each finding carries
+.BR rule_id ", " severity ", " category ", " "(schema v2)" " "
+.BR behavior ", " "interpretation[]" ", " confidence ", " false_positives ", "
+.BR evidence_quality ,
+and a
+.B capture_health
+sub-object.
+.\" -----------------------------------------------------------------
+.SH CAPTURE SUMMARY
+On exit (or
+.BR SIGINT )
+.B neutron
+prints a capture summary block to standard error containing the BPF
+.B COUNTERS
+map plus userspace counters.
+Slots:
+.IP
+.EX
+events submitted          # reached userspace
+ringbuf reserve failed    # ring full \(em events DROPPED
+inflight update failed    # sys_enter could not store args
+inflight lookup missed    # sys_exit had no matching enter
+user stack failed         # bpf_get_stackid(USER)  -> error
+kernel stack failed       # bpf_get_stackid(0)     -> error
+path read failed          # bpf_probe_read_user_str failed
+path truncated            # path filled data[128] (no NUL)
+fd lookup missed          # FD graph miss
+symbolization failed      # userspace IP -> symbol failed
+fd graph: N miss(es), M resolved via /proc/<pid>/fd
+.EE
+.IP
+A
+.B WARNING
+banner is printed if any drop or degradation counter is non-zero, with the
+text
+.RB \(lq "absence of a finding is NOT conclusive" \(rq.
+Treat findings derived from a degraded run as suggestive, not conclusive.
+.\" -----------------------------------------------------------------
+.SH FD-GRAPH
+.B neutron
+maintains a userspace
+.I (pid, fd) -> resource
+graph so events that reference a bare fd
+.RB ( ioctl ", " read ", " write ", " mmap ", " close ", " dup3 )
+get enriched with
+.B fd_kind
+and
+.B fd_path
+in the JSON output.
+State transitions are driven by
+.BR openat ", " openat2 ", " close ", " dup ", " dup3 ", " socket ", " accept ", "
+.BR accept4 ", " memfd_create ", and " exit_group .
+With
+.B \-\-resolve\-paths
+a missing entry is backfilled via a single
+.IR /proc/<pid>/fd/<fd>
+readlink and the miss + backfill counts are surfaced in the capture summary.
+.\" -----------------------------------------------------------------
+.SH EXIT STATUS
+.TP
+.B 0
+Trace mode exited cleanly (operator sent SIGINT, or input EOF).
+.B doctor
+finished with no FAIL checks.
+.TP
+.B 1
+A required BPF map or program could not be loaded; an attach failed; the BPF
+object did not parse;
+.B doctor
+recorded at least one FAIL.
+.\" -----------------------------------------------------------------
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Log filter for the
+.B env_logger
+crate (e.g.
+.B RUST_LOG=debug ).
+Affects only userspace; BPF programs are unaffected.
+.\" -----------------------------------------------------------------
+.SH FILES
+.TP
+.I /data/local/tmp/neutron.bpf.elf
+Default location for the compiled BPF object.
+Override with
+.BR \-\-object .
+.TP
+.I /sys/kernel/btf/vmlinux
+Required.
+Aya consumes BTF for CO-RE relocation at load time.
+.B doctor
+verifies presence.
+.TP
+.I /sys/kernel/tracing/events/raw_syscalls/sys_{enter,exit}
+Required tracepoints.
+.B doctor
+verifies presence.
+.TP
+.I /sys/kernel/tracing/events/binder/binder_transaction
+Required only when
+.B \-\-binder
+is given.
+.TP
+.I /proc/kallsyms
+Read once at start when
+.B \-\-stacks
+is set, to symbolize kernel frames.
+A masked kallsyms (kptr_restrict \(>= 1) leaves kernel frames as raw hex.
+.TP
+.I /proc/<pid>/maps
+Read per-PID for native ELF stack symbolization.
+Currently parsed once at first event for that PID; the v1.1 ProcSymbolizer
+will refresh on
+.BR mmap ", " munmap ", and " mprotect
+events.
+.TP
+.I /proc/<pid>/fd/<fd>
+Read on demand by the FD-graph fallback when
+.B \-\-resolve\-paths
+is set and a fd is referenced before its open was observed.
+.\" -----------------------------------------------------------------
+.SH EXAMPLES
+.SS Quick start (one rooted Pixel)
+.PP
+.EX
+# Build BPF + userspace, push to /data/local/tmp.
+\&./build.sh
+PID=$(adb shell pidof com.example.app)
+
+# Run with stack-aware rules and procfs fallback path resolution.
+adb shell su -c "/data/local/tmp/neutron \\
+    --pid $PID \\
+    --profile security \\
+    --stacks \\
+    --resolve-paths"
+.EE
+.SS Capture NDJSON for offline analysis
+.PP
+.EX
+adb shell su -c "/data/local/tmp/neutron --pid $PID --json --binder" \\
+    > app-trace.ndjson
+# inspect later, optionally re-run the rule engine offline:
+neutron --raw --no-findings < app-trace.ndjson
+.EE
+.SS Self-test on the demo target
+.PP
+.EX
+cargo xtask demo                          # builds + pushes neutron + demo-target
+adb shell su -c '/data/local/tmp/neutron --pid 0 --json' > demo-trace.ndjson &
+adb shell '/data/local/tmp/demo-target'   # 18 phases, ~2s
+# Ctrl-C neutron, then verify:
+cargo xtask check-findings demo-trace.ndjson
+.EE
+.SS Verify the device is supported
+.PP
+.EX
+adb shell su -c '/data/local/tmp/neutron doctor'
+.EE
+.SS Trace one app and follow its child processes
+.PP
+.EX
+adb shell su -c "/data/local/tmp/neutron \\
+    --pid $(adb shell pidof com.example.app) \\
+    --follow-children \\
+    --json"
+.EE
+.SS Highlight only RWX memory operations
+.PP
+.EX
+adb shell su -c "/data/local/tmp/neutron --pid $PID --alert-rwx --raw"
+.EE
+.\" -----------------------------------------------------------------
+.SH WIRE FORMAT
+The single source of truth is
+.B SyscallEvent
+in
+.IR neutron-common/src/lib.rs .
+v1.0.0 wire format is
+.B 257 bytes
+.RB ( "#[repr(C, packed)]" ),
+verified at compile time by an assertion in both the BPF and userspace
+crates.
+A wire-format change requires bumping both assertions and the version note
+in
+.IR CHANGELOG.md .
+.PP
+The
+.B pid
+and
+.B tgid
+field names in the wire are inverted relative to kernel terminology for
+historical compatibility:
+.B pid
+holds the userspace PID (kernel
+.BR tgid )
+and is what
+.B \-\-pid
+matches against;
+.B tgid
+holds the userspace TID (kernel
+.BR pid ),
+distinct per thread.
+The BPF source uses self-documenting local names
+.RB ( userspace_pid ", " userspace_tid )
+to avoid confusion.
+.\" -----------------------------------------------------------------
+.SH LIMITATIONS
+.B neutron
+cannot fully infer:
+.IP \(bu
+Java/Kotlin method-level behaviour (no JVMTI / instrumentation; pair with
+Frida).
+.IP \(bu
+Full Binder Parcel contents (only tracepoint metadata; v1.2 will decode
+BINDER_WRITE_READ).
+.IP \(bu
+Complete app
+.RI \(-> "system service" \(->
+driver causal chains (driver work happens in
+.BR system_server ", " cameraserver ", "
+HAL processes; v2.0 will support multi-PID attach + binder transaction
+stitching).
+.IP \(bu
+Runtime behaviour fully inside userspace without syscalls (intra-process
+method calls, in-process decryption of already-mapped pages).
+.PP
+See
+.IR docs/LIMITATIONS.md
+for the full list and roadmap pointers.
+Per-rule false-positive scenarios are documented in
+.IR docs/FALSE-POSITIVES.md .
+.\" -----------------------------------------------------------------
+.SH DISCLOSURE SURFACE
+.B neutron
+does
+.B not
+hide:
+.IP \(bu
+The presence of root (KernelSU, Magisk).
+.IP \(bu
+Its own BPF programs (visible to
+.BR "bpftool prog list" ).
+.IP \(bu
+Loaded BPF maps (visible to
+.BR "bpftool map list" ).
+.IP \(bu
+The kernel BPF subsystem itself.
+.IP \(bu
+SELinux domain anomalies on the test bench.
+.IP \(bu
+Timing side-channels caused by tracepoint dispatch.
+.PP
+A target performing full environment fingerprinting can detect that
+something is observing it.
+.B neutron
+is meant for authorized assessment of applications you own or have written
+permission to test.
+.\" -----------------------------------------------------------------
+.SH SEE ALSO
+.BR adb (1),
+.BR bpf (2),
+.BR ptrace (2),
+.BR strace (1),
+.BR perf (1),
+.BR bpftool (8),
+.BR frida (1).
+.PP
+Project documentation:
+.IR docs/guides/quickstart.md ,
+.IR docs/guides/security-assessment.md ,
+.IR docs/guides/writing-rules.md ,
+.IR docs/guides/output-formats.md ,
+.IR docs/REFERENCE.md ,
+.IR docs/ARCHITECTURE.md ,
+.IR docs/LIMITATIONS.md ,
+.IR docs/FALSE-POSITIVES.md ,
+.IR docs/devices/pixel8pro.md ,
+.IR docs/benchmarks/pixel8pro-v1.0.md .
+.\" -----------------------------------------------------------------
+.SH BUGS
+Report at the project's issue tracker.
+Include
+.B "neutron doctor"
+output, the device build fingerprint
+.RB ( "getprop ro.build.fingerprint" ),
+the kernel version
+.RB ( "uname -srm" ),
+and a minimal repro
+\(em ideally a captured NDJSON segment that reproduces the issue.
+Do
+.B not
+include personally identifiable data, app secrets, or device serial numbers
+in the trace; redact before sharing.
+.\" -----------------------------------------------------------------
+.SH AUTHORS
+neutron contributors.
+See
+.IR docs/CONTRIBUTING.md .
+.\" -----------------------------------------------------------------
+.SH COPYRIGHT
+Apache-2.0.
+See
+.IR LICENSE .
+.\" end of neutron(1)

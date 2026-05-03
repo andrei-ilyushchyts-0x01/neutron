@@ -1,0 +1,37 @@
+// Expected NDJSON event shape from `demo-target` under `neutron`.
+//
+// This is a TEMPLATE, not a byte-exact golden. Real captures vary in:
+//   - timestamp_ns (per-boot ktime)
+//   - tid (thread IDs)
+//   - kernel_stackid / user_stackid (per-boot ringbuf nonce)
+//   - exact comm string (truncated at 16 chars, locale-affected)
+//
+// Use this file as a *shape* reference; per-rule field expectations are
+// enforced by the engine integration tests in `neutron-rules/tests/`.
+//
+// Each block below corresponds to one demo phase. `<TS>` is a placeholder
+// for any non-zero u64 timestamp; `<TID>` for any u32 thread ID; `<...>`
+// for fields that vary across runs.
+
+// Phase 1 — T001 /proc/self/maps polling. Three openat events; the third
+// trips the rule's frequency window.
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":56,"name":"openat","comm":"demo-target","enter":false,"ret":3,"args":[<...>],"data":"/proc/self/maps","fd_kind":"file","fd_path":"/proc/self/maps","enter_ts_ns":<TS>}
+
+// Phase 2 — T002 mountinfo
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":56,"name":"openat","comm":"demo-target","enter":false,"ret":3,"args":[<...>],"data":"/proc/self/mountinfo","fd_kind":"file","fd_path":"/proc/self/mountinfo","enter_ts_ns":<TS>}
+
+// Phase 11 — T011 RWX mmap. data field carries the marker tag.
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":222,"name":"mmap","comm":"demo-target","enter":true,"ret":0,"args":[0,4096,7,34,18446744073709551615,0],"rwx_alert":"RWX"}
+
+// Phase 17 — T022 bpf()
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":280,"name":"bpf","comm":"demo-target","enter":true,"ret":0,"args":[0,0,0,0,0,0]}
+
+// Phase 18 — FD graph: openat(/dev/null) inserts (pid, fd) → device.
+// Subsequent dup3 + ioctl + close events on the duplicated fd carry
+// `fd_kind:"device"` and `fd_path:"/dev/null"`.
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":56,"name":"openat","comm":"demo-target","enter":false,"ret":3,"args":[<...>],"data":"/dev/null","fd_kind":"file","fd_path":"/dev/null","enter_ts_ns":<TS>}
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":24,"name":"dup3","comm":"demo-target","enter":false,"ret":103,"args":[3,103,0,0,0,0],"fd_kind":"device","fd_path":"/dev/null","enter_ts_ns":<TS>}
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":29,"name":"ioctl","comm":"demo-target","enter":false,"ret":-25,"args":[103,3222553344,0,0,0,0],"fd_kind":"device","fd_path":"/dev/null","enter_ts_ns":<TS>}
+{"ts_ns":<TS>,"pid":<PID>,"tid":<TID>,"uid":<UID>,"nr":57,"name":"close","comm":"demo-target","enter":true,"ret":0,"args":[103,0,0,0,0,0],"fd_kind":"device","fd_path":"/dev/null"}
+
+// ---- end of template ----

@@ -1,0 +1,18 @@
+[package]
+name = "neutron-rules"
+description = "Rule engine and default detector pack for the neutron syscall tracer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+serde_yaml  = "0.9"
+thiserror   = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,24 @@
+[package]
+name = "neutron-ebpf"
+description = "Aya-based eBPF programs for the neutron tracer (bpfel-unknown-none)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# BPF programs require no_std and the bpfel-unknown-none target.
+# Build with: cargo xtask build-ebpf
+# (or manually: cargo +nightly build -Z build-std=core \
+#   --target bpfel-unknown-none --release \
+#   --manifest-path neutron-ebpf/Cargo.toml)
+
+[dependencies]
+aya-ebpf       = "0.1"
+aya-log-ebpf   = "0.1"
+neutron-common = { path = "../neutron-common" }
+
+[profile.release]
+lto = true
+opt-level = 3  # required: verifier rejects unoptimized BPF bytecode patterns
