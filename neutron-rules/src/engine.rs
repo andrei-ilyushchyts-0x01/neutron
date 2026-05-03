@@ -95,10 +95,17 @@ impl RuleEngine {
             };
 
             // Make a snapshot before mutating state (cheap, bounded by max evidence).
-            let snap_target = if target_str.is_empty() { None } else { Some(target_str.clone()) };
+            let snap_target = if target_str.is_empty() {
+                None
+            } else {
+                Some(target_str.clone())
+            };
 
             let state = self.states.entry(key).or_insert_with(|| {
-                let window = rule.frequency.as_ref().map(|f| SlidingWindow::new(f.window_ms));
+                let window = rule
+                    .frequency
+                    .as_ref()
+                    .map(|f| SlidingWindow::new(f.window_ms));
                 ActiveState {
                     first_ns: ev.ts_ns,
                     last_ns: ev.ts_ns,
@@ -142,8 +149,10 @@ impl RuleEngine {
             };
 
             if should_emit {
-                state.emitted = matches!(rule.aggregate, AggregateMode::PerProcess | AggregateMode::PerTarget)
-                    || rule.frequency.is_some();
+                state.emitted = matches!(
+                    rule.aggregate,
+                    AggregateMode::PerProcess | AggregateMode::PerTarget
+                ) || rule.frequency.is_some();
                 let finding = build_finding(rule, ev.pid, state);
                 self.pending.push(finding);
             }

@@ -70,11 +70,7 @@ pub fn format_finding_text(f: &neutron_rules::Finding) -> String {
 }
 
 /// Emit findings drained from the engine. Format depends on `use_json`.
-pub fn emit_findings(
-    findings: &[neutron_rules::Finding],
-    out: &mut dyn IoWrite,
-    use_json: bool,
-) {
+pub fn emit_findings(findings: &[neutron_rules::Finding], out: &mut dyn IoWrite, use_json: bool) {
     for f in findings {
         if use_json {
             // Tag the line so a mixed stream can be demultiplexed downstream.

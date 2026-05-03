@@ -53,7 +53,11 @@ impl<'a> Event<'a> {
     pub fn from_value(v: &'a Value, raw_line: Option<&'a str>) -> Option<Self> {
         let obj = v.as_object()?;
         let is_binder = obj.get("type").and_then(|t| t.as_str()) == Some("binder");
-        let kind = if is_binder { EventKind::Binder } else { EventKind::Syscall };
+        let kind = if is_binder {
+            EventKind::Binder
+        } else {
+            EventKind::Syscall
+        };
 
         let syscall_nr = if is_binder {
             -1

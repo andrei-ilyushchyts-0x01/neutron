@@ -246,10 +246,7 @@ mod tests {
         // prot=7 (RWX), flags = MAP_PRIVATE | MAP_ANONYMOUS = 2 | 0x20 = 0x22
         let args: [u64; 6] = [0, 4096, 7, 0x22, (-1i64) as u64, 0];
         let s = format_mmap_args(&args);
-        assert!(
-            s.contains("PROT_READ|PROT_WRITE|PROT_EXEC"),
-            "got {s}"
-        );
+        assert!(s.contains("PROT_READ|PROT_WRITE|PROT_EXEC"), "got {s}");
         assert!(s.contains("MAP_PRIVATE|MAP_ANONYMOUS"), "got {s}");
     }
 

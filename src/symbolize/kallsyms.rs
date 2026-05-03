@@ -45,7 +45,10 @@ impl KernelSymbolizer {
             if addr == 0 {
                 continue; // masked or invalid
             }
-            syms.push(KernSym { addr, name: name.to_string() });
+            syms.push(KernSym {
+                addr,
+                name: name.to_string(),
+            });
         }
 
         if syms.is_empty() {

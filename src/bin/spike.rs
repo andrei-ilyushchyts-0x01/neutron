@@ -41,16 +41,31 @@ fn parse_opts() -> Opts {
     let mut quiet = false;
     while let Some(flag) = it.next() {
         match flag.as_str() {
-            "--object" | "-o" => object = it.next().map(PathBuf::from).expect("--object needs path"),
+            "--object" | "-o" => {
+                object = it.next().map(PathBuf::from).expect("--object needs path")
+            }
             "--pid" | "-p" => {
-                pid = it.next().expect("--pid needs value").parse().expect("pid must be u32");
+                pid = it
+                    .next()
+                    .expect("--pid needs value")
+                    .parse()
+                    .expect("pid must be u32");
             }
             "--duration" | "-d" => {
-                let s: u64 = it.next().expect("--duration needs seconds").parse().expect("seconds");
+                let s: u64 = it
+                    .next()
+                    .expect("--duration needs seconds")
+                    .parse()
+                    .expect("seconds");
                 duration = Some(Duration::from_secs(s));
             }
             "--max-events" | "-n" => {
-                max_events = Some(it.next().expect("--max-events needs value").parse().expect("u64"));
+                max_events = Some(
+                    it.next()
+                        .expect("--max-events needs value")
+                        .parse()
+                        .expect("u64"),
+                );
             }
             "--resolve-paths" => resolve_paths = true,
             "--json" => json = true,
@@ -61,7 +76,15 @@ fn parse_opts() -> Opts {
             }
         }
     }
-    Opts { object, pid, duration, max_events, resolve_paths, json, quiet }
+    Opts {
+        object,
+        pid,
+        duration,
+        max_events,
+        resolve_paths,
+        json,
+        quiet,
+    }
 }
 
 fn main() {
@@ -94,7 +117,8 @@ fn attach_tp<'a>(
         .ok_or_else(|| format!("program {name} not found"))?
         .try_into()
         .map_err(|e| format!("{name}: not a TracePoint: {e}"))?;
-    prog.load().map_err(|e| format!("{name} load failed: {e}"))?;
+    prog.load()
+        .map_err(|e| format!("{name} load failed: {e}"))?;
     prog.attach(category, event)
         .map_err(|e| format!("{name} attach failed: {e}"))?;
     eprintln!("[OK] {name} loaded + attached to {category}/{event}");
@@ -112,11 +136,17 @@ fn run(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
 
     attach_tp(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
     attach_tp(&mut bpf, "trace_sys_exit", "raw_syscalls", "sys_exit")?;
-    attach_tp(&mut bpf, "trace_binder_transaction", "binder", "binder_transaction")?;
+    attach_tp(
+        &mut bpf,
+        "trace_binder_transaction",
+        "binder",
+        "binder_transaction",
+    )?;
 
     // Set filter: pid + active flag (0 = allow all syscalls).
     {
-        let mut filter: Array<_, u32> = Array::try_from(bpf.map_mut("FILTER_MAP").ok_or("FILTER_MAP missing")?)?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(bpf.map_mut("FILTER_MAP").ok_or("FILTER_MAP missing")?)?;
         filter.set(FILTER_KEY_PID, opts.pid, 0)?;
         filter.set(FILTER_KEY_ACTIVE, 0u32, 0)?;
         eprintln!("[OK] FILTER_MAP: pid={} active=0", opts.pid);
@@ -196,7 +226,11 @@ fn run(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_compact<W: Write>(w: &mut W, ev: &SyscallEvent, resolve_paths: bool) -> std::io::Result<()> {
+fn write_compact<W: Write>(
+    w: &mut W,
+    ev: &SyscallEvent,
+    resolve_paths: bool,
+) -> std::io::Result<()> {
     // Avoid packed-field borrows: copy scalars out first.
     let ts = ev.timestamp_ns;
     let pid = ev.pid;
@@ -207,7 +241,11 @@ fn write_compact<W: Write>(w: &mut W, ev: &SyscallEvent, resolve_paths: bool) ->
     let kstk = ev.kernel_stackid;
     let ustk = ev.user_stackid;
     let a = ev.args;
-    let comm_len = ev.comm.iter().position(|&b| b == 0).unwrap_or(ev.comm.len());
+    let comm_len = ev
+        .comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(ev.comm.len());
     let comm = core::str::from_utf8(&ev.comm[..comm_len]).unwrap_or("?");
     let path = decode::resolve_path(ev, resolve_paths);
     write!(
@@ -215,7 +253,12 @@ fn write_compact<W: Write>(w: &mut W, ev: &SyscallEvent, resolve_paths: bool) ->
         "{ts} {comm} pid={pid} tid={tid} nr={nr} {} ret={ret} \
          a=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] kstk={kstk} ustk={ustk}",
         if is_enter == 1 { "ENT" } else { "EXT" },
-        a[0], a[1], a[2], a[3], a[4], a[5],
+        a[0],
+        a[1],
+        a[2],
+        a[3],
+        a[4],
+        a[5],
     )?;
     if let Some(path) = path {
         write!(w, " data=\"{path}\"")?;
@@ -223,7 +266,11 @@ fn write_compact<W: Write>(w: &mut W, ev: &SyscallEvent, resolve_paths: bool) ->
     writeln!(w)
 }
 
-fn write_json<W: Write>(w: &mut W, ev: &SyscallEvent, resolve_paths: bool) -> std::io::Result<bool> {
+fn write_json<W: Write>(
+    w: &mut W,
+    ev: &SyscallEvent,
+    resolve_paths: bool,
+) -> std::io::Result<bool> {
     let Some(line) = format_json_line(ev, resolve_paths) else {
         return Ok(false);
     };
@@ -243,7 +290,11 @@ fn format_json_line(ev: &SyscallEvent, resolve_paths: bool) -> Option<String> {
     let tid = ev.tgid;
     let ret = ev.ret;
     let is_enter = ev.is_enter;
-    let comm_len = ev.comm.iter().position(|&b| b == 0).unwrap_or(ev.comm.len());
+    let comm_len = ev
+        .comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(ev.comm.len());
     let comm = core::str::from_utf8(&ev.comm[..comm_len]).unwrap_or("?");
     let comm = escape_json(comm);
     let path = match decode::resolve_path(ev, resolve_paths) {
@@ -266,7 +317,8 @@ fn escape_json(input: &str) -> String {
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
             _ if ch.is_control() => {
-                let _ = std::fmt::Write::write_fmt(&mut escaped, format_args!("\\u{:04x}", ch as u32));
+                let _ =
+                    std::fmt::Write::write_fmt(&mut escaped, format_args!("\\u{:04x}", ch as u32));
             }
             _ => escaped.push(ch),
         }

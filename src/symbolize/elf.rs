@@ -83,10 +83,7 @@ impl ElfSymbols {
         // Dedupe by vaddr (some libs alias the same address with multiple names).
         syms.dedup_by(|a, b| a.vaddr == b.vaddr);
 
-        let is_dyn = matches!(
-            elf.header.e_type,
-            goblin::elf::header::ET_DYN
-        );
+        let is_dyn = matches!(elf.header.e_type, goblin::elf::header::ET_DYN);
 
         Some(ElfSymbols { syms, is_dyn })
     }
@@ -134,7 +131,10 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe");
         let bytes = fs::read(&exe).expect("read self");
         let elf = ElfSymbols::from_bytes(&bytes);
-        assert!(elf.is_some(), "expected at least one FUNC symbol in test binary");
+        assert!(
+            elf.is_some(),
+            "expected at least one FUNC symbol in test binary"
+        );
         let elf = elf.unwrap();
         assert!(!elf.syms.is_empty());
         // Symbols must be sorted ascending.
@@ -168,8 +168,16 @@ mod tests {
     fn lookup_returns_symbol_plus_offset_for_exec() {
         let syms = ElfSymbols {
             syms: vec![
-                ElfSymbol { vaddr: 0x1000, size: 0x100, name: "foo".into() },
-                ElfSymbol { vaddr: 0x2000, size: 0x100, name: "bar".into() },
+                ElfSymbol {
+                    vaddr: 0x1000,
+                    size: 0x100,
+                    name: "foo".into(),
+                },
+                ElfSymbol {
+                    vaddr: 0x2000,
+                    size: 0x100,
+                    name: "bar".into(),
+                },
             ],
             is_dyn: false,
         };

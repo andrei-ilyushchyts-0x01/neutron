@@ -173,7 +173,10 @@ fn run_phases(verbose: bool) {
     // ── Phase 8: T008 — execve(su) ────────────────────────────────────────
     // The exec almost always fails (su not present, EACCES, ENOENT) but
     // raw_syscalls/sys_enter fires before the failure resolves.
-    let _ = std::process::Command::new("su").arg("-c").arg("true").output();
+    let _ = std::process::Command::new("su")
+        .arg("-c")
+        .arg("true")
+        .output();
     m(8, "T008", "execve(su)");
 
     // ── Phase 9: T009 — ptrace(PTRACE_TRACEME) ────────────────────────────
@@ -181,7 +184,12 @@ fn run_phases(verbose: bool) {
     // anti-debug self-probe. Returns -1/EPERM if a tracer is already
     // attached, success otherwise; either way the syscall fires.
     unsafe {
-        let _ = libc::ptrace(libc::PTRACE_TRACEME, 0, std::ptr::null_mut::<libc::c_void>(), 0);
+        let _ = libc::ptrace(
+            libc::PTRACE_TRACEME,
+            0,
+            std::ptr::null_mut::<libc::c_void>(),
+            0,
+        );
     }
     m(9, "T009", "ptrace(PTRACE_TRACEME)");
 

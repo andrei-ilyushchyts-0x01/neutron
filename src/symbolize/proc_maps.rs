@@ -77,7 +77,13 @@ fn parse_line(line: &str) -> Option<MapEntry> {
     let end = u64::from_str_radix(end_s, 16).ok()?;
     let offset = u64::from_str_radix(offset_s, 16).ok()?;
 
-    Some(MapEntry { start, end, offset, perms, name })
+    Some(MapEntry {
+        start,
+        end,
+        offset,
+        perms,
+        name,
+    })
 }
 
 #[cfg(test)]
@@ -106,7 +112,8 @@ mod tests {
 
     #[test]
     fn parses_pseudo_name_with_spaces() {
-        let line = "70a0000000-70a8000000 rw-p 00000000 00:00 0  [anon:dalvik-jit-code-cache (zygote)]";
+        let line =
+            "70a0000000-70a8000000 rw-p 00000000 00:00 0  [anon:dalvik-jit-code-cache (zygote)]";
         let entry = parse_line(line).expect("parse");
         assert_eq!(entry.name, "[anon:dalvik-jit-code-cache (zygote)]");
     }

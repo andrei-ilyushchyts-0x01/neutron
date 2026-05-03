@@ -23,16 +23,56 @@ use neutron_common::{
 /// Slots not listed here are treated as reserved and ignored by the summary
 /// printer. Order is purely cosmetic — it controls the printed layout.
 pub const COUNTER_LABELS: &[(u32, &str, CounterKind)] = &[
-    (COUNTER_EVENTS_SUBMITTED, "events submitted", CounterKind::Volume),
-    (COUNTER_RINGBUF_RESERVE_FAILED, "ringbuf reserve failed", CounterKind::Drop),
-    (COUNTER_INFLIGHT_UPDATE_FAILED, "inflight update failed", CounterKind::Degradation),
-    (COUNTER_INFLIGHT_LOOKUP_MISSED, "inflight lookup missed", CounterKind::Degradation),
-    (COUNTER_STACK_USER_FAILED, "user stack failed", CounterKind::Degradation),
-    (COUNTER_STACK_KERNEL_FAILED, "kernel stack failed", CounterKind::Degradation),
-    (COUNTER_PATH_READ_FAILED, "path read failed", CounterKind::Degradation),
-    (COUNTER_PATH_TRUNCATED, "path truncated", CounterKind::Degradation),
-    (COUNTER_FD_LOOKUP_MISSED, "fd lookup missed", CounterKind::Degradation),
-    (COUNTER_SYMBOLIZATION_FAILED, "symbolization failed", CounterKind::Degradation),
+    (
+        COUNTER_EVENTS_SUBMITTED,
+        "events submitted",
+        CounterKind::Volume,
+    ),
+    (
+        COUNTER_RINGBUF_RESERVE_FAILED,
+        "ringbuf reserve failed",
+        CounterKind::Drop,
+    ),
+    (
+        COUNTER_INFLIGHT_UPDATE_FAILED,
+        "inflight update failed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_INFLIGHT_LOOKUP_MISSED,
+        "inflight lookup missed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_STACK_USER_FAILED,
+        "user stack failed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_STACK_KERNEL_FAILED,
+        "kernel stack failed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_PATH_READ_FAILED,
+        "path read failed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_PATH_TRUNCATED,
+        "path truncated",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_FD_LOOKUP_MISSED,
+        "fd lookup missed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_SYMBOLIZATION_FAILED,
+        "symbolization failed",
+        CounterKind::Degradation,
+    ),
 ];
 
 /// Severity tagging for summary rendering.
@@ -189,7 +229,10 @@ mod tests {
     #[test]
     fn format_summary_with_emits_fd_graph_line_when_nonzero() {
         let h = CaptureHealth::default();
-        let user = UserspaceHealth { fd_graph_miss: 12, fd_graph_backfilled: 9 };
+        let user = UserspaceHealth {
+            fd_graph_miss: 12,
+            fd_graph_backfilled: 9,
+        };
         let s = format_summary_with(&h, &user, 100);
         assert!(s.contains("fd graph: 12 miss(es), 9 resolved"));
     }

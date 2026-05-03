@@ -154,7 +154,10 @@ mod tests {
     fn format_sockaddr_decodes_af_inet() {
         // family=2 LE, port=80 BE, addr=8.8.8.8
         let buf = buf_from(&[0x02, 0x00, 0x00, 0x50, 8, 8, 8, 8]);
-        assert_eq!(format_sockaddr(&buf), Some("AF_INET 8.8.8.8:80".to_string()));
+        assert_eq!(
+            format_sockaddr(&buf),
+            Some("AF_INET 8.8.8.8:80".to_string())
+        );
     }
 
     #[test]

@@ -99,7 +99,11 @@ impl ProcSymbolizer {
 
         // Anonymous mapping (no file): fall back to plain offset.
         if name.is_empty() || name.starts_with('[') {
-            let label = if name.is_empty() { "[anon]" } else { name.as_str() };
+            let label = if name.is_empty() {
+                "[anon]"
+            } else {
+                name.as_str()
+            };
             return format!("{}+{:#x}", label, offset_in_region);
         }
 

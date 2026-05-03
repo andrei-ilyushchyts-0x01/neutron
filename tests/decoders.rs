@@ -40,8 +40,7 @@ fn openat_su_event_triggers_su_binary_probe_rule() {
     };
     let line = format_event_json(&ev, false);
 
-    let mut engine = neutron_rules::RuleEngine::with_default_rules()
-        .expect("default rules load");
+    let mut engine = neutron_rules::RuleEngine::with_default_rules().expect("default rules load");
     let owned = neutron_rules::Event::parse_line(&line)
         .expect("event parses (this confirms the JSON contract)");
     let view = owned.view().expect("event view");
@@ -115,8 +114,7 @@ fn format_event_json_with_stack_feeds_engine_for_stack_contains_rules() {
     let line = format_event_json_with_stack(&ev, false, Some(stack));
 
     let mut engine = neutron_rules::RuleEngine::with_default_rules().unwrap();
-    let owned = neutron_rules::Event::parse_line(&line)
-        .expect("event parses with stack field");
+    let owned = neutron_rules::Event::parse_line(&line).expect("event parses with stack field");
     let view = owned.view().expect("event view");
     // Confirm the parsed view actually carries the stack so the engine can
     // see it — this is the load-bearing contract for stack-aware rules.
@@ -125,7 +123,9 @@ fn format_event_json_with_stack_feeds_engine_for_stack_contains_rules() {
 
     let findings = engine.flush_all();
     assert!(
-        findings.iter().any(|f| f.rule_id == "T016_native_root_check_via_libc"),
+        findings
+            .iter()
+            .any(|f| f.rule_id == "T016_native_root_check_via_libc"),
         "expected T016 finding via stack-aware rule, got: {:?}",
         findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
     );

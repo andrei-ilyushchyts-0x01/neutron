@@ -30,7 +30,7 @@ use neutron::fdgraph::FdGraph;
 use neutron::format::{format_event_json_full, format_event_text_with_stack, FdHint};
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
 use neutron::rules::{build_rule_engine, emit_findings};
-use neutron::symbolize::{KernelSymbolizer, ProcSymbolizer, is_kernel_addr};
+use neutron::symbolize::{is_kernel_addr, KernelSymbolizer, ProcSymbolizer};
 use neutron::SyscallEvent;
 use neutron_common::{FILTER_KEY_ACTIVE, FILTER_KEY_PID};
 
@@ -74,7 +74,10 @@ fn install_sigint(running: Arc<AtomicBool>) {
     let leaked = Box::into_raw(Box::new(running)) as usize;
     RUNNING_PTR.store(leaked, Ordering::SeqCst);
     unsafe {
-        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -99,7 +102,10 @@ fn apply_profile(args: &mut Args) -> Result<()> {
         bail!("unknown profile '{profile}' (available: {SECURITY_PROFILE})");
     }
     if args.exclude_comm.is_empty() {
-        args.exclude_comm = SECURITY_EXCLUDE_COMM.iter().map(|s| (*s).to_string()).collect();
+        args.exclude_comm = SECURITY_EXCLUDE_COMM
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
     }
     Ok(())
 }
@@ -107,17 +113,12 @@ fn apply_profile(args: &mut Args) -> Result<()> {
 // ── BPF load + attach ────────────────────────────────────────────────────────
 
 fn load_bpf(object_path: &str) -> Result<Ebpf> {
-    let bytes = fs::read(object_path)
-        .with_context(|| format!("cannot read BPF object {object_path}"))?;
+    let bytes =
+        fs::read(object_path).with_context(|| format!("cannot read BPF object {object_path}"))?;
     Ebpf::load(&bytes).with_context(|| format!("Ebpf::load failed for {object_path}"))
 }
 
-fn attach_tracepoint(
-    bpf: &mut Ebpf,
-    name: &str,
-    category: &str,
-    event: &str,
-) -> Result<()> {
+fn attach_tracepoint(bpf: &mut Ebpf, name: &str, category: &str, event: &str) -> Result<()> {
     let prog: &mut TracePoint = bpf
         .program_mut(name)
         .with_context(|| format!("program {name} not found in BPF object"))?
@@ -136,8 +137,8 @@ fn populate_filter_map(bpf: &mut Ebpf, pid: u32) -> Result<()> {
     let map = bpf
         .map_mut("FILTER_MAP")
         .context("FILTER_MAP missing from BPF object")?;
-    let mut filter: Array<_, u32> = Array::try_from(map)
-        .context("FILTER_MAP is not an Array<u32>")?;
+    let mut filter: Array<_, u32> =
+        Array::try_from(map).context("FILTER_MAP is not an Array<u32>")?;
     filter
         .set(FILTER_KEY_PID, pid, 0)
         .context("setting FILTER_MAP[PID]")?;
@@ -313,7 +314,11 @@ fn run_trace(mut args: Args) -> Result<()> {
     eprintln!("  loading {}", args.object);
     eprintln!(
         "  target pid: {}",
-        if args.pid == 0 { "all".to_string() } else { args.pid.to_string() }
+        if args.pid == 0 {
+            "all".to_string()
+        } else {
+            args.pid.to_string()
+        }
     );
     if args.pid == 0 {
         eprintln!("  note: tracing all processes; inflight map may overflow under heavy load");
@@ -356,8 +361,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     let events_map = bpf
         .take_map("EVENTS")
         .context("EVENTS map missing from BPF object")?;
-    let mut ring: RingBuf<_> = RingBuf::try_from(events_map)
-        .context("EVENTS is not a RingBuf")?;
+    let mut ring: RingBuf<_> = RingBuf::try_from(events_map).context("EVENTS is not a RingBuf")?;
     let ring_fd = ring.as_raw_fd();
     if args.verbose {
         eprintln!("  ring buffer: 1 producer (kernel) → 1 consumer (this loop)");
@@ -447,18 +451,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                         if let Some(stmap) = bpf.map("STACK_TRACES") {
                             if let Ok(stack_traces) = StackTraceMap::try_from(stmap) {
                                 let proc_sym_mut = proc_sym_opt.as_mut();
-                                let kernel_str = format_stack(
-                                    &stack_traces,
-                                    kstk,
-                                    None,
-                                    kernel_sym.as_ref(),
-                                );
-                                let user_str = format_stack(
-                                    &stack_traces,
-                                    ustk,
-                                    proc_sym_mut,
-                                    None,
-                                );
+                                let kernel_str =
+                                    format_stack(&stack_traces, kstk, None, kernel_sym.as_ref());
+                                let user_str =
+                                    format_stack(&stack_traces, ustk, proc_sym_mut, None);
                                 match (kernel_str, user_str) {
                                     (Some(k), Some(u)) => Some(format!("{k} ;; {u}")),
                                     (Some(k), None) => Some(k),
@@ -495,7 +491,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                     } else {
                         fd_graph.lookup(pid, fd).cloned()
                     };
-                    opt.map(|e| FdHint { kind: e.kind, path: e.path })
+                    opt.map(|e| FdHint {
+                        kind: e.kind,
+                        path: e.path,
+                    })
                 });
 
                 // Always compute the JSON form: cheap and fed to the rule engine.
@@ -518,11 +517,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     let line = if args.json {
                         json_line.clone()
                     } else {
-                        format_event_text_with_stack(
-                            &ev,
-                            args.resolve_paths,
-                            stack_str.as_deref(),
-                        )
+                        format_event_text_with_stack(&ev, args.resolve_paths, stack_str.as_deref())
                     };
                     let _ = writeln!(out, "{line}");
                 }
@@ -540,18 +535,17 @@ fn run_trace(mut args: Args) -> Result<()> {
 
                 // Side effects that need to happen AFTER the event is consumed.
                 if args.follow_children {
-                    let map = bpf.map_mut("PID_WHITELIST")
+                    let map = bpf
+                        .map_mut("PID_WHITELIST")
                         .context("PID_WHITELIST missing")?;
-                    let mut pid_whitelist: AyaHashMap<_, u32, u8> =
-                        AyaHashMap::try_from(map)
-                            .context("PID_WHITELIST is not HashMap<u32,u8>")?;
+                    let mut pid_whitelist: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(map)
+                        .context("PID_WHITELIST is not HashMap<u32,u8>")?;
                     handle_follow_children(&ev, &mut pid_whitelist, args.verbose)?;
                 }
                 if args.capture_reads {
                     let map = bpf.map_mut("WATCH_FDS").context("WATCH_FDS missing")?;
                     let mut watch_fds: AyaHashMap<_, u64, u8> =
-                        AyaHashMap::try_from(map)
-                            .context("WATCH_FDS is not HashMap<u64,u8>")?;
+                        AyaHashMap::try_from(map).context("WATCH_FDS is not HashMap<u64,u8>")?;
                     handle_capture_reads(&ev, &mut watch_fds, &mut *out, args.verbose)?;
                 }
 
@@ -598,7 +592,10 @@ fn run_trace(mut args: Args) -> Result<()> {
         match Array::<_, u64>::try_from(map) {
             Ok(arr) => {
                 let health = CaptureHealth::read(&arr);
-                eprint!("{}", format_summary_with(&health, &user_health, total_events));
+                eprint!(
+                    "{}",
+                    format_summary_with(&health, &user_health, total_events)
+                );
             }
             Err(e) => {
                 eprintln!("\nneutron: COUNTERS map present but unreadable: {e}");

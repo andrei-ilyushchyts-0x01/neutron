@@ -293,8 +293,14 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
             return;
         }
         let name_ptr = u64::from_le_bytes([
-            hdr_head[0], hdr_head[1], hdr_head[2], hdr_head[3],
-            hdr_head[4], hdr_head[5], hdr_head[6], hdr_head[7],
+            hdr_head[0],
+            hdr_head[1],
+            hdr_head[2],
+            hdr_head[3],
+            hdr_head[4],
+            hdr_head[5],
+            hdr_head[6],
+            hdr_head[7],
         ]);
         let namelen = u32::from_le_bytes([hdr_head[8], hdr_head[9], hdr_head[10], hdr_head[11]]);
         if name_ptr != 0 && namelen >= 2 {
@@ -355,7 +361,7 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
     // self-documenting.
     let pid_tgid = bpf_get_current_pid_tgid();
     let userspace_pid = (pid_tgid >> 32) as u32; // kernel tgid
-    let userspace_tid = pid_tgid as u32;          // kernel pid
+    let userspace_tid = pid_tgid as u32; // kernel pid
 
     if !pid_matches(userspace_pid) {
         return Err(());
@@ -456,7 +462,7 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
     // See `try_sys_enter` for the kernel/userspace pid/tgid naming inversion.
     let pid_tgid = bpf_get_current_pid_tgid();
     let userspace_pid = (pid_tgid >> 32) as u32; // kernel tgid
-    let userspace_tid = pid_tgid as u32;          // kernel pid
+    let userspace_tid = pid_tgid as u32; // kernel pid
 
     if !pid_matches(userspace_pid) {
         return Err(());
@@ -552,7 +558,7 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
     // See `try_sys_enter` for the kernel/userspace pid/tgid naming inversion.
     let pid_tgid = bpf_get_current_pid_tgid();
     let userspace_pid = (pid_tgid >> 32) as u32; // kernel tgid
-    let userspace_tid = pid_tgid as u32;          // kernel pid
+    let userspace_tid = pid_tgid as u32; // kernel pid
 
     if !pid_matches(userspace_pid) {
         return Err(());

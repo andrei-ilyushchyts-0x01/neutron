@@ -93,7 +93,11 @@ pub fn format_event_json_full(
     let fd_json = match fd_hint {
         Some(h) => {
             let escaped = h.path.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(r#","fd_kind":"{}","fd_path":"{}""#, h.kind.as_str(), escaped)
+            format!(
+                r#","fd_kind":"{}","fd_path":"{}""#,
+                h.kind.as_str(),
+                escaped
+            )
         }
         None => String::new(),
     };
@@ -231,7 +235,10 @@ mod tests {
         assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("openat"));
         assert_eq!(obj.get("nr").and_then(|v| v.as_i64()), Some(56));
         assert_eq!(obj.get("enter").and_then(|v| v.as_bool()), Some(true));
-        let args = obj.get("args").and_then(|v| v.as_array()).expect("args array");
+        let args = obj
+            .get("args")
+            .and_then(|v| v.as_array())
+            .expect("args array");
         assert_eq!(args.len(), 6);
     }
 
@@ -276,7 +283,10 @@ mod tests {
         };
         let v = parse(&format_event_json(&ev, false));
         assert_eq!(v.get("latency_us").and_then(|x| x.as_u64()), Some(500));
-        assert_eq!(v.get("enter_ts_ns").and_then(|x| x.as_u64()), Some(1_500_000));
+        assert_eq!(
+            v.get("enter_ts_ns").and_then(|x| x.as_u64()),
+            Some(1_500_000)
+        );
     }
 
     #[test]
@@ -371,7 +381,8 @@ mod tests {
             data: data_path(b"/proc/self/maps\0"),
             ..SyscallEvent::default()
         };
-        let line = format_event_json_with_stack(&ev, false, Some("libc.so:malloc+0x12 <- main+0x40"));
+        let line =
+            format_event_json_with_stack(&ev, false, Some("libc.so:malloc+0x12 <- main+0x40"));
         let v = parse(&line);
         assert_eq!(
             v.get("stack").and_then(|x| x.as_str()),
@@ -389,7 +400,10 @@ mod tests {
         // Embed a quote — must still parse as JSON.
         let line = format_event_json_with_stack(&ev, false, Some(r#"weird"frame"#));
         let v = parse(&line);
-        assert_eq!(v.get("stack").and_then(|x| x.as_str()), Some(r#"weird"frame"#));
+        assert_eq!(
+            v.get("stack").and_then(|x| x.as_str()),
+            Some(r#"weird"frame"#)
+        );
     }
 
     #[test]
@@ -439,11 +453,17 @@ mod tests {
             ..SyscallEvent::default()
         };
         ev.args[0] = 12;
-        let hint = FdHint { kind: FdKind::Binder, path: "/dev/binder".into() };
+        let hint = FdHint {
+            kind: FdKind::Binder,
+            path: "/dev/binder".into(),
+        };
         let line = format_event_json_full(&ev, false, None, Some(&hint));
         let v = parse(&line);
         assert_eq!(v.get("fd_kind").and_then(|x| x.as_str()), Some("binder"));
-        assert_eq!(v.get("fd_path").and_then(|x| x.as_str()), Some("/dev/binder"));
+        assert_eq!(
+            v.get("fd_path").and_then(|x| x.as_str()),
+            Some("/dev/binder")
+        );
     }
 
     #[test]
@@ -467,9 +487,15 @@ mod tests {
             is_enter: 1,
             ..SyscallEvent::default()
         };
-        let hint = FdHint { kind: FdKind::File, path: r#"/tmp/wei"rd"#.into() };
+        let hint = FdHint {
+            kind: FdKind::File,
+            path: r#"/tmp/wei"rd"#.into(),
+        };
         let line = format_event_json_full(&ev, false, None, Some(&hint));
         let v = parse(&line);
-        assert_eq!(v.get("fd_path").and_then(|x| x.as_str()), Some(r#"/tmp/wei"rd"#));
+        assert_eq!(
+            v.get("fd_path").and_then(|x| x.as_str()),
+            Some(r#"/tmp/wei"rd"#)
+        );
     }
 }

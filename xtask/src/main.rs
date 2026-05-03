@@ -10,9 +10,9 @@
 //!                                   # diff a captured NDJSON trace against
 //!                                   # examples/expected/findings.txt
 
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use anyhow::{bail, Context, Result};
 
 const EBPF_OBJ_NAME: &str = "neutron.bpf.elf";
 const DEMO_BIN: &str = "demo-target";
@@ -42,10 +42,7 @@ fn main() -> Result<()> {
         }
         Some("bench") => {
             // Optional duration argument; defaults to 30 seconds per profile.
-            let secs: u64 = args
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30);
+            let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
             bench(secs)
         }
         Some("bench-parse") => {
@@ -54,10 +51,7 @@ fn main() -> Result<()> {
             let profile = args
                 .next()
                 .context("usage: cargo xtask bench-parse <profile_name>")?;
-            let secs: u64 = args
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30);
+            let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
             bench_parse_stdin(&profile, secs)
         }
         Some(cmd) => bail!("unknown command: {cmd}"),
@@ -83,7 +77,10 @@ fn build_ebpf(release: bool) -> Result<()> {
     let root = workspace_root();
     let ebpf_dir = root.join("neutron-ebpf");
 
-    println!("=== Building BPF programs ({}) ===", if release { "release" } else { "debug" });
+    println!(
+        "=== Building BPF programs ({}) ===",
+        if release { "release" } else { "debug" }
+    );
 
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
@@ -131,7 +128,12 @@ fn build_userspace() -> Result<()> {
 
     let status = Command::new("cargo")
         .current_dir(&root)
-        .args(["build", "--release", "--target", "aarch64-unknown-linux-musl"])
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "aarch64-unknown-linux-musl",
+        ])
         .status()
         .context("cargo build for userspace failed")?;
 
@@ -183,7 +185,10 @@ fn demo() -> Result<()> {
     let demo_bin = build_demo_target()?;
 
     println!("\n=== Pushing demo-target to /data/local/tmp ===");
-    let state = Command::new("adb").args(["get-state"]).output().context("adb not found")?;
+    let state = Command::new("adb")
+        .args(["get-state"])
+        .output()
+        .context("adb not found")?;
     if !state.status.success() {
         bail!("no adb device connected — connect a Pixel and re-run");
     }
@@ -207,7 +212,13 @@ fn demo() -> Result<()> {
         }
     }
     let _ = Command::new("adb")
-        .args(["shell", "chmod", "+x", "/data/local/tmp/neutron", "/data/local/tmp/demo-target"])
+        .args([
+            "shell",
+            "chmod",
+            "+x",
+            "/data/local/tmp/neutron",
+            "/data/local/tmp/demo-target",
+        ])
         .status();
 
     println!("\n=== How to run on-device ===");
@@ -232,8 +243,7 @@ fn demo() -> Result<()> {
 /// `examples/expected/findings.txt` list. Prints a unified diff of the
 /// rule_id sets and exits non-zero if they don't match.
 fn check_findings(path: &str) -> Result<()> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {path}"))?;
+    let contents = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
 
     // Extract rule_id values from JSON lines that contain them. We use a
     // simple substring scan rather than a JSON parser to avoid pulling
@@ -266,7 +276,11 @@ fn check_findings(path: &str) -> Result<()> {
     let missing: Vec<_> = expected.difference(&actual).collect();
     let extra: Vec<_> = actual.difference(&expected).collect();
 
-    println!("expected: {} rules; got: {} rules", expected.len(), actual.len());
+    println!(
+        "expected: {} rules; got: {} rules",
+        expected.len(),
+        actual.len()
+    );
     if !missing.is_empty() {
         println!("\n  MISSING (expected but not seen):");
         for m in &missing {
@@ -283,8 +297,10 @@ fn check_findings(path: &str) -> Result<()> {
         println!("OK: every expected rule fired and no surprise rules appeared");
         Ok(())
     } else if missing.is_empty() {
-        println!("\nNote: extras are not a failure — they may be stack-aware or \
-                 environment-specific rules that happened to match.");
+        println!(
+            "\nNote: extras are not a failure — they may be stack-aware or \
+                 environment-specific rules that happened to match."
+        );
         Ok(())
     } else {
         bail!(
@@ -300,9 +316,7 @@ fn check_findings(path: &str) -> Result<()> {
 /// `neutron`-stderr captures via `bench-parse`.
 fn bench(secs: u64) -> Result<()> {
     println!("=== neutron bench harness ===\n");
-    println!(
-        "Each profile runs for {secs}s under demo-target's --loop. We capture"
-    );
+    println!("Each profile runs for {secs}s under demo-target's --loop. We capture");
     println!("neutron's stderr (which prints the capture summary on Ctrl-C),");
     println!("then parse events_submitted / drops / fd-graph misses out of it.\n");
 
@@ -381,10 +395,7 @@ fn bench_parse_stdin(profile: &str, secs: u64) -> Result<()> {
             stack_kernel_failed = rest.trim().parse().ok();
         } else if let Some(rest) = trimmed.strip_prefix("fd graph:") {
             // "fd graph: 12 miss(es), 9 resolved via /proc/<pid>/fd"
-            fd_misses = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse().ok());
+            fd_misses = rest.split_whitespace().next().and_then(|s| s.parse().ok());
         }
     }
 
@@ -424,8 +435,10 @@ fn deploy() -> Result<()> {
 
     for (src, dst) in &[
         (EBPF_OBJ_NAME, "/data/local/tmp/neutron.bpf.elf"),
-        ("target/aarch64-unknown-linux-musl/release/neutron",
-         "/data/local/tmp/neutron"),
+        (
+            "target/aarch64-unknown-linux-musl/release/neutron",
+            "/data/local/tmp/neutron",
+        ),
     ] {
         let src_path = root.join(src);
         println!("  push {} -> {}", src_path.display(), dst);

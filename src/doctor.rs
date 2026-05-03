@@ -45,13 +45,25 @@ pub struct CheckResult {
 
 impl CheckResult {
     pub fn pass(name: &'static str, reason: impl Into<String>) -> Self {
-        Self { name, status: Status::Pass, reason: reason.into() }
+        Self {
+            name,
+            status: Status::Pass,
+            reason: reason.into(),
+        }
     }
     pub fn warn(name: &'static str, reason: impl Into<String>) -> Self {
-        Self { name, status: Status::Warn, reason: reason.into() }
+        Self {
+            name,
+            status: Status::Warn,
+            reason: reason.into(),
+        }
     }
     pub fn fail(name: &'static str, reason: impl Into<String>) -> Self {
-        Self { name, status: Status::Fail, reason: reason.into() }
+        Self {
+            name,
+            status: Status::Fail,
+            reason: reason.into(),
+        }
     }
 }
 
@@ -115,7 +127,9 @@ pub fn check_arch<E: Env>(env: &E) -> CheckResult {
 pub fn check_kernel_version<E: Env>(env: &E) -> CheckResult {
     let v = match env.read_to_string("/proc/version") {
         Ok(s) => s,
-        Err(e) => return CheckResult::fail("kernel version", format!("cannot read /proc/version: {e}")),
+        Err(e) => {
+            return CheckResult::fail("kernel version", format!("cannot read /proc/version: {e}"))
+        }
     };
     // Lines look like "Linux version 6.1.145-android14-11-... ".
     let prefix = "Linux version ";
@@ -191,7 +205,10 @@ pub fn check_raw_syscalls<E: Env>(env: &E) -> CheckResult {
     let have_enter = env.path_exists(enter);
     let have_exit = env.path_exists(exit);
     match (have_enter, have_exit) {
-        (true, true) => CheckResult::pass("raw_syscalls tracepoints", "both sys_enter and sys_exit present"),
+        (true, true) => CheckResult::pass(
+            "raw_syscalls tracepoints",
+            "both sys_enter and sys_exit present",
+        ),
         (true, false) => CheckResult::fail(
             "raw_syscalls tracepoints",
             "sys_enter present but sys_exit missing — neutron needs both",
@@ -235,7 +252,10 @@ pub fn check_kallsyms<E: Env>(env: &E) -> CheckResult {
                     "addresses zeroed (kptr_restrict ≥ 1) — kernel stack frames stay hex",
                 )
             } else {
-                CheckResult::pass("kallsyms", "/proc/kallsyms readable with non-zero addresses")
+                CheckResult::pass(
+                    "kallsyms",
+                    "/proc/kallsyms readable with non-zero addresses",
+                )
             }
         }
     }
@@ -391,22 +411,22 @@ mod tests {
 
     #[test]
     fn kernel_version_pass_for_pixel_8_pro() {
-        let env = FakeEnv::new()
-            .with_file("/proc/version", "Linux version 6.1.145-android14-11 (build@host) ...");
+        let env = FakeEnv::new().with_file(
+            "/proc/version",
+            "Linux version 6.1.145-android14-11 (build@host) ...",
+        );
         assert_eq!(check_kernel_version(&env).status, Status::Pass);
     }
 
     #[test]
     fn kernel_version_fail_for_4_14() {
-        let env = FakeEnv::new()
-            .with_file("/proc/version", "Linux version 4.14.180 (legacy)");
+        let env = FakeEnv::new().with_file("/proc/version", "Linux version 4.14.180 (legacy)");
         assert_eq!(check_kernel_version(&env).status, Status::Fail);
     }
 
     #[test]
     fn kernel_version_warn_for_5_15() {
-        let env = FakeEnv::new()
-            .with_file("/proc/version", "Linux version 5.15.0 ...");
+        let env = FakeEnv::new().with_file("/proc/version", "Linux version 5.15.0 ...");
         assert_eq!(check_kernel_version(&env).status, Status::Warn);
     }
 
@@ -432,8 +452,7 @@ mod tests {
 
     #[test]
     fn raw_syscalls_fail_when_either_missing() {
-        let env = FakeEnv::new()
-            .with_existing("/sys/kernel/tracing/events/raw_syscalls/sys_enter");
+        let env = FakeEnv::new().with_existing("/sys/kernel/tracing/events/raw_syscalls/sys_enter");
         assert_eq!(check_raw_syscalls(&env).status, Status::Fail);
     }
 
@@ -445,15 +464,16 @@ mod tests {
 
     #[test]
     fn kallsyms_warn_when_addresses_masked() {
-        let env = FakeEnv::new()
-            .with_file("/proc/kallsyms", "0000000000000000 T do_syscall_64\n0000000000000000 T do_anything\n");
+        let env = FakeEnv::new().with_file(
+            "/proc/kallsyms",
+            "0000000000000000 T do_syscall_64\n0000000000000000 T do_anything\n",
+        );
         assert_eq!(check_kallsyms(&env).status, Status::Warn);
     }
 
     #[test]
     fn kallsyms_pass_when_real_addresses() {
-        let env = FakeEnv::new()
-            .with_file("/proc/kallsyms", "ffffffc01023f000 T do_syscall_64\n");
+        let env = FakeEnv::new().with_file("/proc/kallsyms", "ffffffc01023f000 T do_syscall_64\n");
         assert_eq!(check_kallsyms(&env).status, Status::Pass);
     }
 
@@ -480,10 +500,7 @@ mod tests {
 
     #[test]
     fn print_and_exit_returns_zero_on_only_warnings() {
-        let results = vec![
-            CheckResult::pass("a", "ok"),
-            CheckResult::warn("b", "soft"),
-        ];
+        let results = vec![CheckResult::pass("a", "ok"), CheckResult::warn("b", "soft")];
         assert_eq!(print_and_exit_code(&results), 0);
     }
 }

@@ -13,9 +13,7 @@ pub use args::{
 };
 pub use binder::{format_binder_event, format_binder_event_json};
 pub use ioctl::format_ioctl_deep;
-pub use sockaddr::{
-    format_sockaddr, lookup_socket_by_inode, parse_net_addr, read_socket_inode,
-};
+pub use sockaddr::{format_sockaddr, lookup_socket_by_inode, parse_net_addr, read_socket_inode};
 pub use syscalls::syscall_name;
 
 /// True if `nr` carries a NUL-terminated path in `data[128]`.
@@ -82,8 +80,7 @@ pub fn format_data_field(ev: &SyscallEvent) -> Option<String> {
         // sendmsg/recvmsg: sockaddr from msg_name + controllen at data[64..72]
         211 | 212 => {
             let addr = format_sockaddr(&data);
-            let controllen =
-                u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
+            let controllen = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
             match (addr, controllen) {
                 (Some(a), 0) => Some(a),
                 (Some(a), n) => Some(format!("{} ctrl_len={}", a, n)),
@@ -167,7 +164,10 @@ mod tests {
     #[test]
     fn format_data_as_path_reads_nul_terminated_string() {
         let data = path_bytes(b"/proc/self/maps\0ignored");
-        assert_eq!(format_data_as_path(&data), Some("/proc/self/maps".to_string()));
+        assert_eq!(
+            format_data_as_path(&data),
+            Some("/proc/self/maps".to_string())
+        );
     }
 
     #[test]
@@ -194,7 +194,10 @@ mod tests {
     fn format_data_field_decodes_all_file_path_syscalls() {
         for nr in [56, 48, 79, 78, 43, 36, 35, 221, 281] {
             let ev = path_event(nr, b"/system/lib/libc.so\0");
-            assert_eq!(format_data_field(&ev), Some("/system/lib/libc.so".to_string()));
+            assert_eq!(
+                format_data_field(&ev),
+                Some("/system/lib/libc.so".to_string())
+            );
         }
     }
 

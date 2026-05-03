@@ -168,7 +168,13 @@ mod tests {
     fn empty_v2_fields_are_omitted_from_json() {
         let f = minimal();
         let s = serde_json::to_string(&f).unwrap();
-        for key in ["behavior", "interpretation", "confidence", "false_positives", "evidence_quality"] {
+        for key in [
+            "behavior",
+            "interpretation",
+            "confidence",
+            "false_positives",
+            "evidence_quality",
+        ] {
             assert!(!s.contains(key), "expected {key} to be omitted, got: {s}");
         }
         // capture_health serializes as `{}` when defaults match the skip rules.

@@ -89,12 +89,20 @@ impl FdEntry {
     fn new(path: impl Into<String>, ts_ns: u64) -> Self {
         let path = path.into();
         let kind = classify(&path);
-        Self { kind, path, opened_at_ns: ts_ns }
+        Self {
+            kind,
+            path,
+            opened_at_ns: ts_ns,
+        }
     }
 
     fn synthetic(kind: FdKind, ts_ns: u64) -> Self {
         let path = synthetic_path(kind).to_string();
-        Self { kind, path, opened_at_ns: ts_ns }
+        Self {
+            kind,
+            path,
+            opened_at_ns: ts_ns,
+        }
     }
 }
 
@@ -124,10 +132,7 @@ fn synthetic_path(kind: FdKind) -> &'static str {
 /// - `anon_inode:...` → AnonInode
 /// - everything else → File
 pub fn classify(path: &str) -> FdKind {
-    if path.starts_with("/dev/binder")
-        || path == "/dev/hwbinder"
-        || path == "/dev/vndbinder"
-    {
+    if path.starts_with("/dev/binder") || path == "/dev/hwbinder" || path == "/dev/vndbinder" {
         return FdKind::Binder;
     }
     if path.contains("ashmem") {
@@ -197,12 +202,7 @@ impl FdGraph {
     /// the entry is missing. The backfilled entry is inserted into the
     /// graph for subsequent lookups. The miss counter increments either
     /// way; `backfill_count` increments only on a successful readlink.
-    pub fn lookup_or_resolve(
-        &mut self,
-        pid: u32,
-        fd: i32,
-        ts_hint_ns: u64,
-    ) -> Option<FdEntry> {
+    pub fn lookup_or_resolve(&mut self, pid: u32, fd: i32, ts_hint_ns: u64) -> Option<FdEntry> {
         if let Some(entry) = self.per_pid.get(&pid).and_then(|m| m.get(&fd)) {
             return Some(entry.clone());
         }
@@ -489,7 +489,12 @@ mod tests {
     }
 
     fn ev_enter_exit_group(pid: u32) -> SyscallEvent {
-        SyscallEvent { pid, syscall_nr: 94, is_enter: 1, ..SyscallEvent::default() }
+        SyscallEvent {
+            pid,
+            syscall_nr: 94,
+            is_enter: 1,
+            ..SyscallEvent::default()
+        }
     }
 
     #[test]

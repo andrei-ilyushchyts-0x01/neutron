@@ -5,8 +5,8 @@ use std::fs;
 
 /// Number of online CPUs as reported by `/sys/devices/system/cpu/online`.
 pub fn online_cpus() -> Result<usize> {
-    let s = fs::read_to_string("/sys/devices/system/cpu/online")
-        .context("cannot read online CPUs")?;
+    let s =
+        fs::read_to_string("/sys/devices/system/cpu/online").context("cannot read online CPUs")?;
     let s = s.trim();
     if let Some(pos) = s.rfind('-') {
         let max: usize = s[pos + 1..].parse()?;

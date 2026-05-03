@@ -35,22 +35,22 @@
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct SyscallEvent {
-    pub timestamp_ns:       u64,
-    pub pid:                u32,
-    pub tgid:               u32,
-    pub uid:                u32,
-    pub syscall_nr:         i32,
-    pub args:               [u64; 6],
-    pub ret:                i64,
-    pub is_enter:           u8,
-    pub comm:               [u8; 16],
-    pub data:               [u8; 128],
-    pub kernel_stackid:     i32,
-    pub user_stackid:       i32,
-    pub ptr_hint:           u64,
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub tgid: u32,
+    pub uid: u32,
+    pub syscall_nr: i32,
+    pub args: [u64; 6],
+    pub ret: i64,
+    pub is_enter: u8,
+    pub comm: [u8; 16],
+    pub data: [u8; 128],
+    pub kernel_stackid: i32,
+    pub user_stackid: i32,
+    pub ptr_hint: u64,
     pub enter_timestamp_ns: u64,
-    pub maps_generation:    u16,
-    pub _reserved:          [u8; 6],
+    pub maps_generation: u16,
+    pub _reserved: [u8; 6],
 }
 
 // Compile-time layout check. v1.0 wire format is 257 bytes:
@@ -68,7 +68,7 @@ impl Default for SyscallEvent {
 }
 
 /// Keys for filter_map (BPF_MAP_TYPE_ARRAY, 2 entries)
-pub const FILTER_KEY_PID:    u32 = 0;
+pub const FILTER_KEY_PID: u32 = 0;
 pub const FILTER_KEY_ACTIVE: u32 = 1;
 
 /// Maximum number of stack frames stored per stack trace
@@ -81,7 +81,7 @@ pub const STACK_FRAMES: u32 = 127;
 // — they may be added at the end but never reordered.
 
 /// Number of events successfully submitted to the ring buffer.
-pub const COUNTER_EVENTS_SUBMITTED:      u32 = 0;
+pub const COUNTER_EVENTS_SUBMITTED: u32 = 0;
 /// `EVENTS.reserve()` returned `None` (ring full). Event was dropped.
 pub const COUNTER_RINGBUF_RESERVE_FAILED: u32 = 1;
 /// `INFLIGHT.insert()` failed on enter — exit event will lack args/stack ids.
@@ -89,17 +89,17 @@ pub const COUNTER_INFLIGHT_UPDATE_FAILED: u32 = 2;
 /// `INFLIGHT.get_ptr()` returned `None` on exit — args/data/stack lost.
 pub const COUNTER_INFLIGHT_LOOKUP_MISSED: u32 = 3;
 /// `bpf_get_stackid(BPF_F_USER_STACK)` returned an error.
-pub const COUNTER_STACK_USER_FAILED:      u32 = 4;
+pub const COUNTER_STACK_USER_FAILED: u32 = 4;
 /// `bpf_get_stackid(0)` (kernel stack) returned an error.
-pub const COUNTER_STACK_KERNEL_FAILED:    u32 = 5;
+pub const COUNTER_STACK_KERNEL_FAILED: u32 = 5;
 /// `bpf_probe_read_user_str_bytes` returned an error — path/string capture lost.
-pub const COUNTER_PATH_READ_FAILED:       u32 = 6;
+pub const COUNTER_PATH_READ_FAILED: u32 = 6;
 /// Path capture filled the whole `data[128]` buffer (no NUL seen).
-pub const COUNTER_PATH_TRUNCATED:         u32 = 7;
+pub const COUNTER_PATH_TRUNCATED: u32 = 7;
 /// Userspace fd graph lookup miss (resolving via `/proc/<pid>/fd/<fd>`).
-pub const COUNTER_FD_LOOKUP_MISSED:       u32 = 8;
+pub const COUNTER_FD_LOOKUP_MISSED: u32 = 8;
 /// Userspace symbolizer failed to resolve a non-zero IP to a symbol.
-pub const COUNTER_SYMBOLIZATION_FAILED:   u32 = 9;
+pub const COUNTER_SYMBOLIZATION_FAILED: u32 = 9;
 
 /// Number of slots in the COUNTERS map. New counters extend the tail; bumping
 /// requires updating the `Array::with_max_entries(...)` size in BPF and the
