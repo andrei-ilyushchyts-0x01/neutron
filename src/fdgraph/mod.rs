@@ -44,6 +44,8 @@ use std::collections::HashMap;
 
 use neutron_common::SyscallEvent;
 
+pub mod poller;
+
 /// Coarse classification of what a fd points at. Driven from the path
 /// (or synthetic prefix for socket/pipe/memfd).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +161,53 @@ pub fn classify(path: &str) -> FdKind {
     FdKind::File
 }
 
+/// Per-PID first-class metrics derived from poller samples.
+///
+/// `current` is computed from the live graph at sample time; the rest are
+/// stamped in by [`FdGraph::record_sample`]. Sprint-1 PR 3 adds these so
+/// rules like `R001_fd_table_exhaustion` can match `fd_count_pct_of_rlimit_gt`
+/// against a single observable predicate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FdStats {
+    /// FD count at the last sample. The poller passes the value it read
+    /// from `/proc/<pid>/fd` so this is authoritative even when neutron
+    /// missed some open/close events earlier in the session.
+    pub current: u32,
+    /// Maximum [`current`] observed for this PID since the graph was
+    /// created. Monotonically non-decreasing — exposed for "fd table grew
+    /// to N/M" findings.
+    pub high_water_mark: u32,
+    /// Average growth rate (fds/second) between the last two samples.
+    /// `0.0` until at least two samples have been recorded.
+    pub growth_rate_per_sec: f32,
+    /// Wallclock-equivalent (`bpf_ktime_get_ns()`-domain) timestamp of the
+    /// most recent [`record_sample`] call. `0` when never sampled.
+    pub last_sample_ts_ns: u64,
+    /// Snapshot of [`current`] at the previous sample. Together with
+    /// `last_sample_ts_ns` this is what `growth_rate_per_sec` is computed
+    /// from. Reset to zero on `drop_pid`.
+    pub last_sample_count: u32,
+    /// Per-process open files limit from `/proc/<pid>/limits` (the soft
+    /// `RLIMIT_NOFILE`). `0` when unknown — rules guarding on
+    /// `fd_count_pct_of_rlimit_gt` skip events with `rlimit == 0`.
+    pub rlimit_nofile: u32,
+}
+
+impl FdStats {
+    /// Percent of `rlimit_nofile` currently consumed, rounded down to the
+    /// nearest whole percent. Returns `None` when `rlimit_nofile == 0`
+    /// (unknown limit) so rule predicates can distinguish "no signal" from
+    /// "0 percent".
+    pub fn pct_of_rlimit(&self) -> Option<u8> {
+        if self.rlimit_nofile == 0 {
+            return None;
+        }
+        // Use u64 arithmetic to avoid overflow on pathological counts.
+        let pct = (self.current as u64 * 100) / self.rlimit_nofile as u64;
+        Some(pct.min(100) as u8)
+    }
+}
+
 /// FD graph keyed by `(pid, fd)`.
 ///
 /// Memory: O(open fds across tracked processes). On Android one app
@@ -166,6 +215,7 @@ pub fn classify(path: &str) -> FdKind {
 #[derive(Debug, Default)]
 pub struct FdGraph {
     per_pid: HashMap<u32, HashMap<i32, FdEntry>>,
+    per_stats: HashMap<u32, FdStats>,
     miss_count: u64,
     backfill_count: u64,
 }
@@ -190,6 +240,65 @@ impl FdGraph {
     /// Drop all state for a pid (e.g. on `exit_group` or process death).
     pub fn drop_pid(&mut self, pid: u32) {
         self.per_pid.remove(&pid);
+        self.per_stats.remove(&pid);
+    }
+
+    /// First-class metrics for `pid`. `None` when no sample has been
+    /// recorded and no fd-bearing event has been observed.
+    pub fn stats(&self, pid: u32) -> Option<&FdStats> {
+        self.per_stats.get(&pid)
+    }
+
+    /// Record a poller sample. Updates `current`, `high_water_mark`, and
+    /// (when at least one prior sample is on file) `growth_rate_per_sec`.
+    /// `rlimit` is the soft `RLIMIT_NOFILE` from `/proc/<pid>/limits`;
+    /// pass `0` when unknown.
+    pub fn record_sample(&mut self, pid: u32, count: u32, rlimit: u32, ts_ns: u64) {
+        let entry = self.per_stats.entry(pid).or_default();
+        // Growth rate over the interval since the last sample. Compare the
+        // new `count` against the *previous* sample's count, which is held
+        // in `entry.current` until we overwrite it below. Negative deltas
+        // (process closed many fds) round to a non-negative rate so rule
+        // predicates can use `growth_rate_per_sec > N` without sign quirks.
+        let rate = if entry.last_sample_ts_ns != 0 && ts_ns > entry.last_sample_ts_ns {
+            let dt_ns = (ts_ns - entry.last_sample_ts_ns) as f64;
+            let delta = count as i64 - entry.current as i64;
+            ((delta.max(0) as f64) * 1_000_000_000.0 / dt_ns) as f32
+        } else {
+            0.0
+        };
+        entry.last_sample_count = entry.current;
+        entry.last_sample_ts_ns = ts_ns;
+        entry.current = count;
+        if count > entry.high_water_mark {
+            entry.high_water_mark = count;
+        }
+        entry.growth_rate_per_sec = rate;
+        if rlimit != 0 {
+            entry.rlimit_nofile = rlimit;
+        }
+    }
+
+    /// Top-N most-occurring `path` values across this PID's tracked fds.
+    /// Returned in descending count order; ties broken by path string for
+    /// stability across runs (test-friendly).
+    pub fn top_paths(&self, pid: u32, n: usize) -> Vec<(String, u32)> {
+        let Some(map) = self.per_pid.get(&pid) else {
+            return Vec::new();
+        };
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        for entry in map.values() {
+            *counts.entry(entry.path.as_str()).or_insert(0) += 1;
+        }
+        let mut pairs: Vec<(String, u32)> = counts
+            .into_iter()
+            .map(|(p, c)| (p.to_string(), c))
+            .collect();
+        // Descending by count, then ascending by path for deterministic
+        // ordering — matters for golden-output assertions.
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        pairs.truncate(n);
+        pairs
     }
 
     /// Plain lookup — does NOT touch `/proc`. Returns `None` if the fd is
@@ -567,5 +676,98 @@ mod tests {
     fn fd_arg_for_event_skips_non_fd_syscalls() {
         let ev = ev_exit_openat(7, 5);
         assert_eq!(FdGraph::fd_arg_for_event(&ev), None);
+    }
+
+    // ── FdStats / poller-facing metrics (sprint-1 PR 3) ─────────────────────
+
+    #[test]
+    fn record_sample_initialises_high_water_and_zero_growth_rate() {
+        let mut g = FdGraph::new();
+        g.record_sample(42, 100, 1024, 1_000_000_000);
+        let s = g.stats(42).expect("stats present after first sample");
+        assert_eq!(s.current, 100);
+        assert_eq!(s.high_water_mark, 100);
+        assert_eq!(s.rlimit_nofile, 1024);
+        // First sample has no prior data point — growth rate stays 0.
+        assert_eq!(s.growth_rate_per_sec, 0.0);
+    }
+
+    #[test]
+    fn record_sample_high_water_mark_is_monotonic() {
+        let mut g = FdGraph::new();
+        g.record_sample(42, 100, 1024, 1_000_000_000);
+        g.record_sample(42, 50, 1024, 2_000_000_000);
+        // current shrank but HWM must not regress.
+        assert_eq!(g.stats(42).unwrap().current, 50);
+        assert_eq!(g.stats(42).unwrap().high_water_mark, 100);
+        g.record_sample(42, 150, 1024, 3_000_000_000);
+        assert_eq!(g.stats(42).unwrap().high_water_mark, 150);
+    }
+
+    #[test]
+    fn record_sample_growth_rate_uses_last_two_samples() {
+        let mut g = FdGraph::new();
+        g.record_sample(42, 100, 1024, 1_000_000_000);
+        // 1s later, +50 fds → 50 fds/s.
+        g.record_sample(42, 150, 1024, 2_000_000_000);
+        let rate = g.stats(42).unwrap().growth_rate_per_sec;
+        assert!((rate - 50.0).abs() < 0.5, "expected ~50 fds/s, got {rate}");
+    }
+
+    #[test]
+    fn record_sample_negative_delta_clamps_growth_rate_to_zero() {
+        // Process closed fds between samples. We don't model that as a
+        // negative rate (rules use `> N` predicates); growth rate stays >= 0.
+        let mut g = FdGraph::new();
+        g.record_sample(42, 200, 1024, 1_000_000_000);
+        g.record_sample(42, 100, 1024, 2_000_000_000);
+        assert_eq!(g.stats(42).unwrap().growth_rate_per_sec, 0.0);
+    }
+
+    #[test]
+    fn pct_of_rlimit_returns_none_when_limit_unknown() {
+        let mut g = FdGraph::new();
+        g.record_sample(42, 100, 0, 1_000_000_000);
+        assert_eq!(g.stats(42).unwrap().pct_of_rlimit(), None);
+    }
+
+    #[test]
+    fn pct_of_rlimit_rounds_down_and_caps_at_one_hundred() {
+        let mut g = FdGraph::new();
+        g.record_sample(42, 950, 1000, 1_000_000_000);
+        assert_eq!(g.stats(42).unwrap().pct_of_rlimit(), Some(95));
+        // Capping protects against rlimit changing mid-session.
+        g.record_sample(42, 2000, 1000, 2_000_000_000);
+        assert_eq!(g.stats(42).unwrap().pct_of_rlimit(), Some(100));
+    }
+
+    #[test]
+    fn top_paths_returns_descending_counts_with_path_tiebreak() {
+        let mut g = FdGraph::new();
+        // Three fds to /dev/dma_heap/system, two to /dev/binder, one to /tmp/x.
+        g.insert(7, 1, FdEntry::new("/dev/dma_heap/system", 0));
+        g.insert(7, 2, FdEntry::new("/dev/dma_heap/system", 0));
+        g.insert(7, 3, FdEntry::new("/dev/dma_heap/system", 0));
+        g.insert(7, 4, FdEntry::new("/dev/binder", 0));
+        g.insert(7, 5, FdEntry::new("/dev/binder", 0));
+        g.insert(7, 6, FdEntry::new("/tmp/x", 0));
+        let top = g.top_paths(7, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0], ("/dev/dma_heap/system".into(), 3));
+        assert_eq!(top[1], ("/dev/binder".into(), 2));
+    }
+
+    #[test]
+    fn top_paths_returns_empty_for_unknown_pid() {
+        let g = FdGraph::new();
+        assert!(g.top_paths(42, 5).is_empty());
+    }
+
+    #[test]
+    fn drop_pid_clears_per_stats_too() {
+        let mut g = FdGraph::new();
+        g.record_sample(42, 100, 1024, 1_000_000_000);
+        g.drop_pid(42);
+        assert!(g.stats(42).is_none());
     }
 }

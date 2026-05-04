@@ -624,3 +624,139 @@ fn finding_json_omits_v2_fields_when_unset() {
         "expected omitted interpretation; got {s}"
     );
 }
+
+// ── Sprint-1 PR 3: FdSnapshot event support ─────────────────────────────────
+
+#[test]
+fn fd_snapshot_event_kind_is_recognised_by_parser() {
+    let line = r#"{"type":"fd_snapshot","ts_ns":100,"pid":540,"uid":1000,"comm":"hal","fd_count":16380,"fd_rlimit":32768,"fd_pct_of_rlimit":49,"high_water_mark":16380,"growth_rate_per_sec":0.0,"top_paths":[]}"#;
+    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+    let ev = Event::from_value(&value, Some(line)).expect("snapshot parses");
+    assert_eq!(ev.kind, neutron_rules::EventKind::FdSnapshot);
+    assert_eq!(ev.fd_count, Some(16380));
+    assert_eq!(ev.fd_pct_of_rlimit, Some(49));
+}
+
+#[test]
+fn fd_count_pct_of_rlimit_gt_fires_only_above_threshold_and_only_on_snapshots() {
+    // Custom YAML rule predicating on the new fields. Locks the predicate
+    // semantics: requires snapshot kind, requires non-zero rlimit, and
+    // strict-greater comparison.
+    let yaml = r#"
+- id: TEST_fd_pct_threshold
+  name: FD percent over threshold
+  description: Test rule.
+  severity: high
+  category: ipc
+  conditions:
+    - fd_snapshot: true
+      fd_count_pct_of_rlimit_gt: 90
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+
+    // Below threshold (89) → no fire.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"fd_snapshot","ts_ns":100,"pid":1,"uid":1,"comm":"a","fd_count":890,"fd_rlimit":1000,"fd_pct_of_rlimit":89,"high_water_mark":890,"growth_rate_per_sec":0.0,"top_paths":[]}"#,
+        ],
+    );
+    assert!(engine.drain_ready().is_empty(), "should not fire at 89%");
+
+    // Above threshold (95) → fires once per pid.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"fd_snapshot","ts_ns":200,"pid":1,"uid":1,"comm":"a","fd_count":950,"fd_rlimit":1000,"fd_pct_of_rlimit":95,"high_water_mark":950,"growth_rate_per_sec":0.0,"top_paths":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "TEST_fd_pct_threshold");
+    assert_eq!(findings[0].pid, 1);
+
+    // Syscall event with fd_count absent → does not match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"ts_ns":300,"pid":2,"tid":2,"uid":1,"nr":56,"name":"openat","comm":"b","enter":false,"ret":7,"args":[0,0,0,0,0,0],"data":"/proc/self/maps"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_fd_pct_threshold"),
+        "syscall event must not satisfy fd_count_pct_of_rlimit_gt"
+    );
+}
+
+#[test]
+fn fd_count_gt_predicate_requires_snapshot_event() {
+    let yaml = r#"
+- id: TEST_fd_count_threshold
+  name: FD count over threshold
+  description: Test rule.
+  severity: medium
+  category: ipc
+  conditions:
+    - fd_count_gt: 1000
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+
+    // Snapshot with fd_count=1500 → fires.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"fd_snapshot","ts_ns":100,"pid":7,"uid":1,"comm":"x","fd_count":1500,"fd_rlimit":4096,"fd_pct_of_rlimit":36,"high_water_mark":1500,"growth_rate_per_sec":0.0,"top_paths":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(findings
+        .iter()
+        .any(|f| f.rule_id == "TEST_fd_count_threshold"));
+
+    // Syscall event has no fd_count — must not fire even with high args[0].
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"ts_ns":200,"pid":8,"tid":8,"uid":1,"nr":29,"name":"ioctl","comm":"y","enter":false,"ret":0,"args":[5000,0,0,0,0,0],"data":""}"#,
+        ],
+    );
+    let new_findings = engine.drain_ready();
+    assert!(
+        new_findings.iter().all(|f| f.pid != 8),
+        "fd_count_gt must not match syscall events: got {new_findings:?}"
+    );
+}
+
+#[test]
+fn fd_count_pct_of_rlimit_gt_skips_when_rlimit_unknown() {
+    let yaml = r#"
+- id: TEST_pct_unknown_rlimit
+  name: pct unknown
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - fd_count_pct_of_rlimit_gt: 0
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+    // fd_pct_of_rlimit absent ⇒ predicate fails open, no match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"fd_snapshot","ts_ns":100,"pid":9,"uid":1,"comm":"z","fd_count":50,"fd_rlimit":0,"high_water_mark":50,"growth_rate_per_sec":0.0,"top_paths":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_pct_unknown_rlimit"),
+        "snapshot without rlimit must not satisfy pct predicate"
+    );
+}

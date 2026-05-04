@@ -94,6 +94,23 @@ pub struct MatchCondition {
     /// substrings. Events without a stack pass this filter trivially.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack_not_contains: Option<Vec<String>>,
+
+    /// Match if the event is an FD-poller snapshot (`type:"fd_snapshot"`).
+    /// Sprint-1 PR 3. Required precondition for `fd_count_*` predicates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_snapshot: Option<bool>,
+
+    /// Match if the event's `fd_count` is strictly greater than this value.
+    /// Implies `EventKind::FdSnapshot` — non-snapshot events have no
+    /// fd_count and never match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_count_gt: Option<u32>,
+
+    /// Match if the event's `fd_pct_of_rlimit` is strictly greater than
+    /// this value. Implies `EventKind::FdSnapshot` AND that the snapshot
+    /// carried a non-zero rlimit (events with unknown rlimit never match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_count_pct_of_rlimit_gt: Option<u8>,
 }
 
 impl MatchCondition {
@@ -194,6 +211,26 @@ impl MatchCondition {
                 if forbidden.iter().any(|f| s.contains(f.as_str())) {
                     return false;
                 }
+            }
+        }
+        if let Some(true) = self.fd_snapshot {
+            if ev.kind != EventKind::FdSnapshot {
+                return false;
+            }
+        }
+        if let Some(threshold) = self.fd_count_gt {
+            // Implicit: requires an FdSnapshot event with fd_count present.
+            // Non-snapshot events can't satisfy this; rule authors who want
+            // to match on syscall-level fd values must use `arg0_*` etc.
+            match ev.fd_count {
+                Some(c) if c > threshold => {}
+                _ => return false,
+            }
+        }
+        if let Some(threshold) = self.fd_count_pct_of_rlimit_gt {
+            match ev.fd_pct_of_rlimit {
+                Some(pct) if pct > threshold => {}
+                _ => return false,
             }
         }
         true

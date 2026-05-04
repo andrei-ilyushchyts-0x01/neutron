@@ -262,6 +262,61 @@ pub fn format_event_json_full(
     )
 }
 
+/// Render a single FD-poller sample as a `type:"fd_snapshot"` NDJSON line.
+///
+/// Sprint-1 PR 3 introduces this as a third event class alongside `syscall`
+/// and `binder`. The rule engine consumes it via [`crate::rules`] →
+/// `neutron_rules::EventKind::FdSnapshot`; rules like
+/// `R001_fd_table_exhaustion` predicate on `fd_count_pct_of_rlimit_gt`.
+///
+/// `high_water_mark` and `growth_rate_per_sec` come from the userspace
+/// [`crate::fdgraph::FdGraph::stats`] entry the caller updates immediately
+/// before formatting (`record_sample` then `stats(pid)`).
+pub fn format_fd_snapshot_json(
+    sample: &crate::fdgraph::poller::FdSampleEvent,
+    high_water_mark: u32,
+    growth_rate_per_sec: f32,
+    event_id: Option<u64>,
+) -> String {
+    let pct_json = if sample.rlimit_nofile == 0 {
+        String::new()
+    } else {
+        let pct = ((sample.fd_count as u64 * 100) / sample.rlimit_nofile as u64).min(100);
+        format!(r#","fd_pct_of_rlimit":{}"#, pct)
+    };
+    let event_id_json = match event_id {
+        Some(id) => format!(r#","event_id":{}"#, id),
+        None => String::new(),
+    };
+    // Comm/path strings come straight from /proc — escape JSON-significant
+    // chars so a pathological filename can't break parsing.
+    let escaped_comm = sample.comm.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut top_paths_json = String::from(r#","top_paths":["#);
+    for (i, (path, count)) in sample.top_paths.iter().enumerate() {
+        if i > 0 {
+            top_paths_json.push(',');
+        }
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        top_paths_json.push_str(&format!(r#"{{"path":"{}","count":{}}}"#, escaped, count));
+    }
+    top_paths_json.push(']');
+
+    format!(
+        r#"{{"type":"fd_snapshot","ts_ns":{},"pid":{},"uid":{},"comm":"{}","fd_count":{},"fd_rlimit":{}{},"high_water_mark":{},"growth_rate_per_sec":{:.2}{}{}}}"#,
+        sample.ts_ns,
+        sample.pid,
+        sample.uid,
+        escaped_comm,
+        sample.fd_count,
+        sample.rlimit_nofile,
+        pct_json,
+        high_water_mark,
+        growth_rate_per_sec,
+        top_paths_json,
+        event_id_json,
+    )
+}
+
 /// Inject `"stack":"<escaped>"` just before the trailing `}` of an
 /// already-rendered JSON object. Used for the binder-event branch where we
 /// re-use the binder formatter and don't want to duplicate its logic.
@@ -785,6 +840,116 @@ mod tests {
         assert_eq!(
             v.get("ioctl_family").and_then(|x| x.as_str()),
             Some("binder")
+        );
+    }
+
+    // ── fd_snapshot formatter (sprint-1 PR 3) ────────────────────────────
+
+    fn snap(
+        pid: u32,
+        fd_count: u32,
+        rlimit: u32,
+        comm: &str,
+        top: Vec<(&str, u32)>,
+    ) -> crate::fdgraph::poller::FdSampleEvent {
+        crate::fdgraph::poller::FdSampleEvent {
+            pid,
+            uid: 1000,
+            comm: comm.into(),
+            fd_count,
+            rlimit_nofile: rlimit,
+            top_paths: top.into_iter().map(|(p, c)| (p.to_string(), c)).collect(),
+            ts_ns: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn fd_snapshot_emits_required_keys_and_pct_when_rlimit_known() {
+        let s = snap(
+            540,
+            16380,
+            32768,
+            "hal-allocator",
+            vec![("/dev/dmabuf", 100)],
+        );
+        let line = format_fd_snapshot_json(&s, 16380, 124.5, Some(42));
+        let v = parse(&line);
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("fd_snapshot"));
+        assert_eq!(v.get("pid").and_then(|x| x.as_u64()), Some(540));
+        assert_eq!(v.get("fd_count").and_then(|x| x.as_u64()), Some(16380));
+        assert_eq!(v.get("fd_rlimit").and_then(|x| x.as_u64()), Some(32768));
+        assert_eq!(v.get("fd_pct_of_rlimit").and_then(|x| x.as_u64()), Some(49));
+        assert_eq!(
+            v.get("high_water_mark").and_then(|x| x.as_u64()),
+            Some(16380)
+        );
+        let rate = v
+            .get("growth_rate_per_sec")
+            .and_then(|x| x.as_f64())
+            .expect("rate");
+        assert!((rate - 124.5).abs() < 0.01);
+        let tp = v
+            .get("top_paths")
+            .and_then(|x| x.as_array())
+            .expect("top_paths array");
+        assert_eq!(tp.len(), 1);
+        assert_eq!(
+            tp[0].get("path").and_then(|x| x.as_str()),
+            Some("/dev/dmabuf")
+        );
+        assert_eq!(tp[0].get("count").and_then(|x| x.as_u64()), Some(100));
+        assert_eq!(v.get("event_id").and_then(|x| x.as_u64()), Some(42));
+    }
+
+    #[test]
+    fn fd_snapshot_omits_pct_when_rlimit_unknown() {
+        let s = snap(540, 100, 0, "init", vec![]);
+        let line = format_fd_snapshot_json(&s, 100, 0.0, None);
+        let v = parse(&line);
+        assert!(!v.as_object().unwrap().contains_key("fd_pct_of_rlimit"));
+        assert_eq!(v.get("fd_rlimit").and_then(|x| x.as_u64()), Some(0));
+        // event_id omitted when None.
+        assert!(!v.as_object().unwrap().contains_key("event_id"));
+    }
+
+    #[test]
+    fn fd_snapshot_caps_pct_at_one_hundred() {
+        // Defensive: rlimit can shift mid-session; the percentage must
+        // never exceed 100 in the wire format.
+        let s = snap(540, 2000, 1000, "leaky", vec![]);
+        let line = format_fd_snapshot_json(&s, 2000, 0.0, None);
+        let v = parse(&line);
+        assert_eq!(
+            v.get("fd_pct_of_rlimit").and_then(|x| x.as_u64()),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn fd_snapshot_emits_empty_top_paths_array_when_no_aggregation() {
+        let s = snap(540, 100, 1024, "init", vec![]);
+        let line = format_fd_snapshot_json(&s, 100, 0.0, None);
+        let v = parse(&line);
+        let tp = v
+            .get("top_paths")
+            .and_then(|x| x.as_array())
+            .expect("top_paths must always be present (possibly empty)");
+        assert!(tp.is_empty());
+    }
+
+    #[test]
+    fn fd_snapshot_escapes_quotes_in_comm_and_paths() {
+        let s = snap(540, 5, 1024, r#"weird"comm"#, vec![(r#"/tmp/wei"rd"#, 1)]);
+        let line = format_fd_snapshot_json(&s, 5, 0.0, None);
+        let v = parse(&line);
+        assert_eq!(
+            v.get("comm").and_then(|x| x.as_str()),
+            Some(r#"weird"comm"#)
+        );
+        let tp = v.get("top_paths").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(
+            tp[0].get("path").and_then(|x| x.as_str()),
+            Some(r#"/tmp/wei"rd"#)
         );
     }
 

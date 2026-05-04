@@ -24,6 +24,10 @@
 | `--raw`                           | flag             | off                                      | Output raw syscall events in addition to (or instead of, with `--no-findings`) findings. Without this flag, neutron emits only rule-engine findings. |
 | `--no-findings`                   | flag             | off                                      | Suppress findings output. Useful with `--raw` for the legacy per-event-only behavior of pre-rule-engine versions. |
 | `--findings-drain-interval N`     | u64              | `256`                                    | Drain pending findings every N events. |
+| `--fdgraph-pids POLICY`           | String           | `active`                                 | Periodic FD-poller scope: `traced` (target + followed children), `active` (PIDs with at least one traced event), `uid` (sprint-2 stub → falls back to `active`), `all` (every `/proc/<NUM>` — heavy). |
+| `--fdgraph-interval DURATION`     | String           | `1s`                                     | Poller interval. Accepts `1s`, `500ms`, or `off` to disable polling. |
+| `--fdgraph-thresholds TIERS`      | String           | `1024,8192,90%`                          | Comma-separated FD-count alert tiers. Parsed for forward-compat; rules carry their own thresholds today. |
+| `--fdgraph-top-paths-n N`         | usize            | `0`                                      | Top-N `/proc/<pid>/fd/<fd>` readlink aggregation per snapshot. `0` disables. |
 
 <!-- END AUTO-GENERATED -->
 
@@ -124,6 +128,34 @@ Binder transactions are point-in-time so `phase` is always `"enter"`. Binder
 events have no `ret`/`ok`/`errno` (the binder tracepoint does not expose a
 return code) and no `data`/`data_phase` (the routing fields are first-class
 columns on the event itself).
+
+### FD Snapshot Event (`type == "fd_snapshot"`)
+
+```json
+{
+  "type":              "fd_snapshot",
+  "ts_ns":             1234567890,
+  "pid":               540,
+  "uid":               1000,
+  "comm":              "vendor.qti.cam",
+  "fd_count":          16380,
+  "fd_rlimit":         32768,
+  "fd_pct_of_rlimit":  49,
+  "high_water_mark":   16380,
+  "growth_rate_per_sec": 124.5,
+  "top_paths":         [{"path":"/dev/dma_heap/system","count":8190}],
+  "event_id":          18234
+}
+```
+
+| Field                  | Type   | Description                                                                 |
+|------------------------|--------|-----------------------------------------------------------------------------|
+| `fd_count`             | u32    | Authoritative count from `/proc/<pid>/fd` at sample time.                   |
+| `fd_rlimit`            | u32    | Soft `RLIMIT_NOFILE` from `/proc/<pid>/limits`. `0` = unknown.              |
+| `fd_pct_of_rlimit`     | u8     | `0..=100`, omitted when `fd_rlimit == 0`.                                   |
+| `high_water_mark`      | u32    | Maximum `fd_count` ever observed for this PID this session.                 |
+| `growth_rate_per_sec`  | f32    | (fds gained since last sample) / interval. `0.0` for the first sample.      |
+| `top_paths`            | array  | `[{"path","count"}]` from readlinks. Empty unless `--fdgraph-top-paths-n > 0`. |
 
 ### Finding Event
 

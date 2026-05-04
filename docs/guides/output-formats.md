@@ -120,6 +120,51 @@ A failed call carries `ok:false` plus the decoded `errno`:
 
 Binder transactions are point-in-time, so `phase` is always `"enter"` — there is no symmetric exit event. There is no `ok`/`errno`/`ret` because the binder tracepoint does not expose a return code.
 
+### FD Snapshot Event
+
+Sprint-1 PR 3 introduces a third event class emitted by the periodic
+`/proc/<pid>/fd` poller. One line per in-scope PID per `--fdgraph-interval`
+tick. Drives the `R001_fd_table_exhaustion`-class rules and gives operators
+a first-class "HAL fd table grew to N/M" signal.
+
+```json
+{
+  "type":               "fd_snapshot",
+  "ts_ns":              1234567890,
+  "pid":                540,
+  "uid":                1000,
+  "comm":               "vendor.qti.cam",
+  "fd_count":           16380,
+  "fd_rlimit":          32768,
+  "fd_pct_of_rlimit":   49,
+  "high_water_mark":    16380,
+  "growth_rate_per_sec": 124.5,
+  "top_paths":          [
+    {"path":"/dev/dma_heap/system","count":8190},
+    {"path":"/dev/dma_heap/count-negative","count":8190}
+  ],
+  "event_id":           18234
+}
+```
+
+| Field                  | JSON type    | Notes                                                                 |
+|------------------------|--------------|-----------------------------------------------------------------------|
+| `type`                 | string       | Always `"fd_snapshot"`.                                               |
+| `pid`, `uid`, `comm`   | as elsewhere | Identifying triplet.                                                  |
+| `fd_count`             | u32          | Authoritative count from `/proc/<pid>/fd` at sample time.             |
+| `fd_rlimit`            | u32          | Soft `RLIMIT_NOFILE` from `/proc/<pid>/limits`. `0` = unknown.        |
+| `fd_pct_of_rlimit`     | u8           | `0..=100`. **Omitted** when `fd_rlimit == 0`. Rule predicates skip.   |
+| `high_water_mark`      | u32          | Maximum `fd_count` ever observed for this PID, this session.          |
+| `growth_rate_per_sec`  | f32          | (fds gained since last sample) / interval. Negative deltas → `0.0`.   |
+| `top_paths`            | array        | Top-N `(path, count)` pairs from readlinks. Empty unless `--fdgraph-top-paths-n > 0`. |
+| `event_id`             | u64          | Monotonic correlation token. |
+
+The poller scope is controlled by `--fdgraph-pids`: `active` (default) covers
+the explicit `--pid` target plus any PID that produced a traced event;
+`traced` is equivalent today; `all` walks all of `/proc` (heavy); `uid` is a
+sprint-2 stub that degrades to `active` with a warning. Set `--fdgraph-interval off`
+to disable polling entirely.
+
 ## Field Reference
 
 ### Common Fields

@@ -9,11 +9,13 @@
 //! Targets: kernel 6.1+ (Pixel 8 Pro). The legacy raw-`bpf()`-syscall loader
 //! that targeted kernel 4.14 lives in git history before this commit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as IoWrite;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::os::fd::AsRawFd;
 
@@ -26,8 +28,11 @@ use clap::Parser;
 use neutron::cli::{Args, Cli, Command};
 use neutron::decode::{format_comm, format_data_field, resolve_path_from_fd};
 use neutron::doctor;
+use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
 use neutron::fdgraph::FdGraph;
-use neutron::format::{format_event_json_full, format_event_text_with_stack, FdHint};
+use neutron::format::{
+    format_event_json_full, format_event_text_with_stack, format_fd_snapshot_json, FdHint,
+};
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
 use neutron::rules::{build_rule_engine, emit_findings};
 use neutron::symbolize::{is_kernel_addr, KernelSymbolizer, ProcSymbolizer};
@@ -90,6 +95,30 @@ fn print_banner() {
     );
     eprintln!("authorized security testing only — see SECURITY.md");
     eprintln!();
+}
+
+// ── FD-poller config helpers (sprint-1 PR 3) ────────────────────────────────
+
+/// Parse `--fdgraph-interval` (`1s`, `500ms`, `off`). `Ok(None)` means
+/// the poller should not be spawned at all.
+fn parse_fdgraph_interval(s: &str) -> Result<Option<Duration>> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    if let Some(rest) = trimmed.strip_suffix("ms") {
+        let n: u64 = rest
+            .parse()
+            .with_context(|| format!("invalid --fdgraph-interval ms value: {trimmed}"))?;
+        return Ok(Some(Duration::from_millis(n)));
+    }
+    if let Some(rest) = trimmed.strip_suffix('s') {
+        let n: u64 = rest
+            .parse()
+            .with_context(|| format!("invalid --fdgraph-interval s value: {trimmed}"))?;
+        return Ok(Some(Duration::from_secs(n)));
+    }
+    bail!("invalid --fdgraph-interval (expected '1s', '500ms', or 'off'): {trimmed}");
 }
 
 // ── Profile handling ─────────────────────────────────────────────────────────
@@ -413,6 +442,47 @@ fn run_trace(mut args: Args) -> Result<()> {
     // miss/backfill counts are surfaced in the capture summary on exit.
     let mut fd_graph = FdGraph::new();
 
+    // ── FD poller (sprint-1 PR 3) ────────────────────────────────────────
+    //
+    // Spawn a separate thread that periodically reads /proc/<pid>/fd and
+    // /proc/<pid>/limits for in-scope PIDs and forwards FdSampleEvent
+    // values through an mpsc::sync_channel. Each sample becomes a
+    // `type:"fd_snapshot"` JSON line and feeds the rule engine.
+    //
+    // The "active" set (PIDs that have produced any traced event since
+    // startup) is the default scope — keeping the poller off broad /proc
+    // scans under `--pid 0`. We send a fresh copy of the set whenever it
+    // grows; the poller drains updates non-blockingly.
+    let scope = ScopePolicy::from_str(&args.fdgraph_pids).map_err(anyhow::Error::msg)?;
+    let interval = parse_fdgraph_interval(&args.fdgraph_interval)?;
+    let mut active_pids: HashSet<u32> = HashSet::new();
+    if args.pid != 0 {
+        active_pids.insert(args.pid);
+    }
+    let poller_state: Option<(_, _, _, _)> = match interval {
+        Some(dt) => {
+            let cfg = PollerConfig {
+                interval: dt,
+                scope,
+                target_pid: args.pid,
+                top_paths_n: args.fdgraph_top_paths_n,
+            };
+            if args.verbose {
+                eprintln!(
+                    "  fdgraph poller: interval={:?}, scope={:?}, top_paths_n={}",
+                    cfg.interval, cfg.scope, cfg.top_paths_n
+                );
+            }
+            let (samples_rx, active_tx, stop_tx, handle) =
+                poller::spawn(cfg, Box::new(RealProcReader));
+            // Seed the poller's view with the initial active set so the
+            // explicit --pid target is sampled on the very first tick.
+            let _ = active_tx.try_send(active_pids.clone());
+            Some((samples_rx, active_tx, stop_tx, handle))
+        }
+        None => None,
+    };
+
     while running.load(Ordering::Relaxed) {
         let mut saw_any = false;
         loop {
@@ -540,6 +610,20 @@ fn run_trace(mut args: Args) -> Result<()> {
                     }
                 }
 
+                // Active-set bookkeeping for the FD poller's "active" scope.
+                // We add every PID that produced an event the userspace
+                // pipeline saw — strictly broader than "fd-bearing" but
+                // ensures the target process is sampled even if it does
+                // nothing fd-related. Send updated set to poller only when
+                // it grew; sending is non-blocking so we never stall the
+                // event loop.
+                if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
+                    let pid = { ev.pid };
+                    if pid != 0 && active_pids.insert(pid) {
+                        let _ = active_tx.try_send(active_pids.clone());
+                    }
+                }
+
                 // Side effects that need to happen AFTER the event is consumed.
                 if args.follow_children {
                     let map = bpf
@@ -561,6 +645,38 @@ fn run_trace(mut args: Args) -> Result<()> {
                 }
             }
         }
+        // Drain any FD-poller samples produced since the last iteration.
+        // Each sample becomes a `type:"fd_snapshot"` JSON line; the engine
+        // sees it as `EventKind::FdSnapshot` and matches `R001`-class rules.
+        if let Some((samples_rx, _, _, _)) = poller_state.as_ref() {
+            while let Ok(sample) = samples_rx.try_recv() {
+                fd_graph.record_sample(
+                    sample.pid,
+                    sample.fd_count,
+                    sample.rlimit_nofile,
+                    sample.ts_ns,
+                );
+                let stats_snapshot = fd_graph.stats(sample.pid).copied().unwrap_or_default();
+                event_id_counter = event_id_counter.wrapping_add(1);
+                let line = format_fd_snapshot_json(
+                    &sample,
+                    stats_snapshot.high_water_mark,
+                    stats_snapshot.growth_rate_per_sec,
+                    Some(event_id_counter),
+                );
+                if let Some(eng) = engine.as_mut() {
+                    if let Some(owned) = neutron_rules::Event::parse_line(&line) {
+                        if let Some(view) = owned.view() {
+                            eng.feed(&view);
+                        }
+                    }
+                }
+                if !suppress_raw {
+                    let _ = writeln!(out, "{line}");
+                }
+            }
+        }
+
         if !saw_any {
             // Block on `poll(2)` until the ring becomes readable (or timeout).
             // SAFETY: `pollfd` is a POD; we initialise all fields before the call.
@@ -575,6 +691,12 @@ fn run_trace(mut args: Args) -> Result<()> {
                 libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS);
             }
         }
+    }
+
+    // Signal the FD poller to stop; the thread exits within one tick.
+    if let Some((_, _, stop_tx, handle)) = poller_state {
+        let _ = stop_tx.send(());
+        let _ = handle.join();
     }
 
     // 9. Flush rule engine.

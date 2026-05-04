@@ -111,4 +111,33 @@ pub struct Args {
     /// Print every N events, drain findings produced so far. Default 256.
     #[arg(long, default_value_t = 256)]
     pub findings_drain_interval: u64,
+
+    // ── FD poller (sprint-1 PR 3) ──────────────────────────────────────────
+    /// PID scope for the periodic `/proc/<pid>/fd` poller.
+    /// `traced` = `--pid` target + followed children + (under `--pid 0`)
+    /// PIDs that already produced fd-bearing events.
+    /// `active` (default) = same as `traced` but excludes followed children.
+    /// `uid` = sprint-2 stub; falls back to `active` with a stderr warning.
+    /// `all` = scan all PIDs in `/proc` (heavy; use only for one-off audits).
+    #[arg(long, default_value = "active")]
+    pub fdgraph_pids: String,
+
+    /// Periodic FD-poller interval. Accepts `1s`, `500ms`, or `off` to
+    /// disable polling entirely. Default 1 second.
+    #[arg(long, default_value = "1s")]
+    pub fdgraph_interval: String,
+
+    /// Comma-separated FD-count alert tiers (e.g. `1024,8192,90%`). Parsed
+    /// for forward-compatibility but advisory in sprint-1; rule predicates
+    /// (`R001_fd_table_exhaustion` etc.) carry their own thresholds. A
+    /// future PR may surface these as `--alert-tier`-style banners.
+    #[arg(long, default_value = "1024,8192,90%")]
+    pub fdgraph_thresholds: String,
+
+    /// Top-N FD path aggregation per snapshot. `0` (default) disables the
+    /// per-PID readlink scan; set to e.g. `5` to populate the
+    /// `top_paths` field on every `fd_snapshot` JSON line. Has cost
+    /// proportional to fd count for in-scope PIDs.
+    #[arg(long, default_value_t = 0)]
+    pub fdgraph_top_paths_n: usize,
 }

@@ -162,6 +162,7 @@ vulnerability, a feature, or a false positive is up to the analyst.
 |------------|------------------|-------|
 | Binder Parcel decoding | v1.2 | BINDER_WRITE_READ buffer parser; service-handle table |
 | FD → device/socket attribution for ioctl | v1.1 | Userspace FD graph (landed) |
+| FD-count rules / poller / rlimit awareness | sprint-1 PR 3 | `fd_snapshot` events + `fd_count_*` predicates |
 | ioctl decoder registry | sprint-1 PR 2 | DMA_HEAP_IOCTL_ALLOC decoded; family classification for binder / dma-buf / ashmem |
 | `--package` attach + zygote-follow | v1.3 | Resolves PID via UID; auto-attaches new app processes |
 | Cross-process causal tracing | v2.0 | Trace `system_server` etc.; stitch binder transactions to service-side syscalls |

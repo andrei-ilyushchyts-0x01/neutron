@@ -7,11 +7,16 @@
 use serde_json::Value;
 
 /// What category the underlying event belongs to. Allows rules to match
-/// `binder` events without forcing them into the same shape as syscalls.
+/// `binder` and `fd_snapshot` events without forcing them into the same
+/// shape as syscalls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventKind {
     Syscall,
     Binder,
+    /// Sprint-1 PR 3: periodic `/proc/<pid>/fd` poller sample. Carries
+    /// `fd_count`, `fd_pct_of_rlimit`, and high-water marks. Drives the
+    /// `R001_fd_table_exhaustion`-class rules.
+    FdSnapshot,
 }
 
 /// Lightweight read-only view of one event line. Lifetime is bound to the JSON
@@ -42,6 +47,12 @@ pub struct Event<'a> {
     /// Caller-supplied monotonic correlation token. `None` when the producer
     /// did not stamp one (offline NDJSON captured before the field existed).
     pub event_id: Option<u64>,
+    /// `fd_count` field from a `type:"fd_snapshot"` event. `None` for
+    /// syscall and binder events.
+    pub fd_count: Option<u32>,
+    /// `fd_pct_of_rlimit` field from a `type:"fd_snapshot"` event when the
+    /// rlimit was known. `None` when missing or for non-snapshot events.
+    pub fd_pct_of_rlimit: Option<u8>,
 
     /// Owned JSON value — kept so callers can clone it into snapshots without
     /// re-parsing the raw line. Use [`Event::raw_json`] to access.
@@ -55,15 +66,25 @@ impl<'a> Event<'a> {
     /// missing or if the JSON object is the wrong shape.
     pub fn from_value(v: &'a Value, raw_line: Option<&'a str>) -> Option<Self> {
         let obj = v.as_object()?;
-        let is_binder = obj.get("type").and_then(|t| t.as_str()) == Some("binder");
+        let type_str = obj.get("type").and_then(|t| t.as_str());
+        let is_binder = type_str == Some("binder");
+        let is_fd_snapshot = type_str == Some("fd_snapshot");
         let kind = if is_binder {
             EventKind::Binder
+        } else if is_fd_snapshot {
+            EventKind::FdSnapshot
         } else {
             EventKind::Syscall
         };
 
+        // Snapshot events carry no `nr` field — synthesise a sentinel so
+        // existing rule predicates that check `syscall_in` simply fail to
+        // match (they do today: list.contains(&-2) is false for any real
+        // syscall number).
         let syscall_nr = if is_binder {
             -1
+        } else if is_fd_snapshot {
+            -2
         } else {
             obj.get("nr").and_then(|n| n.as_i64())? as i32
         };
@@ -88,6 +109,15 @@ impl<'a> Event<'a> {
         let rwx_alert = obj.get("rwx_alert").and_then(|v| v.as_str());
         let stack = obj.get("stack").and_then(|v| v.as_str());
         let event_id = obj.get("event_id").and_then(|v| v.as_u64());
+        // FdSnapshot-only fields. None for syscall/binder events.
+        let fd_count = obj
+            .get("fd_count")
+            .and_then(|v| v.as_u64())
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+        let fd_pct_of_rlimit = obj
+            .get("fd_pct_of_rlimit")
+            .and_then(|v| v.as_u64())
+            .map(|n| u8::try_from(n.min(255)).unwrap_or(u8::MAX));
 
         let mut args = [0u64; 6];
         if let Some(arr) = obj.get("args").and_then(|a| a.as_array()) {
@@ -114,6 +144,8 @@ impl<'a> Event<'a> {
             rwx_alert,
             stack,
             event_id,
+            fd_count,
+            fd_pct_of_rlimit,
             raw: v,
             raw_line,
         })
