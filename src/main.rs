@@ -403,6 +403,11 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
     }
     let mut total_events: u64 = 0;
+    // Session-scoped monotonic correlation token stamped onto every emitted
+    // JSON line as `"event_id":N`. Resets on neutron restart — consumers must
+    // not assume cross-session uniqueness. Used by the rule engine and (in
+    // upcoming sprints) the binder-causality and raw-on-finding correlators.
+    let mut event_id_counter: u64 = 0;
     // Userspace FD graph: tracks (pid, fd) → resource so ioctl/read/write/mmap
     // events can be enriched with `fd_kind`, `fd_path`. Updated every event;
     // miss/backfill counts are surfaced in the capture summary on exit.
@@ -413,7 +418,7 @@ fn run_trace(mut args: Args) -> Result<()> {
         loop {
             let bytes_owned: Vec<u8> = match ring.next() {
                 Some(item) => {
-                    let slice: &[u8] = &*item;
+                    let slice: &[u8] = &item;
                     if slice.len() < ev_size {
                         continue;
                     }
@@ -498,11 +503,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                 });
 
                 // Always compute the JSON form: cheap and fed to the rule engine.
+                event_id_counter = event_id_counter.wrapping_add(1);
                 let json_line = format_event_json_full(
                     &ev,
                     args.resolve_paths,
                     stack_str.as_deref(),
                     fd_hint.as_ref(),
+                    Some(event_id_counter),
                 );
 
                 if let Some(eng) = engine.as_mut() {

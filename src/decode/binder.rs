@@ -33,11 +33,20 @@ pub fn format_binder_event(ev: &SyscallEvent) -> String {
 }
 
 /// Format a binder transaction event as JSON.
-pub fn format_binder_event_json(ev: &SyscallEvent) -> String {
+///
+/// `event_id` is the caller-supplied monotonic correlation token; omitted
+/// from the line when `None`. Binder transactions are point-in-time so the
+/// emitted `phase` is always `"enter"` — there is no symmetric exit event
+/// to pair with.
+pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> String {
     let args = { ev.args };
     let comm = format_comm(&{ ev.comm });
+    let event_id_json = match event_id {
+        Some(id) => format!(r#","event_id":{}"#, id),
+        None => String::new(),
+    };
     format!(
-        r#"{{"ts_ns":{},"pid":{},"tgid":{},"uid":{},"type":"binder","comm":"{}","reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{}}}"#,
+        r#"{{"ts_ns":{},"pid":{},"tgid":{},"uid":{},"type":"binder","phase":"enter","comm":"{}","reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{}{}}}"#,
         { ev.timestamp_ns },
         { ev.pid },
         { ev.tgid },
@@ -49,6 +58,7 @@ pub fn format_binder_event_json(ev: &SyscallEvent) -> String {
         args[5] as u32,
         args[1] as u32,
         args[2],
+        event_id_json,
     )
 }
 
@@ -106,7 +116,7 @@ mod tests {
     #[test]
     fn format_binder_event_json_is_valid_json_with_expected_keys() {
         let ev = binder_event([42, 0x5, 0x10, 99, 1, 7]);
-        let s = format_binder_event_json(&ev);
+        let s = format_binder_event_json(&ev, None);
         let v: serde_json::Value =
             serde_json::from_str(&s).unwrap_or_else(|e| panic!("bad json: {e} for {s}"));
         let obj = v.as_object().expect("object");
@@ -116,6 +126,7 @@ mod tests {
             "tgid",
             "uid",
             "type",
+            "phase",
             "reply",
             "to_proc",
             "to_thread",
@@ -126,8 +137,20 @@ mod tests {
             assert!(obj.contains_key(k), "missing key {k} in {s}");
         }
         assert_eq!(obj.get("type").and_then(|v| v.as_str()), Some("binder"));
+        assert_eq!(obj.get("phase").and_then(|v| v.as_str()), Some("enter"));
         assert_eq!(obj.get("reply").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(obj.get("to_proc").and_then(|v| v.as_u64()), Some(42));
         assert_eq!(obj.get("target_node").and_then(|v| v.as_u64()), Some(7));
+        // event_id omitted when caller doesn't supply one.
+        assert!(!obj.contains_key("event_id"));
+    }
+
+    #[test]
+    fn format_binder_event_json_includes_event_id_when_provided() {
+        let ev = binder_event([1, 0, 0, 0, 0, 0]);
+        let s = format_binder_event_json(&ev, Some(99));
+        let v: serde_json::Value =
+            serde_json::from_str(&s).unwrap_or_else(|e| panic!("bad json: {e} for {s}"));
+        assert_eq!(v.get("event_id").and_then(|x| x.as_u64()), Some(99));
     }
 }

@@ -60,7 +60,8 @@ mod tests {
         // type='b' (0x62), nr=0, size=4, dir=W(1)
         // dir is the top 2 bits in 32-bit cmd: 1 << 30 = 0x40000000
         // size in bits 16..30 (14 bits): 4 << 16 = 0x00040000
-        let cmd: u32 = (1 << 30) | (4 << 16) | (0x62 << 8) | 0;
+        // nr (low byte) is 0; clippy::identity_op flags `| 0`, so we omit it.
+        let cmd: u32 = (1 << 30) | (4 << 16) | (0x62 << 8);
         let buf = buf_with_cmd(cmd);
         let s = format_ioctl_deep(&buf);
         assert_eq!(s, "binder:_IOC(W,0,4)");

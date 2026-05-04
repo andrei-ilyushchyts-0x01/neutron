@@ -47,6 +47,7 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
 
 ```json
 {
+  "type":           "syscall",
   "ts_ns":          1712345678901234,
   "pid":            21093,
   "tid":            21093,
@@ -55,19 +56,23 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
   "name":           "openat",
   "comm":           "e.bankapp",
   "enter":          false,
+  "phase":          "exit",
   "ret":            42,
-  "args":           [4294967196, 140234567890, 524288, 438, 0, 1712345678800000],
+  "ok":             true,
+  "args":           [4294967196, 140234567890, 524288, 438, 0, 0],
   "data":           "/proc/self/maps",
-  "rwx_alert":      null,
+  "data_phase":     "enter",
   "kernel_stackid": 17,
   "user_stackid":   42,
   "latency_us":     123,
-  "stack":          "libc.so:__openat+0x4 <- libnative.so:check_root+0x40 ;; vfs_open+0x12"
+  "stack":          "libc.so:__openat+0x4 <- libnative.so:check_root+0x40 ;; vfs_open+0x12",
+  "event_id":       18437
 }
 ```
 
 | Field             | Type                | Description                                                  |
 |-------------------|---------------------|--------------------------------------------------------------|
+| `type`            | String              | Always `"syscall"` for syscall events. Stable event-class identifier. |
 | `ts_ns`           | u64                 | Kernel monotonic timestamp (ns since boot)                   |
 | `pid`             | u32                 | Linux PID (= POSIX `tgid`)                                   |
 | `tid`             | u32                 | Linux TID (= kernel `pid`)                                   |
@@ -75,25 +80,31 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
 | `nr`              | i32                 | Syscall number; `-1` for binder synthetic events             |
 | `name`            | String              | Human-readable syscall name (from internal table)            |
 | `comm`            | String              | Task comm (up to 15 chars, kernel-set)                       |
-| `enter`           | bool                | `true` = enter event, `false` = exit                         |
+| `enter`           | bool                | **Deprecated.** Use `phase` instead. Both fields are still emitted for one release. |
+| `phase`           | String              | `"enter"` or `"exit"`.                                       |
 | `ret`             | i64                 | Return value (exit only; 0 on enter)                         |
-| `args`            | u64[6]              | Syscall arguments; `args[5]` = enter timestamp on exit       |
+| `ok`              | bool (optional)     | `true` if `ret >= 0` on an exit event; omitted on enter events. |
+| `errno`           | u32 (optional)      | `-ret` for failed exit events (when `ok:false`); omitted otherwise. |
+| `args`            | u64[6]              | Syscall arguments. All six positions reflect the actual ABI args. |
 | `data`            | String (optional)   | Decoded `data[128]`: path, sockaddr, hex; omitted if empty   |
+| `data_phase`      | String              | `"enter"` for every captured `data[]` today. PR 2 sets `"exit"` for whitelisted R/RW ioctls. |
 | `rwx_alert`       | `"RWX" \| "WX" \| null` | Set on mmap/mprotect with PROT_EXEC                      |
 | `kernel_stackid`  | i32 (optional)      | Key into `STACK_TRACES` map; omitted if both ids are negative |
 | `user_stackid`    | i32 (optional)      | Key into `STACK_TRACES` map; omitted if both ids are negative |
 | `latency_us`      | u64 (optional)      | Syscall latency (exit only; omitted if `INFLIGHT` evicted)   |
 | `stack`           | String (optional)   | Resolved stack trace; only present with `--stacks`           |
+| `event_id`        | u64 (optional)      | Session-scoped monotonic correlation token. Resets on neutron restart. |
 
 ### Binder Event (`syscall_nr == -1`)
 
 ```json
 {
+  "type":        "binder",
   "ts_ns":       1712345678901234,
   "pid":         21093,
   "tgid":        21093,
   "uid":         10147,
-  "type":        "binder",
+  "phase":       "enter",
   "comm":        "e.bankapp",
   "reply":       false,
   "to_proc":     1234,
@@ -101,9 +112,15 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
   "target_node": 7,
   "code":        2,
   "flags":       16,
-  "stack":       "..."
+  "stack":       "...",
+  "event_id":    18438
 }
 ```
+
+Binder transactions are point-in-time so `phase` is always `"enter"`. Binder
+events have no `ret`/`ok`/`errno` (the binder tracepoint does not expose a
+return code) and no `data`/`data_phase` (the routing fields are first-class
+columns on the event itself).
 
 ### Finding Event
 

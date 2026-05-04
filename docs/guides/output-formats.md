@@ -66,6 +66,7 @@ absent.
 
 ```json
 {
+  "type":           "syscall",
   "ts_ns":          1712345678901234,
   "pid":            21093,
   "tid":            21157,
@@ -74,26 +75,37 @@ absent.
   "name":           "connect",
   "comm":           "e.bankapp",
   "enter":          false,
+  "phase":          "exit",
   "ret":            0,
-  "args":           [17, 140234567890, 16, 0, 0, 1712345678800000],
+  "ok":             true,
+  "args":           [17, 140234567890, 16, 0, 0, 0],
   "data":           "AF_INET 52.19.245.87:443",
+  "data_phase":     "enter",
   "rwx_alert":      "RWX",
   "kernel_stackid": 17,
   "user_stackid":   42,
   "latency_us":     7234,
-  "stack":          "libc.so:__connect+0x10 <- libnative.so:do_call+0x80 ;; vfs_socket_connect+0x40"
+  "stack":          "libc.so:__connect+0x10 <- libnative.so:do_call+0x80 ;; vfs_socket_connect+0x40",
+  "event_id":       18437
 }
+```
+
+A failed call carries `ok:false` plus the decoded `errno`:
+
+```json
+{ "type":"syscall", "name":"openat", "phase":"exit", "ret":-2, "ok":false, "errno":2, ... }
 ```
 
 ### Binder Event
 
 ```json
 {
+  "type":        "binder",
   "ts_ns":       1712345678901234,
   "pid":         21093,
   "tgid":        21093,
   "uid":         10147,
-  "type":        "binder",
+  "phase":       "enter",
   "comm":        "e.bankapp",
   "reply":       false,
   "to_proc":     1234,
@@ -101,21 +113,27 @@ absent.
   "target_node": 7,
   "code":        2,
   "flags":       16,
-  "stack":       "..."
+  "stack":       "...",
+  "event_id":    18438
 }
 ```
+
+Binder transactions are point-in-time, so `phase` is always `"enter"` — there is no symmetric exit event. There is no `ok`/`errno`/`ret` because the binder tracepoint does not expose a return code.
 
 ## Field Reference
 
 ### Common Fields
 
-| Field   | JSON type | Notes                                               |
-|---------|-----------|-----------------------------------------------------|
-| `ts_ns` | number    | Kernel monotonic nanoseconds since boot             |
-| `pid`   | number    | Linux PID (= POSIX process ID = `tgid`)             |
-| `tid`   | number    | Linux TID (= POSIX thread ID = kernel `pid`)        |
-| `uid`   | number    | Effective user ID                                   |
-| `comm`  | string    | Process comm name (up to 15 chars, from kernel)     |
+| Field      | JSON type | Notes                                                                      |
+|------------|-----------|----------------------------------------------------------------------------|
+| `type`     | string    | Event class: `"syscall"`, `"binder"`, or `"finding"`. Stable identifier.   |
+| `ts_ns`    | number    | Kernel monotonic nanoseconds since boot                                    |
+| `pid`      | number    | Linux PID (= POSIX process ID = `tgid`)                                    |
+| `tid`      | number    | Linux TID (= POSIX thread ID = kernel `pid`)                               |
+| `uid`      | number    | Effective user ID                                                          |
+| `comm`     | string    | Process comm name (up to 15 chars, from kernel)                            |
+| `phase`    | string    | `"enter"` or `"exit"`. Canonical replacement for `enter:bool`.             |
+| `event_id` | number (optional) | Session-scoped monotonic correlation token. Resets on neutron restart. |
 
 ### Syscall-Specific Fields
 
@@ -123,15 +141,18 @@ absent.
 |-------------------|---------------------|-------------------------------------------------------------|
 | `nr`              | number              | Syscall number; `-1` for binder synthetic events            |
 | `name`            | string              | Human-readable name or `"syscall_NR"` for unknown           |
-| `enter`           | boolean             | `true` on enter, `false` on exit                            |
-| `ret`             | number              | Return value; `0` on enter events                           |
-| `args`            | number[6]           | Raw syscall arguments. `args[5]` = enter timestamp on exit  |
+| `enter`           | boolean             | **Deprecated.** Mirrors `phase`; kept for one release for backward compatibility. New consumers should read `phase`. |
+| `ret`             | number              | Return value (exit only; `0` on enter events).              |
+| `ok`              | boolean (exit only) | `true` when `ret >= 0`. Convenience derivation; omitted on enter events.   |
+| `errno`           | number (optional)   | `-ret` for failed exit events (`ok:false`). Omitted otherwise.             |
+| `args`            | number[6]           | Raw syscall arguments. All six positions reflect the actual ABI args (no field hijacking — the enter timestamp lives in its own field). |
 | `data`            | string (optional)   | Decoded argument data (path, sockaddr, hex, …); omitted if empty |
+| `data_phase`      | string              | `"enter"` for every captured `data[]` blob today. PR 2 will set `"exit"` for whitelisted R/RW ioctls so consumers can tell pre-call from post-call snapshots. |
 | `rwx_alert`       | `"RWX" \| "WX"`     | Set on `mmap`/`mprotect` with PROT_EXEC; omitted otherwise  |
 | `latency_us`      | number (optional)   | Syscall duration in µs (exit only); omitted if `INFLIGHT` evicted |
 | `kernel_stackid`  | number (optional)   | Stack trace map key; omitted if both stack ids are negative |
 | `user_stackid`    | number (optional)   | Stack trace map key; omitted if both stack ids are negative |
-| `stack`           | string (optional)   | **NEW in 1.0.** Resolved stack trace string (see below); only present with `--stacks` |
+| `stack`           | string (optional)   | Resolved stack trace string (see below); only present with `--stacks` |
 
 ### `stack` field rendering
 

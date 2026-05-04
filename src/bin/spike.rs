@@ -106,8 +106,8 @@ fn read_kernel_version() -> String {
         .to_string()
 }
 
-fn attach_tp<'a>(
-    bpf: &'a mut Ebpf,
+fn attach_tp(
+    bpf: &mut Ebpf,
     name: &str,
     category: &str,
     event: &str,
@@ -177,7 +177,7 @@ fn run(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let bytes_owned: Vec<u8> = match ring.next() {
                 Some(item) => {
-                    let slice: &[u8] = &*item;
+                    let slice: &[u8] = &item;
                     if slice.len() < ev_size {
                         continue;
                     }

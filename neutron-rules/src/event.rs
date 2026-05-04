@@ -39,6 +39,9 @@ pub struct Event<'a> {
     /// Resolved stack trace (kernel + user, joined with `" <- "` and `" ;; "`).
     /// `None` when stack capture is off or the frames couldn't be resolved.
     pub stack: Option<&'a str>,
+    /// Caller-supplied monotonic correlation token. `None` when the producer
+    /// did not stamp one (offline NDJSON captured before the field existed).
+    pub event_id: Option<u64>,
 
     /// Owned JSON value — kept so callers can clone it into snapshots without
     /// re-parsing the raw line. Use [`Event::raw_json`] to access.
@@ -69,13 +72,22 @@ impl<'a> Event<'a> {
         let pid = obj.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let tid = obj.get("tid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let uid = obj.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let is_enter = obj.get("enter").and_then(|v| v.as_bool()).unwrap_or(true);
+        // Schema cleanup (sprint 1): prefer the explicit `phase` field when
+        // present, fall back to the legacy `enter` boolean. Defaults to `true`
+        // (treat as enter) when neither is supplied — matches prior behaviour
+        // for malformed lines.
+        let is_enter = match obj.get("phase").and_then(|v| v.as_str()) {
+            Some("enter") => true,
+            Some("exit") => false,
+            _ => obj.get("enter").and_then(|v| v.as_bool()).unwrap_or(true),
+        };
         let ret = obj.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
         let comm = obj.get("comm").and_then(|v| v.as_str()).unwrap_or("");
         let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let data = obj.get("data").and_then(|v| v.as_str());
         let rwx_alert = obj.get("rwx_alert").and_then(|v| v.as_str());
         let stack = obj.get("stack").and_then(|v| v.as_str());
+        let event_id = obj.get("event_id").and_then(|v| v.as_u64());
 
         let mut args = [0u64; 6];
         if let Some(arr) = obj.get("args").and_then(|a| a.as_array()) {
@@ -101,6 +113,7 @@ impl<'a> Event<'a> {
             data,
             rwx_alert,
             stack,
+            event_id,
             raw: v,
             raw_line,
         })
@@ -173,5 +186,40 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(Event::parse_line("not json").is_none());
+    }
+
+    #[test]
+    fn prefers_phase_over_legacy_enter_boolean() {
+        // Producer emits phase:"exit" but stale `enter:true` (e.g. a buggy
+        // bridge). The explicit phase field wins.
+        let line = r#"{"type":"syscall","ts_ns":100,"pid":42,"tid":42,"uid":1000,"nr":56,"name":"openat","comm":"app","enter":true,"phase":"exit","ret":7,"args":[0,0,0,0,0,0]}"#;
+        let owned = Event::parse_line(line).unwrap();
+        let ev = owned.view().unwrap();
+        assert!(!ev.is_enter);
+    }
+
+    #[test]
+    fn falls_back_to_enter_boolean_when_phase_absent() {
+        // Pre-PR-1 producers don't emit `phase`. We must still parse correctly.
+        let line = r#"{"ts_ns":100,"pid":42,"tid":42,"uid":1000,"nr":56,"name":"openat","comm":"app","enter":false,"ret":7,"args":[0,0,0,0,0,0]}"#;
+        let owned = Event::parse_line(line).unwrap();
+        let ev = owned.view().unwrap();
+        assert!(!ev.is_enter);
+    }
+
+    #[test]
+    fn parses_event_id_when_present() {
+        let line = r#"{"type":"syscall","ts_ns":100,"pid":42,"tid":42,"uid":1000,"nr":56,"name":"openat","comm":"app","enter":true,"phase":"enter","ret":0,"args":[0,0,0,0,0,0],"event_id":4242}"#;
+        let owned = Event::parse_line(line).unwrap();
+        let ev = owned.view().unwrap();
+        assert_eq!(ev.event_id, Some(4242));
+    }
+
+    #[test]
+    fn omits_event_id_when_absent() {
+        let line = r#"{"ts_ns":100,"pid":42,"tid":42,"uid":1000,"nr":56,"name":"openat","comm":"app","enter":true,"ret":0,"args":[0,0,0,0,0,0]}"#;
+        let owned = Event::parse_line(line).unwrap();
+        let ev = owned.view().unwrap();
+        assert_eq!(ev.event_id, None);
     }
 }
