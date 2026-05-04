@@ -23,6 +23,11 @@ training/model/*.pkl
 training/model/*.bin
 training/model/*.onnx
 
+# Exception: synthetic golden fixtures committed for regression tests.
+# `examples/expected/` only contains hand-crafted decoder output; never real
+# device captures.
+!examples/expected/*.ndjson
+
 # Local environment
 .env
 .env.local

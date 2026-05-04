@@ -75,16 +75,24 @@ are the appropriate tools.
 
 ### 6. The full set of ioctl arguments for a given device
 
-Today neutron captures `ioctl(fd, cmd, arg)`'s `cmd` (4 bytes) and the
-first 124 bytes of the `arg` buffer. That suffices for short binder
+neutron captures `ioctl(fd, cmd, arg)`'s `cmd` (4 bytes) and the first
+124 bytes of the `arg` buffer. That suffices for short binder
 transactions and for most Android driver command structs, but a long
 DMA-heap allocation request or a driver-specific buffer deeper than 124
 bytes is truncated. The truncation is recorded in the BPF `COUNTERS` map
 under `path_truncated` (slot reserved; instrumentation TODO).
 
-Userspace `ioctl` decoders for known command pairs land in v1.1 along
-with the full FD/resource graph; today only the raw cmd + truncated buffer
-is exposed.
+Sprint-1 PR 2 adds:
+- a userspace decoder registry with typed views for known commands
+  (today `DMA_HEAP_IOCTL_ALLOC`; binder / dma-buf / ashmem are
+  classified to `ioctl_family` only);
+- BPF post-exit re-read of `data[4..128]` for whitelisted R/RW families
+  (`'H'` dma_heap, `'b'` binder/dma-buf, `'w'` ashmem) so callers see
+  kernel-written fields like `dma_heap_allocation_data.fd`. Userspace
+  marks these events with `"data_phase":"exit"`.
+
+Long buffers (> 124 bytes) still truncate; broader cmd coverage and a
+larger `data[]` slot are tracked separately.
 
 ### 7. Pre-attach activity
 
@@ -153,8 +161,8 @@ vulnerability, a feature, or a false positive is up to the analyst.
 | Limitation | Tracking version | Notes |
 |------------|------------------|-------|
 | Binder Parcel decoding | v1.2 | BINDER_WRITE_READ buffer parser; service-handle table |
-| FD → device/socket attribution for ioctl | v1.1 | Userspace FD graph |
-| ioctl decoder registry | v1.1 | Per-`/dev/*` known command tables |
+| FD → device/socket attribution for ioctl | v1.1 | Userspace FD graph (landed) |
+| ioctl decoder registry | sprint-1 PR 2 | DMA_HEAP_IOCTL_ALLOC decoded; family classification for binder / dma-buf / ashmem |
 | `--package` attach + zygote-follow | v1.3 | Resolves PID via UID; auto-attaches new app processes |
 | Cross-process causal tracing | v2.0 | Trace `system_server` etc.; stitch binder transactions to service-side syscalls |
 | `path_truncated` counter wired in BPF | v1.1 | Currently reserved in COUNTERS but not incremented |

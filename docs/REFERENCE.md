@@ -87,7 +87,10 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
 | `errno`           | u32 (optional)      | `-ret` for failed exit events (when `ok:false`); omitted otherwise. |
 | `args`            | u64[6]              | Syscall arguments. All six positions reflect the actual ABI args. |
 | `data`            | String (optional)   | Decoded `data[128]`: path, sockaddr, hex; omitted if empty   |
-| `data_phase`      | String              | `"enter"` for every captured `data[]` today. PR 2 sets `"exit"` for whitelisted R/RW ioctls. |
+| `data_phase`      | String              | `"enter"` when `data[]` is the pre-call buffer; `"exit"` when the BPF program refreshed it post-call (for `ioctl(2)` cmds with `_IOC_DIR ∈ {R,RW}` and `_IOC_TYPE ∈ {'H','b','w'}`). |
+| `ioctl_family`    | String (optional)   | `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, or `"unknown"`. Emitted for `ioctl(2)` events. |
+| `ioctl_name`      | String (optional)   | Human cmd name (e.g. `"DMA_HEAP_IOCTL_ALLOC"`) when the decoder registry recognises it. |
+| `dma_heap`        | Object (optional)   | Decoded `struct dma_heap_allocation_data`. Fields: `len`, `returned_fd`, `fd_flags`, `fd_flags_str`, `heap_flags`. |
 | `rwx_alert`       | `"RWX" \| "WX" \| null` | Set on mmap/mprotect with PROT_EXEC                      |
 | `kernel_stackid`  | i32 (optional)      | Key into `STACK_TRACES` map; omitted if both ids are negative |
 | `user_stackid`    | i32 (optional)      | Key into `STACK_TRACES` map; omitted if both ids are negative |

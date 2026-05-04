@@ -6,6 +6,9 @@
 //!   cargo xtask build               # build everything (ebpf + userspace aarch64-musl)
 //!   cargo xtask deploy              # build + adb push to device
 //!   cargo xtask demo                # build + push demo target; print run instructions
+//!   cargo xtask demo-hal            # host-only ioctl decoder fixture; prints
+//!                                   # synthetic NDJSON and diffs it against
+//!                                   # examples/expected/dma-heap.ndjson
 //!   cargo xtask check-findings <file>
 //!                                   # diff a captured NDJSON trace against
 //!                                   # examples/expected/findings.txt
@@ -34,6 +37,7 @@ fn main() -> Result<()> {
             deploy()
         }
         Some("demo") => demo(),
+        Some("demo-hal") => demo_hal(),
         Some("check-findings") => {
             let path = args
                 .next()
@@ -58,7 +62,7 @@ fn main() -> Result<()> {
         None => {
             println!(
                 "Usage: cargo xtask <build-ebpf [release] | build | deploy \
-                | demo | check-findings <file>>"
+                | demo | demo-hal | check-findings <file>>"
             );
             Ok(())
         }
@@ -236,6 +240,51 @@ fn demo() -> Result<()> {
     println!();
     println!("Expected rule IDs: see examples/expected/findings.txt");
     Ok(())
+}
+
+/// Run the host-only `demo-hal` example, capture its NDJSON output, and diff
+/// it against `examples/expected/dma-heap.ndjson`. Sprint-1 PR 2 fixture.
+///
+/// This validates ioctl decoder semantics (DMA_HEAP_IOCTL_ALLOC field
+/// extraction, `b` magic disambiguation by FD-graph kind, defensive handling
+/// of zero-payload captures) without needing a Pixel device. On a mismatch
+/// it prints both blocks and exits non-zero so CI catches schema drift.
+fn demo_hal() -> Result<()> {
+    let root = workspace_root();
+    println!("=== running examples/demo-hal.rs ===");
+    let out = Command::new("cargo")
+        .current_dir(&root)
+        .args(["run", "--quiet", "--example", "demo-hal"])
+        .output()
+        .context("invoking cargo run --example demo-hal")?;
+    if !out.status.success() {
+        bail!(
+            "demo-hal example failed:\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let actual = String::from_utf8(out.stdout).context("demo-hal stdout is not valid UTF-8")?;
+    let expected_path = root.join("examples/expected/dma-heap.ndjson");
+    let expected = std::fs::read_to_string(&expected_path)
+        .with_context(|| format!("reading {}", expected_path.display()))?;
+
+    if actual.trim() == expected.trim() {
+        println!(
+            "OK demo-hal output matches {} ({} line(s))",
+            expected_path.display(),
+            actual.lines().count()
+        );
+        return Ok(());
+    }
+
+    println!("=== EXPECTED ({}) ===", expected_path.display());
+    print!("{expected}");
+    println!("=== ACTUAL ===");
+    print!("{actual}");
+    bail!(
+        "demo-hal NDJSON mismatch — update {} or fix the regression",
+        expected_path.display()
+    );
 }
 
 /// Compare findings emitted by neutron (read from `path` — an NDJSON file

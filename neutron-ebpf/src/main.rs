@@ -532,6 +532,32 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
             let _ = bpf_probe_read_kernel_buf(addr_of!((*saved).data) as *const u8, dst);
 
             let _ = INFLIGHT.remove(&pid_tgid);
+
+            // ── Sprint-1 PR 2: post-exit refresh for whitelisted R/RW ioctls ──
+            //
+            // For ioctl families where the kernel writes back into the user
+            // buffer (`DMA_HEAP_*`, `BINDER_*`, `DMA_BUF_*`, `ASHMEM_*` with
+            // `_IOC_DIR ∈ {R,RW}`) the meaningful payload is post-call. The
+            // enter capture above gave us pre-call bytes; we now overwrite
+            // `data[4..128]` with the post-call user buffer so userspace
+            // decoders see kernel-written fields like
+            // `dma_heap_allocation_data.fd`.
+            //
+            // `data[0..4]` keeps the cmd word from enter — the userspace
+            // formatter uses it to flip `"data_phase":"exit"` via the same
+            // [`neutron_common::ioctl_post_exit_refresh`] predicate. The
+            // user pointer was stashed on enter as `ptr_hint` and survived
+            // through INFLIGHT.
+            if saved_nr == 29 && saved_ptr_hint != 0 {
+                // ioctl(2) ABI: args[1] = cmd. Use the saved value rather
+                // than re-reading data[0..4] so we avoid additional pointer
+                // arithmetic the verifier would have to track.
+                let cmd = saved_args[1] as u32;
+                if neutron_common::ioctl_post_exit_refresh(cmd) {
+                    let dst = data_slice(ev, 4, 124);
+                    let _ = bpf_probe_read_user_buf(saved_ptr_hint as *const u8, dst);
+                }
+            }
         } else {
             bump_counter(COUNTER_INFLIGHT_LOOKUP_MISSED);
             addr_of_mut!((*ev).syscall_nr).write_unaligned(nr);

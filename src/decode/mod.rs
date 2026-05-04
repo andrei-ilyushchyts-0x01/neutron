@@ -12,7 +12,10 @@ pub use args::{
     format_openat_args, format_rw_args, format_socket_args, prot_name, sock_type_name,
 };
 pub use binder::{format_binder_event, format_binder_event_json};
-pub use ioctl::format_ioctl_deep;
+pub use ioctl::{
+    decode_ioctl, format_ioctl_deep, render_decoded_ioctl_json, DecodedIoctl, IoctlFamily,
+    IoctlFields,
+};
 pub use sockaddr::{format_sockaddr, lookup_socket_by_inode, parse_net_addr, read_socket_inode};
 pub use syscalls::syscall_name;
 

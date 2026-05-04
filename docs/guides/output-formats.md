@@ -147,7 +147,10 @@ Binder transactions are point-in-time, so `phase` is always `"enter"` — there 
 | `errno`           | number (optional)   | `-ret` for failed exit events (`ok:false`). Omitted otherwise.             |
 | `args`            | number[6]           | Raw syscall arguments. All six positions reflect the actual ABI args (no field hijacking — the enter timestamp lives in its own field). |
 | `data`            | string (optional)   | Decoded argument data (path, sockaddr, hex, …); omitted if empty |
-| `data_phase`      | string              | `"enter"` for every captured `data[]` blob today. PR 2 will set `"exit"` for whitelisted R/RW ioctls so consumers can tell pre-call from post-call snapshots. |
+| `data_phase`      | string              | `"enter"` when `data[]` carries the pre-call buffer; `"exit"` when the BPF program refreshed the buffer post-call. Today the refresh fires for `ioctl(2)` cmds whose `_IOC_DIR` is R or RW *and* whose `_IOC_TYPE` is `'H'` (`dma_heap`), `'b'` (`binder`/`dma_buf`), or `'w'` (`ashmem`). |
+| `ioctl_family`    | string (optional)   | Family classification for `ioctl(2)` events: `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, or `"unknown"`. The `'b'` magic is shared between `binder` and `dma_buf`; userspace disambiguates via the FD-graph kind of the target fd. |
+| `ioctl_name`      | string (optional)   | Human name for the cmd when the decoder registry knows it (e.g. `"DMA_HEAP_IOCTL_ALLOC"`). |
+| `dma_heap`        | object (optional)   | Decoded `struct dma_heap_allocation_data`: `{ "len":N, "returned_fd":N, "fd_flags":N, "fd_flags_str":"O_RDWR\|O_CLOEXEC", "heap_flags":N }`. Meaningful only when `data_phase == "exit"` (the kernel writes `fd` post-call). |
 | `rwx_alert`       | `"RWX" \| "WX"`     | Set on `mmap`/`mprotect` with PROT_EXEC; omitted otherwise  |
 | `latency_us`      | number (optional)   | Syscall duration in µs (exit only); omitted if `INFLIGHT` evicted |
 | `kernel_stackid`  | number (optional)   | Stack trace map key; omitted if both stack ids are negative |

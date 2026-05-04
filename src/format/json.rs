@@ -1,11 +1,16 @@
 //! NDJSON rendering of `SyscallEvent`s.
 
 use crate::decode::{
-    compute_latency_us, format_binder_event_json, format_comm, format_data_field,
-    lookup_socket_by_inode, read_socket_inode, resolve_path_from_fd, syscall_name,
+    compute_latency_us, decode_ioctl, format_binder_event_json, format_comm, format_data_field,
+    lookup_socket_by_inode, read_socket_inode, render_decoded_ioctl_json, resolve_path_from_fd,
+    syscall_name, IoctlFamily,
 };
 use crate::fdgraph::FdKind;
 use neutron_common::SyscallEvent;
+
+/// `ioctl(2)` syscall number on aarch64. The post-exit decoder/refresh logic
+/// is gated on this — file-name to keep the magic number out of inline checks.
+const SYSCALL_IOCTL: i32 = 29;
 
 /// Pre-resolved fd reference for an event, computed by the caller from the
 /// userspace [`crate::fdgraph::FdGraph`]. Carried into the JSON line as
@@ -189,14 +194,43 @@ pub fn format_event_json_full(
     } else {
         (String::new(), String::new())
     };
-    let data_phase_json = r#","data_phase":"enter""#;
+    // ── Sprint-1 PR 2: ioctl decoder + data_phase flip ────────────────────────
+    //
+    // For ioctl events we ask the decoder registry for a typed view. When the
+    // family is recognised the JSON line gains "ioctl_family", "ioctl_name"
+    // (when the cmd is in the registry's name table), and a per-family nested
+    // object such as "dma_heap":{"len":N,"returned_fd":N,…}.
+    //
+    // `data_phase` flips to "exit" exactly when the BPF program performed an
+    // exit-time re-read of `data[4..128]`. The two sides key off the shared
+    // [`neutron_common::ioctl_post_exit_refresh`] predicate so they can never
+    // disagree.
+    let (ioctl_json, data_phase_json) = if syscall_nr == SYSCALL_IOCTL {
+        let raw = { ev.data };
+        let cmd = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let fd_kind = fd_hint.as_ref().map(|h| h.kind);
+        let decoded = decode_ioctl(cmd, &raw[4..], ret, fd_kind);
+        let json = if decoded.family != IoctlFamily::Unknown || decoded.name.is_some() {
+            render_decoded_ioctl_json(&decoded)
+        } else {
+            String::new()
+        };
+        let phase = if is_enter == 0 && neutron_common::ioctl_post_exit_refresh(cmd) {
+            r#","data_phase":"exit""#
+        } else {
+            r#","data_phase":"enter""#
+        };
+        (json, phase)
+    } else {
+        (String::new(), r#","data_phase":"enter""#)
+    };
     let event_id_json = match event_id {
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
     };
 
     format!(
-        r#"{{"type":"syscall","ts_ns":{},"pid":{},"tid":{},"uid":{},"nr":{},"name":"{}","comm":"{}","enter":{}{},"ret":{}{}{},"args":[{},{},{},{},{},{}]{}{}{}{}{}{}{}{}{}}}"#,
+        r#"{{"type":"syscall","ts_ns":{},"pid":{},"tid":{},"uid":{},"nr":{},"name":"{}","comm":"{}","enter":{}{},"ret":{}{}{},"args":[{},{},{},{},{},{}]{}{}{}{}{}{}{}{}{}{}}}"#,
         ts_ns,
         pid,
         tid,
@@ -217,6 +251,7 @@ pub fn format_event_json_full(
         args[5],
         data_json,
         data_phase_json,
+        ioctl_json,
         fd_json,
         rwx_json,
         stack_json,
@@ -647,5 +682,129 @@ mod tests {
         assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("binder"));
         assert_eq!(v.get("phase").and_then(|x| x.as_str()), Some("enter"));
         assert_eq!(v.get("event_id").and_then(|x| x.as_u64()), Some(123));
+    }
+
+    // ── ioctl decoder integration (sprint 1, PR 2) ─────────────────────────
+
+    /// Build an ioctl exit event whose `data[0..4]` carries `cmd` and
+    /// `data[4..]` carries the post-call payload bytes.
+    fn ioctl_exit_event(cmd: u32, payload: &[u8]) -> SyscallEvent {
+        let mut data = [0u8; 128];
+        data[..4].copy_from_slice(&cmd.to_le_bytes());
+        let take = payload.len().min(124);
+        data[4..4 + take].copy_from_slice(&payload[..take]);
+        SyscallEvent {
+            syscall_nr: 29,
+            is_enter: 0,
+            ret: 0,
+            // ioctl(2) ABI: args[1] = cmd. The BPF program also stamps it
+            // here so userspace sees a consistent view.
+            args: [12, cmd as u64, 0, 0, 0, 0],
+            data,
+            ..SyscallEvent::default()
+        }
+    }
+
+    #[test]
+    fn ioctl_dma_heap_alloc_exit_emits_decoded_nested_object() {
+        // dma_heap_allocation_data { len=4096, fd=32, fd_flags=O_RDWR|O_CLOEXEC, heap_flags=0 }
+        let mut payload = Vec::with_capacity(24);
+        payload.extend_from_slice(&4096u64.to_le_bytes());
+        payload.extend_from_slice(&32i32.to_le_bytes());
+        payload.extend_from_slice(&0x80002u32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let ev = ioctl_exit_event(0xC018_4800, &payload);
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(
+            v.get("ioctl_family").and_then(|x| x.as_str()),
+            Some("dma_heap")
+        );
+        assert_eq!(
+            v.get("ioctl_name").and_then(|x| x.as_str()),
+            Some("DMA_HEAP_IOCTL_ALLOC")
+        );
+        let dh = v
+            .get("dma_heap")
+            .and_then(|x| x.as_object())
+            .expect("dma_heap nested object");
+        assert_eq!(dh.get("len").and_then(|x| x.as_u64()), Some(4096));
+        assert_eq!(dh.get("returned_fd").and_then(|x| x.as_i64()), Some(32));
+        assert_eq!(
+            dh.get("fd_flags_str").and_then(|x| x.as_str()),
+            Some("O_RDWR|O_CLOEXEC")
+        );
+    }
+
+    #[test]
+    fn ioctl_refresh_target_exit_marks_data_phase_exit() {
+        // DMA_HEAP_IOCTL_ALLOC is a R/RW + dma_heap-type cmd ⇒ post-exit
+        // refresh ⇒ data_phase flips to "exit".
+        let ev = ioctl_exit_event(0xC018_4800, &[0u8; 24]);
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("data_phase").and_then(|x| x.as_str()), Some("exit"));
+    }
+
+    #[test]
+    fn ioctl_non_refresh_exit_keeps_data_phase_enter() {
+        // _IOW (write-only, dir=1) is NOT in the refresh whitelist — the
+        // kernel doesn't write back, so data_phase stays "enter".
+        let cmd: u32 = (1u32 << 30) | (32u32 << 16) | (0x62u32 << 8) | 5;
+        let ev = ioctl_exit_event(cmd, &[0u8; 32]);
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("data_phase").and_then(|x| x.as_str()), Some("enter"));
+    }
+
+    #[test]
+    fn ioctl_refresh_target_enter_keeps_data_phase_enter() {
+        // Even for refresh-target cmds, the enter event was captured pre-call,
+        // so data_phase must stay "enter" on enter regardless of cmd policy.
+        let mut ev = ioctl_exit_event(0xC018_4800, &[0u8; 24]);
+        ev.is_enter = 1;
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("data_phase").and_then(|x| x.as_str()), Some("enter"));
+    }
+
+    #[test]
+    fn ioctl_disambiguates_b_magic_via_fd_kind_hint() {
+        // BINDER_WRITE_READ-shaped cmd (type='b', dir=RW) — without an FdHint
+        // we default to dma_buf; with a Binder hint we get binder.
+        let cmd: u32 = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
+        let ev = ioctl_exit_event(cmd, &[0u8; 48]);
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(
+            v.get("ioctl_family").and_then(|x| x.as_str()),
+            Some("dma_buf")
+        );
+
+        let hint = FdHint {
+            kind: FdKind::Binder,
+            path: "/dev/binder".into(),
+        };
+        let line = format_event_json_full(&ev, false, None, Some(&hint), None);
+        let v = parse(&line);
+        assert_eq!(
+            v.get("ioctl_family").and_then(|x| x.as_str()),
+            Some("binder")
+        );
+    }
+
+    #[test]
+    fn non_ioctl_event_omits_ioctl_fields_and_keeps_data_phase_enter() {
+        let ev = SyscallEvent {
+            syscall_nr: 56, // openat
+            is_enter: 0,
+            ret: 7,
+            data: data_path(b"/tmp/x\0"),
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("ioctl_family"));
+        assert!(!obj.contains_key("ioctl_name"));
+        assert!(!obj.contains_key("dma_heap"));
+        assert_eq!(
+            obj.get("data_phase").and_then(|x| x.as_str()),
+            Some("enter")
+        );
     }
 }
