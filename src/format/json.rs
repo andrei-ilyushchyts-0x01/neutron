@@ -317,6 +317,136 @@ pub fn format_fd_snapshot_json(
     )
 }
 
+/// Render a [`crate::sources::ProcessExitEvent`] as a `type:"process_exit"`
+/// NDJSON line. Sprint-2 PR 1.
+///
+/// `crash_context` carries the per-PID lookback ring buffer (last N raw
+/// event lines neutron emitted for this PID before the exit was observed).
+/// Each entry is a quoted, JSON-escaped string of the original NDJSON line —
+/// downstream consumers can re-parse them. Empty array when lookback is
+/// disabled or the PID was never recorded (e.g. exit observed via tombstone
+/// for a PID neutron never traced).
+pub fn format_process_exit_json(
+    ev: &crate::sources::ProcessExitEvent,
+    crash_context: &[String],
+    event_id: Option<u64>,
+) -> String {
+    let escaped_comm = ev.comm.replace('\\', "\\\\").replace('"', "\\\"");
+    let signal_json = if ev.exit_signal == 0 {
+        String::new()
+    } else {
+        format!(r#","exit_signal":{}"#, ev.exit_signal)
+    };
+    let signal_name_json = match ev.signal_name() {
+        Some(name) => format!(r#","signal_name":"{}""#, name),
+        None => String::new(),
+    };
+    let exit_code_json = if ev.exit_code == 0 {
+        String::new()
+    } else {
+        format!(r#","exit_code":{}"#, ev.exit_code)
+    };
+    let event_id_json = match event_id {
+        Some(id) => format!(r#","event_id":{}"#, id),
+        None => String::new(),
+    };
+    let mut ctx_json = String::from(r#","crash_context":["#);
+    for (i, raw) in crash_context.iter().enumerate() {
+        if i > 0 {
+            ctx_json.push(',');
+        }
+        let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+        ctx_json.push('"');
+        ctx_json.push_str(&escaped);
+        ctx_json.push('"');
+    }
+    ctx_json.push(']');
+
+    format!(
+        r#"{{"type":"process_exit","ts_ns":{},"pid":{},"uid":{},"comm":"{}","source":"{}","classification":"{}"{}{}{}{}{}}}"#,
+        ev.ts_ns,
+        ev.pid,
+        ev.uid,
+        escaped_comm,
+        ev.source.as_str(),
+        ev.classify().as_str(),
+        signal_json,
+        signal_name_json,
+        exit_code_json,
+        ctx_json,
+        event_id_json,
+    )
+}
+
+#[cfg(test)]
+mod process_exit_json_tests {
+    use super::*;
+    use crate::sources::ProcessExitEvent;
+    use neutron_common::{ExitSource, SIGSEGV};
+
+    #[test]
+    fn crash_event_includes_signal_classification_and_context() {
+        let ev = ProcessExitEvent {
+            ts_ns: 1_000_000_000,
+            pid: 42,
+            uid: 1000,
+            comm: "vendor.qti.cam".into(),
+            exit_code: 0,
+            exit_signal: SIGSEGV,
+            source: ExitSource::Tombstone,
+        };
+        let ctx = vec![
+            r#"{"type":"syscall","nr":29,"name":"ioctl"}"#.to_string(),
+            r#"{"type":"binder","code":1}"#.to_string(),
+        ];
+        let line = format_process_exit_json(&ev, &ctx, Some(99));
+        assert!(line.contains(r#""type":"process_exit""#));
+        assert!(line.contains(r#""pid":42"#));
+        assert!(line.contains(r#""source":"tombstone""#));
+        assert!(line.contains(r#""classification":"crash""#));
+        assert!(line.contains(r#""exit_signal":11"#));
+        assert!(line.contains(r#""signal_name":"SIGSEGV""#));
+        assert!(line.contains(r#""event_id":99"#));
+        assert!(line.contains(r#""crash_context":["#));
+        // Context entries embed escaped JSON strings.
+        assert!(line.contains(r#"\"type\":\"syscall\""#));
+    }
+
+    #[test]
+    fn normal_exit_omits_signal_fields() {
+        let ev = ProcessExitEvent {
+            ts_ns: 100,
+            pid: 7,
+            uid: 1000,
+            comm: "task".into(),
+            exit_code: 0,
+            exit_signal: 0,
+            source: ExitSource::Tracepoint,
+        };
+        let line = format_process_exit_json(&ev, &[], None);
+        assert!(line.contains(r#""classification":"normal_exit""#));
+        assert!(!line.contains("exit_signal"));
+        assert!(!line.contains("signal_name"));
+        assert!(!line.contains("event_id"));
+        assert!(line.contains(r#""crash_context":[]"#));
+    }
+
+    #[test]
+    fn comm_with_quotes_is_escaped() {
+        let ev = ProcessExitEvent {
+            ts_ns: 0,
+            pid: 1,
+            uid: 0,
+            comm: r#"weird"name"#.into(),
+            exit_code: 0,
+            exit_signal: 0,
+            source: ExitSource::Tracepoint,
+        };
+        let line = format_process_exit_json(&ev, &[], None);
+        assert!(line.contains(r#""comm":"weird\"name""#));
+    }
+}
+
 /// Inject `"stack":"<escaped>"` just before the trailing `}` of an
 /// already-rendered JSON object. Used for the binder-event branch where we
 /// re-use the binder formatter and don't want to duplicate its logic.

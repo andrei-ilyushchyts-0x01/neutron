@@ -166,6 +166,123 @@ pub const fn ioctl_post_exit_refresh(cmd: u32) -> bool {
             || ty == IOCTL_TYPE_ASHMEM)
 }
 
+// ── Process exit (sprint-2 PR 1) ─────────────────────────────────────────────
+//
+// Synthetic syscall_nr sentinel for `type:"process_exit"` events. Encoded
+// into the existing `SyscallEvent` wire layout so no bump is required:
+// - syscall_nr = -3 (sentinel; -1 = binder, -2 = fd_snapshot)
+// - args[0]   = exit_code (0..=255 from exit(2), or 0 when killed by signal)
+// - args[1]   = exit_signal (0 = no signal, otherwise SIG* value)
+// - args[2]   = exit_source (ExitSource discriminant)
+// - args[3..] = reserved
+//
+// The BPF sched_process_exit handler emits with source=0 (Tracepoint) and
+// args[0]/args[1] = 0 (the task_struct->exit_code BTF read is deferred).
+// Userspace sources (logcat, tombstone watchers) emit with source=1/2 and
+// fill in signal info parsed from their respective stream formats.
+
+/// Sentinel `syscall_nr` for `type:"process_exit"` events.
+pub const SYSCALL_NR_PROCESS_EXIT: i32 = -3;
+
+/// Discriminant for the source that detected an exit. Stored in
+/// `SyscallEvent.args[2]` when `syscall_nr == SYSCALL_NR_PROCESS_EXIT`.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExitSource {
+    #[default]
+    Tracepoint = 0,
+    Logcat = 1,
+    Tombstone = 2,
+}
+
+impl ExitSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ExitSource::Tracepoint => "tracepoint",
+            ExitSource::Logcat => "logcat",
+            ExitSource::Tombstone => "tombstone",
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(ExitSource::Tracepoint),
+            1 => Some(ExitSource::Logcat),
+            2 => Some(ExitSource::Tombstone),
+            _ => None,
+        }
+    }
+}
+
+/// Fatal POSIX signal numbers that classify an exit as `"crash"`. Aarch64
+/// Linux numbering — matches `<bits/signum-generic.h>` and is identical to
+/// the values logcat / tombstoned print.
+pub const SIGILL: u32 = 4;
+pub const SIGABRT: u32 = 6;
+pub const SIGBUS: u32 = 7;
+pub const SIGFPE: u32 = 8;
+pub const SIGSEGV: u32 = 11;
+pub const SIGSYS: u32 = 31;
+
+/// Returns the symbolic name (`"SIGSEGV"` etc.) for a signal number, or
+/// `None` for values neutron does not classify. Used by userspace formatters.
+pub const fn signal_name(sig: u32) -> Option<&'static str> {
+    match sig {
+        SIGILL => Some("SIGILL"),
+        SIGABRT => Some("SIGABRT"),
+        SIGBUS => Some("SIGBUS"),
+        SIGFPE => Some("SIGFPE"),
+        SIGSEGV => Some("SIGSEGV"),
+        SIGSYS => Some("SIGSYS"),
+        // Common non-fatal that a watcher may still surface.
+        9 => Some("SIGKILL"),
+        15 => Some("SIGTERM"),
+        2 => Some("SIGINT"),
+        _ => None,
+    }
+}
+
+/// `true` when a signal terminates a process and warrants the `"crash"`
+/// classification. R003_process_crash matches exactly this set.
+pub const fn is_fatal_signal(sig: u32) -> bool {
+    matches!(sig, SIGILL | SIGABRT | SIGBUS | SIGFPE | SIGSEGV | SIGSYS)
+}
+
+#[cfg(test)]
+mod exit_classification_tests {
+    use super::*;
+
+    #[test]
+    fn fatal_signals_match_documented_set() {
+        for sig in [SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGSYS] {
+            assert!(is_fatal_signal(sig), "{sig} should be fatal");
+        }
+        assert!(!is_fatal_signal(0));
+        assert!(!is_fatal_signal(9), "SIGKILL deliberately excluded");
+        assert!(!is_fatal_signal(15));
+    }
+
+    #[test]
+    fn signal_name_round_trips_for_known_signals() {
+        assert_eq!(signal_name(SIGSEGV), Some("SIGSEGV"));
+        assert_eq!(signal_name(SIGABRT), Some("SIGABRT"));
+        assert_eq!(signal_name(9), Some("SIGKILL"));
+        assert_eq!(signal_name(0xff), None);
+    }
+
+    #[test]
+    fn exit_source_round_trips() {
+        for src in [
+            ExitSource::Tracepoint,
+            ExitSource::Logcat,
+            ExitSource::Tombstone,
+        ] {
+            assert_eq!(ExitSource::from_u8(src as u8), Some(src));
+        }
+        assert_eq!(ExitSource::from_u8(99), None);
+    }
+}
+
 #[cfg(test)]
 mod ioctl_policy_tests {
     use super::*;

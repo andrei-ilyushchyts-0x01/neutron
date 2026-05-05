@@ -165,6 +165,45 @@ the explicit `--pid` target plus any PID that produced a traced event;
 sprint-2 stub that degrades to `active` with a warning. Set `--fdgraph-interval off`
 to disable polling entirely.
 
+### Process Exit Event (`type == "process_exit"`)
+
+Sprint-2 PR 1 introduces a fourth event class. Three independent sources can
+emit `process_exit` lines: the `sched_process_exit` BPF tracepoint, the
+logcat tail (`FATAL EXCEPTION`, native `DEBUG`, `ANR in`), and a poll-based
+watcher over `/data/tombstones/`. Per-process aggregation in the rule engine
+collapses the typical fan-out.
+
+```json
+{
+  "type":           "process_exit",
+  "ts_ns":          1234567890,
+  "pid":            12345,
+  "uid":            10123,
+  "comm":           "vendor.qti.cam",
+  "source":         "tombstone",
+  "classification": "crash",
+  "exit_signal":    11,
+  "signal_name":    "SIGSEGV",
+  "crash_context":  ["{\"type\":\"syscall\",\"nr\":29,...}", "..."],
+  "event_id":       18234
+}
+```
+
+| Field            | JSON type | Notes                                                                  |
+|------------------|-----------|------------------------------------------------------------------------|
+| `type`           | string    | Always `"process_exit"`.                                               |
+| `source`         | string    | `"tracepoint"` (BPF), `"logcat"`, or `"tombstone"`.                    |
+| `classification` | string    | `"crash"`, `"signal_exit"`, `"abnormal_exit"`, or `"normal_exit"`.     |
+| `exit_signal`    | u32       | POSIX signal number. Omitted when 0.                                   |
+| `signal_name`    | string    | Symbolic name (`"SIGSEGV"`). Omitted when not in the lookup table.     |
+| `exit_code`      | u8        | exit(2) status. Omitted when 0.                                        |
+| `crash_context`  | array     | Last N raw NDJSON lines neutron observed for this PID before the exit. |
+| `event_id`       | u64       | Monotonic correlation token.                                           |
+
+`crash_context` entries are JSON-escaped strings of the original NDJSON
+lines. Disable with `--lookback-events 0`. Disable the tombstone watcher
+with `--tombstone-dir ""` and the logcat tail with `--no-logcat`.
+
 ## Field Reference
 
 ### Common Fields

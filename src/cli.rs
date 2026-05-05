@@ -140,4 +140,23 @@ pub struct Args {
     /// proportional to fd count for in-scope PIDs.
     #[arg(long, default_value_t = 0)]
     pub fdgraph_top_paths_n: usize,
+
+    // ── Crash correlation (sprint-2 PR 1) ──────────────────────────────────
+    /// Per-PID ring-buffer depth for the crash-context lookback. Each
+    /// emitted JSON line is buffered; on `process_exit` the buffer is dumped
+    /// into the `crash_context` field. `0` disables lookback. Default 100.
+    #[arg(long, default_value_t = 100)]
+    pub lookback_events: usize,
+
+    /// Directory the tombstone watcher polls. Default
+    /// `/data/tombstones` (Android). Set to empty string to disable the
+    /// watcher entirely. Polled at 1 Hz alongside the FD-graph drain.
+    #[arg(long, default_value = "/data/tombstones")]
+    pub tombstone_dir: String,
+
+    /// Skip spawning the `logcat` tail. Useful for hosts without the
+    /// Android `logcat` binary, or to silence its overhead in raw-only
+    /// captures where the rule engine is disabled.
+    #[arg(long)]
+    pub no_logcat: bool,
 }

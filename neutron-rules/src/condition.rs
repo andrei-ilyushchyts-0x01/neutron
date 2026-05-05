@@ -123,6 +123,32 @@ pub struct MatchCondition {
     /// known name never match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ioctl_name_in: Option<Vec<String>>,
+
+    /// Match if the event is a `type:"process_exit"` line (sprint-2 PR 1).
+    /// Required precondition for any of the `exit_*` predicates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_exit: Option<bool>,
+
+    /// Match if the event's `exit_signal` is in this list. Implies
+    /// `EventKind::ProcessExit`. Non-exit events have no signal field and
+    /// never match. The list values are POSIX signal numbers (`11` for
+    /// SIGSEGV, `6` for SIGABRT, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal_in: Option<Vec<u32>>,
+
+    /// Match if the event's `classification` field is one of the listed
+    /// values. Allowed values: `"crash"`, `"signal_exit"`, `"abnormal_exit"`,
+    /// `"normal_exit"`. Implies `EventKind::ProcessExit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_classification_in: Option<Vec<String>>,
+
+    /// Match if the event's `source` field is one of the listed values.
+    /// Allowed: `"tracepoint"`, `"logcat"`, `"tombstone"`. Implies
+    /// `EventKind::ProcessExit`. Useful for rules that should only fire
+    /// when the signal info actually came from a userspace source (tombstone
+    /// or logcat) rather than the bare BPF tracepoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_source_in: Option<Vec<String>>,
 }
 
 impl MatchCondition {
@@ -254,6 +280,32 @@ impl MatchCondition {
         if let Some(list) = &self.ioctl_name_in {
             match ev.ioctl_name {
                 Some(n) if list.iter().any(|s| s == n) => {}
+                _ => return false,
+            }
+        }
+        if let Some(true) = self.process_exit {
+            if ev.kind != EventKind::ProcessExit {
+                return false;
+            }
+        }
+        if let Some(list) = &self.exit_signal_in {
+            // exit_signal is `Some(0)` on a normal exit; we still want
+            // exit_signal_in: [0] to match that case if a rule author writes it,
+            // hence Some(s) instead of Some(s) if s != 0.
+            match ev.exit_signal {
+                Some(s) if list.contains(&s) => {}
+                _ => return false,
+            }
+        }
+        if let Some(list) = &self.exit_classification_in {
+            match ev.exit_classification {
+                Some(c) if list.iter().any(|s| s == c) => {}
+                _ => return false,
+            }
+        }
+        if let Some(list) = &self.exit_source_in {
+            match ev.exit_source {
+                Some(s) if list.iter().any(|x| x == s) => {}
                 _ => return false,
             }
         }

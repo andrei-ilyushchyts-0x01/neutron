@@ -7,8 +7,8 @@
 use serde_json::Value;
 
 /// What category the underlying event belongs to. Allows rules to match
-/// `binder` and `fd_snapshot` events without forcing them into the same
-/// shape as syscalls.
+/// `binder`, `fd_snapshot`, and `process_exit` events without forcing them
+/// into the same shape as syscalls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventKind {
     Syscall,
@@ -17,6 +17,10 @@ pub enum EventKind {
     /// `fd_count`, `fd_pct_of_rlimit`, and high-water marks. Drives the
     /// `R001_fd_table_exhaustion`-class rules.
     FdSnapshot,
+    /// Sprint-2 PR 1: process exit observed by BPF tracepoint, logcat tail,
+    /// or tombstone watcher. Carries `exit_signal`, `exit_classification`,
+    /// and `source`. Drives `R003_process_crash`.
+    ProcessExit,
 }
 
 /// Lightweight read-only view of one event line. Lifetime is bound to the JSON
@@ -60,6 +64,18 @@ pub struct Event<'a> {
     /// Decoded ioctl name — e.g. `"DMA_HEAP_IOCTL_ALLOC"`. `None` when the
     /// command isn't in the userspace decoder registry.
     pub ioctl_name: Option<&'a str>,
+    /// Sprint-2 PR 1: signal value from a `type:"process_exit"` event. `0`
+    /// when the source did not observe a signal (normal exit, ANR-only).
+    /// `None` for non-exit events.
+    pub exit_signal: Option<u32>,
+    /// Sprint-2 PR 1: classification string (`"crash"`, `"signal_exit"`,
+    /// `"abnormal_exit"`, `"normal_exit"`) from a `type:"process_exit"`
+    /// event. `None` for non-exit events.
+    pub exit_classification: Option<&'a str>,
+    /// Sprint-2 PR 1: source attribution (`"tracepoint"` / `"logcat"` /
+    /// `"tombstone"`) from a `type:"process_exit"` event. `None` for
+    /// non-exit events.
+    pub exit_source: Option<&'a str>,
 
     /// Owned JSON value — kept so callers can clone it into snapshots without
     /// re-parsing the raw line. Use [`Event::raw_json`] to access.
@@ -76,22 +92,27 @@ impl<'a> Event<'a> {
         let type_str = obj.get("type").and_then(|t| t.as_str());
         let is_binder = type_str == Some("binder");
         let is_fd_snapshot = type_str == Some("fd_snapshot");
+        let is_process_exit = type_str == Some("process_exit");
         let kind = if is_binder {
             EventKind::Binder
         } else if is_fd_snapshot {
             EventKind::FdSnapshot
+        } else if is_process_exit {
+            EventKind::ProcessExit
         } else {
             EventKind::Syscall
         };
 
-        // Snapshot events carry no `nr` field — synthesise a sentinel so
+        // Snapshot/exit events carry no `nr` field — synthesise a sentinel so
         // existing rule predicates that check `syscall_in` simply fail to
-        // match (they do today: list.contains(&-2) is false for any real
+        // match (they do today: list.contains(&-2)/(-3) is false for any real
         // syscall number).
         let syscall_nr = if is_binder {
             -1
         } else if is_fd_snapshot {
             -2
+        } else if is_process_exit {
+            -3
         } else {
             obj.get("nr").and_then(|n| n.as_i64())? as i32
         };
@@ -127,6 +148,29 @@ impl<'a> Event<'a> {
             .map(|n| u8::try_from(n.min(255)).unwrap_or(u8::MAX));
         let ioctl_family = obj.get("ioctl_family").and_then(|v| v.as_str());
         let ioctl_name = obj.get("ioctl_name").and_then(|v| v.as_str());
+        let exit_signal = if is_process_exit {
+            // Absent = normal exit (no signal). Treat as 0 so predicates that
+            // require non-zero signal (R003 with exit_signal_in) just don't
+            // match, instead of needing a separate "is exit" guard.
+            Some(
+                obj.get("exit_signal")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                    .unwrap_or(0),
+            )
+        } else {
+            None
+        };
+        let exit_classification = if is_process_exit {
+            obj.get("classification").and_then(|v| v.as_str())
+        } else {
+            None
+        };
+        let exit_source = if is_process_exit {
+            obj.get("source").and_then(|v| v.as_str())
+        } else {
+            None
+        };
 
         let mut args = [0u64; 6];
         if let Some(arr) = obj.get("args").and_then(|a| a.as_array()) {
@@ -157,6 +201,9 @@ impl<'a> Event<'a> {
             fd_pct_of_rlimit,
             ioctl_family,
             ioctl_name,
+            exit_signal,
+            exit_classification,
+            exit_source,
             raw: v,
             raw_line,
         })

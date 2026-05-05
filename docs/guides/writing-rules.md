@@ -61,6 +61,10 @@ event must be both `openat` *and* have a path starting with
 | `fd_count_pct_of_rlimit_gt` | `u8`     | snapshot's `fd_pct_of_rlimit > value` (rlimit must be known) |
 | `ioctl_family_in`         | `[string]` | decoded `ioctl_family` ∈ list (e.g. `dma_heap`, `binder`) |
 | `ioctl_name_in`           | `[string]` | decoded `ioctl_name` ∈ list (e.g. `DMA_HEAP_IOCTL_ALLOC`) |
+| `process_exit`            | `bool`     | event is a `type:"process_exit"` line                    |
+| `exit_signal_in`          | `[u32]`    | exit's `exit_signal` ∈ list (POSIX numbers, `11`=SIGSEGV)|
+| `exit_classification_in`  | `[string]` | `classification` ∈ list (`crash`, `signal_exit`, ...)    |
+| `exit_source_in`          | `[string]` | `source` ∈ list (`tracepoint`, `logcat`, `tombstone`)    |
 
 `stack_contains` / `stack_not_contains` require the tracer to be running
 with `--stacks`. The substrings match against the rendered stack string
@@ -77,6 +81,15 @@ registry recognises (sprint-1 PR 2). The decoder fills `ioctl_family`
 for known type bytes (`dma_heap`, `binder`, `dma_buf`, `ashmem`) and
 fills `ioctl_name` for commands in its registry. Unknown commands carry
 no decoded fields and never match these predicates.
+
+The `exit_*` predicates only match `type:"process_exit"` events (sprint-2
+PR 1). These are emitted by the BPF `sched_process_exit` tracepoint, the
+logcat tail, and the `/data/tombstones/` watcher. `exit_classification_in`
+accepts `crash` (fatal signal), `signal_exit` (non-fatal signal like
+SIGKILL), `abnormal_exit` (`exit(N)` with `N != 0`), and `normal_exit`.
+`exit_source_in` is useful when only userspace-attributed crashes carry
+enough info to act on — the bare BPF tracepoint emits `exit_signal: 0`
+because reading `task_struct->exit_code` requires BTF and is deferred.
 
 ### Stack-aware example
 
@@ -125,6 +138,30 @@ This fires for any traced process whose live FD count crosses 90% of its
 `RLIMIT_NOFILE` allowance. The default poller interval is 1 s, so the
 rule produces at most one finding per process even during sustained
 exhaustion thanks to `per_process` aggregation.
+
+### Crash-correlation example (R003)
+
+Sprint-2 PR 1 introduced `process_exit` events. They are emitted by three
+independent sources (BPF tracepoint, logcat tail, tombstone watcher); the
+default rule R003 fires once per fatal-signal crash regardless of which
+source observed it first:
+
+```yaml
+- id: R003_process_crash
+  name: Process killed by fatal signal
+  severity: critical
+  category: crash
+  conditions:
+    - process_exit: true
+      exit_classification_in: [crash]
+  aggregate: per_process
+```
+
+`per_process` aggregation collapses the typical fan-out (a single SIGSEGV
+yields a `tracepoint` line, then a `tombstone` line, then a `logcat` line).
+The emitted JSON carries `crash_context` — the last `--lookback-events`
+NDJSON lines neutron observed for the PID — so a finding is self-contained
+evidence without needing to grep the full stream.
 
 ### Decoded-ioctl example (R002)
 

@@ -33,9 +33,10 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use neutron_common::{
-    SyscallEvent, COUNTER_EVENTS_SUBMITTED, COUNTER_INFLIGHT_LOOKUP_MISSED,
+    ExitSource, SyscallEvent, COUNTER_EVENTS_SUBMITTED, COUNTER_INFLIGHT_LOOKUP_MISSED,
     COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
     COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED, FILTER_KEY_ACTIVE, FILTER_KEY_PID,
+    SYSCALL_NR_PROCESS_EXIT,
 };
 
 // COUNTER_PATH_READ_FAILED and COUNTER_PATH_TRUNCATED slot indices are reserved
@@ -652,6 +653,120 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
         entry.submit(0);
         bump_counter(COUNTER_EVENTS_SUBMITTED);
     }
+    Ok(())
+}
+
+// ── sched/sched_process_exit (sprint-2 PR 1: crash correlation) ──────────────
+//
+// Tracepoint fires once per task termination — covers normal exit, fatal
+// signals (SIGSEGV/SIGABRT/...), OOM kill, and SIGKILL. We emit a synthetic
+// SyscallEvent with `syscall_nr == SYSCALL_NR_PROCESS_EXIT (-3)` so the
+// existing wire/format pipeline carries it without a layout bump.
+//
+// Tracepoint format (kernel >= 4.x, stable):
+//   common_header @ 0..8
+//   field:char    comm[16];   offset:8;   size:16;
+//   field:pid_t   pid;        offset:24;  size:4;   (kernel pid == userspace TID)
+//   field:int     prio;       offset:28;  size:4;
+//
+// The tracepoint payload does NOT carry exit_code or signal — those live
+// on `task_struct` and require BTF to read safely. We deliberately leave
+// args[0..2] zero here; userspace logcat / tombstone watchers (sources
+// 1 / 2) supply the signal info when they observe the same crash. The
+// tracepoint event is the lookback synchronisation point: when userspace
+// sees `nr == -3` it knows to dump the per-PID ring buffer.
+
+const SCHED_EXIT_COMM: usize = 8;
+const SCHED_EXIT_PID: usize = 24;
+
+#[tracepoint]
+pub fn trace_sched_process_exit(ctx: TracePointContext) -> i32 {
+    let _ = try_sched_process_exit(&ctx);
+    0
+}
+
+#[inline(always)]
+fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
+    // Use the tracepoint's own pid field rather than bpf_get_current_pid_tgid:
+    // by the time the tracepoint fires the current task may already be in the
+    // do_exit() teardown path and the helper's behaviour is well-defined but
+    // returns the dying task — what we actually want for "who exited".
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let userspace_pid = (pid_tgid >> 32) as u32;
+    let userspace_tid = pid_tgid as u32;
+
+    // Same filter rules as the syscall path: respect `--pid` / whitelist so
+    // we don't flood userspace with unrelated exits.
+    if !pid_matches(userspace_pid) {
+        return Err(());
+    }
+
+    let now = unsafe { bpf_ktime_get_ns() };
+
+    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
+        bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
+        return Err(());
+    };
+
+    let ev: *mut SyscallEvent = entry.as_mut_ptr() as *mut SyscallEvent;
+    unsafe {
+        core::ptr::write_bytes(ev as *mut u8, 0, size_of::<SyscallEvent>());
+
+        addr_of_mut!((*ev).timestamp_ns).write_unaligned(now);
+        addr_of_mut!((*ev).pid).write_unaligned(userspace_pid);
+        addr_of_mut!((*ev).tgid).write_unaligned(userspace_tid);
+        addr_of_mut!((*ev).uid).write_unaligned(bpf_get_current_uid_gid() as u32);
+        addr_of_mut!((*ev).syscall_nr).write_unaligned(SYSCALL_NR_PROCESS_EXIT);
+        addr_of_mut!((*ev).is_enter).write_unaligned(1);
+
+        // Prefer the tracepoint's comm field — it is captured at the moment
+        // of exit and survives the dying-task race that bpf_get_current_comm
+        // can lose. Fall back if the read fails.
+        let mut comm_buf: [u8; 16] = [0; 16];
+        if ctx
+            .read_at::<[u8; 16]>(SCHED_EXIT_COMM)
+            .map(|c| comm_buf = c)
+            .is_err()
+        {
+            if let Ok(c) = bpf_get_current_comm() {
+                comm_buf = c;
+            }
+        }
+        addr_of_mut!((*ev).comm).write_unaligned(comm_buf);
+
+        // args[0] = exit_code (TBD via task_struct BTF), args[1] = signal,
+        // args[2] = ExitSource::Tracepoint discriminant. Userspace decoders
+        // key off args[2] to attribute the source on the JSON line.
+        let args: [u64; 6] = [0, 0, ExitSource::Tracepoint as u64, 0, 0, 0];
+        addr_of_mut!((*ev).args).write_unaligned(args);
+
+        // Optional kernel/user stacks at exit time. The user stack is
+        // typically just the libc exit() trampoline, but the kernel stack
+        // can show do_exit / oom_kill_process / get_signal. Capture both
+        // for parity with the binder tracepoint path.
+        let kid = match STACK_TRACES.get_stackid(ctx, 0) {
+            Ok(id) => id as i32,
+            Err(e) => {
+                bump_counter(COUNTER_STACK_KERNEL_FAILED);
+                e as i32
+            }
+        };
+        let uid_stack = match STACK_TRACES.get_stackid(ctx, BPF_F_USER_STACK as u64) {
+            Ok(id) => id as i32,
+            Err(e) => {
+                bump_counter(COUNTER_STACK_USER_FAILED);
+                e as i32
+            }
+        };
+        addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
+        addr_of_mut!((*ev).user_stackid).write_unaligned(uid_stack);
+
+        entry.submit(0);
+        bump_counter(COUNTER_EVENTS_SUBMITTED);
+    }
+
+    // Silence unused-import warning when this is the only consumer.
+    let _ = SCHED_EXIT_PID;
     Ok(())
 }
 

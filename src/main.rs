@@ -31,13 +31,18 @@ use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
 use neutron::fdgraph::FdGraph;
 use neutron::format::{
-    format_event_json_full, format_event_text_with_stack, format_fd_snapshot_json, FdHint,
+    format_event_json_full, format_event_text_with_stack, format_fd_snapshot_json,
+    format_process_exit_json, FdHint,
 };
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
 use neutron::rules::{build_rule_engine, emit_findings};
+use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
+use neutron::sources::lookback::RingBufferStore;
+use neutron::sources::tombstone::{RealTombstoneWatcher, TombstoneWatcher};
+use neutron::sources::ProcessExitEvent;
 use neutron::symbolize::{is_kernel_addr, KernelSymbolizer, ProcSymbolizer};
 use neutron::SyscallEvent;
-use neutron_common::{FILTER_KEY_ACTIVE, FILTER_KEY_PID};
+use neutron_common::{ExitSource, FILTER_KEY_ACTIVE, FILTER_KEY_PID, SYSCALL_NR_PROCESS_EXIT};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -324,6 +329,50 @@ fn handle_capture_reads(
     Ok(())
 }
 
+// ── Crash-correlation emit helper (sprint-2 PR 1) ────────────────────────────
+
+/// Emit a single `ProcessExitEvent` through the same pipeline that handles
+/// raw events: stamp event_id, dump lookback into `crash_context`, feed the
+/// rule engine, write the formatted line. Used by all three crash sources.
+#[allow(clippy::too_many_arguments)]
+fn emit_process_exit(
+    ev: &ProcessExitEvent,
+    lookback: Option<&mut RingBufferStore>,
+    engine: &mut Option<neutron_rules::RuleEngine>,
+    out: &mut dyn IoWrite,
+    suppress_raw: bool,
+    json_mode: bool,
+    event_id_counter: &mut u64,
+) {
+    let ctx = lookback.map(|lb| lb.take(ev.pid)).unwrap_or_default();
+    *event_id_counter = event_id_counter.wrapping_add(1);
+    let line = format_process_exit_json(ev, &ctx, Some(*event_id_counter));
+    if let Some(eng) = engine.as_mut() {
+        if let Some(owned) = neutron_rules::Event::parse_line(&line) {
+            if let Some(view) = owned.view() {
+                eng.feed(&view);
+            }
+        }
+    }
+    if !suppress_raw {
+        // process_exit lines are always JSON-shaped; in text mode print a
+        // one-line summary so non-JSON consumers still see crashes.
+        let printed = if json_mode {
+            line
+        } else {
+            format!(
+                "[exit] pid={} comm={} class={} signal={} source={}",
+                ev.pid,
+                ev.comm,
+                ev.classify().as_str(),
+                ev.exit_signal,
+                ev.source.as_str(),
+            )
+        };
+        let _ = writeln!(out, "{printed}");
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -483,6 +532,70 @@ fn run_trace(mut args: Args) -> Result<()> {
         None => None,
     };
 
+    // ── Crash correlation (sprint-2 PR 1) ────────────────────────────────
+    //
+    // Lookback ring buffer captures every emitted JSON line per PID. On a
+    // process_exit event (from any source) the buffer is dumped into the
+    // crash_context field of the emitted JSON. Bounded — see lookback.rs.
+    let mut lookback: Option<RingBufferStore> = if args.lookback_events == 0 {
+        None
+    } else {
+        Some(RingBufferStore::new(200, args.lookback_events))
+    };
+    if let Some(lb) = lookback.as_ref() {
+        if args.verbose {
+            eprintln!(
+                "  lookback: max_pids={}, max_lines_per_pid={}",
+                lb.max_pids(),
+                lb.max_lines_per_pid()
+            );
+        }
+    }
+
+    // Tombstone watcher — only spawned when the configured directory exists
+    // and is readable. On hosts without `/data/tombstones/` we silently skip
+    // (the watcher would otherwise log "ENOENT" every poll).
+    let mut tombstone_watcher: Option<RealTombstoneWatcher> = if args.tombstone_dir.is_empty() {
+        None
+    } else {
+        let w = RealTombstoneWatcher::with_dir(&args.tombstone_dir);
+        if w.dir_available() {
+            if args.verbose {
+                eprintln!("  tombstone watcher: polling {}", args.tombstone_dir);
+            }
+            Some(w)
+        } else {
+            if args.verbose {
+                eprintln!(
+                    "  tombstone watcher: {} not present — skipped",
+                    args.tombstone_dir
+                );
+            }
+            None
+        }
+    };
+
+    // Logcat tail — Android-only. On hosts the spawn fails with ENOENT
+    // (`logcat` not in PATH); we degrade gracefully.
+    let mut logcat_reader: Option<RealLogcatReader> = if args.no_logcat {
+        None
+    } else {
+        match RealLogcatReader::spawn() {
+            Ok(r) => {
+                if args.verbose {
+                    eprintln!("  logcat tail: spawned");
+                }
+                Some(r)
+            }
+            Err(e) => {
+                if args.verbose {
+                    eprintln!("  logcat tail: spawn failed ({e}) — skipped");
+                }
+                None
+            }
+        }
+    };
+
     while running.load(Ordering::Relaxed) {
         let mut saw_any = false;
         loop {
@@ -509,6 +622,36 @@ fn run_trace(mut args: Args) -> Result<()> {
                     continue;
                 }
                 if args.alert_rwx && should_skip_for_alert_rwx(&ev) {
+                    continue;
+                }
+
+                // ── Sprint-2 PR 1: BPF sched_process_exit handoff ────
+                //
+                // The tracepoint emits a synthetic SyscallEvent with
+                // syscall_nr == -3. Convert to a ProcessExitEvent and route
+                // through the shared emit path; do NOT format it as a normal
+                // syscall JSON line.
+                if { ev.syscall_nr } == SYSCALL_NR_PROCESS_EXIT {
+                    let args_arr = { ev.args };
+                    let pe = ProcessExitEvent {
+                        ts_ns: { ev.timestamp_ns },
+                        pid: { ev.pid },
+                        uid: { ev.uid },
+                        comm: format_comm(&{ ev.comm }),
+                        exit_code: (args_arr[0] & 0xff) as u8,
+                        exit_signal: (args_arr[1] & 0xffffffff) as u32,
+                        source: ExitSource::from_u8((args_arr[2] & 0xff) as u8)
+                            .unwrap_or(ExitSource::Tracepoint),
+                    };
+                    emit_process_exit(
+                        &pe,
+                        lookback.as_mut(),
+                        &mut engine,
+                        &mut *out,
+                        suppress_raw,
+                        args.json,
+                        &mut event_id_counter,
+                    );
                     continue;
                 }
 
@@ -598,6 +741,12 @@ fn run_trace(mut args: Args) -> Result<()> {
                     };
                     let _ = writeln!(out, "{line}");
                 }
+                // Lookback: record the JSON form (not the text form — JSON
+                // round-trips losslessly into the crash_context array).
+                if let Some(lb) = lookback.as_mut() {
+                    let pid = { ev.pid };
+                    lb.record(pid, &json_line);
+                }
 
                 events_since_drain += 1;
                 if events_since_drain >= drain_interval {
@@ -674,6 +823,46 @@ fn run_trace(mut args: Args) -> Result<()> {
                 if !suppress_raw {
                     let _ = writeln!(out, "{line}");
                 }
+                if let Some(lb) = lookback.as_mut() {
+                    lb.record(sample.pid, &line);
+                }
+            }
+        }
+
+        // ── Crash-correlation watcher drain (sprint-2 PR 1) ──────────
+        //
+        // Pull any new ProcessExitEvent values from the tombstone watcher
+        // and the logcat tail. Each drains independently; per_process
+        // aggregation in the rule engine collapses dups when both sources
+        // describe the same crash.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        if let Some(w) = tombstone_watcher.as_mut() {
+            for pe in w.poll(now_ns) {
+                emit_process_exit(
+                    &pe,
+                    lookback.as_mut(),
+                    &mut engine,
+                    &mut *out,
+                    suppress_raw,
+                    args.json,
+                    &mut event_id_counter,
+                );
+            }
+        }
+        if let Some(r) = logcat_reader.as_mut() {
+            for pe in r.drain(now_ns) {
+                emit_process_exit(
+                    &pe,
+                    lookback.as_mut(),
+                    &mut engine,
+                    &mut *out,
+                    suppress_raw,
+                    args.json,
+                    &mut event_id_counter,
+                );
             }
         }
 

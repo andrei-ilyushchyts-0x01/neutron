@@ -923,3 +923,209 @@ fn ioctl_family_in_predicate_fails_when_event_has_no_decoded_family() {
         "decoded dma_heap ioctl must match: got {findings:?}"
     );
 }
+
+// ── Sprint-2 PR 1: R003 + ProcessExit predicates ─────────────────────────────
+
+#[test]
+fn process_exit_event_kind_is_recognised_by_parser() {
+    let line = r#"{"type":"process_exit","ts_ns":100,"pid":42,"uid":1000,"comm":"app","source":"tombstone","classification":"crash","exit_signal":11,"signal_name":"SIGSEGV","crash_context":[]}"#;
+    let owned = neutron_rules::Event::parse_line(line).unwrap();
+    let ev = owned.view().unwrap();
+    assert_eq!(ev.kind, neutron_rules::EventKind::ProcessExit);
+    assert_eq!(ev.exit_signal, Some(11));
+    assert_eq!(ev.exit_classification, Some("crash"));
+    assert_eq!(ev.exit_source, Some("tombstone"));
+}
+
+#[test]
+fn r003_process_crash_fires_on_segv_event() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":1000,"pid":42,"uid":1000,"comm":"app","source":"tombstone","classification":"crash","exit_signal":11,"signal_name":"SIGSEGV","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    let hit: Vec<_> = findings
+        .iter()
+        .filter(|f| f.rule_id == "R003_process_crash")
+        .collect();
+    assert_eq!(
+        hit.len(),
+        1,
+        "expected exactly one R003 finding, got {findings:?}"
+    );
+    assert_eq!(hit[0].pid, 42);
+}
+
+#[test]
+fn r003_does_not_fire_on_normal_exit() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":1000,"pid":7,"uid":1000,"comm":"task","source":"tracepoint","classification":"normal_exit","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings.iter().all(|f| f.rule_id != "R003_process_crash"),
+        "R003 must not fire on a normal exit: got {findings:?}"
+    );
+}
+
+#[test]
+fn r003_does_not_fire_on_sigkill_signal_exit() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    // SIGKILL (9) is non-fatal per is_fatal_signal — classification should be
+    // "signal_exit", which R003 deliberately excludes.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":1000,"pid":8,"uid":1000,"comm":"oom_victim","source":"tracepoint","classification":"signal_exit","exit_signal":9,"signal_name":"SIGKILL","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings.iter().all(|f| f.rule_id != "R003_process_crash"),
+        "R003 must not fire on SIGKILL: got {findings:?}"
+    );
+}
+
+#[test]
+fn process_exit_predicate_rejects_non_exit_events() {
+    let yaml = r#"
+- id: TEST_process_exit_only
+  name: process_exit only
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - process_exit: true
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+    feed_lines(
+        &mut engine,
+        &[
+            // syscall — must not match.
+            r#"{"ts_ns":100,"pid":1,"tid":1,"uid":1,"nr":56,"name":"openat","comm":"x","enter":false,"ret":7,"args":[0,0,0,0,0,0],"data":"/etc/passwd"}"#,
+            // binder — must not match.
+            r#"{"type":"binder","ts_ns":200,"pid":2,"tid":2,"comm":"y","to_proc":1,"code":1}"#,
+            // fd_snapshot — must not match.
+            r#"{"type":"fd_snapshot","ts_ns":300,"pid":3,"uid":1,"comm":"z","fd_count":10,"fd_rlimit":1000,"fd_pct_of_rlimit":1,"high_water_mark":10,"growth_rate_per_sec":0.0,"top_paths":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_process_exit_only"),
+        "process_exit predicate must reject non-exit events: got {findings:?}"
+    );
+
+    // Now a real process_exit event — must match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":400,"pid":4,"uid":1,"comm":"q","source":"tracepoint","classification":"normal_exit","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "TEST_process_exit_only"),
+        "process_exit event must match the predicate: got {findings:?}"
+    );
+}
+
+#[test]
+fn exit_signal_in_predicate_filters_by_signal_number() {
+    let yaml = r#"
+- id: TEST_only_segv_or_abrt
+  name: SEGV/ABRT only
+  description: Test rule.
+  severity: high
+  category: ipc
+  conditions:
+    - process_exit: true
+      exit_signal_in: [11, 6]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+    // SIGBUS — outside the list, must NOT match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":100,"pid":1,"uid":1,"comm":"a","source":"tombstone","classification":"crash","exit_signal":7,"signal_name":"SIGBUS","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_only_segv_or_abrt"),
+        "SIGBUS must not match SEGV/ABRT-only filter: got {findings:?}"
+    );
+    // SIGSEGV — must match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":200,"pid":2,"uid":1,"comm":"b","source":"tombstone","classification":"crash","exit_signal":11,"signal_name":"SIGSEGV","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "TEST_only_segv_or_abrt"),
+        "SIGSEGV must match: got {findings:?}"
+    );
+}
+
+#[test]
+fn exit_source_in_predicate_filters_by_source_attribution() {
+    // A rule that only fires when the signal came from a userspace source.
+    let yaml = r#"
+- id: TEST_userspace_sources_only
+  name: userspace-attributed crashes
+  description: Test rule.
+  severity: medium
+  category: ipc
+  conditions:
+    - process_exit: true
+      exit_source_in: [logcat, tombstone]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+    // Bare BPF tracepoint event — must NOT match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":100,"pid":1,"uid":1,"comm":"a","source":"tracepoint","classification":"normal_exit","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_userspace_sources_only"),
+        "tracepoint source must not match userspace-only filter"
+    );
+    // Tombstone-attributed event — must match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"process_exit","ts_ns":200,"pid":2,"uid":1,"comm":"b","source":"tombstone","classification":"crash","exit_signal":11,"signal_name":"SIGSEGV","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "TEST_userspace_sources_only"),
+        "tombstone source must match: got {findings:?}"
+    );
+}

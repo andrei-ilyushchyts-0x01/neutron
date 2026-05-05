@@ -157,6 +157,38 @@ columns on the event itself).
 | `growth_rate_per_sec`  | f32    | (fds gained since last sample) / interval. `0.0` for the first sample.      |
 | `top_paths`            | array  | `[{"path","count"}]` from readlinks. Empty unless `--fdgraph-top-paths-n > 0`. |
 
+### Process Exit Event (`type == "process_exit"`)
+
+```json
+{
+  "type":           "process_exit",
+  "ts_ns":          1234567890,
+  "pid":            12345,
+  "uid":            10123,
+  "comm":           "vendor.qti.cam",
+  "source":         "tombstone",
+  "classification": "crash",
+  "exit_signal":    11,
+  "signal_name":    "SIGSEGV",
+  "crash_context":  ["{\"type\":\"syscall\",...}", "..."],
+  "event_id":       18234
+}
+```
+
+| Field            | Type   | Description                                                                  |
+|------------------|--------|------------------------------------------------------------------------------|
+| `source`         | string | `"tracepoint"` (BPF), `"logcat"`, or `"tombstone"`.                          |
+| `classification` | string | `"crash"`, `"signal_exit"`, `"abnormal_exit"`, or `"normal_exit"`.           |
+| `exit_signal`    | u32    | POSIX signal number (omitted when 0). `11` = SIGSEGV, `6` = SIGABRT, etc.    |
+| `signal_name`    | string | Symbolic name when known (omitted otherwise).                                |
+| `exit_code`      | u8     | exit(2) status (omitted when 0).                                             |
+| `crash_context`  | array  | Last N raw NDJSON lines for this PID (lookback ring buffer). Empty when off. |
+
+Sources are independent: a single SIGSEGV typically produces all three
+events within milliseconds. `R003_process_crash` uses `aggregate: per_process`
+so the rule fires once per PID. The `exit_source_in` predicate lets rules
+require a specific source (e.g. only act on tombstone-backed evidence).
+
 ### Finding Event
 
 ```json
@@ -175,7 +207,7 @@ columns on the event itself).
 }
 ```
 
-## Default Detector Pack (24 rules)
+## Default Detector Pack (25 rules)
 
 | ID    | Category             | What it catches                                           |
 |-------|----------------------|-----------------------------------------------------------|
@@ -203,11 +235,16 @@ columns on the event itself).
 | T022  | antitamper           | `bpf(2)` from a non-system process                        |
 | R001  | resource_exhaustion  | FD table > 90% of `RLIMIT_NOFILE` (FD-graph poller)       |
 | R002  | resource_exhaustion  | DMA-heap allocation burst (50+ in 5 s)                    |
+| R003  | crash                | Process killed by fatal signal (SEGV/ABRT/BUS/ILL/FPE/SYS)|
 
 Source: [`neutron-rules/rules/default.yaml`](../neutron-rules/rules/default.yaml).
 T016..T021 require `--stacks`. R001 requires the FD-graph poller
 (`--fdgraph-pids active --fdgraph-interval 1s`, on by default). R002
 requires post-exit ioctl decoding (always on for whitelisted commands).
+R003 requires the `sched_process_exit` BPF tracepoint (always attached);
+the lookback ring buffer (`--lookback-events 100` default) and at least
+one of the three crash sources (`--lookback-events`, `--tombstone-dir`,
+`logcat` available in PATH) populate `crash_context` and the signal field.
 
 ## Syscall Table (aarch64)
 

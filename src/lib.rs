@@ -7,6 +7,7 @@ pub mod fdgraph;
 pub mod format;
 pub mod health;
 pub mod rules;
+pub mod sources;
 pub mod symbolize;
 pub mod util;
 

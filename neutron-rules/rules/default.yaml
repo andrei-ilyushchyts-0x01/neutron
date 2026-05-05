@@ -533,3 +533,38 @@
     window_ms: 5000
     min_count: 50
   aggregate: per_process
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crash correlation (sprint-2 PR 1) — fed by sched_process_exit BPF
+# tracepoint, logcat tail (FATAL EXCEPTION / debuggerd), and tombstoned
+# watcher. Per_process aggregation collapses the typical fan-out (a single
+# SIGSEGV produces an event from every available source within milliseconds).
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: R003_process_crash
+  name: Process killed by fatal signal
+  description: >-
+    A traced process terminated due to a fatal POSIX signal (SIGSEGV,
+    SIGABRT, SIGBUS, SIGILL, SIGFPE, or SIGSYS). These signals indicate
+    a crash — either a programming defect (null deref, double free,
+    failed assertion) or an exploitation attempt that triggered a
+    runtime sanitizer. The crash_context field on the emitted JSON
+    line carries the last N raw events neutron observed for the PID,
+    making the evidence self-contained.
+  severity: critical
+  category: crash
+  behavior: fatal_signal_termination
+  interpretation:
+    - possible memory-safety bug in native code (use-after-free, OOB)
+    - possible failed assertion / abort path in a runtime
+    - possible exploitation attempt caught by a sanitizer (HWASan, MTE)
+  confidence: 0.9
+  false_positives:
+    - debug builds intentionally abort() on assertions during testing
+    - native unit tests that exercise crash recovery
+  references:
+    - "https://man7.org/linux/man-pages/man7/signal.7.html"
+  conditions:
+    - process_exit: true
+      exit_classification_in: [crash]
+  aggregate: per_process
