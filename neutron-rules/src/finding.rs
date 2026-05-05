@@ -34,6 +34,64 @@ pub struct EventSnapshot {
     pub raw: Option<Value>,
 }
 
+/// Numerical and counting aggregates computed from the events that
+/// contributed to a [`Finding`]. Sprint-2 PR 4. All fields are optional;
+/// the engine populates whichever apply for the contributing event kinds
+/// (frequency-based fields fill in for any rule with `>=2` events; the
+/// fd_* fields fill only when `EventKind::FdSnapshot` events matched;
+/// the binder_* fields fill only when `EventKind::BinderCall` events
+/// matched). Empty/None fields are omitted from JSON output.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Aggregates {
+    /// `event_count / span_secs`. Populated when at least two events
+    /// matched within a non-zero span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_per_sec: Option<f64>,
+    /// Tightest gap between consecutive matched events, in milliseconds.
+    /// `None` when fewer than two events matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_interval_ms: Option<f64>,
+    /// Loosest gap between consecutive matched events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_interval_ms: Option<f64>,
+    /// Number of distinct `target` strings observed across contributing
+    /// events. `None` when no event carried a usable target (data/comm
+    /// fallback inside `match_target`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_targets: Option<u32>,
+    /// Highest `fd_count` observed in any contributing FdSnapshot event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_fd_count: Option<u32>,
+    /// Highest `fd_pct_of_rlimit` observed in any contributing FdSnapshot
+    /// event. `None` when the matching events had unknown rlimit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_fd_pct_of_rlimit: Option<u8>,
+    /// Number of distinct `callee_pid` values observed in contributing
+    /// BinderCall events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_callee_pids: Option<u32>,
+    /// Number of distinct AIDL `code` values observed in contributing
+    /// BinderCall events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_binder_codes: Option<u32>,
+}
+
+impl Aggregates {
+    /// Returns `true` when no field has been populated. Used by the
+    /// finding serializer to omit the whole `aggregates` object instead
+    /// of emitting `{}`.
+    pub fn is_empty(&self) -> bool {
+        self.events_per_sec.is_none()
+            && self.min_interval_ms.is_none()
+            && self.max_interval_ms.is_none()
+            && self.distinct_targets.is_none()
+            && self.peak_fd_count.is_none()
+            && self.peak_fd_pct_of_rlimit.is_none()
+            && self.distinct_callee_pids.is_none()
+            && self.distinct_binder_codes.is_none()
+    }
+}
+
 /// Coarse evidence quality bucket. Derived (in future versions) from
 /// `capture_health` plus stack-resolution outcome. Today this is left `None`
 /// in the engine; users of v2-aware rules can still set it explicitly.
@@ -134,6 +192,18 @@ pub struct Finding {
     /// engine populates it when the loader threads runtime counters in.
     #[serde(default)]
     pub capture_health: CaptureHealthSnapshot,
+
+    // ── Sprint-2 PR 4 — finding aggregation + raw window ────────────────────
+    /// Numerical and counting aggregates computed at flush time. Omitted
+    /// from JSON when no field was populated.
+    #[serde(default, skip_serializing_if = "Aggregates::is_empty")]
+    pub aggregates: Aggregates,
+    /// Up to `--finding-raw-window` full NDJSON lines from the events that
+    /// contributed to this finding. Order matches the matching order. The
+    /// engine clones each line verbatim (byte-exact), so consumers can
+    /// re-parse them with the same parser as the live capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_window: Vec<String>,
 }
 
 #[cfg(test)]
@@ -161,6 +231,8 @@ mod tests {
             false_positives: vec![],
             evidence_quality: None,
             capture_health: CaptureHealthSnapshot::default(),
+            aggregates: Aggregates::default(),
+            raw_window: Vec::new(),
         }
     }
 
@@ -217,5 +289,44 @@ mod tests {
         assert_eq!(back.behavior.as_deref(), Some("test"));
         assert_eq!(back.confidence, Some(0.5));
         assert_eq!(back.evidence_quality, Some(EvidenceQuality::Medium));
+    }
+
+    #[test]
+    fn empty_aggregates_and_raw_window_omitted_from_json() {
+        let f = minimal();
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(
+            !s.contains("aggregates"),
+            "empty Aggregates should be omitted: {s}"
+        );
+        assert!(
+            !s.contains("raw_window"),
+            "empty raw_window should be omitted: {s}"
+        );
+    }
+
+    #[test]
+    fn populated_aggregates_appear_in_json() {
+        let mut f = minimal();
+        f.aggregates.events_per_sec = Some(42.0);
+        f.aggregates.min_interval_ms = Some(1.5);
+        f.aggregates.peak_fd_count = Some(31000);
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains(r#""events_per_sec":42.0"#));
+        assert!(s.contains(r#""min_interval_ms":1.5"#));
+        assert!(s.contains(r#""peak_fd_count":31000"#));
+    }
+
+    #[test]
+    fn raw_window_lines_round_trip_through_serde() {
+        let mut f = minimal();
+        f.raw_window = vec![
+            r#"{"type":"syscall","nr":56}"#.into(),
+            r#"{"type":"binder_call","status":"completed"}"#.into(),
+        ];
+        let s = serde_json::to_string(&f).unwrap();
+        let back: Finding = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.raw_window.len(), 2);
+        assert_eq!(back.raw_window[0], r#"{"type":"syscall","nr":56}"#);
     }
 }

@@ -42,6 +42,7 @@ For `window`, see [docs/guides/window.md](guides/window.md).
 | `--tombstone-dir PATH`            | String           | `/data/tombstones`                       | Directory the tombstone watcher polls at 1 Hz. Empty string disables. |
 | `--no-logcat`                     | flag             | off                                      | Skip spawning the `logcat` tail. Useful on hosts without `logcat` in PATH. |
 | `--binder-inflight N`             | usize            | `1024`                                   | Max in-flight binder transactions tracked by the userspace correlator. `0` disables (raw events still flow). |
+| `--finding-raw-window N`          | usize            | `10`                                     | Per-finding `raw_window` length — full NDJSON lines from contributing events. `0` disables. |
 
 <!-- END AUTO-GENERATED -->
 
@@ -261,9 +262,40 @@ require a specific source (e.g. only act on tombstone-backed evidence).
   "first_seen_ms": 1037686.946,
   "last_seen_ms":  1037946.946,
   "period_ms":     2033.0,
-  "evidence":      [...]
+  "evidence":      [...],
+  "aggregates": {
+    "events_per_sec":          0.49,
+    "min_interval_ms":         1850.0,
+    "max_interval_ms":         2200.0,
+    "distinct_targets":        1,
+    "peak_fd_count":           31130,
+    "peak_fd_pct_of_rlimit":   95,
+    "distinct_callee_pids":    3,
+    "distinct_binder_codes":   2
+  },
+  "raw_window": ["{\"type\":\"syscall\",\"nr\":56,...}", "..."]
 }
 ```
+
+Sprint-2 PR 4 adds two optional blocks to every finding:
+
+| Field          | Type   | Description                                                                                      |
+|----------------|--------|--------------------------------------------------------------------------------------------------|
+| `aggregates`   | object | Numerical / counting aggregates over contributing events. Whole block omitted when nothing fills.|
+| `raw_window`   | array  | Up to `--finding-raw-window` (default 10) full NDJSON lines from contributing events.            |
+
+Aggregate fields populate selectively by event kind:
+
+| Field                       | Filled when…                                                            |
+|-----------------------------|-------------------------------------------------------------------------|
+| `events_per_sec`            | ≥2 events matched within a non-zero span                                |
+| `min_interval_ms` / `max_interval_ms` | ≥2 events matched (computed from consecutive ts_ns gaps)      |
+| `distinct_targets`          | any matched event carried a usable `data` / fallback comm string         |
+| `peak_fd_count` / `peak_fd_pct_of_rlimit` | matched events were `type:"fd_snapshot"`                  |
+| `distinct_callee_pids` / `distinct_binder_codes` | matched events were `type:"binder_call"`           |
+
+Distinct-set trackers cap at 1024 entries per finding to prevent unbounded
+memory growth on long-running rules; the count saturates at the cap.
 
 ## Default Detector Pack (26 rules)
 

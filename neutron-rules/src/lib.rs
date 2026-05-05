@@ -49,6 +49,6 @@ pub mod window;
 pub use condition::MatchCondition;
 pub use engine::RuleEngine;
 pub use event::{Event, EventKind};
-pub use finding::{CaptureHealthSnapshot, EventSnapshot, EvidenceQuality, Finding};
+pub use finding::{Aggregates, CaptureHealthSnapshot, EventSnapshot, EvidenceQuality, Finding};
 pub use loader::{load_rules_yaml_file, load_rules_yaml_str, LoaderError};
 pub use rule::{AggregateMode, Category, FrequencySpec, Rule, Severity};

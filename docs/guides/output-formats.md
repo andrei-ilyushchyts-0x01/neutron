@@ -337,9 +337,33 @@ events.
   "first_seen_ms": 1037686.946,
   "last_seen_ms": 1037946.946,
   "period_ms": 2033.000,
-  "evidence": [...]
+  "evidence": [...],
+  "aggregates": {
+    "events_per_sec":   0.49,
+    "min_interval_ms":  1850.0,
+    "max_interval_ms":  2200.0,
+    "distinct_targets": 1
+  },
+  "raw_window": [
+    "{\"type\":\"syscall\",\"nr\":56,\"data\":\"/proc/self/maps\",...}",
+    "{\"type\":\"syscall\",\"nr\":56,\"data\":\"/proc/self/maps\",...}"
+  ]
 }
 ```
+
+Sprint-2 PR 4 introduced the `aggregates` and `raw_window` blocks. Both
+are additive and omitted from the JSON when empty:
+
+- `aggregates` carries numerical aggregates over contributing events
+  (`events_per_sec`, `min_interval_ms`, `max_interval_ms`,
+  `distinct_targets`, `peak_fd_count`, `peak_fd_pct_of_rlimit`,
+  `distinct_callee_pids`, `distinct_binder_codes`). Whichever fields
+  apply to the matched event kinds populate; the rest stay omitted.
+- `raw_window` carries up to `--finding-raw-window N` (default 10) full
+  NDJSON lines from the events that contributed to this finding, in
+  matching order. Disable with `--finding-raw-window 0`.
+
+See [REFERENCE.md](../REFERENCE.md#finding-event) for the full field table.
 
 ## Parsing Examples
 

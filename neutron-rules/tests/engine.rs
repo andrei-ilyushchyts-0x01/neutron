@@ -1301,3 +1301,210 @@ fn r004_aggregates_by_caller_pid_per_process() {
     );
     assert_eq!(hit[0].pid, 100);
 }
+
+// ── Sprint-2 PR 4: Aggregates + raw_window ───────────────────────────────────
+
+#[test]
+fn raw_window_collects_contributing_lines_up_to_cap() {
+    let yaml = r#"
+- id: TEST_collect_raw
+  name: collect raw
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - syscall_in: [56]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    engine.set_raw_window_cap(3);
+    // Feed five matching events.
+    let lines: Vec<String> = (0..5)
+        .map(|i| {
+            format!(
+                r#"{{"ts_ns":{ts},"pid":42,"tid":42,"uid":1,"nr":56,"name":"openat","comm":"app","enter":false,"ret":7,"args":[0,0,0,0,0,0],"data":"/p{i}"}}"#,
+                ts = 1000 + i * 100,
+            )
+        })
+        .collect();
+    let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    feed_lines(&mut engine, &line_refs);
+    let pending = engine.flush_all();
+    // PerProcess aggregation emits twice — once on first match, once as a
+    // flush summary with the running tallies. Inspect the summary (last).
+    let f = pending
+        .iter()
+        .rfind(|f| f.rule_id == "TEST_collect_raw")
+        .expect("flush summary emits");
+    assert_eq!(
+        f.raw_window.len(),
+        3,
+        "raw_window must respect the cap, got {:?}",
+        f.raw_window
+    );
+    assert!(f.raw_window[0].contains(r#""data":"/p0""#));
+    assert!(f.raw_window[2].contains(r#""data":"/p2""#));
+}
+
+#[test]
+fn raw_window_disabled_when_cap_zero() {
+    let yaml = r#"
+- id: TEST_no_raw
+  name: no raw
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - syscall_in: [56]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    engine.set_raw_window_cap(0);
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"ts_ns":100,"pid":1,"tid":1,"uid":1,"nr":56,"name":"openat","comm":"x","enter":false,"ret":7,"args":[0,0,0,0,0,0],"data":"/x"}"#,
+        ],
+    );
+    let f = engine
+        .drain_ready()
+        .into_iter()
+        .find(|f| f.rule_id == "TEST_no_raw")
+        .unwrap();
+    assert!(f.raw_window.is_empty(), "cap=0 must disable raw_window");
+}
+
+#[test]
+fn aggregates_compute_events_per_sec_and_intervals() {
+    let yaml = r#"
+- id: TEST_agg
+  name: agg
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - syscall_in: [56]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    // Three events at 0ns, 100ms, 300ms — span 300ms, intervals 100ms / 200ms.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"ts_ns":0,"pid":1,"tid":1,"uid":1,"nr":56,"name":"openat","comm":"x","enter":false,"ret":0,"args":[0,0,0,0,0,0],"data":"/a"}"#,
+            r#"{"ts_ns":100000000,"pid":1,"tid":1,"uid":1,"nr":56,"name":"openat","comm":"x","enter":false,"ret":0,"args":[0,0,0,0,0,0],"data":"/b"}"#,
+            r#"{"ts_ns":300000000,"pid":1,"tid":1,"uid":1,"nr":56,"name":"openat","comm":"x","enter":false,"ret":0,"args":[0,0,0,0,0,0],"data":"/a"}"#,
+        ],
+    );
+    let pending = engine.flush_all();
+    // PerProcess emits one finding on first match plus a flush summary;
+    // aggregates are populated on the summary.
+    let f = pending.iter().rfind(|f| f.rule_id == "TEST_agg").unwrap();
+    let a = &f.aggregates;
+    // 3 events / 0.3s = 10/s
+    assert!(
+        (a.events_per_sec.unwrap() - 10.0).abs() < 0.1,
+        "events_per_sec was {:?}",
+        a.events_per_sec
+    );
+    assert!((a.min_interval_ms.unwrap() - 100.0).abs() < 0.01);
+    assert!((a.max_interval_ms.unwrap() - 200.0).abs() < 0.01);
+    // Distinct targets: /a appears twice, /b once → 2.
+    assert_eq!(a.distinct_targets, Some(2));
+}
+
+#[test]
+fn aggregates_track_fd_snapshot_peaks() {
+    let yaml = r#"
+- id: TEST_fd_agg
+  name: fd agg
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - fd_snapshot: true
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"fd_snapshot","ts_ns":100,"pid":7,"uid":1,"comm":"a","fd_count":500,"fd_rlimit":1000,"fd_pct_of_rlimit":50,"high_water_mark":500,"growth_rate_per_sec":0.0,"top_paths":[]}"#,
+            r#"{"type":"fd_snapshot","ts_ns":200,"pid":7,"uid":1,"comm":"a","fd_count":900,"fd_rlimit":1000,"fd_pct_of_rlimit":90,"high_water_mark":900,"growth_rate_per_sec":4000.0,"top_paths":[]}"#,
+            r#"{"type":"fd_snapshot","ts_ns":300,"pid":7,"uid":1,"comm":"a","fd_count":700,"fd_rlimit":1000,"fd_pct_of_rlimit":70,"high_water_mark":900,"growth_rate_per_sec":-2000.0,"top_paths":[]}"#,
+        ],
+    );
+    let pending = engine.flush_all();
+    let f = pending
+        .iter()
+        .rfind(|f| f.rule_id == "TEST_fd_agg")
+        .unwrap();
+    assert_eq!(f.aggregates.peak_fd_count, Some(900));
+    assert_eq!(f.aggregates.peak_fd_pct_of_rlimit, Some(90));
+}
+
+#[test]
+fn aggregates_track_binder_call_distincts() {
+    let yaml = r#"
+- id: TEST_binder_agg
+  name: binder agg
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - binder_call: true
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"binder_call","ts_ns":100,"debug_id":1,"caller_pid":100,"caller_uid":1,"caller_comm":"a","callee_pid":200,"code":7,"flags":0,"reply":false,"sent_ts_ns":100,"status":"completed"}"#,
+            r#"{"type":"binder_call","ts_ns":200,"debug_id":2,"caller_pid":100,"caller_uid":1,"caller_comm":"a","callee_pid":300,"code":7,"flags":0,"reply":false,"sent_ts_ns":200,"status":"completed"}"#,
+            r#"{"type":"binder_call","ts_ns":300,"debug_id":3,"caller_pid":100,"caller_uid":1,"caller_comm":"a","callee_pid":300,"code":13,"flags":0,"reply":false,"sent_ts_ns":300,"status":"completed"}"#,
+        ],
+    );
+    let pending = engine.flush_all();
+    let f = pending
+        .iter()
+        .rfind(|f| f.rule_id == "TEST_binder_agg")
+        .unwrap();
+    assert_eq!(f.aggregates.distinct_callee_pids, Some(2));
+    assert_eq!(f.aggregates.distinct_binder_codes, Some(2));
+}
+
+#[test]
+fn aggregates_omit_unrelated_fields_in_json() {
+    // A pure syscall finding should not carry binder_* or fd_* aggregates.
+    let yaml = r#"
+- id: TEST_clean_agg
+  name: clean agg
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - syscall_in: [56]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    engine.set_raw_window_cap(0);
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"ts_ns":100,"pid":1,"tid":1,"uid":1,"nr":56,"name":"openat","comm":"x","enter":false,"ret":7,"args":[0,0,0,0,0,0],"data":"/x"}"#,
+        ],
+    );
+    let f = engine
+        .drain_ready()
+        .into_iter()
+        .find(|f| f.rule_id == "TEST_clean_agg")
+        .unwrap();
+    let s = serde_json::to_string(&f).unwrap();
+    assert!(!s.contains("peak_fd_count"), "fd aggregates leaked: {s}");
+    assert!(
+        !s.contains("distinct_binder_codes"),
+        "binder aggregates leaked: {s}"
+    );
+    // events_per_sec is None for a single event → also omitted.
+    assert!(!s.contains("events_per_sec"));
+}

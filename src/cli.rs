@@ -164,6 +164,12 @@ pub struct Args {
     #[arg(long, default_value_t = 256)]
     pub findings_drain_interval: u64,
 
+    /// Per-finding `raw_window` cap — number of full NDJSON lines from
+    /// contributing events embedded in each emitted finding. `0` disables.
+    /// Sprint-2 PR 4. Default 10.
+    #[arg(long, default_value_t = 10)]
+    pub finding_raw_window: usize,
+
     // ── FD poller (sprint-1 PR 3) ──────────────────────────────────────────
     /// PID scope for the periodic `/proc/<pid>/fd` poller.
     /// `traced` = `--pid` target + followed children + (under `--pid 0`)

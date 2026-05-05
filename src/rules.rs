@@ -11,7 +11,7 @@ pub fn build_rule_engine(args: &Args) -> Result<Option<neutron_rules::RuleEngine
     if args.no_findings {
         return Ok(None);
     }
-    let engine = match &args.rules {
+    let mut engine = match &args.rules {
         Some(path) => {
             let rules = neutron_rules::load_rules_yaml_file(path)
                 .with_context(|| format!("loading rules from {path}"))?;
@@ -25,6 +25,7 @@ pub fn build_rule_engine(args: &Args) -> Result<Option<neutron_rules::RuleEngine
             engine
         }
     };
+    engine.set_raw_window_cap(args.finding_raw_window);
     Ok(Some(engine))
 }
 
