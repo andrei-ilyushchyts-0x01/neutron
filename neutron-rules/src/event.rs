@@ -53,6 +53,13 @@ pub struct Event<'a> {
     /// `fd_pct_of_rlimit` field from a `type:"fd_snapshot"` event when the
     /// rlimit was known. `None` when missing or for non-snapshot events.
     pub fd_pct_of_rlimit: Option<u8>,
+    /// Decoded ioctl family — emitted by the post-exit ioctl decoder
+    /// (sprint-1 PR 2). Examples: `"dma_heap"`, `"binder"`, `"dma_buf"`.
+    /// `None` for non-ioctl syscalls or when the cmd type byte is unknown.
+    pub ioctl_family: Option<&'a str>,
+    /// Decoded ioctl name — e.g. `"DMA_HEAP_IOCTL_ALLOC"`. `None` when the
+    /// command isn't in the userspace decoder registry.
+    pub ioctl_name: Option<&'a str>,
 
     /// Owned JSON value — kept so callers can clone it into snapshots without
     /// re-parsing the raw line. Use [`Event::raw_json`] to access.
@@ -118,6 +125,8 @@ impl<'a> Event<'a> {
             .get("fd_pct_of_rlimit")
             .and_then(|v| v.as_u64())
             .map(|n| u8::try_from(n.min(255)).unwrap_or(u8::MAX));
+        let ioctl_family = obj.get("ioctl_family").and_then(|v| v.as_str());
+        let ioctl_name = obj.get("ioctl_name").and_then(|v| v.as_str());
 
         let mut args = [0u64; 6];
         if let Some(arr) = obj.get("args").and_then(|a| a.as_array()) {
@@ -146,6 +155,8 @@ impl<'a> Event<'a> {
             event_id,
             fd_count,
             fd_pct_of_rlimit,
+            ioctl_family,
+            ioctl_name,
             raw: v,
             raw_line,
         })

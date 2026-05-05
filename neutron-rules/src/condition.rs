@@ -111,6 +111,18 @@ pub struct MatchCondition {
     /// carried a non-zero rlimit (events with unknown rlimit never match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fd_count_pct_of_rlimit_gt: Option<u8>,
+
+    /// Match if the event's decoded `ioctl_family` (e.g. `dma_heap`,
+    /// `binder`) equals one of the listed strings. Sprint-1 PR 4. Events
+    /// without a decoded family (non-ioctl, undecodable) never match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ioctl_family_in: Option<Vec<String>>,
+
+    /// Match if the event's decoded `ioctl_name` (e.g. `DMA_HEAP_IOCTL_ALLOC`)
+    /// equals one of the listed strings. Sprint-1 PR 4. Events without a
+    /// known name never match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ioctl_name_in: Option<Vec<String>>,
 }
 
 impl MatchCondition {
@@ -230,6 +242,18 @@ impl MatchCondition {
         if let Some(threshold) = self.fd_count_pct_of_rlimit_gt {
             match ev.fd_pct_of_rlimit {
                 Some(pct) if pct > threshold => {}
+                _ => return false,
+            }
+        }
+        if let Some(list) = &self.ioctl_family_in {
+            match ev.ioctl_family {
+                Some(f) if list.iter().any(|s| s == f) => {}
+                _ => return false,
+            }
+        }
+        if let Some(list) = &self.ioctl_name_in {
+            match ev.ioctl_name {
+                Some(n) if list.iter().any(|s| s == n) => {}
                 _ => return false,
             }
         }

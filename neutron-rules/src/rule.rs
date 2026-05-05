@@ -41,6 +41,7 @@ pub enum Category {
     Memory,
     Ipc,
     Recon,
+    ResourceExhaustion,
 }
 
 /// Sliding-window trigger spec: emit a finding only after at least `min_count`

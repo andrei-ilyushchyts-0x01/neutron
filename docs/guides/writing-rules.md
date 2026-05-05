@@ -56,10 +56,27 @@ event must be both `openat` *and* have a path starting with
 | `ret_eq`              | `i64`      | `event.ret == value`                                    |
 | `stack_contains`      | `[string]` | resolved `event.stack` contains any of the substrings   |
 | `stack_not_contains`  | `[string]` | resolved `event.stack` contains **none** of the strings |
+| `fd_snapshot`             | `bool`     | event is a `type:"fd_snapshot"` poller sample           |
+| `fd_count_gt`             | `u32`      | snapshot's `fd_count > value` (snapshot events only)    |
+| `fd_count_pct_of_rlimit_gt` | `u8`     | snapshot's `fd_pct_of_rlimit > value` (rlimit must be known) |
+| `ioctl_family_in`         | `[string]` | decoded `ioctl_family` ∈ list (e.g. `dma_heap`, `binder`) |
+| `ioctl_name_in`           | `[string]` | decoded `ioctl_name` ∈ list (e.g. `DMA_HEAP_IOCTL_ALLOC`) |
 
 `stack_contains` / `stack_not_contains` require the tracer to be running
 with `--stacks`. The substrings match against the rendered stack string
 (see [output-formats.md](output-formats.md) for the format).
+
+The `fd_*` predicates only match against `type:"fd_snapshot"` events
+emitted by the periodic FD-graph poller (sprint-1 PR 3). Enable the
+poller with `--fdgraph-pids active` (default) and an interval other than
+`off`. `fd_count_pct_of_rlimit_gt` requires a non-zero `RLIMIT_NOFILE`
+in the snapshot — events with unknown rlimit never match (fail-closed).
+
+The `ioctl_*_in` predicates only match events the userspace decoder
+registry recognises (sprint-1 PR 2). The decoder fills `ioctl_family`
+for known type bytes (`dma_heap`, `binder`, `dma_buf`, `ashmem`) and
+fills `ioctl_name` for commands in its registry. Unknown commands carry
+no decoded fields and never match these predicates.
 
 ### Stack-aware example
 
@@ -86,6 +103,52 @@ This fires once per process when `fstatat` on a known su path resolves
 to a stack containing the substring `libc`. The default ruleset uses
 `stack_not_contains` to exclude RenderScript / Skia from
 `/system/lib64/*` probing in T019.
+
+### FD-graph example (R001)
+
+Sprint-1 PR 3 introduced periodic `/proc/<pid>/fd` snapshots. Rules can
+match those snapshots directly without needing a frequency window — the
+poller's interval already drives the cadence.
+
+```yaml
+- id: R001_fd_table_exhaustion
+  name: FD table approaching rlimit
+  severity: high
+  category: resource_exhaustion
+  conditions:
+    - fd_snapshot: true
+      fd_count_pct_of_rlimit_gt: 90
+  aggregate: per_process
+```
+
+This fires for any traced process whose live FD count crosses 90% of its
+`RLIMIT_NOFILE` allowance. The default poller interval is 1 s, so the
+rule produces at most one finding per process even during sustained
+exhaustion thanks to `per_process` aggregation.
+
+### Decoded-ioctl example (R002)
+
+Sprint-1 PR 2 introduced post-exit ioctl decoding. Combine the family /
+name predicates with a frequency window to catch DMA-heap allocation
+storms:
+
+```yaml
+- id: R002_dma_heap_allocation_burst
+  name: DMA-heap allocation burst
+  severity: medium
+  category: resource_exhaustion
+  conditions:
+    - syscall_in: [29]                # ioctl
+      ioctl_family_in: [dma_heap]
+      ioctl_name_in: [DMA_HEAP_IOCTL_ALLOC]
+  frequency:
+    window_ms: 5000
+    min_count: 50
+  aggregate: per_process
+```
+
+`syscall_in: [29]` keeps the predicate cheap — non-ioctl events skip
+the family/name checks entirely.
 
 ## Frequency rules
 

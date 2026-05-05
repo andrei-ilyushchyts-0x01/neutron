@@ -760,3 +760,166 @@ fn fd_count_pct_of_rlimit_gt_skips_when_rlimit_unknown() {
         "snapshot without rlimit must not satisfy pct predicate"
     );
 }
+
+// ── Sprint-1 PR 4: R001 + R002 + ioctl_*_in predicates ───────────────────────
+
+#[test]
+fn r001_fd_table_exhaustion_fires_at_high_pct() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    // Snapshot with 95% utilisation — must fire R001.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"fd_snapshot","ts_ns":1000,"pid":540,"uid":1000,"comm":"hal","fd_count":31130,"fd_rlimit":32768,"fd_pct_of_rlimit":95,"high_water_mark":31130,"growth_rate_per_sec":12.5,"top_paths":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    let hit: Vec<_> = findings
+        .iter()
+        .filter(|f| f.rule_id == "R001_fd_table_exhaustion")
+        .collect();
+    assert_eq!(
+        hit.len(),
+        1,
+        "expected exactly one R001 finding, got {findings:?}"
+    );
+    assert_eq!(hit[0].pid, 540);
+}
+
+#[test]
+fn r001_fd_table_exhaustion_does_not_fire_below_threshold() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    // Snapshot at 89% — strictly less-than threshold of 90 ⇒ no fire.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"fd_snapshot","ts_ns":1000,"pid":541,"uid":1000,"comm":"app","fd_count":890,"fd_rlimit":1000,"fd_pct_of_rlimit":89,"high_water_mark":890,"growth_rate_per_sec":0.0,"top_paths":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "R001_fd_table_exhaustion"),
+        "R001 must not fire below 90%: got {findings:?}"
+    );
+}
+
+#[test]
+fn r002_dma_heap_burst_fires_after_window_threshold() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    // Emit 50 ioctl-exit events with the decoded dma_heap family/name in the
+    // same 5s window. R002 frequency=50/5000ms ⇒ should fire.
+    let lines: Vec<String> = (0..50)
+        .map(|i| {
+            format!(
+                r#"{{"type":"syscall","phase":"exit","ts_ns":{ts},"pid":777,"tid":777,"uid":1000,"nr":29,"name":"ioctl","comm":"camera","enter":false,"ret":12,"args":[3,3221767168,0,0,0,0],"ioctl_family":"dma_heap","ioctl_name":"DMA_HEAP_IOCTL_ALLOC"}}"#,
+                ts = 1_000_000_000u64 + (i as u64) * 50_000_000u64,
+            )
+        })
+        .collect();
+    let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    feed_lines(&mut engine, &line_refs);
+    let findings = engine.drain_ready();
+    let hit: Vec<_> = findings
+        .iter()
+        .filter(|f| f.rule_id == "R002_dma_heap_allocation_burst")
+        .collect();
+    assert_eq!(
+        hit.len(),
+        1,
+        "expected exactly one R002 finding after a 50-event burst, got {findings:?}"
+    );
+    assert_eq!(hit[0].pid, 777);
+}
+
+#[test]
+fn r002_dma_heap_burst_does_not_fire_below_threshold() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    // Only 49 events in the same window — below frequency floor ⇒ no fire.
+    let lines: Vec<String> = (0..49)
+        .map(|i| {
+            format!(
+                r#"{{"type":"syscall","phase":"exit","ts_ns":{ts},"pid":778,"tid":778,"uid":1000,"nr":29,"name":"ioctl","comm":"camera","enter":false,"ret":12,"args":[3,3221767168,0,0,0,0],"ioctl_family":"dma_heap","ioctl_name":"DMA_HEAP_IOCTL_ALLOC"}}"#,
+                ts = 1_000_000_000u64 + (i as u64) * 50_000_000u64,
+            )
+        })
+        .collect();
+    let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    feed_lines(&mut engine, &line_refs);
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "R002_dma_heap_allocation_burst"),
+        "R002 must not fire with only 49 events: got {findings:?}"
+    );
+}
+
+#[test]
+fn r002_does_not_match_unrelated_ioctl_family() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    // Burst of 50 ioctl events but with binder family — must NOT fire R002.
+    let lines: Vec<String> = (0..50)
+        .map(|i| {
+            format!(
+                r#"{{"type":"syscall","phase":"exit","ts_ns":{ts},"pid":779,"tid":779,"uid":1000,"nr":29,"name":"ioctl","comm":"binder","enter":false,"ret":0,"args":[3,3224372224,0,0,0,0],"ioctl_family":"binder","ioctl_name":"BINDER_WRITE_READ"}}"#,
+                ts = 1_000_000_000u64 + (i as u64) * 50_000_000u64,
+            )
+        })
+        .collect();
+    let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    feed_lines(&mut engine, &line_refs);
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "R002_dma_heap_allocation_burst"),
+        "R002 must not match binder family: got {findings:?}"
+    );
+}
+
+#[test]
+fn ioctl_family_in_predicate_fails_when_event_has_no_decoded_family() {
+    // Custom rule: only the predicate, no frequency.
+    let yaml = r#"
+- id: TEST_ioctl_family_only
+  name: dma_heap touch
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - syscall_in: [29]
+      ioctl_family_in: [dma_heap]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+    // ioctl with no decoded family — must not match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"syscall","phase":"exit","ts_ns":100,"pid":1,"tid":1,"uid":1,"nr":29,"name":"ioctl","comm":"x","enter":false,"ret":0,"args":[3,99,0,0,0,0]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_ioctl_family_only"),
+        "events without ioctl_family must not match the predicate: got {findings:?}"
+    );
+    // Now a decoded ioctl event — must match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"syscall","phase":"exit","ts_ns":200,"pid":1,"tid":1,"uid":1,"nr":29,"name":"ioctl","comm":"x","enter":false,"ret":12,"args":[3,3221767168,0,0,0,0],"ioctl_family":"dma_heap","ioctl_name":"DMA_HEAP_IOCTL_ALLOC"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "TEST_ioctl_family_only"),
+        "decoded dma_heap ioctl must match: got {findings:?}"
+    );
+}

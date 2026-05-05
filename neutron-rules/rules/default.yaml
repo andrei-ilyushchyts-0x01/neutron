@@ -476,3 +476,60 @@
         - surfaceflinger
         - neutron               # avoid self-loops
   aggregate: per_process
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resource-exhaustion rules (sprint-1 PR 4) — sourced from FD-graph poller
+# (R001) and post-exit ioctl decoder (R002). These rules consume the
+# `type:"fd_snapshot"` events emitted by the periodic `/proc/<pid>/fd` poller
+# and the decoded ioctl events emitted by the userspace decoder registry.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: R001_fd_table_exhaustion
+  name: FD table approaching rlimit
+  description: >-
+    A process is sitting at >90% of its RLIMIT_NOFILE allowance. Almost
+    always indicates an FD leak (sockets / pipes / open files that are
+    never closed); rarely a legitimate spike for a process that is doing
+    sustained file-IO. Either way the next allocation likely fails with
+    EMFILE — surface as resource exhaustion.
+  severity: high
+  category: resource_exhaustion
+  behavior: fd_table_exhaustion
+  interpretation:
+    - possible FD leak (sockets, pipes, files opened without close)
+    - possible legitimate burst against an undersized rlimit
+  confidence: 0.85
+  false_positives:
+    - daemons that intentionally hold many connections (proxies, brokers)
+    - misconfigured rlimit (process granted too few FDs for its workload)
+  conditions:
+    - fd_snapshot: true
+      fd_count_pct_of_rlimit_gt: 90
+  aggregate: per_process
+
+- id: R002_dma_heap_allocation_burst
+  name: DMA-heap allocation burst
+  description: >-
+    A process is hammering DMA_HEAP_IOCTL_ALLOC. Sustained bursts (>=50
+    allocations in 5s) typically indicate a graphics / camera / codec
+    leak — the heap returns FDs that aren't being closed, so the process
+    keeps allocating new ones. Strong predictor of an upcoming OOM /
+    "out of contiguous memory" failure.
+  severity: medium
+  category: resource_exhaustion
+  behavior: dma_heap_allocation_burst
+  interpretation:
+    - possible DMA-heap FD leak in a graphics / camera / codec stack
+    - possible misbehaving HAL releasing buffers slowly
+  confidence: 0.7
+  false_positives:
+    - genuine high-throughput camera capture or video encoding workloads
+    - app start-up phase that legitimately preallocates many surfaces
+  conditions:
+    - syscall_in: [29]                # ioctl
+      ioctl_family_in: [dma_heap]
+      ioctl_name_in: [DMA_HEAP_IOCTL_ALLOC]
+  frequency:
+    window_ms: 5000
+    min_count: 50
+  aggregate: per_process

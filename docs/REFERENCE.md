@@ -175,32 +175,39 @@ columns on the event itself).
 }
 ```
 
-## Default Detector Pack (19 rules)
+## Default Detector Pack (24 rules)
 
-| ID    | Category        | What it catches                                           |
-|-------|-----------------|-----------------------------------------------------------|
-| T001  | root_detection  | Periodic `/proc/self/maps` polling                        |
-| T002  | root_detection  | Mount table inspection (Magisk overlay detection)         |
-| T003  | antitamper      | `/proc/self/status` (TracerPid scrape)                    |
-| T004  | root_detection  | `su` binary probe                                         |
-| T005  | root_detection  | Magisk artifact probe                                     |
-| T006  | antitamper      | Frida artifact probe                                      |
-| T007  | antitamper      | Xposed / EdXposed artifact probe                          |
-| T008  | root_detection  | `Runtime.exec` of root-related binaries                   |
-| T009  | antitamper      | `ptrace` syscall observed                                 |
-| T010  | antitamper      | `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)`                |
-| T011  | memory          | RWX or W^X-violating memory mapping                       |
-| T012  | network_recon   | `/proc/net/tcp*` enumeration                              |
-| T013  | antitamper      | SELinux enforcement state probe                           |
-| T014  | antitamper      | Android property service access                           |
-| T015  | recon           | Cross-process `/proc/<pid>/{maps,cmdline,exe}` reads      |
-| T016  | root_detection  | `fstatat` on `su` binary with `libc` on the stack         |
-| T017  | antitamper      | Syscalls from inside the ART JIT code cache               |
-| T018  | antitamper      | `ptrace` resolved to `sys_ptrace` from native code        |
-| T019  | recon           | `/system/lib64/*` probing excluding RenderScript / Skia   |
+| ID    | Category             | What it catches                                           |
+|-------|----------------------|-----------------------------------------------------------|
+| T001  | root_detection       | Periodic `/proc/self/maps` polling                        |
+| T002  | root_detection       | Mount table inspection (Magisk overlay detection)         |
+| T003  | antitamper           | `/proc/self/status` (TracerPid scrape)                    |
+| T004  | root_detection       | `su` binary probe                                         |
+| T005  | root_detection       | Magisk artifact probe                                     |
+| T006  | antitamper           | Frida artifact probe                                      |
+| T007  | antitamper           | Xposed / EdXposed artifact probe                          |
+| T008  | root_detection       | `Runtime.exec` of root-related binaries                   |
+| T009  | antitamper           | `ptrace` syscall observed                                 |
+| T010  | antitamper           | `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)`                |
+| T011  | memory               | RWX or W^X-violating memory mapping                       |
+| T012  | network_recon        | `/proc/net/tcp*` enumeration                              |
+| T013  | antitamper           | SELinux enforcement state probe                           |
+| T014  | antitamper           | Android property service access                           |
+| T015  | recon                | Cross-process `/proc/<pid>/{maps,cmdline,exe}` reads      |
+| T016  | root_detection       | `fstatat` on `su` binary with `libc` on the stack         |
+| T017  | antitamper           | Syscalls from inside the ART JIT code cache               |
+| T018  | antitamper           | `ptrace` resolved to `sys_ptrace` from native code        |
+| T019  | recon                | `/system/lib64/*` probing excluding RenderScript / Skia   |
+| T020  | antitamper           | `/proc/self/*` introspection from anonymous r-x mapping   |
+| T021  | antitamper           | Thread-comm enumeration (`/proc/self/task/<TID>/comm`)    |
+| T022  | antitamper           | `bpf(2)` from a non-system process                        |
+| R001  | resource_exhaustion  | FD table > 90% of `RLIMIT_NOFILE` (FD-graph poller)       |
+| R002  | resource_exhaustion  | DMA-heap allocation burst (50+ in 5 s)                    |
 
 Source: [`neutron-rules/rules/default.yaml`](../neutron-rules/rules/default.yaml).
-T016..T019 require `--stacks`.
+T016..T021 require `--stacks`. R001 requires the FD-graph poller
+(`--fdgraph-pids active --fdgraph-interval 1s`, on by default). R002
+requires post-exit ioctl decoding (always on for whitelisted commands).
 
 ## Syscall Table (aarch64)
 
