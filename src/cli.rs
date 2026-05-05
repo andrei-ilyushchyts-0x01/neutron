@@ -30,6 +30,58 @@ pub enum Command {
     /// privileges, and BPF subsystem are in a state where neutron can attach.
     /// Prints PASS/WARN/FAIL per check and exits non-zero on any FAIL.
     Doctor,
+
+    /// Host-side post-processor: cut a window of events around an anchor
+    /// (finding, crash, pid, etc.) from a previously-captured NDJSON file.
+    /// Sprint-2 PR 3.
+    Window(WindowArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct WindowArgs {
+    /// Path to the NDJSON capture file (`-` for stdin).
+    pub capture: String,
+
+    /// Anchor specification. One of:
+    /// `finding:<RULE_ID>`, `crash`, `pid:<N>`, `event_id:<N>`,
+    /// `comm:<substring>`, or `binder_call:<status>`.
+    /// Multiple `--anchor` flags are AND-joined inside one window per match
+    /// (i.e. each matching event becomes its own anchor; windows are then
+    /// merged across all anchors).
+    #[arg(long, value_name = "SPEC")]
+    pub anchor: Vec<String>,
+
+    /// Time window before each anchor (e.g. `5s`, `500ms`). Mutually
+    /// exclusive with `--before-events`.
+    #[arg(long, value_name = "DURATION")]
+    pub before: Option<String>,
+
+    /// Time window after each anchor.
+    #[arg(long, value_name = "DURATION")]
+    pub after: Option<String>,
+
+    /// Shorthand: `--around 2s` is equivalent to `--before 2s --after 2s`.
+    #[arg(long, value_name = "DURATION")]
+    pub around: Option<String>,
+
+    /// Event-count window before each anchor. Mutually exclusive with
+    /// `--before`.
+    #[arg(long, value_name = "N")]
+    pub before_events: Option<usize>,
+
+    /// Event-count window after each anchor.
+    #[arg(long, value_name = "N")]
+    pub after_events: Option<usize>,
+
+    /// Shorthand: `--around-events 100` is `--before-events 100
+    /// --after-events 100`.
+    #[arg(long, value_name = "N")]
+    pub around_events: Option<usize>,
+
+    /// Print one summary line per merged window instead of the raw NDJSON.
+    /// Format: `[<from_ts_ns>..<to_ts_ns>] events=<N> anchors=<list>`.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 #[derive(Parser, Debug, Default)]

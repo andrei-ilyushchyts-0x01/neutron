@@ -1,0 +1,12 @@
+{"type":"syscall","ts_ns":1000000000,"pid":42,"tid":42,"uid":1000,"nr":56,"name":"openat","comm":"app","enter":false,"ret":7,"args":[0,0,0,0,0,0],"data":"/etc/cfg","event_id":1}
+{"type":"syscall","ts_ns":1100000000,"pid":42,"tid":42,"uid":1000,"nr":29,"name":"ioctl","comm":"app","enter":false,"ret":12,"args":[3,3221767168,0,0,0,0],"event_id":2}
+{"type":"binder","ts_ns":1200000000,"pid":42,"tgid":42,"uid":1000,"comm":"app","reply":false,"to_proc":1000,"to_thread":1000,"target_node":1,"code":7,"flags":16,"debug_id":42,"event_id":3}
+{"type":"binder_received","ts_ns":1250000000,"pid":1000,"tgid":1000,"uid":1000,"comm":"hal","debug_id":42,"event_id":4}
+{"type":"binder_call","ts_ns":1200000000,"debug_id":42,"caller_pid":42,"caller_uid":1000,"caller_comm":"app","callee_pid":1000,"code":7,"flags":16,"reply":false,"sent_ts_ns":1200000000,"received_ts_ns":1250000000,"latency_us":50000,"status":"completed","event_id":5}
+{"type":"syscall","ts_ns":1300000000,"pid":42,"tid":42,"uid":1000,"nr":56,"name":"openat","comm":"app","enter":false,"ret":8,"args":[0,0,0,0,0,0],"data":"/dev/something","event_id":6}
+{"type":"process_exit","ts_ns":1400000000,"pid":1000,"uid":1000,"comm":"hal","source":"tombstone","classification":"crash","exit_signal":11,"signal_name":"SIGSEGV","crash_context":[],"event_id":7}
+{"type":"binder_call","ts_ns":1400000000,"debug_id":42,"caller_pid":42,"caller_uid":1000,"caller_comm":"app","callee_pid":1000,"code":7,"flags":16,"reply":false,"sent_ts_ns":1400000000,"status":"callee_crashed","event_id":8}
+{"type":"finding","rule_id":"R003_process_crash","rule_name":"Process killed by fatal signal","category":"crash","severity":"critical","process":{"comm":"hal","pid":1000},"event_count":1,"first_seen_ms":1400.0,"last_seen_ms":1400.0,"period_ms":0.0}
+{"type":"finding","rule_id":"R004_binder_callee_crash","rule_name":"Binder callee crashed mid-transaction","category":"crash","severity":"high","process":{"comm":"app","pid":42},"event_count":1,"first_seen_ms":1400.0,"last_seen_ms":1400.0,"period_ms":0.0}
+{"type":"syscall","ts_ns":1500000000,"pid":42,"tid":42,"uid":1000,"nr":221,"name":"execve","comm":"app","enter":true,"ret":0,"args":[0,0,0,0,0,0],"data":"/bin/sh","event_id":9}
+{"type":"syscall","ts_ns":1600000000,"pid":99,"tid":99,"uid":1000,"nr":56,"name":"openat","comm":"unrelated","enter":false,"ret":3,"args":[0,0,0,0,0,0],"data":"/tmp/x","event_id":10}

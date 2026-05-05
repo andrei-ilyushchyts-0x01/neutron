@@ -1,5 +1,15 @@
 # Reference
 
+## Subcommands
+
+| Command   | Purpose                                                                                |
+|-----------|----------------------------------------------------------------------------------------|
+| (default) | Tracer mode: load BPF, attach tracepoints, emit NDJSON / findings.                     |
+| `doctor`  | Preflight environment checks (kernel, privileges, BPF subsystem). Exits non-zero on FAIL. |
+| `window`  | Host-side post-processor: cut event windows around an anchor from a captured NDJSON.   |
+
+For `window`, see [docs/guides/window.md](guides/window.md).
+
 ## CLI Flags
 
 <!-- AUTO-GENERATED from src/cli.rs Args struct -->
@@ -28,6 +38,10 @@
 | `--fdgraph-interval DURATION`     | String           | `1s`                                     | Poller interval. Accepts `1s`, `500ms`, or `off` to disable polling. |
 | `--fdgraph-thresholds TIERS`      | String           | `1024,8192,90%`                          | Comma-separated FD-count alert tiers. Parsed for forward-compat; rules carry their own thresholds today. |
 | `--fdgraph-top-paths-n N`         | usize            | `0`                                      | Top-N `/proc/<pid>/fd/<fd>` readlink aggregation per snapshot. `0` disables. |
+| `--lookback-events N`             | usize            | `100`                                    | Per-PID ring-buffer depth dumped into `crash_context` on `process_exit`. `0` disables. |
+| `--tombstone-dir PATH`            | String           | `/data/tombstones`                       | Directory the tombstone watcher polls at 1 Hz. Empty string disables. |
+| `--no-logcat`                     | flag             | off                                      | Skip spawning the `logcat` tail. Useful on hosts without `logcat` in PATH. |
+| `--binder-inflight N`             | usize            | `1024`                                   | Max in-flight binder transactions tracked by the userspace correlator. `0` disables (raw events still flow). |
 
 <!-- END AUTO-GENERATED -->
 

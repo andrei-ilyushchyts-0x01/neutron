@@ -10,5 +10,6 @@ pub mod rules;
 pub mod sources;
 pub mod symbolize;
 pub mod util;
+pub mod window;
 
 pub use neutron_common::SyscallEvent;

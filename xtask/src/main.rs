@@ -9,6 +9,9 @@
 //!   cargo xtask demo-hal            # host-only ioctl decoder fixture; prints
 //!                                   # synthetic NDJSON and diffs it against
 //!                                   # examples/expected/dma-heap.ndjson
+//!   cargo xtask demo-window         # runs `neutron window` against
+//!                                   # examples/expected/window-capture.ndjson
+//!                                   # and diffs against window-output.ndjson
 //!   cargo xtask check-findings <file>
 //!                                   # diff a captured NDJSON trace against
 //!                                   # examples/expected/findings.txt
@@ -38,6 +41,7 @@ fn main() -> Result<()> {
         }
         Some("demo") => demo(),
         Some("demo-hal") => demo_hal(),
+        Some("demo-window") => demo_window(),
         Some("check-findings") => {
             let path = args
                 .next()
@@ -283,6 +287,65 @@ fn demo_hal() -> Result<()> {
     print!("{actual}");
     bail!(
         "demo-hal NDJSON mismatch — update {} or fix the regression",
+        expected_path.display()
+    );
+}
+
+/// Run `neutron window` against `examples/expected/window-capture.ndjson`
+/// with a fixed anchor + size and diff against
+/// `examples/expected/window-output.ndjson`. Sprint-2 PR 3 fixture —
+/// catches schema drift in the window subcommand without needing a real
+/// capture.
+fn demo_window() -> Result<()> {
+    let root = workspace_root();
+    let capture = root.join("examples/expected/window-capture.ndjson");
+    let expected_path = root.join("examples/expected/window-output.ndjson");
+    println!(
+        "=== running neutron window against {} ===",
+        capture.display()
+    );
+    let out = Command::new("cargo")
+        .current_dir(&root)
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "neutron",
+            "--",
+            "window",
+            capture.to_str().unwrap(),
+            "--anchor",
+            "crash",
+            "--before-events",
+            "2",
+            "--after-events",
+            "2",
+        ])
+        .output()
+        .context("invoking cargo run -- window")?;
+    if !out.status.success() {
+        bail!(
+            "neutron window failed:\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let actual = String::from_utf8(out.stdout).context("window stdout is not valid UTF-8")?;
+    let expected = std::fs::read_to_string(&expected_path)
+        .with_context(|| format!("reading {}", expected_path.display()))?;
+    if actual.trim() == expected.trim() {
+        println!(
+            "OK demo-window output matches {} ({} line(s))",
+            expected_path.display(),
+            actual.lines().count()
+        );
+        return Ok(());
+    }
+    println!("=== EXPECTED ({}) ===", expected_path.display());
+    print!("{expected}");
+    println!("=== ACTUAL ===");
+    print!("{actual}");
+    bail!(
+        "demo-window NDJSON mismatch — update {} or fix the regression",
         expected_path.display()
     );
 }

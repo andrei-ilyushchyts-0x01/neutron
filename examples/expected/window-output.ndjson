@@ -1,0 +1,5 @@
+{"type":"binder_call","ts_ns":1200000000,"debug_id":42,"caller_pid":42,"caller_uid":1000,"caller_comm":"app","callee_pid":1000,"code":7,"flags":16,"reply":false,"sent_ts_ns":1200000000,"received_ts_ns":1250000000,"latency_us":50000,"status":"completed","event_id":5}
+{"type":"syscall","ts_ns":1300000000,"pid":42,"tid":42,"uid":1000,"nr":56,"name":"openat","comm":"app","enter":false,"ret":8,"args":[0,0,0,0,0,0],"data":"/dev/something","event_id":6}
+{"type":"process_exit","ts_ns":1400000000,"pid":1000,"uid":1000,"comm":"hal","source":"tombstone","classification":"crash","exit_signal":11,"signal_name":"SIGSEGV","crash_context":[],"event_id":7}
+{"type":"binder_call","ts_ns":1400000000,"debug_id":42,"caller_pid":42,"caller_uid":1000,"caller_comm":"app","callee_pid":1000,"code":7,"flags":16,"reply":false,"sent_ts_ns":1400000000,"status":"callee_crashed","event_id":8}
+{"type":"finding","rule_id":"R003_process_crash","rule_name":"Process killed by fatal signal","category":"crash","severity":"critical","process":{"comm":"hal","pid":1000},"event_count":1,"first_seen_ms":1400.0,"last_seen_ms":1400.0,"period_ms":0.0}

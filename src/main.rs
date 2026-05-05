@@ -435,6 +435,7 @@ fn main() -> Result<()> {
         Some(Command::Doctor) => {
             std::process::exit(doctor::run());
         }
+        Some(Command::Window(args)) => neutron::window::run(args),
         None => run_trace(cli.args),
     }
 }
