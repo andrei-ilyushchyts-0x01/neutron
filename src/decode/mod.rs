@@ -11,7 +11,7 @@ pub use args::{
     af_name, format_enter_args, format_ioctl_args, format_mmap_args, format_mprotect_args,
     format_openat_args, format_rw_args, format_socket_args, prot_name, sock_type_name,
 };
-pub use binder::{format_binder_event, format_binder_event_json};
+pub use binder::{format_binder_event, format_binder_event_json, format_binder_received_json};
 pub use ioctl::{
     decode_ioctl, format_ioctl_deep, render_decoded_ioctl_json, DecodedIoctl, IoctlFamily,
     IoctlFields,

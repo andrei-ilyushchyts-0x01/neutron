@@ -20,6 +20,7 @@
 //! `TombstoneWatcher`) so unit tests can feed synthetic streams without
 //! touching `/data/tombstones/` or spawning subprocesses.
 
+pub mod binder_tracker;
 pub mod logcat;
 pub mod lookback;
 pub mod tombstone;

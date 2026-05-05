@@ -36,7 +36,7 @@ use neutron_common::{
     ExitSource, SyscallEvent, COUNTER_EVENTS_SUBMITTED, COUNTER_INFLIGHT_LOOKUP_MISSED,
     COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
     COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED, FILTER_KEY_ACTIVE, FILTER_KEY_PID,
-    SYSCALL_NR_PROCESS_EXIT,
+    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
 };
 
 // COUNTER_PATH_READ_FAILED and COUNTER_PATH_TRUNCATED slot indices are reserved
@@ -116,12 +116,17 @@ const SYS_EXIT_RET: usize = 16;
 //   to_proc (s32)     @ +16    to_thread (s32)   @ +20
 //   reply (s32)       @ +24    code (u32)        @ +28
 //   flags (u32)       @ +32
+const BT_DEBUG_ID: usize = 8;
 const BT_TARGET_NODE: usize = 12;
 const BT_TO_PROC: usize = 16;
 const BT_TO_THREAD: usize = 20;
 const BT_REPLY: usize = 24;
 const BT_CODE: usize = 28;
 const BT_FLAGS: usize = 32;
+
+// binder/binder_transaction_received tracepoint:
+//   debug_id (s32)    @ +8
+const BTR_DEBUG_ID: usize = 8;
 
 // ── Common filter helpers ────────────────────────────────────────────────────
 
@@ -594,6 +599,7 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
     // Tracepoint fields. Failures default to 0 (the C version did the same via
     // `bpf_probe_read` into a zero-initialised local).
     // SAFETY: tracepoint layout fixed by the kernel; offsets from event format.
+    let debug_id = unsafe { ctx.read_at::<i32>(BT_DEBUG_ID) }.unwrap_or(0);
     let to_proc = unsafe { ctx.read_at::<i32>(BT_TO_PROC) }.unwrap_or(0);
     let to_thread = unsafe { ctx.read_at::<i32>(BT_TO_THREAD) }.unwrap_or(0);
     let reply = unsafe { ctx.read_at::<i32>(BT_REPLY) }.unwrap_or(0);
@@ -632,6 +638,11 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
             target_node as u32 as u64,
         ];
         addr_of_mut!((*ev).args).write_unaligned(args);
+        // Stash the binder transaction id in `ptr_hint` so the userspace
+        // correlator can pair this caller event with the callee-side
+        // `binder_transaction_received` (sprint-2 PR 2). Cast preserves bits;
+        // userspace casts back to i32.
+        addr_of_mut!((*ev).ptr_hint).write_unaligned(debug_id as u32 as u64);
 
         let kid = match STACK_TRACES.get_stackid(ctx, 0) {
             Ok(id) => id as i32,
@@ -649,6 +660,62 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
         };
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
         addr_of_mut!((*ev).user_stackid).write_unaligned(uid_stack);
+
+        entry.submit(0);
+        bump_counter(COUNTER_EVENTS_SUBMITTED);
+    }
+    Ok(())
+}
+
+// ── binder/binder_transaction_received (sprint-2 PR 2: causality) ────────────
+//
+// Callee-side companion of `binder_transaction`. Fires when the binder
+// thread dequeues an inbound transaction. We stash the same `debug_id` in
+// `ptr_hint` so the userspace correlator can match it to the caller-side
+// event by ID. Comm/uid come from `bpf_get_current_*` (the receiving
+// thread is a worker thread of the callee process).
+
+#[tracepoint]
+pub fn trace_binder_transaction_received(ctx: TracePointContext) -> i32 {
+    let _ = try_binder_received(&ctx);
+    0
+}
+
+#[inline(always)]
+fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let userspace_pid = (pid_tgid >> 32) as u32;
+    let userspace_tid = pid_tgid as u32;
+
+    if !pid_matches(userspace_pid) {
+        return Err(());
+    }
+
+    let debug_id = unsafe { ctx.read_at::<i32>(BTR_DEBUG_ID) }.unwrap_or(0);
+    let now = unsafe { bpf_ktime_get_ns() };
+
+    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
+        bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
+        return Err(());
+    };
+
+    let ev: *mut SyscallEvent = entry.as_mut_ptr() as *mut SyscallEvent;
+    unsafe {
+        core::ptr::write_bytes(ev as *mut u8, 0, size_of::<SyscallEvent>());
+        addr_of_mut!((*ev).timestamp_ns).write_unaligned(now);
+        addr_of_mut!((*ev).pid).write_unaligned(userspace_pid);
+        addr_of_mut!((*ev).tgid).write_unaligned(userspace_tid);
+        addr_of_mut!((*ev).uid).write_unaligned(bpf_get_current_uid_gid() as u32);
+        addr_of_mut!((*ev).syscall_nr).write_unaligned(SYSCALL_NR_BINDER_RECEIVED);
+        addr_of_mut!((*ev).is_enter).write_unaligned(1);
+        if let Ok(comm) = bpf_get_current_comm() {
+            addr_of_mut!((*ev).comm).write_unaligned(comm);
+        }
+        addr_of_mut!((*ev).ptr_hint).write_unaligned(debug_id as u32 as u64);
+        // No useful args / stacks here — debug_id alone is the matching key.
+        // Stack capture is skipped to keep this tracepoint cheap.
+        addr_of_mut!((*ev).kernel_stackid).write_unaligned(-1);
+        addr_of_mut!((*ev).user_stackid).write_unaligned(-1);
 
         entry.submit(0);
         bump_counter(COUNTER_EVENTS_SUBMITTED);

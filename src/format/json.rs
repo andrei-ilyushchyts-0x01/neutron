@@ -1,9 +1,9 @@
 //! NDJSON rendering of `SyscallEvent`s.
 
 use crate::decode::{
-    compute_latency_us, decode_ioctl, format_binder_event_json, format_comm, format_data_field,
-    lookup_socket_by_inode, read_socket_inode, render_decoded_ioctl_json, resolve_path_from_fd,
-    syscall_name, IoctlFamily,
+    compute_latency_us, decode_ioctl, format_binder_event_json, format_binder_received_json,
+    format_comm, format_data_field, lookup_socket_by_inode, read_socket_inode,
+    render_decoded_ioctl_json, resolve_path_from_fd, syscall_name, IoctlFamily,
 };
 use crate::fdgraph::FdKind;
 use neutron_common::SyscallEvent;
@@ -64,6 +64,12 @@ pub fn format_event_json_full(
             inject_stack_field(&mut line, s);
         }
         return line;
+    }
+    // Sprint-2 PR 2: callee-side binder_transaction_received. No stack
+    // capture (the BPF program skips stacks for this hot tracepoint), so
+    // we don't bother with the inject_stack_field path.
+    if syscall_nr == neutron_common::SYSCALL_NR_BINDER_RECEIVED {
+        return format_binder_received_json(ev, event_id);
     }
 
     let ts_ns = { ev.timestamp_ns };
@@ -376,6 +382,104 @@ pub fn format_process_exit_json(
         ctx_json,
         event_id_json,
     )
+}
+
+/// Render a [`crate::sources::binder_tracker::BinderCallEvent`] as a
+/// `type:"binder_call"` NDJSON line. Sprint-2 PR 2.
+///
+/// Synthesised by the userspace correlator; not produced directly by BPF.
+/// The `latency_us` field is omitted when the entry is a `callee_crashed`
+/// pair (the receive event never fired).
+pub fn format_binder_call_json(
+    pair: &crate::sources::binder_tracker::BinderCallEvent,
+    event_id: Option<u64>,
+) -> String {
+    let escaped_comm = pair.caller_comm.replace('\\', "\\\\").replace('"', "\\\"");
+    let event_id_json = match event_id {
+        Some(id) => format!(r#","event_id":{}"#, id),
+        None => String::new(),
+    };
+    let latency_json = match pair.latency_us() {
+        Some(l) => format!(r#","latency_us":{}"#, l),
+        None => String::new(),
+    };
+    let received_json = match pair.received_ts_ns {
+        Some(r) => format!(r#","received_ts_ns":{}"#, r),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"sent_ts_ns":{}{}{},"status":"{}"{}}}"#,
+        pair.sent_ts_ns,
+        pair.debug_id,
+        pair.caller_pid,
+        pair.caller_uid,
+        escaped_comm,
+        pair.callee_pid,
+        pair.code,
+        pair.flags,
+        pair.reply,
+        pair.sent_ts_ns,
+        received_json,
+        latency_json,
+        pair.status.as_str(),
+        event_id_json,
+    )
+}
+
+#[cfg(test)]
+mod binder_call_json_tests {
+    use super::*;
+    use crate::sources::binder_tracker::BinderCallEvent;
+    use neutron_common::BinderCallStatus;
+
+    fn pair_completed() -> BinderCallEvent {
+        BinderCallEvent {
+            debug_id: 42,
+            caller_pid: 100,
+            caller_uid: 10001,
+            caller_comm: "myapp".into(),
+            callee_pid: 200,
+            code: 7,
+            flags: 0x10,
+            reply: false,
+            sent_ts_ns: 1_000_000,
+            received_ts_ns: Some(1_500_000),
+            status: BinderCallStatus::Completed,
+        }
+    }
+
+    #[test]
+    fn completed_pair_includes_latency() {
+        let line = format_binder_call_json(&pair_completed(), Some(99));
+        assert!(line.contains(r#""type":"binder_call""#));
+        assert!(line.contains(r#""status":"completed""#));
+        assert!(line.contains(r#""debug_id":42"#));
+        assert!(line.contains(r#""caller_pid":100"#));
+        assert!(line.contains(r#""callee_pid":200"#));
+        assert!(line.contains(r#""latency_us":500"#));
+        assert!(line.contains(r#""received_ts_ns":1500000"#));
+        assert!(line.contains(r#""event_id":99"#));
+    }
+
+    #[test]
+    fn callee_crashed_pair_omits_latency_and_received_ts() {
+        let mut p = pair_completed();
+        p.status = BinderCallStatus::CalleeCrashed;
+        p.received_ts_ns = None;
+        let line = format_binder_call_json(&p, None);
+        assert!(line.contains(r#""status":"callee_crashed""#));
+        assert!(!line.contains("latency_us"));
+        assert!(!line.contains("received_ts_ns"));
+        assert!(!line.contains("event_id"));
+    }
+
+    #[test]
+    fn caller_comm_with_quotes_is_escaped() {
+        let mut p = pair_completed();
+        p.caller_comm = r#"weird"name"#.into();
+        let line = format_binder_call_json(&p, None);
+        assert!(line.contains(r#""caller_comm":"weird\"name""#));
+    }
 }
 
 #[cfg(test)]

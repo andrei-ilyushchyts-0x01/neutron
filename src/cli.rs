@@ -159,4 +159,12 @@ pub struct Args {
     /// captures where the rule engine is disabled.
     #[arg(long)]
     pub no_logcat: bool,
+
+    // ── Binder causality (sprint-2 PR 2) ───────────────────────────────────
+    /// Maximum in-flight binder transactions tracked by the userspace
+    /// correlator. When the cap is exceeded the least-recently-touched
+    /// entry is silently dropped. `0` disables the correlator entirely
+    /// (raw `binder` / `binder_received` events still flow). Default 1024.
+    #[arg(long, default_value_t = 1024)]
+    pub binder_inflight: usize,
 }

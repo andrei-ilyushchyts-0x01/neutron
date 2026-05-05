@@ -31,18 +31,22 @@ use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
 use neutron::fdgraph::FdGraph;
 use neutron::format::{
-    format_event_json_full, format_event_text_with_stack, format_fd_snapshot_json,
-    format_process_exit_json, FdHint,
+    format_binder_call_json, format_event_json_full, format_event_text_with_stack,
+    format_fd_snapshot_json, format_process_exit_json, FdHint,
 };
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
 use neutron::rules::{build_rule_engine, emit_findings};
+use neutron::sources::binder_tracker::BinderTracker;
 use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
 use neutron::sources::lookback::RingBufferStore;
 use neutron::sources::tombstone::{RealTombstoneWatcher, TombstoneWatcher};
 use neutron::sources::ProcessExitEvent;
 use neutron::symbolize::{is_kernel_addr, KernelSymbolizer, ProcSymbolizer};
 use neutron::SyscallEvent;
-use neutron_common::{ExitSource, FILTER_KEY_ACTIVE, FILTER_KEY_PID, SYSCALL_NR_PROCESS_EXIT};
+use neutron_common::{
+    ExitSource, FILTER_KEY_ACTIVE, FILTER_KEY_PID, SYSCALL_NR_BINDER_RECEIVED,
+    SYSCALL_NR_PROCESS_EXIT,
+};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -373,6 +377,56 @@ fn emit_process_exit(
     }
 }
 
+// ── Binder-causality emit helper (sprint-2 PR 2) ─────────────────────────────
+
+/// Emit a synthesised `binder_call` event through the same pipeline as raw
+/// events: stamp event_id, feed the rule engine, write the formatted line,
+/// and (optionally) push it into the lookback ring buffer for the caller's
+/// PID so subsequent crash events surface the binder activity in their
+/// `crash_context`.
+fn emit_binder_call(
+    pair: &neutron::sources::binder_tracker::BinderCallEvent,
+    lookback: Option<&mut RingBufferStore>,
+    engine: &mut Option<neutron_rules::RuleEngine>,
+    out: &mut dyn IoWrite,
+    suppress_raw: bool,
+    json_mode: bool,
+    event_id_counter: &mut u64,
+) {
+    *event_id_counter = event_id_counter.wrapping_add(1);
+    let line = format_binder_call_json(pair, Some(*event_id_counter));
+    if let Some(eng) = engine.as_mut() {
+        if let Some(owned) = neutron_rules::Event::parse_line(&line) {
+            if let Some(view) = owned.view() {
+                eng.feed(&view);
+            }
+        }
+    }
+    if !suppress_raw {
+        let printed = if json_mode {
+            line.clone()
+        } else {
+            format!(
+                "[binder] {}->{} code={} status={}{}",
+                pair.caller_pid,
+                pair.callee_pid,
+                pair.code,
+                pair.status.as_str(),
+                pair.latency_us()
+                    .map(|l| format!(" lat_us={l}"))
+                    .unwrap_or_default(),
+            )
+        };
+        let _ = writeln!(out, "{printed}");
+    }
+    if let Some(lb) = lookback {
+        // Record the pair against the *caller* PID so a later caller-side
+        // crash carries the binder activity in its lookback. Callee-side
+        // crashes already trigger the on_callee_crash drain.
+        lb.record(pair.caller_pid, &line);
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -422,6 +476,23 @@ fn run_trace(mut args: Args) -> Result<()> {
             "binder_transaction",
         )?;
         attached.push("trace_binder_transaction");
+        // Sprint-2 PR 2: callee-side companion. Best-effort — older kernels
+        // before the tracepoint was upstreamed will fail attach. Continue
+        // without it (the userspace correlator simply never matches).
+        match attach_tracepoint(
+            &mut bpf,
+            "trace_binder_transaction_received",
+            "binder",
+            "binder_transaction_received",
+        ) {
+            Ok(()) => attached.push("trace_binder_transaction_received"),
+            Err(e) => {
+                eprintln!(
+                    "neutron: warn: binder_transaction_received attach failed: {e}; \
+                     binder causality (R004) will be silent"
+                );
+            }
+        }
     }
 
     // 2. Populate filter map.
@@ -575,6 +646,25 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
     };
 
+    // ── Binder causality (sprint-2 PR 2) ─────────────────────────────────
+    //
+    // Userspace correlator pairs caller-side `binder_transaction` events
+    // (BPF nr=-1) with callee-side `binder_transaction_received` (BPF
+    // nr=-4) by the `debug_id` carried in `ptr_hint`. On match the loop
+    // emits a synthetic `type:"binder_call"` line; on callee crash
+    // (process_exit with classification=crash) any in-flight transactions
+    // for that PID are emitted with `status:"callee_crashed"`.
+    let mut binder_tracker: Option<BinderTracker> = if args.binder_inflight == 0 {
+        None
+    } else {
+        Some(BinderTracker::new(args.binder_inflight))
+    };
+    if let Some(t) = binder_tracker.as_ref() {
+        if args.verbose {
+            eprintln!("  binder tracker: max_inflight={}", t.max_inflight());
+        }
+    }
+
     // Logcat tail — Android-only. On hosts the spawn fails with ENOENT
     // (`logcat` not in PATH); we degrade gracefully.
     let mut logcat_reader: Option<RealLogcatReader> = if args.no_logcat {
@@ -643,6 +733,25 @@ fn run_trace(mut args: Args) -> Result<()> {
                         source: ExitSource::from_u8((args_arr[2] & 0xff) as u8)
                             .unwrap_or(ExitSource::Tracepoint),
                     };
+                    // Sprint-2 PR 2: drain in-flight binder transactions
+                    // for the dying PID before emitting the exit. Each
+                    // drained entry becomes a `binder_call` line with
+                    // status=callee_crashed, feeding R004.
+                    if pe.classify() == neutron::sources::ExitClassification::Crash {
+                        if let Some(t) = binder_tracker.as_mut() {
+                            for pair in t.on_callee_crash(pe.pid) {
+                                emit_binder_call(
+                                    &pair,
+                                    lookback.as_mut(),
+                                    &mut engine,
+                                    &mut *out,
+                                    suppress_raw,
+                                    args.json,
+                                    &mut event_id_counter,
+                                );
+                            }
+                        }
+                    }
                     emit_process_exit(
                         &pe,
                         lookback.as_mut(),
@@ -653,6 +762,51 @@ fn run_trace(mut args: Args) -> Result<()> {
                         &mut event_id_counter,
                     );
                     continue;
+                }
+
+                // ── Sprint-2 PR 2: binder caller / received tracker ────
+                //
+                // Caller side (nr=-1) goes into the in-flight map. Callee
+                // side (nr=-4) tries to match and emits a binder_call on
+                // success. The raw binder / binder_received JSON line is
+                // still emitted below so operators can grep low-level
+                // detail.
+                let nr_now = { ev.syscall_nr };
+                if nr_now == -1 {
+                    if let Some(t) = binder_tracker.as_mut() {
+                        let args_arr = { ev.args };
+                        let debug_id = { ev.ptr_hint } as u32 as i32;
+                        let pid = { ev.pid };
+                        let uid = { ev.uid };
+                        let ts = { ev.timestamp_ns };
+                        t.record_caller(
+                            debug_id,
+                            pid,
+                            uid,
+                            format_comm(&{ ev.comm }),
+                            args_arr[0] as u32,
+                            args_arr[1] as u32,
+                            args_arr[2] as u32,
+                            args_arr[4] != 0,
+                            ts,
+                        );
+                    }
+                } else if nr_now == SYSCALL_NR_BINDER_RECEIVED {
+                    if let Some(t) = binder_tracker.as_mut() {
+                        let debug_id = { ev.ptr_hint } as u32 as i32;
+                        let ts = { ev.timestamp_ns };
+                        if let Some(pair) = t.record_received(debug_id, ts) {
+                            emit_binder_call(
+                                &pair,
+                                lookback.as_mut(),
+                                &mut engine,
+                                &mut *out,
+                                suppress_raw,
+                                args.json,
+                                &mut event_id_counter,
+                            );
+                        }
+                    }
                 }
 
                 // Resolve the stack BEFORE building the JSON line so the
@@ -841,6 +995,21 @@ fn run_trace(mut args: Args) -> Result<()> {
             .unwrap_or(0);
         if let Some(w) = tombstone_watcher.as_mut() {
             for pe in w.poll(now_ns) {
+                if pe.classify() == neutron::sources::ExitClassification::Crash {
+                    if let Some(t) = binder_tracker.as_mut() {
+                        for pair in t.on_callee_crash(pe.pid) {
+                            emit_binder_call(
+                                &pair,
+                                lookback.as_mut(),
+                                &mut engine,
+                                &mut *out,
+                                suppress_raw,
+                                args.json,
+                                &mut event_id_counter,
+                            );
+                        }
+                    }
+                }
                 emit_process_exit(
                     &pe,
                     lookback.as_mut(),
@@ -854,6 +1023,21 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
         if let Some(r) = logcat_reader.as_mut() {
             for pe in r.drain(now_ns) {
+                if pe.classify() == neutron::sources::ExitClassification::Crash {
+                    if let Some(t) = binder_tracker.as_mut() {
+                        for pair in t.on_callee_crash(pe.pid) {
+                            emit_binder_call(
+                                &pair,
+                                lookback.as_mut(),
+                                &mut engine,
+                                &mut *out,
+                                suppress_raw,
+                                args.json,
+                                &mut event_id_counter,
+                            );
+                        }
+                    }
+                }
                 emit_process_exit(
                     &pe,
                     lookback.as_mut(),

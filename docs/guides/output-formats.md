@@ -165,6 +165,51 @@ the explicit `--pid` target plus any PID that produced a traced event;
 sprint-2 stub that degrades to `active` with a warning. Set `--fdgraph-interval off`
 to disable polling entirely.
 
+### Binder Call Event (`type == "binder_call"`)
+
+Sprint-2 PR 2. Synthesised pair: caller-side `binder_transaction` plus
+callee-side `binder_transaction_received` matched by `debug_id`. On callee
+crash, in-flight transactions are flushed with `status:"callee_crashed"`.
+Raw `type:"binder"` (caller) and `type:"binder_received"` (callee) lines
+continue to flow alongside the synthesised `binder_call` so operators can
+see low-level detail.
+
+```json
+{
+  "type":           "binder_call",
+  "ts_ns":          1234567890,
+  "debug_id":       8421,
+  "caller_pid":     12345,
+  "caller_uid":     10001,
+  "caller_comm":    "com.example.app",
+  "callee_pid":     1000,
+  "code":           7,
+  "flags":          16,
+  "reply":          false,
+  "sent_ts_ns":     1234567890,
+  "received_ts_ns": 1234568390,
+  "latency_us":     500,
+  "status":         "completed",
+  "event_id":       18234
+}
+```
+
+| Field            | JSON type | Notes                                                                  |
+|------------------|-----------|------------------------------------------------------------------------|
+| `type`           | string    | Always `"binder_call"`.                                                |
+| `debug_id`       | i32       | Kernel-assigned binder transaction id; matching key.                    |
+| `caller_pid`     | u32       | Sending process (TGID).                                                |
+| `callee_pid`     | u32       | Receiving process — taken from caller-side `to_proc`.                  |
+| `code`           | u32       | AIDL transaction code.                                                 |
+| `flags`          | u32       | TF_* flags (`0x01` = TF_ONE_WAY async).                               |
+| `received_ts_ns` | u64       | Omitted for `callee_crashed` pairs.                                    |
+| `latency_us`     | u64       | Omitted when `received_ts_ns` is absent.                               |
+| `status`         | string    | `"completed"`, `"callee_crashed"`, or `"unmatched"`.                  |
+
+Disable the correlator with `--binder-inflight 0`. The default cap (1024
+in-flight transactions) is enough for ~steady-state Pixel HAL traffic;
+heavily multiplexed workloads can raise it.
+
 ### Process Exit Event (`type == "process_exit"`)
 
 Sprint-2 PR 1 introduces a fourth event class. Three independent sources can

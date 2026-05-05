@@ -157,6 +157,50 @@ columns on the event itself).
 | `growth_rate_per_sec`  | f32    | (fds gained since last sample) / interval. `0.0` for the first sample.      |
 | `top_paths`            | array  | `[{"path","count"}]` from readlinks. Empty unless `--fdgraph-top-paths-n > 0`. |
 
+### Binder Call Event (`type == "binder_call"`)
+
+Synthesised by the userspace correlator (sprint-2 PR 2). Pairs caller-side
+`binder_transaction` (BPF nr=-1, raw `type:"binder"`) with callee-side
+`binder_transaction_received` (BPF nr=-4, raw `type:"binder_received"`) by
+`debug_id` carried in `ptr_hint`. On callee crash, in-flight transactions
+are flushed with `status:"callee_crashed"`.
+
+```json
+{
+  "type":           "binder_call",
+  "ts_ns":          1234567890,
+  "debug_id":       8421,
+  "caller_pid":     12345,
+  "caller_uid":     10001,
+  "caller_comm":    "com.example.app",
+  "callee_pid":     1000,
+  "code":           7,
+  "flags":          16,
+  "reply":          false,
+  "sent_ts_ns":     1234567890,
+  "received_ts_ns": 1234568390,
+  "latency_us":     500,
+  "status":         "completed",
+  "event_id":       18234
+}
+```
+
+| Field            | Type    | Description                                                                |
+|------------------|---------|----------------------------------------------------------------------------|
+| `debug_id`       | i32     | Kernel-assigned binder transaction id; matching key.                        |
+| `caller_pid`     | u32     | Sending process (TGID).                                                    |
+| `callee_pid`     | u32     | Receiving process — taken from caller-side `to_proc` field.                |
+| `code`           | u32     | AIDL transaction code on the binder interface.                              |
+| `flags`          | u32     | TF_* flags (e.g. `0x01` = TF_ONE_WAY async).                               |
+| `reply`          | bool    | `true` when this is a reply transaction; `false` for a request.             |
+| `received_ts_ns` | u64     | When the callee dequeued. **Omitted** for `callee_crashed` pairs.           |
+| `latency_us`     | u64     | `(received - sent) / 1000`. **Omitted** when `received_ts_ns` is absent.    |
+| `status`         | string  | `"completed"`, `"callee_crashed"`, or `"unmatched"`.                       |
+
+The rule engine maps `caller_pid` → the standard `pid` field for
+`per_process` aggregation. `R004_binder_callee_crash` matches
+`status: "callee_crashed"` and surfaces one finding per caller.
+
 ### Process Exit Event (`type == "process_exit"`)
 
 ```json
@@ -207,7 +251,7 @@ require a specific source (e.g. only act on tombstone-backed evidence).
 }
 ```
 
-## Default Detector Pack (25 rules)
+## Default Detector Pack (26 rules)
 
 | ID    | Category             | What it catches                                           |
 |-------|----------------------|-----------------------------------------------------------|
@@ -236,6 +280,7 @@ require a specific source (e.g. only act on tombstone-backed evidence).
 | R001  | resource_exhaustion  | FD table > 90% of `RLIMIT_NOFILE` (FD-graph poller)       |
 | R002  | resource_exhaustion  | DMA-heap allocation burst (50+ in 5 s)                    |
 | R003  | crash                | Process killed by fatal signal (SEGV/ABRT/BUS/ILL/FPE/SYS)|
+| R004  | crash                | Binder callee crashed mid-transaction                     |
 
 Source: [`neutron-rules/rules/default.yaml`](../neutron-rules/rules/default.yaml).
 T016..T021 require `--stacks`. R001 requires the FD-graph poller
@@ -245,6 +290,8 @@ R003 requires the `sched_process_exit` BPF tracepoint (always attached);
 the lookback ring buffer (`--lookback-events 100` default) and at least
 one of the three crash sources (`--lookback-events`, `--tombstone-dir`,
 `logcat` available in PATH) populate `crash_context` and the signal field.
+R004 requires `--binder` plus `--binder-inflight > 0` (default 1024) for
+the userspace correlator to track in-flight transactions.
 
 ## Syscall Table (aarch64)
 

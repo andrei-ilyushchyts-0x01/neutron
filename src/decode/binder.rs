@@ -38,6 +38,10 @@ pub fn format_binder_event(ev: &SyscallEvent) -> String {
 /// from the line when `None`. Binder transactions are point-in-time so the
 /// emitted `phase` is always `"enter"` — there is no symmetric exit event
 /// to pair with.
+///
+/// Sprint-2 PR 2 added `debug_id` (the binder transaction id stashed in
+/// `ptr_hint` by the BPF programs) so the userspace correlator can pair
+/// caller-side events with `binder_transaction_received` (`type:"binder_received"`).
 pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> String {
     let args = { ev.args };
     let comm = format_comm(&{ ev.comm });
@@ -45,8 +49,14 @@ pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> Str
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
     };
+    let debug_id = { ev.ptr_hint } as u32 as i32;
+    let debug_id_json = if debug_id == 0 {
+        String::new()
+    } else {
+        format!(r#","debug_id":{}"#, debug_id)
+    };
     format!(
-        r#"{{"ts_ns":{},"pid":{},"tgid":{},"uid":{},"type":"binder","phase":"enter","comm":"{}","reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{}{}}}"#,
+        r#"{{"ts_ns":{},"pid":{},"tgid":{},"uid":{},"type":"binder","phase":"enter","comm":"{}","reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{}{}{}}}"#,
         { ev.timestamp_ns },
         { ev.pid },
         { ev.tgid },
@@ -58,6 +68,30 @@ pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> Str
         args[5] as u32,
         args[1] as u32,
         args[2],
+        debug_id_json,
+        event_id_json,
+    )
+}
+
+/// Format a callee-side `binder/binder_transaction_received` event
+/// (synthetic `syscall_nr == SYSCALL_NR_BINDER_RECEIVED`). Carries the
+/// matching `debug_id` so the userspace correlator can find the caller.
+/// Sprint-2 PR 2.
+pub fn format_binder_received_json(ev: &SyscallEvent, event_id: Option<u64>) -> String {
+    let comm = format_comm(&{ ev.comm });
+    let debug_id = { ev.ptr_hint } as u32 as i32;
+    let event_id_json = match event_id {
+        Some(id) => format!(r#","event_id":{}"#, id),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"ts_ns":{},"pid":{},"tgid":{},"uid":{},"type":"binder_received","comm":"{}","debug_id":{}{}}}"#,
+        { ev.timestamp_ns },
+        { ev.pid },
+        { ev.tgid },
+        { ev.uid },
+        comm,
+        debug_id,
         event_id_json,
     )
 }

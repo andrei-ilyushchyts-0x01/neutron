@@ -21,6 +21,11 @@ pub enum EventKind {
     /// or tombstone watcher. Carries `exit_signal`, `exit_classification`,
     /// and `source`. Drives `R003_process_crash`.
     ProcessExit,
+    /// Sprint-2 PR 2: synthesised caller→callee binder transaction pair
+    /// emitted by the userspace correlator. Carries `caller_pid`,
+    /// `callee_pid`, `code`, `flags`, and a lifecycle `status` (completed
+    /// / callee_crashed / unmatched). Drives `R004_binder_callee_crash`.
+    BinderCall,
 }
 
 /// Lightweight read-only view of one event line. Lifetime is bound to the JSON
@@ -76,6 +81,19 @@ pub struct Event<'a> {
     /// `"tombstone"`) from a `type:"process_exit"` event. `None` for
     /// non-exit events.
     pub exit_source: Option<&'a str>,
+    /// Sprint-2 PR 2: lifecycle status from a `type:"binder_call"` event
+    /// (`"completed"` / `"callee_crashed"` / `"unmatched"`). `None` for
+    /// non-binder_call events.
+    pub binder_status: Option<&'a str>,
+    /// Sprint-2 PR 2: AIDL transaction code from a `type:"binder_call"`
+    /// event. `None` for non-binder_call events.
+    pub binder_code: Option<u32>,
+    /// Sprint-2 PR 2: caller-side PID from a `type:"binder_call"` event.
+    /// `None` for non-binder_call events.
+    pub binder_caller_pid: Option<u32>,
+    /// Sprint-2 PR 2: callee-side PID from a `type:"binder_call"` event.
+    /// `None` for non-binder_call events.
+    pub binder_callee_pid: Option<u32>,
 
     /// Owned JSON value — kept so callers can clone it into snapshots without
     /// re-parsing the raw line. Use [`Event::raw_json`] to access.
@@ -93,32 +111,45 @@ impl<'a> Event<'a> {
         let is_binder = type_str == Some("binder");
         let is_fd_snapshot = type_str == Some("fd_snapshot");
         let is_process_exit = type_str == Some("process_exit");
+        let is_binder_call = type_str == Some("binder_call");
         let kind = if is_binder {
             EventKind::Binder
         } else if is_fd_snapshot {
             EventKind::FdSnapshot
         } else if is_process_exit {
             EventKind::ProcessExit
+        } else if is_binder_call {
+            EventKind::BinderCall
         } else {
             EventKind::Syscall
         };
 
-        // Snapshot/exit events carry no `nr` field — synthesise a sentinel so
+        // Snapshot/exit/call events carry no `nr` field — synthesise a sentinel so
         // existing rule predicates that check `syscall_in` simply fail to
-        // match (they do today: list.contains(&-2)/(-3) is false for any real
-        // syscall number).
+        // match (they do today: list.contains(&-2)/(-3)/(-5) is false for any
+        // real syscall number).
         let syscall_nr = if is_binder {
             -1
         } else if is_fd_snapshot {
             -2
         } else if is_process_exit {
             -3
+        } else if is_binder_call {
+            -5
         } else {
             obj.get("nr").and_then(|n| n.as_i64())? as i32
         };
 
         let ts_ns = obj.get("ts_ns").and_then(|v| v.as_u64()).unwrap_or(0);
-        let pid = obj.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        // For `binder_call` synthetic events the caller-side PID is the
+        // useful aggregation key (per_process collapses calls from the same
+        // app); the raw JSON does not carry a top-level `pid` field, so map
+        // `caller_pid` onto `pid` here.
+        let pid = if is_binder_call {
+            obj.get("caller_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32
+        } else {
+            obj.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32
+        };
         let tid = obj.get("tid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let uid = obj.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         // Schema cleanup (sprint 1): prefer the explicit `phase` field when
@@ -171,6 +202,32 @@ impl<'a> Event<'a> {
         } else {
             None
         };
+        let binder_status = if is_binder_call {
+            obj.get("status").and_then(|v| v.as_str())
+        } else {
+            None
+        };
+        let binder_code = if is_binder_call {
+            obj.get("code")
+                .and_then(|v| v.as_u64())
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        } else {
+            None
+        };
+        let binder_caller_pid = if is_binder_call {
+            obj.get("caller_pid")
+                .and_then(|v| v.as_u64())
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        } else {
+            None
+        };
+        let binder_callee_pid = if is_binder_call {
+            obj.get("callee_pid")
+                .and_then(|v| v.as_u64())
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        } else {
+            None
+        };
 
         let mut args = [0u64; 6];
         if let Some(arr) = obj.get("args").and_then(|a| a.as_array()) {
@@ -204,6 +261,10 @@ impl<'a> Event<'a> {
             exit_signal,
             exit_classification,
             exit_source,
+            binder_status,
+            binder_code,
+            binder_caller_pid,
+            binder_callee_pid,
             raw: v,
             raw_line,
         })

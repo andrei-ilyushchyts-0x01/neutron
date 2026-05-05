@@ -1129,3 +1129,175 @@ fn exit_source_in_predicate_filters_by_source_attribution() {
         "tombstone source must match: got {findings:?}"
     );
 }
+
+// ── Sprint-2 PR 2: R004 + binder_call predicates ─────────────────────────────
+
+#[test]
+fn binder_call_event_kind_is_recognised_by_parser() {
+    let line = r#"{"type":"binder_call","ts_ns":100,"debug_id":42,"caller_pid":100,"caller_uid":10001,"caller_comm":"app","callee_pid":200,"code":7,"flags":16,"reply":false,"sent_ts_ns":100,"received_ts_ns":600,"latency_us":500,"status":"completed"}"#;
+    let owned = neutron_rules::Event::parse_line(line).unwrap();
+    let ev = owned.view().unwrap();
+    assert_eq!(ev.kind, neutron_rules::EventKind::BinderCall);
+    assert_eq!(ev.binder_status, Some("completed"));
+    assert_eq!(ev.binder_code, Some(7));
+    assert_eq!(ev.binder_caller_pid, Some(100));
+    assert_eq!(ev.binder_callee_pid, Some(200));
+    // pid is mapped from caller_pid for aggregation.
+    assert_eq!(ev.pid, 100);
+}
+
+#[test]
+fn r004_fires_on_callee_crashed_binder_call() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"binder_call","ts_ns":100,"debug_id":42,"caller_pid":100,"caller_uid":10001,"caller_comm":"app","callee_pid":200,"code":7,"flags":0,"reply":false,"sent_ts_ns":100,"status":"callee_crashed"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    let hit: Vec<_> = findings
+        .iter()
+        .filter(|f| f.rule_id == "R004_binder_callee_crash")
+        .collect();
+    assert_eq!(
+        hit.len(),
+        1,
+        "expected exactly one R004 finding, got {findings:?}"
+    );
+    // Aggregation key is caller_pid → pid.
+    assert_eq!(hit[0].pid, 100);
+}
+
+#[test]
+fn r004_does_not_fire_on_completed_binder_call() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"binder_call","ts_ns":100,"debug_id":42,"caller_pid":100,"caller_uid":1,"caller_comm":"x","callee_pid":200,"code":7,"flags":0,"reply":false,"sent_ts_ns":100,"received_ts_ns":600,"latency_us":500,"status":"completed"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "R004_binder_callee_crash"),
+        "R004 must not fire on a completed pair: got {findings:?}"
+    );
+}
+
+#[test]
+fn binder_call_predicate_rejects_non_binder_call_events() {
+    let yaml = r#"
+- id: TEST_binder_call_only
+  name: binder_call only
+  description: Test rule.
+  severity: low
+  category: ipc
+  conditions:
+    - binder_call: true
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+    feed_lines(
+        &mut engine,
+        &[
+            // syscall — must not match.
+            r#"{"ts_ns":100,"pid":1,"tid":1,"uid":1,"nr":56,"name":"openat","comm":"x","enter":false,"ret":7,"args":[0,0,0,0,0,0],"data":"/etc"}"#,
+            // raw binder — must not match (this is binder, not binder_call).
+            r#"{"type":"binder","ts_ns":200,"pid":2,"tid":2,"comm":"y","to_proc":1,"code":1}"#,
+            // process_exit — must not match.
+            r#"{"type":"process_exit","ts_ns":300,"pid":3,"uid":1,"comm":"z","source":"tracepoint","classification":"normal_exit","crash_context":[]}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_binder_call_only"),
+        "binder_call must reject non-binder_call events: got {findings:?}"
+    );
+    // Now a real binder_call — must match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"binder_call","ts_ns":400,"debug_id":1,"caller_pid":4,"caller_uid":1,"caller_comm":"q","callee_pid":5,"code":1,"flags":0,"reply":false,"sent_ts_ns":400,"status":"completed"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "TEST_binder_call_only"),
+        "binder_call event must match: got {findings:?}"
+    );
+}
+
+#[test]
+fn binder_code_in_predicate_filters_by_aidl_code() {
+    let yaml = r#"
+- id: TEST_only_codes_5_or_7
+  name: codes 5 or 7
+  description: Test rule.
+  severity: medium
+  category: ipc
+  conditions:
+    - binder_call: true
+      binder_code_in: [5, 7]
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).expect("yaml parses");
+    let mut engine = RuleEngine::new(rules).expect("engine builds");
+    // code=99 — outside the list, no match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"binder_call","ts_ns":100,"debug_id":1,"caller_pid":1,"caller_uid":1,"caller_comm":"a","callee_pid":2,"code":99,"flags":0,"reply":false,"sent_ts_ns":100,"status":"completed"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.rule_id != "TEST_only_codes_5_or_7"),
+        "code=99 must not match: got {findings:?}"
+    );
+    // code=5 — must match.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"binder_call","ts_ns":200,"debug_id":2,"caller_pid":3,"caller_uid":1,"caller_comm":"b","callee_pid":4,"code":5,"flags":0,"reply":false,"sent_ts_ns":200,"status":"completed"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "TEST_only_codes_5_or_7"),
+        "code=5 must match: got {findings:?}"
+    );
+}
+
+#[test]
+fn r004_aggregates_by_caller_pid_per_process() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    // Two crashes from the same caller against different callees — one finding.
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"binder_call","ts_ns":100,"debug_id":1,"caller_pid":100,"caller_uid":1,"caller_comm":"a","callee_pid":200,"code":1,"flags":0,"reply":false,"sent_ts_ns":100,"status":"callee_crashed"}"#,
+            r#"{"type":"binder_call","ts_ns":200,"debug_id":2,"caller_pid":100,"caller_uid":1,"caller_comm":"a","callee_pid":300,"code":2,"flags":0,"reply":false,"sent_ts_ns":200,"status":"callee_crashed"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    let hit: Vec<_> = findings
+        .iter()
+        .filter(|f| f.rule_id == "R004_binder_callee_crash")
+        .collect();
+    assert_eq!(
+        hit.len(),
+        1,
+        "per_process aggregation should collapse to one finding, got {findings:?}"
+    );
+    assert_eq!(hit[0].pid, 100);
+}

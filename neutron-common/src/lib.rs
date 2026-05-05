@@ -184,6 +184,11 @@ pub const fn ioctl_post_exit_refresh(cmd: u32) -> bool {
 /// Sentinel `syscall_nr` for `type:"process_exit"` events.
 pub const SYSCALL_NR_PROCESS_EXIT: i32 = -3;
 
+/// Sentinel `syscall_nr` for `binder/binder_transaction_received` events
+/// emitted by the BPF callee-side tracepoint (sprint-2 PR 2). Paired with
+/// `-1` (binder caller) by debug_id stored in `ptr_hint`.
+pub const SYSCALL_NR_BINDER_RECEIVED: i32 = -4;
+
 /// Discriminant for the source that detected an exit. Stored in
 /// `SyscallEvent.args[2]` when `syscall_nr == SYSCALL_NR_PROCESS_EXIT`.
 #[repr(u8)]
@@ -246,6 +251,52 @@ pub const fn signal_name(sig: u32) -> Option<&'static str> {
 /// classification. R003_process_crash matches exactly this set.
 pub const fn is_fatal_signal(sig: u32) -> bool {
     matches!(sig, SIGILL | SIGABRT | SIGBUS | SIGFPE | SIGSEGV | SIGSYS)
+}
+
+// ── Binder causality (sprint-2 PR 2) ─────────────────────────────────────────
+//
+// Userspace synthesises `type:"binder_call"` events by pairing caller-side
+// `binder_transaction` (nr=-1) with callee-side `binder_transaction_received`
+// (nr=-4) via `debug_id` carried in `ptr_hint`. The status enum is the
+// rule-engine-facing label; `as_str` round-trips through JSON.
+
+/// Lifecycle status of a binder transaction observed by the userspace
+/// correlator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BinderCallStatus {
+    /// Pair matched: callee dequeued the transaction. The default state
+    /// emitted at receive time.
+    #[default]
+    Completed,
+    /// Callee process emitted `process_exit` with `classification == "crash"`
+    /// while the transaction was in flight.
+    CalleeCrashed,
+    /// Tracker's bounded LRU evicted the entry without ever observing a
+    /// receive event. Reserved for follow-up rules; the default emit path
+    /// does not currently surface these.
+    Unmatched,
+}
+
+impl BinderCallStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BinderCallStatus::Completed => "completed",
+            BinderCallStatus::CalleeCrashed => "callee_crashed",
+            BinderCallStatus::Unmatched => "unmatched",
+        }
+    }
+}
+
+#[cfg(test)]
+mod binder_call_tests {
+    use super::*;
+
+    #[test]
+    fn status_strings_are_stable() {
+        assert_eq!(BinderCallStatus::Completed.as_str(), "completed");
+        assert_eq!(BinderCallStatus::CalleeCrashed.as_str(), "callee_crashed");
+        assert_eq!(BinderCallStatus::Unmatched.as_str(), "unmatched");
+    }
 }
 
 #[cfg(test)]

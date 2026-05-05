@@ -149,6 +149,24 @@ pub struct MatchCondition {
     /// or logcat) rather than the bare BPF tracepoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_source_in: Option<Vec<String>>,
+
+    /// Match if the event is a `type:"binder_call"` synthesised pair
+    /// (sprint-2 PR 2). Required precondition for any of the `binder_*`
+    /// predicates below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_call: Option<bool>,
+
+    /// Match if the binder_call's `status` is one of the listed strings.
+    /// Allowed: `"completed"`, `"callee_crashed"`, `"unmatched"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_status_in: Option<Vec<String>>,
+
+    /// Match if the binder_call's `code` (AIDL transaction code) is in
+    /// this list. Use to scope rules to specific service interfaces —
+    /// e.g. SurfaceFlinger frame submission codes, AudioFlinger control
+    /// codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_code_in: Option<Vec<u32>>,
 }
 
 impl MatchCondition {
@@ -306,6 +324,23 @@ impl MatchCondition {
         if let Some(list) = &self.exit_source_in {
             match ev.exit_source {
                 Some(s) if list.iter().any(|x| x == s) => {}
+                _ => return false,
+            }
+        }
+        if let Some(true) = self.binder_call {
+            if ev.kind != EventKind::BinderCall {
+                return false;
+            }
+        }
+        if let Some(list) = &self.binder_status_in {
+            match ev.binder_status {
+                Some(s) if list.iter().any(|x| x == s) => {}
+                _ => return false,
+            }
+        }
+        if let Some(list) = &self.binder_code_in {
+            match ev.binder_code {
+                Some(c) if list.contains(&c) => {}
                 _ => return false,
             }
         }
