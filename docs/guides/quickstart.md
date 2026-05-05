@@ -93,6 +93,32 @@ adb pull /data/local/tmp/trace.ndjson
 findings are emitted. `--no-findings` suppresses findings (useful with
 `--raw` to reproduce the legacy per-event-only behavior).
 
+### Investigate a captured trace with `neutron window`
+
+After capturing NDJSON, cut a window of events around any anchor (a
+finding, a crash, a PID, an `event_id`, a `comm` substring, or a
+`binder_call` status):
+
+```bash
+# 5-second window around every R003 (process_crash) finding.
+neutron window trace.ndjson \
+    --anchor finding:R003_process_crash \
+    --around 5s
+
+# Last 100 events before each crash, plus 50 after — useful as a
+# self-contained triage packet.
+neutron window trace.ndjson \
+    --anchor crash \
+    --before-events 100 --after-events 50
+
+# One summary line per merged window (no raw NDJSON):
+neutron window trace.ndjson \
+    --anchor crash --around 2s --summary
+```
+
+See [docs/guides/window.md](window.md) for the full anchor + window
+reference and a small cookbook.
+
 ## Step 4: Read the Output
 
 Findings (default):

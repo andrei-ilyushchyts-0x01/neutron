@@ -5,13 +5,19 @@ tracing mode does, and how to get the most out of the tool.
 
 ## How Syscall Tracing Works
 
-neutron attaches BPF programs (in `neutron-ebpf`) to two tracepoints:
+neutron attaches BPF programs (in `neutron-ebpf`) to up to five
+tracepoints:
 
-- `raw_syscalls/sys_enter` — fires at the start of every syscall.
-- `raw_syscalls/sys_exit` — fires when the syscall returns.
+| Tracepoint | When attached | Synthetic `nr` | Purpose |
+|------------|---------------|----------------|---------|
+| `raw_syscalls/sys_enter` | always | n/a (real `nr`) | syscall enter capture |
+| `raw_syscalls/sys_exit` | always | n/a (real `nr`) | syscall exit capture |
+| `sched/sched_process_exit` | always | `-3` | process termination marker (crash correlation) |
+| `binder/binder_transaction` | `--binder` | `-1` | caller-side binder transaction |
+| `binder/binder_transaction_received` | `--binder` (best-effort) | `-4` | callee-side binder dequeue |
 
 At each tracepoint, the BPF program runs in kernel context with access to
-BPF helpers. It fills a `SyscallEvent` (241 bytes, packed) and submits it
+BPF helpers. It fills a `SyscallEvent` (257 bytes, packed) and submits it
 to the `EVENTS` `RingBuf`.
 
 The two events are correlated in the `INFLIGHT` map (keyed by
@@ -128,14 +134,40 @@ using the `_IOC` macro structure. Known device types:
 For binder, the most important command is
 `BINDER_WRITE_READ = 0xc0306201`.
 
+## Process Exit Correlation
+
+The `sched/sched_process_exit` tracepoint is always attached and emits
+synthetic events with `syscall_nr == -3`. The handler captures the
+dying task's `comm` (more reliable than `bpf_get_current_comm` on the
+do_exit teardown path) and submits a marker event. Userspace converts
+the marker into a `type:"process_exit"` JSON line and (optionally) dumps
+the per-PID lookback ring buffer into the line's `crash_context` field.
+
+The BPF tracepoint payload does **not** carry `exit_code` /
+`exit_signal` — those live on `task_struct` and require BTF reads
+(deferred to V1.x backlog). Userspace logcat / tombstone watchers
+fill in the signal info when they observe the same crash.
+
+```bash
+# Watch every process exit live (no rules, just raw events):
+$NEUTRON --pid 0 --raw --no-findings --json \
+  | jq -c 'select(.type == "process_exit")'
+```
+
+See [docs/REFERENCE.md](../REFERENCE.md#process-exit-event-type--process_exit)
+for the JSON schema.
+
 ## Binder Transaction Tracing
 
-Enable with `--binder`. Attaches the
-`tracepoint/binder/binder_transaction` program. This gives a
-higher-level view of Android IPC without parsing raw ioctl payloads.
+Enable with `--binder`. Attaches two binder tracepoints (the second is
+best-effort — a missing tracepoint is logged but does not abort attach):
 
-Each binder event has `syscall_nr == -1` (sentinel) and the fields come
-from `args[0..5]`:
+- `binder/binder_transaction` — caller side, `syscall_nr == -1`.
+- `binder/binder_transaction_received` — callee side, `syscall_nr == -4`.
+
+Each caller-side event captures the AIDL routing metadata into
+`args[0..5]`, and the kernel-assigned transaction `debug_id` into the
+`ptr_hint` field:
 
 ```
 args[0] = to_proc    (destination process PID)
@@ -144,7 +176,17 @@ args[2] = flags      (transaction flags)
 args[3] = to_thread  (0 = any thread)
 args[4] = reply      (0 = call, 1 = reply)
 args[5] = target_node
+ptr_hint = debug_id  (kernel transaction id; matching key for callee side)
 ```
+
+Each callee-side event carries only `debug_id` in `ptr_hint`; the
+callee `pid` / `comm` come from `bpf_get_current_*`. The userspace
+correlator pairs caller↔callee by `debug_id` to emit synthesised
+`type:"binder_call"` events with `caller_pid`, `callee_pid`,
+`latency_us`, and a lifecycle `status` (`completed` / `callee_crashed`
+/ `unmatched`). See
+[docs/REFERENCE.md](../REFERENCE.md#binder-call-event-type--binder_call)
+for the JSON schema.
 
 Text output:
 

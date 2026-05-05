@@ -25,12 +25,17 @@ JDWP, or static analysis (jadx, JEB).
 
 The `binder/binder_transaction` tracepoint exposes `to_proc`, `to_thread`,
 transaction `code`, `flags`, `target_node`, and `reply` — the **routing
-metadata**. It does **not** expose the serialized `Parcel` payload (the
+metadata**. The 1.1.0 binder correlator additionally pairs caller↔callee
+by `debug_id` to emit synthesised `type:"binder_call"` events with
+`caller_pid`, `callee_pid`, `code`, `latency_us`, and lifecycle `status`.
+
+What is still **not** exposed: the serialized `Parcel` payload (the
 actual AIDL arguments and return values).
 
-Decoding payloads in `BINDER_WRITE_READ` ioctl buffers is on the v1.2
-roadmap; until then, treat binder events as "who talked to whom about which
-interface code" rather than as RPC tracing.
+Decoding payloads in `BINDER_WRITE_READ` ioctl buffers is V2 territory
+(requires per-AIDL-interface unmarshalling); until then, treat binder
+events as "who talked to whom about which interface code, and how long
+it took" rather than as full RPC tracing.
 
 ### 3. Complete app → system service → driver causal chains
 
@@ -82,7 +87,7 @@ DMA-heap allocation request or a driver-specific buffer deeper than 124
 bytes is truncated. The truncation is recorded in the BPF `COUNTERS` map
 under `path_truncated` (slot reserved; instrumentation TODO).
 
-Sprint-1 PR 2 adds:
+1.1.0 ships:
 - a userspace decoder registry with typed views for known commands
   (today `DMA_HEAP_IOCTL_ALLOC`; binder / dma-buf / ashmem are
   classified to `ioctl_family` only);
@@ -94,7 +99,25 @@ Sprint-1 PR 2 adds:
 Long buffers (> 124 bytes) still truncate; broader cmd coverage and a
 larger `data[]` slot are tracked separately.
 
-### 7. Pre-attach activity
+### 7. BPF-side exit_code / exit_signal on `process_exit`
+
+The `sched/sched_process_exit` BPF tracepoint payload carries `comm`,
+`pid`, and scheduling priority — but **not** `exit_code` or
+`exit_signal`. Reading those from `task_struct` requires BTF and is
+deferred. As a result, the BPF source of `type:"process_exit"` events
+emits `exit_signal: 0` (the userspace formatter omits the field).
+
+The userspace logcat tail and tombstone watcher fill in signal info
+from their respective stream formats. On hosts where neither is
+available (host development, captures from devices without
+`/data/tombstones/`), `R003_process_crash` only fires if logcat is
+enabled and a fatal pattern (`FATAL EXCEPTION`, native `DEBUG`) is
+parsed.
+
+Adding a `task_struct->exit_code` BTF read to the BPF handler is V1.x
+backlog — see [docs/ROADMAP.md](ROADMAP.md).
+
+### 8. Pre-attach activity
 
 neutron captures events from the moment the BPF programs are attached.
 Activity that ran before `--pid <PID>` was issued (zygote initialization,

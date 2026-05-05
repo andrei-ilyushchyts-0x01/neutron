@@ -58,22 +58,32 @@ supported kernel:
 - `procfs` / `sysfs` / filesystem probes (self-inspection and cross-process)
 - memory permission transitions (RWX/WX mmap, mprotect)
 - selected socket activity (connect, bind, sendto, recvmsg)
-- selected `ioctl` activity (cmd + first 124 bytes of arg)
-- Binder transaction tracepoint metadata (target proc, transaction code,
-  flags, target node) — opt-in via `--binder`
+- `ioctl` activity with **typed userspace decoding** for known families
+  (DMA-heap allocations, binder write-read, ashmem control), including
+  post-exit re-read of return-write buffers
+- Binder transaction tracepoint metadata, **paired caller↔callee** by
+  `debug_id` into synthesised `binder_call` events with `latency_us` and
+  a lifecycle `status` (opt-in via `--binder`)
+- **Process termination** observed from three independent sources — the
+  `sched_process_exit` BPF tracepoint, the `logcat` tail (Java FATAL
+  EXCEPTION / native debuggerd / ANR), and a `/data/tombstones/` watcher.
+  Cross-correlated with binder causality to flag callee crashes
+  mid-transaction
+- **FD-table pressure** via a periodic `/proc/<pid>/fd` poller emitting
+  `fd_snapshot` events with `fd_count`, `fd_pct_of_rlimit`, growth rate,
+  and top-N path aggregation
 - user + kernel stack context where available (`--stacks`)
 
 neutron **cannot fully infer** today:
 
 - Java / Kotlin method-level behavior (no JVMTI / instrumentation)
-- full Binder Parcel contents (only the tracepoint metadata, not the
-  serialized arguments)
-- complete app → system service → driver causal chains
-- driver activity performed by `system_server`, `cameraserver`, or HAL
-  processes on behalf of the target app (those run in different PIDs and
-  must be explicitly attached to)
+- full Binder Parcel contents (only tracepoint metadata + the AIDL `code`;
+  serialized arguments are not decoded)
 - runtime behavior that stays entirely inside userspace without making
   syscalls (pure CPU work, intra-process method calls)
+- exit_code on the BPF `sched_process_exit` path — the tracepoint
+  payload does not carry it; userspace logcat / tombstone sources fill
+  in the signal info when available
 
 These limitations are tracked in [docs/LIMITATIONS.md](docs/LIMITATIONS.md);
 the cross-process causal-tracing roadmap lives in
@@ -110,6 +120,42 @@ A target that performs full environment fingerprinting (e.g. a
 hardened banking app that calls a remote attestation service) may notice
 these and refuse to run. neutron is meant for authorized assessment of
 applications you own or have written permission to test.
+
+## What's new in 1.1.0
+
+- **Crash correlation.** Three independent sources feed a unified
+  `type:"process_exit"` event: the `sched_process_exit` BPF tracepoint,
+  a logcat tail (FATAL EXCEPTION / debuggerd / ANR), and a
+  `/data/tombstones/` watcher. Each emitted line carries a
+  `crash_context` lookback (the last N raw events neutron observed for
+  the PID), making findings self-contained evidence. New rule
+  `R003_process_crash` fires on fatal POSIX signals.
+- **Binder causality.** A new `binder_transaction_received` tracepoint
+  pairs with the existing `binder_transaction` by kernel-assigned
+  `debug_id` to produce synthesised `type:"binder_call"` events with
+  `caller_pid`, `callee_pid`, `code`, `latency_us`, and a lifecycle
+  `status`. New rule `R004_binder_callee_crash` fires when a callee
+  crashed with one of our caller's transactions in flight — the
+  strongest signal that a specific AIDL method triggered a HAL crash.
+- **`neutron window` host subcommand.** Cuts NDJSON event windows around
+  an anchor (`finding:RULE`, `crash`, `pid:N`, `event_id:N`,
+  `comm:SUBSTR`, `binder_call:STATUS`) with time-based or event-count
+  bounds. See [docs/guides/window.md](docs/guides/window.md).
+- **HAL-level resource observability.** A periodic FD-graph poller emits
+  `type:"fd_snapshot"` events; a post-exit ioctl decoder registry
+  produces typed `dma_heap` JSON nested objects. Two new rules
+  (`R001_fd_table_exhaustion`, `R002_dma_heap_allocation_burst`) put
+  these signals to work.
+- **Finding aggregates + raw_window.** Findings carry an optional
+  `aggregates` block (`events_per_sec`, peak/distinct counters per
+  event kind) and an optional `raw_window` array of full NDJSON lines
+  from contributing events.
+- **Schema cleanup.** Every NDJSON line carries `"type"`; syscalls add
+  `"phase"`, exit events add `"ok"` / `"errno"`, and a monotonic
+  per-session `"event_id"` correlation token is stamped on every line.
+
+Wire format unchanged (still 257 bytes); all schema additions are
+additive. See [CHANGELOG.md](CHANGELOG.md).
 
 ## What's new in 1.0.0
 
@@ -203,33 +249,37 @@ per-device library layout.
 
 ## Default detector pack
 
-Twenty-two rules ship in [`neutron-rules/rules/default.yaml`](neutron-rules/rules/default.yaml),
+Twenty-six rules ship in [`neutron-rules/rules/default.yaml`](neutron-rules/rules/default.yaml),
 covering the patterns that almost always show up in hardened-app assessments:
 
-| ID    | Category        | What it catches                                           |
-|-------|-----------------|-----------------------------------------------------------|
-| T001  | root_detection  | Periodic `/proc/self/maps` polling                        |
-| T002  | root_detection  | Mount table inspection (Magisk overlay detection)         |
-| T003  | antitamper      | `/proc/self/status` (TracerPid scrape)                    |
-| T004  | root_detection  | `su` binary probe                                         |
-| T005  | root_detection  | Magisk artifact probe                                     |
-| T006  | antitamper      | Frida artifact probe                                      |
-| T007  | antitamper      | Xposed / EdXposed artifact probe                          |
-| T008  | root_detection  | `Runtime.exec` of root-related binaries                   |
-| T009  | antitamper      | `ptrace` syscall observed                                 |
-| T010  | antitamper      | `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)`                |
-| T011  | memory          | RWX or W^X-violating memory mapping                       |
-| T012  | network_recon   | `/proc/net/tcp*` enumeration (Frida-port scan)            |
-| T013  | antitamper      | SELinux enforcement state probe                           |
-| T014  | antitamper      | Android property service access                           |
-| T015  | recon           | Cross-process `/proc/<pid>/{maps,cmdline,exe}` reads      |
-| T016  | root_detection  | `fstatat` on `su` binary with `libc` on the stack         |
-| T017  | antitamper      | Syscalls from inside the ART JIT code cache               |
-| T018  | antitamper      | `ptrace` resolved to `sys_ptrace` from native code        |
-| T019  | recon           | `/system/lib64/*` probing excluding RenderScript / Skia   |
-| T020  | antitamper      | `/proc/self/{maps,status,...}` from anonymous executable mapping |
-| T021  | antitamper      | Frida thread-comm enumeration via `/proc/<pid>/task/<tid>/comm` |
-| T022  | antitamper      | `bpf(2)` syscall from a non-system app process            |
+| ID    | Category             | What it catches                                           |
+|-------|----------------------|-----------------------------------------------------------|
+| T001  | root_detection       | Periodic `/proc/self/maps` polling                        |
+| T002  | root_detection       | Mount table inspection (Magisk overlay detection)         |
+| T003  | antitamper           | `/proc/self/status` (TracerPid scrape)                    |
+| T004  | root_detection       | `su` binary probe                                         |
+| T005  | root_detection       | Magisk artifact probe                                     |
+| T006  | antitamper           | Frida artifact probe                                      |
+| T007  | antitamper           | Xposed / EdXposed artifact probe                          |
+| T008  | root_detection       | `Runtime.exec` of root-related binaries                   |
+| T009  | antitamper           | `ptrace` syscall observed                                 |
+| T010  | antitamper           | `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)`                |
+| T011  | memory               | RWX or W^X-violating memory mapping                       |
+| T012  | network_recon        | `/proc/net/tcp*` enumeration (Frida-port scan)            |
+| T013  | antitamper           | SELinux enforcement state probe                           |
+| T014  | antitamper           | Android property service access                           |
+| T015  | recon                | Cross-process `/proc/<pid>/{maps,cmdline,exe}` reads      |
+| T016  | root_detection       | `fstatat` on `su` binary with `libc` on the stack         |
+| T017  | antitamper           | Syscalls from inside the ART JIT code cache               |
+| T018  | antitamper           | `ptrace` resolved to `sys_ptrace` from native code        |
+| T019  | recon                | `/system/lib64/*` probing excluding RenderScript / Skia   |
+| T020  | antitamper           | `/proc/self/{maps,status,...}` from anonymous executable mapping |
+| T021  | antitamper           | Frida thread-comm enumeration via `/proc/<pid>/task/<tid>/comm` |
+| T022  | antitamper           | `bpf(2)` syscall from a non-system app process            |
+| R001  | resource_exhaustion  | FD table > 90% of `RLIMIT_NOFILE` (FD-graph poller)       |
+| R002  | resource_exhaustion  | DMA-heap allocation burst (50+ in 5 s)                    |
+| R003  | crash                | Process killed by fatal signal (SEGV/ABRT/BUS/ILL/FPE/SYS)|
+| R004  | crash                | Binder callee crashed mid-transaction                     |
 
 A separate DexProtector RASP pack (`DP001`–`DP008`) is bundled at
 `neutron-rules/rules/dexprotector-rasp.yaml`.
@@ -241,20 +291,36 @@ reference.
 ## Architecture
 
 ```
-┌──────────────────────────────────┐  ring buffer  ┌─────────────────────┐
-│ neutron-ebpf (aya-ebpf, Rust)    │──events─────▶ │ neutron (Aya loader)│
-│ tracepoints: sys_enter/sys_exit, │               │ src/main.rs         │
-│ binder_transaction (optional)    │               └────────┬────────────┘
-└──────────────────────────────────┘                        │ events (JSON)
-                                                            ▼
-                                                  ┌─────────────────────┐
-                                                  │   neutron-rules     │
-                                                  │ MatchCondition →    │
-                                                  │ Finding queue       │
-                                                  └────────┬────────────┘
-                                                           │ findings
-                                                           ▼
-                                                       text / NDJSON
+┌────────────────────────────────────────┐  ring buffer  ┌──────────────────────────┐
+│ neutron-ebpf (aya-ebpf, Rust)          │──events─────▶ │ neutron (Aya loader)     │
+│ tracepoints:                           │               │ src/main.rs              │
+│   raw_syscalls/sys_{enter,exit}        │               │ ┌──────────────────────┐ │
+│   sched/sched_process_exit             │               │ │ FD-graph poller      │ │
+│   binder/binder_transaction            │               │ │ Binder tracker       │ │
+│   binder/binder_transaction_received   │               │ │ Tombstone watcher    │ │
+└────────────────────────────────────────┘               │ │ Logcat tail          │ │
+                                                         │ │ Lookback ring buffer │ │
+                                                         │ └──────────┬───────────┘ │
+                                                         └────────────┼─────────────┘
+                                                                      │ events (JSON)
+                                                                      ▼
+                                                            ┌─────────────────────┐
+                                                            │   neutron-rules     │
+                                                            │ MatchCondition →    │
+                                                            │ Finding queue +     │
+                                                            │ aggregates +        │
+                                                            │ raw_window          │
+                                                            └─────────┬───────────┘
+                                                                      │ findings
+                                                                      ▼
+                                                                 text / NDJSON
+                                                                      │
+                                                                      ▼
+                                                            ┌─────────────────────┐
+                                                            │ neutron window      │
+                                                            │ (host-side post-    │
+                                                            │  processor)         │
+                                                            └─────────────────────┘
 ```
 
 - `neutron-ebpf/` — Aya BPF programs compiled to `bpfel-unknown-none`.
@@ -292,6 +358,7 @@ device baseline (kernel config, mountpoints, sysctls).
 - [docs/guides/bpf-tracing.md](docs/guides/bpf-tracing.md) — profiles, filtering, capture, stacks
 - [docs/guides/writing-rules.md](docs/guides/writing-rules.md) — author your own detectors
 - [docs/guides/output-formats.md](docs/guides/output-formats.md) — text + JSON schemas
+- [docs/guides/window.md](docs/guides/window.md) — host-side `neutron window` post-processor
 - [docs/guides/frida-integration.md](docs/guides/frida-integration.md) — Frida + BPF workflows
 - [docs/REFERENCE.md](docs/REFERENCE.md) — CLI flags, JSON schema, syscall table
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — internals

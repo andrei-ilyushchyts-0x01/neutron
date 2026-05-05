@@ -5,7 +5,7 @@
 .\"   sudo install -m 0644 man/man1/neutron.1 /usr/local/share/man/man1/
 .\"   sudo mandb        # rebuild the man index
 .\"
-.TH NEUTRON 1 "2026-04-29" "neutron 1.0.0" "User Commands"
+.TH NEUTRON 1 "2026-05-05" "neutron 1.1.0" "User Commands"
 .\" -----------------------------------------------------------------
 .SH NAME
 neutron \- low-intrusion eBPF syscall tracer for authorized Android
@@ -27,6 +27,12 @@ security assessment
 .RI [ OTHER\ OPTIONS ]
 .PP
 .B neutron doctor
+.PP
+.B neutron window
+.I CAPTURE
+.B \-\-anchor
+.IR SPEC
+.RI [ WINDOW\ OPTIONS ]
 .\" -----------------------------------------------------------------
 .SH DESCRIPTION
 .B neutron
@@ -41,6 +47,8 @@ every 2 seconds",
 "this app probed
 .IR /system/xbin/su
 from a libc-rooted call stack",
+"this process crashed with SIGSEGV holding an in-flight binder transaction
+to the camera HAL",
 or "this app allocated RWX memory") instead of dumping multi-megabyte raw
 event logs.
 .PP
@@ -83,11 +91,26 @@ and
 .IR raw_syscalls/sys_exit
 tracepoints, the
 .IR binder/binder_transaction
-tracepoint (warning if missing), kallsyms readability, and SELinux mode.
+and
+.IR binder/binder_transaction_received
+tracepoints (warning if missing), the
+.IR sched/sched_process_exit
+tracepoint, kallsyms readability, and SELinux mode.
 Each check reports
 .BR PASS ", " WARN ", or " FAIL ;
 the command exits non-zero if any check is
 .BR FAIL .
+.TP
+.BI window " CAPTURE \-\-anchor SPEC " [\fB\-\-before\fR " DUR" "] [\fB\-\-after\fR " DUR" "] [...]"
+Host-side post-processor that cuts windows of NDJSON events around an
+anchor from a previously-captured trace file. Reads
+.I CAPTURE
+(or
+.B -
+for stdin) and writes the merged windows to standard output.
+See the
+.B WINDOW SUBCOMMAND
+section.
 .PP
 When no subcommand is given,
 .B neutron
@@ -156,10 +179,6 @@ profile is recognised; it pre-populates
 with a small set of high-volume Android system threads
 .RI ( "RenderThread, FrameMetricsAgg, PerfStat, Profile Saver, Jit thread pool" )
 that drown the trace in idle noise but never carry security-relevant signal.
-Future versions will add
-.BR runtime ", " ipc ", " drivers ", " memory ", and " raw
-profiles \(em see
-.IR docs/ROADMAP.md .
 .TP
 .BI \-\-exclude\-comm " LIST"
 Comma-separated substring matches; any event whose
@@ -176,11 +195,27 @@ Attach the
 .I binder/binder_transaction
 tracepoint program in addition to
 .IR raw_syscalls/sys_{enter,exit} .
-Binder events are emitted with
+Also attaches
+.I binder/binder_transaction_received
+when the kernel exposes it (best-effort; failure is logged but does not
+abort).
+Caller-side binder events use
 .B nr=\-1
-as a sentinel and decoded by the userspace
-.I src/decode/binder.rs
-formatter.
+as a sentinel; callee-side events use
+.B nr=\-4
+and emit the
+.B type:"binder_received"
+JSON line. The two are paired by
+.B debug_id
+(carried in the
+.B ptr_hint
+wire field) to produce synthesised
+.B type:"binder_call"
+events with
+.BR caller_pid ", " callee_pid ", " code ", " latency_us ", and " status .
+See the
+.B BINDER CAUSALITY
+section.
 .TP
 .B \-\-stacks
 Resolve kernel and user stacks for every event via the BPF
@@ -191,7 +226,7 @@ Native ELF symbols are read with
 .IR /proc/kallsyms
 provides kernel frames; ART JIT regions render as
 \fB<JIT>+0xN\fR.
-Required for stack-aware rules (T016\(enT020).
+Required for stack-aware rules (T016\(enT021).
 .TP
 .B \-\-resolve\-paths
 On
@@ -227,15 +262,14 @@ record the buffer pointer in the event's
 field for downstream tooling.
 The buffer contents themselves are
 .B not
-captured
-.RI ( "post-PAN, the userspace " process_vm_readv " peek was removed" ).
+captured.
 .SS Rule engine
 .TP
 .BI \-\-rules " FILE"
 Path to a custom YAML rule file.
 Defaults to the bundled detector pack
-(22 starter rules \(em see
-.IR docs/guides/writing-rules.md ).
+(26 rules \(em see
+.IR docs/REFERENCE.md ).
 .TP
 .BI \-\-findings\-drain\-interval " N"
 Print drained findings every
@@ -244,6 +278,94 @@ events.
 Default
 .BR 256 .
 Lower values surface findings sooner at the cost of more wakeups.
+.TP
+.BI \-\-finding\-raw\-window " N"
+Per-finding
+.B raw_window
+length \(em number of full NDJSON lines from contributing events embedded
+in each emitted finding. Default
+.BR 10 .
+.B 0
+disables raw-line capture; the
+.B aggregates
+block (per-finding numerical roll-up) still populates.
+.SS FD-graph poller
+.TP
+.BI \-\-fdgraph\-pids " POLICY"
+Periodic FD-poller scope. One of:
+.BR traced ,
+.BR active
+(default \(em explicit
+.B \-\-pid
+plus PIDs that produced a traced event),
+.BR uid
+(reserved; falls back to
+.BR active
+with a warning), or
+.BR all
+(every
+.IR /proc/<NUM> ;
+heavy).
+.TP
+.BI \-\-fdgraph\-interval " DURATION"
+Poller cadence:
+.BR 1s ,
+.BR 500ms ,
+or
+.B off
+to disable polling entirely. Default
+.BR 1s .
+.TP
+.BI \-\-fdgraph\-thresholds " TIERS"
+Comma-separated FD-count alert tiers (e.g.
+.BR 1024,8192,90% ).
+Parsed for forward-compatibility; current rules carry their own thresholds.
+.TP
+.BI \-\-fdgraph\-top\-paths\-n " N"
+Top-N
+.IR /proc/<pid>/fd/<fd>
+readlink aggregation per snapshot. Default
+.B 0
+disables. Set to e.g.
+.B 5
+to populate the
+.B top_paths
+field on every
+.B fd_snapshot
+JSON line.
+.SS Crash correlation
+.TP
+.BI \-\-lookback\-events " N"
+Per-PID ring-buffer depth dumped into the
+.B crash_context
+field on
+.B process_exit
+events. Default
+.BR 100 .
+.B 0
+disables lookback.
+.TP
+.BI \-\-tombstone\-dir " PATH"
+Directory the tombstone watcher polls at 1 Hz. Default
+.IR /data/tombstones .
+Empty string disables. On hosts without the directory the watcher silently
+no-ops.
+.TP
+.B \-\-no\-logcat
+Skip spawning the
+.B logcat
+tail. Useful on hosts without the Android
+.B logcat
+binary in PATH, or when the logcat overhead is undesirable.
+.SS Binder causality
+.TP
+.BI \-\-binder\-inflight " N"
+Maximum in-flight binder transactions tracked by the userspace correlator.
+Default
+.BR 1024 .
+.B 0
+disables the correlator (raw binder / binder_received events still flow).
+LRU eviction when the cap is exceeded.
 .SS Build artefacts
 .TP
 .BI \-\-object " PATH"
@@ -265,6 +387,121 @@ The kernel
 .B RingBuf
 size is fixed in the BPF object.
 .\" -----------------------------------------------------------------
+.SH WINDOW SUBCOMMAND
+.B neutron window
+cuts time- or event-bounded windows of NDJSON events around an
+.I anchor
+from a previously captured trace.
+It is the host-side companion of the in-memory
+.B crash_context
+lookback that ships in
+.B process_exit
+events; the same intuition, but operating on the full capture file
+instead of the bounded ring buffer.
+.PP
+.SS Anchors
+One or more
+.B \-\-anchor
+flags. Each match becomes its own anchor; the resulting windows are merged.
+Specs:
+.IP \(bu
+.BR finding: \fIRULE_ID\fR
+\(em every
+.B type:"finding"
+with matching
+.BR rule_id .
+.IP \(bu
+.B crash
+\(em every
+.B type:"process_exit"
+with
+.BR classification:"crash" .
+.IP \(bu
+.BR pid: \fIN\fR
+\(em any event with
+.B pid==N
+(also matches
+.B caller_pid
+on
+.BR binder_call ).
+.IP \(bu
+.BR event_id: \fIN\fR
+\(em single event by the monotonic correlation token.
+.IP \(bu
+.BR comm: \fISUBSTRING\fR
+\(em events whose
+.B comm
+or
+.B caller_comm
+contains the substring.
+.IP \(bu
+.BR binder_call: \fISTATUS\fR
+\(em
+.B type:"binder_call"
+with matching
+.B status
+.RB ( completed ", " callee_crashed ", " unmatched ).
+.SS Window sizing
+Time-based and event-count windows are mutually exclusive \(em pick one.
+.TP
+.BI \-\-before " DURATION"
+.PD 0
+.TP
+.BI \-\-after " DURATION"
+.TP
+.BI \-\-around " DURATION"
+.PD
+Time grammar:
+.BR 5s ,
+.BR 500ms ,
+.BR 100us ,
+.BR 1000ns .
+.B \-\-around X
+is shorthand for
+.BR "\-\-before X \-\-after X" .
+.TP
+.BI \-\-before\-events " N"
+.PD 0
+.TP
+.BI \-\-after\-events " N"
+.TP
+.BI \-\-around\-events " N"
+.PD
+Pure index arithmetic, ignores timestamps.
+.PP
+Default when no flag is supplied:
+.B 100 events on each side
+\(em matches the
+.B \-\-lookback\-events
+default.
+.SS Output
+Default output is NDJSON of every line in the merged windows, in the
+original capture order. Overlapping or adjacent windows are merged and
+deduplicated.
+.TP
+.B \-\-summary
+Print one line per merged window instead of the raw NDJSON, format:
+.IR "[<from_ts>..<to_ts>] events=<N> anchors=<spec_list>" .
+.SS Window examples
+.PP
+.EX
+\&# 5-second window (\(+-) around every R003 finding.
+neutron window cap.ndjson \-\-anchor finding:R003_process_crash \-\-around 5s
+
+\&# 100 events before / 50 after every crash.
+neutron window cap.ndjson \-\-anchor crash \-\-before-events 100 \-\-after-events 50
+
+\&# Pipe windows back into the rule engine for re-analysis.
+neutron window cap.ndjson \-\-anchor crash \-\-around 5s \\
+  | neutron \-\-raw \-\-json \-\-rules custom-rules.yaml
+
+\&# Summary-only of all crash + service-side windows.
+neutron window cap.ndjson \\
+  \-\-anchor comm:surfaceflinger \\
+  \-\-anchor crash \\
+  \-\-around 1s \-\-summary
+.EE
+.\" -----------------------------------------------------------------
 .SH OUTPUT FORMATS
 .SS Text (default)
 One line per event, columns
@@ -275,43 +512,201 @@ One line per event, columns
 .IR syscall ( decoded\ args ).
 Findings render as multi-line blocks prefixed
 .BR [FINDING] .
-.SS NDJSON ( \fB--json\fR )
-One JSON object per line.
-Stable fields per event:
-.IP
-.EX
-{
-  "ts_ns":         u64,
-  "pid":           u32,    // userspace PID (kernel tgid)
-  "tid":           u32,    // userspace TID (kernel pid)
-  "uid":           u32,
-  "nr":            i32,    // -1 sentinel for binder events
-  "name":          str,    // e.g. "openat"
-  "comm":          str,
-  "enter":         bool,
-  "ret":           i64,
-  "args":          [u64; 6],
-  "data":          ?str,   // decoded path / sockaddr / ioctl payload
-  "fd_kind":       ?str,   // file/device/socket/binder/... when graph hit
-  "fd_path":       ?str,   // resolved fd target
-  "rwx_alert":     ?str,   // "RWX" | "WX"
-  "kernel_stackid":?i32,
-  "user_stackid":  ?i32,
-  "stack":         ?str,   // present when --stacks
-  "latency_us":    ?u64,   // exit events only
-  "enter_ts_ns":   ?u64    // exit events only
-}
-.EE
-.IP
-Findings have a separate object schema; see
-.IR neutron-rules/src/finding.rs .
-Each finding carries
-.BR rule_id ", " severity ", " category ", " "(schema v2)" " "
-.BR behavior ", " "interpretation[]" ", " confidence ", " false_positives ", "
-.BR evidence_quality ,
-and a
-.B capture_health
-sub-object.
+.SS NDJSON ( \fB\-\-json\fR )
+One JSON object per line. The schema covers four event kinds.
+.PP
+.B Syscall events
+carry
+.BR ts_ns ", " pid ", " tid ", " uid ", " nr ", " name ", " comm ", "
+.BR phase ", " ret ", " ok ", " errno ", " "args[6]" ", " data ", " fd_kind ", "
+.BR fd_path ", " rwx_alert ", " stack ", " latency_us ", " enter_ts_ns ", and "
+.BR event_id .
+For
+.BR ioctl (2)
+exits the userspace decoder may add
+.BR "type:\(dqsyscall\(dq" ", " ioctl_family ", " ioctl_name ", and a typed nested object "
+.RB ( dma_heap ", etc.) plus " "data_phase:\(dqexit\(dq" .
+.PP
+.B FD snapshot events
+.RB ( "type:\(dqfd_snapshot\(dq" )
+emit one per in-scope PID per
+.B \-\-fdgraph\-interval
+tick. Carry
+.BR fd_count ", " fd_rlimit ", " fd_pct_of_rlimit ", " high_water_mark ", "
+.BR growth_rate_per_sec ", and " top_paths .
+Drives R001-class rules.
+.PP
+.B Process exit events
+.RB ( "type:\(dqprocess_exit\(dq" )
+fire from three independent sources \(em the BPF
+.B sched_process_exit
+tracepoint, the
+.B logcat
+tail (FATAL EXCEPTION / debuggerd / ANR), and the tombstone watcher.
+Carry
+.BR source ", " classification ", " exit_signal ", " signal_name ", " exit_code ", and "
+.BR crash_context
+(the per-PID lookback ring buffer dump). See
+.BR CRASH\ CORRELATION .
+.PP
+.B Binder call events
+.RB ( "type:\(dqbinder_call\(dq" )
+are synthesised by the userspace correlator from caller-side
+.B binder_transaction
+and callee-side
+.B binder_transaction_received
+events. Carry
+.BR debug_id ", " caller_pid ", " caller_uid ", " caller_comm ", " callee_pid ", "
+.BR code ", " flags ", " reply ", " sent_ts_ns ", " received_ts_ns ", " latency_us ", and "
+.BR status
+.RB ( "completed | callee_crashed | unmatched" ).
+.PP
+.B Findings
+.RB ( "type:\(dqfinding\(dq" )
+add
+.BR rule_id ", " rule_name ", " severity ", " category ", " event_count ", "
+.BR first_seen_ms ", " last_seen_ms ", " period_ms ", " evidence ", " behavior ", "
+.BR "interpretation[]" ", " confidence ", " false_positives ", " evidence_quality ", "
+.BR capture_health ", " aggregates ", and " raw_window .
+The last two are populated by the engine at flush time \(em see
+.BR "FINDING AGGREGATES" .
+.PP
+For full schema tables see
+.IR docs/REFERENCE.md " and " docs/guides/output-formats.md .
+.\" -----------------------------------------------------------------
+.SH FINDING AGGREGATES
+Every finding carries an optional
+.B aggregates
+sub-object computed from the contributing events.
+Whichever fields apply to the matched event kinds populate; the rest are
+omitted from the JSON.
+.IP \(bu
+.BR events_per_sec ", " min_interval_ms ", " max_interval_ms
+\(em populated when at least two events matched within a non-zero span.
+.IP \(bu
+.B distinct_targets
+\(em count of distinct
+.B data
+strings observed.
+.IP \(bu
+.BR peak_fd_count ", " peak_fd_pct_of_rlimit
+\(em populated when the contributing events were
+.BR fd_snapshot .
+.IP \(bu
+.BR distinct_callee_pids ", " distinct_binder_codes
+\(em populated when the contributing events were
+.BR binder_call .
+.PP
+The
+.B raw_window
+array embeds up to
+.B \-\-finding\-raw\-window
+(default 10) full NDJSON lines from contributing events, byte-exact, so
+downstream tools can re-parse with the same parser as the live capture.
+Distinct-set trackers cap at 1024 entries per finding to bound memory on
+runaway rules.
+.\" -----------------------------------------------------------------
+.SH CRASH CORRELATION
+Three independent sources feed the
+.B type:"process_exit"
+event class:
+.IP \(bu
+.B BPF tracepoint:
+.IR sched/sched_process_exit
+fires for every task termination (normal exit, fatal signal, SIGKILL,
+OOM kill). The handler stamps
+.B source:"tracepoint"
+on the emitted line. Always available; carries no signal info because
+reading
+.B task_struct->exit_code
+requires BTF and is deferred.
+.IP \(bu
+.B Logcat tail:
+spawns
+.B logcat -v threadtime *:F
+and parses Java
+.B FATAL EXCEPTION
+blocks, native debuggerd
+.B DEBUG
+crash blocks, and
+.B ANR in
+lines. Stamps
+.BR source:"logcat" .
+.IP \(bu
+.B Tombstone watcher:
+polls
+.IR /data/tombstones/
+at 1 Hz, parses pid/signal/comm from the canonical header. Stamps
+.BR source:"tombstone" .
+.PP
+The three sources typically all fire for a single SIGSEGV within
+milliseconds. Per-process aggregation in the rule engine collapses the
+fan-out;
+.BR R003_process_crash
+fires once per PID.
+.PP
+The
+.B crash_context
+field on each emitted line carries the last
+.B \-\-lookback\-events
+NDJSON lines that neutron observed for the PID before the exit, making
+each finding self-contained evidence.
+.\" -----------------------------------------------------------------
+.SH BINDER CAUSALITY
+With
+.B \-\-binder
+plus the
+.I binder_transaction_received
+tracepoint (auto-attached when present), the userspace correlator pairs
+caller-side and callee-side binder events by the kernel-assigned
+.BR debug_id .
+On match it emits a synthesised
+.B type:"binder_call"
+NDJSON line with
+.B status:"completed"
+and the measured
+.BR latency_us .
+.PP
+When a callee crashes (any
+.B process_exit
+with
+.BR classification:"crash" ),
+the correlator drains every in-flight transaction whose
+.B callee_pid
+matches the dying PID and emits each as
+.BR status:"callee_crashed" .
+This drives
+.BR R004_binder_callee_crash ,
+the strongest signal that a specific AIDL transaction triggered a HAL or
+service crash.
+.\" -----------------------------------------------------------------
+.SH DEFAULT DETECTOR PACK
+26 rules ship in
+.IR neutron-rules/rules/default.yaml :
+T001\(enT022 (legacy anti-tamper / root-detection / recon / memory),
+R001 (FD table > 90% of rlimit, FD-graph poller),
+R002 (DMA-heap allocation burst, post-ioctl decoder),
+R003 (process killed by fatal signal, three crash sources),
+R004 (binder callee crashed mid-transaction).
+A separate DexProtector RASP pack
+.RB ( "DP001\(enDP008" )
+is bundled at
+.IR neutron-rules/rules/dexprotector-rasp.yaml .
+.PP
+T016\(enT021 require
+.BR \-\-stacks .
+R001 requires the FD-graph poller (default on, controlled by
+.BR \-\-fdgraph\-pids " / " \-\-fdgraph\-interval ).
+R002 requires post-exit ioctl decoding (always on for whitelisted commands).
+R003 requires the
+.B sched_process_exit
+tracepoint (always attached) plus the lookback ring buffer
+.RB ( \-\-lookback\-events )
+and at least one userspace crash source for signal info.
+R004 requires
+.B \-\-binder
+plus
+.BR "\-\-binder\-inflight > 0" .
 .\" -----------------------------------------------------------------
 .SH CAPTURE SUMMARY
 On exit (or
@@ -362,6 +757,20 @@ With
 a missing entry is backfilled via a single
 .IR /proc/<pid>/fd/<fd>
 readlink and the miss + backfill counts are surfaced in the capture summary.
+.PP
+A separate periodic poller (
+.BR \-\-fdgraph\-interval ,
+default
+.B 1s
+) reads
+.IR /proc/<pid>/fd
+and
+.IR /proc/<pid>/limits
+for in-scope PIDs and emits
+.B type:"fd_snapshot"
+events with the authoritative count, RLIMIT_NOFILE, high-water mark,
+and growth rate. These feed
+.BR R001_fd_table_exhaustion .
 .\" -----------------------------------------------------------------
 .SH EXIT STATUS
 .TP
@@ -369,12 +778,16 @@ readlink and the miss + backfill counts are surfaced in the capture summary.
 Trace mode exited cleanly (operator sent SIGINT, or input EOF).
 .B doctor
 finished with no FAIL checks.
+.B window
+finished with at least one matched anchor.
 .TP
 .B 1
 A required BPF map or program could not be loaded; an attach failed; the BPF
 object did not parse;
 .B doctor
-recorded at least one FAIL.
+recorded at least one FAIL;
+.B window
+hit an I/O error or invalid anchor spec.
 .\" -----------------------------------------------------------------
 .SH ENVIRONMENT
 .TP
@@ -403,10 +816,17 @@ Required tracepoints.
 .B doctor
 verifies presence.
 .TP
-.I /sys/kernel/tracing/events/binder/binder_transaction
+.I /sys/kernel/tracing/events/binder/binder_{transaction,transaction_received}
 Required only when
 .B \-\-binder
-is given.
+is given. The
+.I _received
+variant is best-effort \(em a missing tracepoint is logged but does not
+abort attach (the userspace correlator simply never matches and R004
+stays silent).
+.TP
+.I /sys/kernel/tracing/events/sched/sched_process_exit
+Required for crash correlation. Always attached.
 .TP
 .I /proc/kallsyms
 Read once at start when
@@ -416,15 +836,21 @@ A masked kallsyms (kptr_restrict \(>= 1) leaves kernel frames as raw hex.
 .TP
 .I /proc/<pid>/maps
 Read per-PID for native ELF stack symbolization.
-Currently parsed once at first event for that PID; the v1.1 ProcSymbolizer
-will refresh on
-.BR mmap ", " munmap ", and " mprotect
-events.
 .TP
 .I /proc/<pid>/fd/<fd>
 Read on demand by the FD-graph fallback when
 .B \-\-resolve\-paths
-is set and a fd is referenced before its open was observed.
+is set, and periodically by the FD-poller for in-scope PIDs.
+.TP
+.I /proc/<pid>/limits
+Read by the FD-poller to extract
+.BR RLIMIT_NOFILE .
+.TP
+.I /data/tombstones/
+Polled by the tombstone watcher when
+.B \-\-tombstone\-dir
+is non-empty (default). Missing on hosts without Android crash reporting;
+the watcher silently no-ops.
 .\" -----------------------------------------------------------------
 .SH EXAMPLES
 .SS Quick start (one rooted Pixel)
@@ -446,8 +872,18 @@ adb shell su -c "/data/local/tmp/neutron \\
 .EX
 adb shell su -c "/data/local/tmp/neutron --pid $PID --json --binder" \\
     > app-trace.ndjson
-# inspect later, optionally re-run the rule engine offline:
-neutron --raw --no-findings < app-trace.ndjson
+# Cut a 5-second window around every crash:
+neutron window app-trace.ndjson --anchor crash --around 5s
+.EE
+.SS Investigate a HAL crash triggered by a specific app
+.PP
+.EX
+adb shell su -c "/data/local/tmp/neutron --pid 0 --json --binder \\
+    --profile security" > capture.ndjson
+# After a crash, find the binder transactions in flight when it fired:
+neutron window capture.ndjson \\
+    --anchor finding:R004_binder_callee_crash \\
+    --around 2s
 .EE
 .SS Self-test on the demo target
 .PP
@@ -482,7 +918,7 @@ The single source of truth is
 .B SyscallEvent
 in
 .IR neutron-common/src/lib.rs .
-v1.0.0 wire format is
+v1.0 wire format is
 .B 257 bytes
 .RB ( "#[repr(C, packed)]" ),
 verified at compile time by an assertion in both the BPF and userspace
@@ -490,6 +926,19 @@ crates.
 A wire-format change requires bumping both assertions and the version note
 in
 .IR CHANGELOG.md .
+.PP
+Sprint-2 introduced three additional synthetic
+.B syscall_nr
+sentinels in the same wire layout (no struct bump):
+.BR \-2
+.RB ( fd_snapshot ),
+.BR \-3
+.RB ( process_exit ),
+and
+.BR \-4
+.RB ( binder_transaction_received ).
+.B \-1
+remains the legacy binder caller sentinel.
 .PP
 The
 .B pid
@@ -510,6 +959,16 @@ distinct per thread.
 The BPF source uses self-documenting local names
 .RB ( userspace_pid ", " userspace_tid )
 to avoid confusion.
+.PP
+The
+.B ptr_hint
+wire field carries the binder
+.B debug_id
+on
+.B nr=\-1
+and
+.B nr=\-4
+events so the userspace correlator can pair them by ID.
 .\" -----------------------------------------------------------------
 .SH LIMITATIONS
 .B neutron
@@ -518,18 +977,22 @@ cannot fully infer:
 Java/Kotlin method-level behaviour (no JVMTI / instrumentation; pair with
 Frida).
 .IP \(bu
-Full Binder Parcel contents (only tracepoint metadata; v1.2 will decode
-BINDER_WRITE_READ).
-.IP \(bu
-Complete app
-.RI \(-> "system service" \(->
-driver causal chains (driver work happens in
-.BR system_server ", " cameraserver ", "
-HAL processes; v2.0 will support multi-PID attach + binder transaction
-stitching).
+Full Binder Parcel contents (only tracepoint metadata + the AIDL
+.B code
+on
+.BR binder_call ;
+the serialized arguments are not decoded).
 .IP \(bu
 Runtime behaviour fully inside userspace without syscalls (intra-process
 method calls, in-process decryption of already-mapped pages).
+.IP \(bu
+.B exit_code
+on the BPF
+.B sched_process_exit
+path \(em the tracepoint payload does not carry it. Userspace logcat /
+tombstone sources fill in
+.B exit_signal
+when available.
 .PP
 See
 .IR docs/LIMITATIONS.md
@@ -577,12 +1040,12 @@ Project documentation:
 .IR docs/guides/security-assessment.md ,
 .IR docs/guides/writing-rules.md ,
 .IR docs/guides/output-formats.md ,
+.IR docs/guides/window.md ,
 .IR docs/REFERENCE.md ,
 .IR docs/ARCHITECTURE.md ,
 .IR docs/LIMITATIONS.md ,
 .IR docs/FALSE-POSITIVES.md ,
-.IR docs/devices/pixel8pro.md ,
-.IR docs/benchmarks/pixel8pro-v1.0.md .
+.IR docs/devices/pixel8pro.md .
 .\" -----------------------------------------------------------------
 .SH BUGS
 Report at the project's issue tracker.

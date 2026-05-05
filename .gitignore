@@ -59,3 +59,11 @@ venv/
 # Misc
 *.bak
 *.tmp
+
+# Local-only planning / design scratch — NEVER commit these.
+# Sprint plans, design docs, roadmap drafts, and similar in-progress
+# planning markdown are session-local artefacts and do not belong in
+# the repository. Outcome-level docs (CHANGELOG, ROADMAP, REFERENCE,
+# guides, man page) are the appropriate places to surface decisions.
+plans/
+design/

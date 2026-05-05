@@ -5,6 +5,119 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-05-05
+
+Two-sprint additive release. Wire format is unchanged (`SyscallEvent` is
+still 257 bytes); JSON schema gains four new event types and several
+new finding fields; rule pack grows from 22 to 26 detectors.
+
+### Sprint 1 — HAL / binder tracing infrastructure
+
+- **Schema cleanup.** Every NDJSON line carries `"type"` (`"syscall"` /
+  `"binder"`); syscalls add `"phase":"enter"|"exit"`. Exit events add
+  `"ok":bool` and `"errno":N` (when `ret < 0`). A monotonic
+  per-session `"event_id":u64` correlation token is stamped on every
+  emitted line. ioctl events get `"data_phase":"enter"|"exit"`.
+- **Post-exit ioctl decoder registry.** The BPF programs now re-read
+  the user buffer on `sys_exit` for whitelisted ioctl families
+  (`_IOC_DIR ∈ {R, RW}` and `_IOC_TYPE ∈ {dma_heap, binder/dma_buf,
+  ashmem}`). Userspace decodes known commands into typed nested JSON
+  objects: `ioctl_family`, `ioctl_name`, `dma_heap` (with `len`,
+  `returned_fd`, `fd_flags`, `heap_flags`).
+- **FD-graph poller.** A dedicated thread polls
+  `/proc/<pid>/fd` and `/proc/<pid>/limits` for in-scope PIDs and emits
+  `type:"fd_snapshot"` events with `fd_count`, `fd_rlimit`,
+  `fd_pct_of_rlimit`, `high_water_mark`, `growth_rate_per_sec`, and
+  `top_paths`. Scope policies: `traced` / `active` (default) /
+  `uid` (reserved) / `all`. Configurable interval (default `1s`).
+- **`R001_fd_table_exhaustion`** — fires when `fd_pct_of_rlimit > 90`
+  on any `fd_snapshot`. New `Category::ResourceExhaustion`.
+- **`R002_dma_heap_allocation_burst`** — fires after 50
+  `DMA_HEAP_IOCTL_ALLOC` calls within a 5-second window per process.
+- **New rule predicates:** `fd_snapshot`, `fd_count_gt`,
+  `fd_count_pct_of_rlimit_gt`, `ioctl_family_in`, `ioctl_name_in`.
+- **CLI:** `--fdgraph-pids`, `--fdgraph-interval`,
+  `--fdgraph-thresholds`, `--fdgraph-top-paths-n`.
+- **`xtask demo-hal`** host fixture: synthesised `SyscallEvent`s
+  pipe through the formatter and diff against
+  `examples/expected/dma-heap.ndjson`.
+
+### Sprint 2 — crash + binder causality + host post-processor
+
+- **Three crash sources** feed a unified `type:"process_exit"` event:
+  the `sched/sched_process_exit` BPF tracepoint, a logcat tail (Java
+  `FATAL EXCEPTION` / native debuggerd / ANR), and a
+  `/data/tombstones/` watcher. Per-process aggregation in the rule
+  engine collapses the typical fan-out (one SIGSEGV → three events
+  → one finding).
+- **`crash_context` lookback ring buffer.** Every emitted JSON line is
+  pushed into a per-PID bounded ring (default 100 lines × 200 PIDs).
+  On `process_exit` the buffer is dumped into the `crash_context`
+  array on the emitted line, making each crash record self-contained
+  evidence. CLI: `--lookback-events`, `--tombstone-dir`, `--no-logcat`.
+- **`R003_process_crash`** — severity `critical`, fires on fatal POSIX
+  signals (SEGV / ABRT / BUS / ILL / FPE / SYS). New
+  `Category::Crash`.
+- **Binder causality.** A new `binder/binder_transaction_received`
+  tracepoint pairs with the existing `binder_transaction` by
+  `debug_id` (carried in `ptr_hint`, no wire bump). The userspace
+  correlator emits synthesised `type:"binder_call"` events with
+  `caller_pid`, `callee_pid`, `code`, `flags`, `latency_us`, and a
+  lifecycle `status` (`completed` / `callee_crashed` / `unmatched`).
+  When a callee crashes, in-flight transactions are flushed with
+  `status:"callee_crashed"`. CLI: `--binder-inflight` (default 1024).
+- **`R004_binder_callee_crash`** — severity `high`, fires when a
+  callee crashed mid-transaction.
+- **New rule predicates:** `process_exit`, `exit_signal_in`,
+  `exit_classification_in`, `exit_source_in`, `binder_call`,
+  `binder_status_in`, `binder_code_in`.
+- **`neutron window` host-side subcommand.** Cuts NDJSON event windows
+  around an anchor (`finding:RULE_ID`, `crash`, `pid:N`,
+  `event_id:N`, `comm:SUBSTRING`, `binder_call:STATUS`) with either
+  time-based (`--before 5s --after 1s` / `--around 2s`) or event-count
+  (`--before-events 100 --after-events 50` / `--around-events 100`)
+  windows. Output is NDJSON in original order, deduplicated; or
+  `--summary` for a one-line-per-window roll-up. Reads `-` from stdin.
+- **Finding aggregates + raw_window.** Findings now carry an optional
+  `aggregates` block (`events_per_sec`, `min_interval_ms`,
+  `max_interval_ms`, `distinct_targets`, `peak_fd_count`,
+  `peak_fd_pct_of_rlimit`, `distinct_callee_pids`,
+  `distinct_binder_codes`) and an optional `raw_window` array of full
+  NDJSON lines from contributing events (default 10, configurable via
+  `--finding-raw-window`). Both are additive and omitted when empty.
+
+### Wire format
+
+- Three new synthetic `syscall_nr` sentinels reuse the existing
+  257-byte layout (no struct bump): `-2` (`fd_snapshot`), `-3`
+  (`process_exit`), `-4` (`binder_transaction_received`). `-1` remains
+  the legacy binder caller sentinel.
+- `ptr_hint` (previously reserved) now carries the binder `debug_id`
+  on `nr=-1` and `nr=-4` events.
+
+### Tests
+
+- Test count: 287 → **367** across the workspace.
+- New host fixtures: `xtask demo-window` (windowed NDJSON
+  cut against `examples/expected/window-{capture,output}.ndjson`).
+
+### Documentation
+
+- New: `docs/guides/window.md`.
+- Updated: `docs/REFERENCE.md` (Subcommands section, all new flags,
+  all new event types), `docs/guides/output-formats.md`,
+  `docs/guides/writing-rules.md`, `man/man1/neutron.1`.
+
+### Notes for downstream consumers
+
+- All schema additions are additive — old NDJSON parsers continue to
+  work; new fields are skipped when empty.
+- `Category` enum gains `ResourceExhaustion` and `Crash` variants;
+  rule YAML files using exhaustive Rust matches must be updated.
+- The `binder_transaction_received` tracepoint requires a kernel where
+  it is upstreamed (Pixel 8 Pro at 6.1+ ships it). Attach failure is
+  logged and the userspace correlator silently never matches.
+
 ## [1.0.0] — 2026-04-26
 
 First public release. Aya-based eBPF syscall tracer for authorized

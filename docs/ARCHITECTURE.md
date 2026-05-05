@@ -1,6 +1,6 @@
 # Architecture
 
-neutron 1.0 is a four-crate Rust workspace that runs an Aya-loaded eBPF
+neutron 1.1 is a four-crate Rust workspace that runs an Aya-loaded eBPF
 program against a kernel 6.1+ Android device. There is no C BPF source, no
 custom ELF parser, no hand-rolled relocation engine, and no per-CPU perf
 ring buffer — Aya owns all of that.
@@ -16,19 +16,22 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 ┌────────────────────────────────────────────────────────────────────────┐
 │                       Android kernel (6.1.x GKI)                       │
 │                                                                        │
-│  tracepoint/raw_syscalls/sys_enter ──┐                                 │
-│  tracepoint/raw_syscalls/sys_exit  ──┼──▶ trace_*  (aya-ebpf, Rust)   │
-│  tracepoint/binder/binder_transaction┘     │                           │
+│  tracepoint/raw_syscalls/sys_enter ─────┐                              │
+│  tracepoint/raw_syscalls/sys_exit  ─────┤                              │
+│  tracepoint/sched/sched_process_exit ───┼─▶ trace_*  (aya-ebpf, Rust) │
+│  tracepoint/binder/binder_transaction  ─┤                              │
+│  tracepoint/binder/binder_transaction_received ─┘                      │
 │                                            │                           │
 │              ┌─────────────────────────────▼─────┐                     │
 │              │ Maps (declared in neutron-ebpf):  │                     │
-│              │   FILTER_MAP    Array<u32>         │                     │
-│              │   EVENTS        RingBuf 1 MiB      │                     │
-│              │   INFLIGHT      HashMap            │                     │
+│              │   FILTER_MAP     Array<u32>        │                     │
+│              │   EVENTS         RingBuf 1 MiB     │                     │
+│              │   INFLIGHT       HashMap           │                     │
 │              │   SYSCALL_FILTER HashMap           │                     │
 │              │   PID_WHITELIST  HashMap           │                     │
 │              │   WATCH_FDS      HashMap           │                     │
 │              │   STACK_TRACES   StackTrace        │                     │
+│              │   COUNTERS       Array<u64>        │                     │
 │              └────────────────┬───────────────────┘                     │
 │                               │  RingBuf reservation                    │
 └───────────────────────────────│────────────────────────────────────────┘
@@ -36,26 +39,44 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 ┌───────────────────────────────▼────────────────────────────────────────┐
 │                      neutron (Aya userspace loader)                    │
 │                                                                        │
-│  Ebpf::load(bytes) → program_mut(name) → load() → attach()            │
+│  Ebpf::load(bytes) → program_mut(name) → load() → attach()             │
 │  bpf.take_map("EVENTS") → RingBuf::try_from(...)                       │
+│                                                                        │
+│  Userspace sources (sprint-2):                                         │
+│    FdGraphPoller   thread → /proc/<pid>/fd  → fd_snapshot lines       │
+│    BinderTracker   in-flight LRU keyed by debug_id → binder_call lines │
+│    LogcatReader    `logcat -v threadtime *:F` → process_exit lines    │
+│    TombstoneWatcher poll /data/tombstones/   → process_exit lines     │
+│    RingBufferStore per-PID lookback ring → crash_context dump         │
 │                                                                        │
 │  Event loop:                                                           │
 │    1. ring.next() → &[u8] → read_unaligned::<SyscallEvent>             │
-│    2. comm/RWX filtering (userspace)                                    │
-│    3. resolve stack via STACK_TRACES + ProcSymbolizer + KernelSymbolizer│
-│    4. format JSON (always) + optional text                             │
-│    5. RuleEngine::feed → drain_ready                                    │
-│    6. follow_children / capture_reads side effects                     │
-│    7. emit                                                             │
+│    2. comm / RWX filtering (userspace)                                 │
+│    3. dispatch by syscall_nr:                                          │
+│         -1  binder caller    → BinderTracker.record_caller             │
+│         -2  fd_snapshot      → (drained from poller channel, not ring) │
+│         -3  process_exit     → BinderTracker.on_callee_crash + emit    │
+│         -4  binder received  → BinderTracker.record_received           │
+│         else syscall         → format + engine + lookback              │
+│    4. resolve stack via STACK_TRACES + ProcSymbolizer + KernelSymbolizer│
+│    5. format JSON (always) + optional text                             │
+│    6. RuleEngine::feed → drain_ready                                    │
+│    7. follow_children / capture_reads side effects                     │
+│    8. emit                                                             │
 │  poll(2) on the ring fd when empty.                                    │
 └────────────────────────────────────────────────────────────────────────┘
+
+Host-side post-processor (`neutron window`, sprint-2): an offline tool
+that reads NDJSON capture files, anchors on findings / crashes / pids /
+binder calls, and emits time- or event-bounded windows for triage. See
+docs/guides/window.md.
 ```
 
 ## BPF Programs (`neutron-ebpf`)
 
-Three programs in `neutron-ebpf/src/main.rs`. All target
+Five programs in `neutron-ebpf/src/main.rs`. All target
 `bpfel-unknown-none`, are linked with `bpf-linker`, and ship as a single ELF
-object (`neutron.bpf.elf`, ~20 KiB).
+object (`neutron.bpf.elf`, ~25 KiB).
 
 ### `trace_sys_enter` (tracepoint/raw_syscalls/sys_enter)
 
@@ -90,7 +111,30 @@ object (`neutron.bpf.elf`, ~20 KiB).
 
 Loaded only with `--binder`. Synthetic `syscall_nr = -1`. Captures
 `to_proc`, AIDL `code`, transaction `flags`, `to_thread`, `reply` flag, and
-`target_node` into `args[0..5]`. `data[128]` is unused for binder events.
+`target_node` into `args[0..5]`. The kernel-assigned `debug_id` is stashed
+in `ptr_hint` so the userspace correlator can pair this with the callee
+side. `data[128]` is unused for binder events.
+
+### `trace_binder_transaction_received` (tracepoint/binder/binder_transaction_received)
+
+Loaded only with `--binder`; best-effort attach (a missing tracepoint is
+logged but does not abort the run). Synthetic `syscall_nr = -4`. Reads
+the kernel-assigned `debug_id` from the tracepoint payload into
+`ptr_hint`. Carries no other useful fields — callee `pid` / `tid` come
+from `bpf_get_current_pid_tgid()`. Userspace pairs caller and callee by
+`debug_id` to emit synthesised `type:"binder_call"` events.
+
+### `trace_sched_process_exit` (tracepoint/sched/sched_process_exit)
+
+Always attached. Synthetic `syscall_nr = -3`. Fires once per task
+termination (normal exit, fatal signal, SIGKILL, OOM kill). Captures the
+dying task's `comm` from the tracepoint payload (more reliable than
+`bpf_get_current_comm()` on the do_exit teardown path) and stamps
+`ExitSource::Tracepoint` in `args[2]`. Does NOT carry `exit_code` or
+`exit_signal` — the tracepoint payload doesn't expose them, and reading
+`task_struct->exit_code` via BTF is deferred. Userspace logcat /
+tombstone watchers fill in the signal info when available; otherwise
+the event is a "this PID died at this time" marker.
 
 ## Aya Loader (`src/main.rs`)
 
@@ -189,28 +233,92 @@ top-level `"stack"` field **before** `engine.feed`, so `stack_contains` /
 `engine.flush_all()` runs at shutdown to emit any frequency / aggregate
 findings still pending in their windows.
 
+## Userspace event sources (sprint-2)
+
+Three crash-correlation sources and the FD-graph poller live in
+`src/sources/` and `src/fdgraph/poller.rs`. They run alongside the BPF
+event loop; main.rs drains their output channels every iteration.
+
+### `FdGraphPoller`
+
+Spawned thread that periodically reads `/proc/<pid>/fd` and
+`/proc/<pid>/limits` for in-scope PIDs and forwards `FdSampleEvent`
+values back via an `mpsc::sync_channel`. Main loop converts each into a
+`type:"fd_snapshot"` JSON line and feeds it to the rule engine. Scope
+policies (`Traced`, `Active`, `UidClass`, `All`) and interval are
+controlled by `--fdgraph-pids` / `--fdgraph-interval`. PID set updates
+are pushed to the poller via a separate channel; sends are non-blocking
+so the BPF event loop never stalls.
+
+### `BinderTracker`
+
+Bounded LRU map keyed by `debug_id`. The BPF caller-side
+`binder_transaction` (nr=-1) inserts an `Inflight` record; the
+callee-side `binder_transaction_received` (nr=-4) removes it and emits a
+synthesised `type:"binder_call"` JSON line with `status:"completed"`.
+On a `process_exit` with `classification=crash`, the tracker drains
+every in-flight entry whose `callee_pid` matches the dying PID and
+emits each as `status:"callee_crashed"`. Default cap is 1024 in-flight
+transactions; LRU eviction silently drops the oldest entry on overflow.
+
+### `LogcatReader` and `TombstoneWatcher`
+
+Two userspace crash sources, both behind small traits so unit tests can
+inject synthetic streams. `LogcatReader` spawns
+`logcat -v threadtime *:F` and parses three line patterns: Java
+`FATAL EXCEPTION:` blocks, native `DEBUG : pid: N, tid: N, name: ...`
+debuggerd headers, and `ANR in <pkg>` lines. `TombstoneWatcher` polls a
+configurable directory (default `/data/tombstones/`) at 1 Hz; on first
+observation it primes the seen-set without emission so pre-existing
+files don't show up as "new" crashes. Both sources emit
+`ProcessExitEvent` values that are formatted into `type:"process_exit"`
+JSON via the shared `emit_process_exit` helper.
+
+### `RingBufferStore`
+
+Per-PID bounded ring buffer of recent NDJSON event lines. The main
+loop pushes every emitted line into it; on `process_exit` (from any
+source) the buffer is drained for the dying PID and dumped into the
+emitted JSON's `crash_context` array. Default cap is 200 PIDs × 100
+lines; LRU eviction handles overflow. Disabled with
+`--lookback-events 0`.
+
 ## SyscallEvent Wire Format
 
 Defined once in `neutron-common/src/lib.rs`. `#[repr(C, packed)]`,
-**241 bytes total**, asserted at compile time. Both `neutron-ebpf` and the
-userspace loader read this type directly via `addr_of!` /
-`read_unaligned`.
+**257 bytes total**, asserted at compile time in both `neutron-common`
+and `neutron-ebpf`. The 1.0.0 layout was 241 bytes; 1.0.0 added a
+dedicated `enter_timestamp_ns` slot (8 B) and `maps_generation` (2 B)
+plus 6 reserved padding bytes for the next single-field bump. Sprint-1
+and sprint-2 added new event semantics without bumping the struct.
 
-| Field            | Type   | Offset | Size | Notes                                         |
-|------------------|--------|--------|------|-----------------------------------------------|
-| `timestamp_ns`   | u64    | 0      | 8    | `bpf_ktime_get_ns()`                          |
-| `pid`            | u32    | 8      | 4    | Linux TID                                     |
-| `tgid`           | u32    | 12     | 4    | Linux PID                                     |
-| `uid`            | u32    | 16     | 4    | from `bpf_get_current_uid_gid()`              |
-| `syscall_nr`     | i32    | 20     | 4    | `-1` = binder synthetic event                 |
-| `args[6]`        | u64[6] | 24     | 48   | syscall args; `args[5]` repurposed on exit    |
-| `ret`            | i64    | 72     | 8    | return value (exit events)                    |
-| `is_enter`       | u8     | 80     | 1    | 1 = enter, 0 = exit                           |
-| `comm[16]`       | u8[16] | 81     | 16   | from `bpf_get_current_comm()`                 |
-| `data[128]`      | u8[128]| 97     | 128  | union, see below                              |
-| `kernel_stackid` | i32    | 225    | 4    | key into `STACK_TRACES`, -1 if unset          |
-| `user_stackid`   | i32    | 229    | 4    | key into `STACK_TRACES`, -1 if unset          |
-| `ptr_hint`       | u64    | 233    | 8    | raw user pointer; reserved for Frida bridge   |
+| Field                | Type   | Offset | Size | Notes                                                    |
+|----------------------|--------|--------|------|----------------------------------------------------------|
+| `timestamp_ns`       | u64    | 0      | 8    | `bpf_ktime_get_ns()`                                     |
+| `pid`                | u32    | 8      | 4    | Userspace PID (kernel `tgid`); what `--pid` matches      |
+| `tgid`               | u32    | 12     | 4    | Userspace TID (kernel `pid`); per-thread                 |
+| `uid`                | u32    | 16     | 4    | from `bpf_get_current_uid_gid()`                         |
+| `syscall_nr`         | i32    | 20     | 4    | -1 binder caller / -2 fd_snapshot / -3 process_exit / -4 binder_received |
+| `args[6]`            | u64[6] | 24     | 48   | syscall args; on exit/synth events: see per-nr table     |
+| `ret`                | i64    | 72     | 8    | return value (exit events)                               |
+| `is_enter`           | u8     | 80     | 1    | 1 = enter, 0 = exit                                      |
+| `comm[16]`           | u8[16] | 81     | 16   | from `bpf_get_current_comm()`                            |
+| `data[128]`          | u8[128]| 97     | 128  | union, see below                                         |
+| `kernel_stackid`     | i32    | 225    | 4    | key into `STACK_TRACES`, -1 if unset                     |
+| `user_stackid`       | i32    | 229    | 4    | key into `STACK_TRACES`, -1 if unset                     |
+| `ptr_hint`           | u64    | 233    | 8    | raw user pointer; binder `debug_id` on nr=-1 / nr=-4     |
+| `enter_timestamp_ns` | u64    | 241    | 8    | enter ts copied through INFLIGHT for latency calc        |
+| `maps_generation`    | u16    | 249    | 2    | reserved for ProcSymbolizer maps-refresh                 |
+| `_reserved`          | u8[6]  | 251    | 6    | padding for next single-field bump                       |
+
+### Synthetic event semantics
+
+| `syscall_nr` | Event kind          | Notes                                                           |
+|--------------|---------------------|-----------------------------------------------------------------|
+| `-1`         | `binder` (caller)   | `args[0..5]` = to_proc/code/flags/to_thread/reply/target_node; `ptr_hint` = debug_id |
+| `-2`         | `fd_snapshot`       | Not emitted via the BPF wire; constructed userspace-side from poller channel |
+| `-3`         | `process_exit`      | `args[0]` = exit_code, `args[1]` = exit_signal, `args[2]` = ExitSource enum |
+| `-4`         | `binder_received`   | `ptr_hint` = debug_id (matched against nr=-1 entries)           |
 
 ### `data[128]` union semantics
 
@@ -225,13 +333,14 @@ userspace loader read this type directly via `addr_of!` /
 | 222, 226 (mmap/mprotect)               | `[0]` = 1 (RWX), 2 (WX), or 0                |
 | -1 (binder)                            | unused; binder fields live in `args[0..5]`   |
 
-### `args[5]` repurposing on exit
+### Latency computation
 
-`trace_sys_exit` writes `INFLIGHT[pid_tgid].timestamp_ns` into the exit
-event's `args[5]` before submitting. Userspace `compute_latency_us()`
-subtracts it from the exit `ts_ns` and divides by 1000 to get
-`latency_us`. If `INFLIGHT` was full and the entry got evicted,
-`latency_us` is `null` in JSON output.
+`trace_sys_exit` copies the enter event's `timestamp_ns` into the exit
+event's `enter_timestamp_ns` slot before submitting (no longer hijacks
+`args[5]` — that was the 1.0.0 baseline workaround). Userspace
+`compute_latency_us()` subtracts it from the exit `ts_ns` and divides
+by 1000 to get `latency_us`. If `INFLIGHT` was full and the entry got
+evicted, `latency_us` is `null` in JSON output.
 
 ## BPF Maps
 
@@ -286,3 +395,11 @@ config.
 - Pinned maps (`/sys/fs/bpf/...`) for cross-process coordination. The
   filesystem is mounted on the device — see V2 considerations in
   ROADMAP.md.
+- `task_struct->exit_code` BTF read on the BPF `sched_process_exit` path.
+  The tracepoint payload doesn't carry exit_code/exit_signal; today
+  userspace logcat / tombstone sources fill them in. A BTF read would
+  let the BPF path emit `exit_signal` directly, useful on hosts where
+  logcat is unavailable.
+- Binder Parcel decoding beyond the AIDL `code` field. The 1.1.0
+  correlator pairs caller↔callee and surfaces `code` and lifecycle
+  status; full Parcel byte unmarshalling is V2 territory.

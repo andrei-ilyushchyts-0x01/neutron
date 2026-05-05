@@ -164,7 +164,58 @@ jq -r 'select(.type == "binder") | .to_proc' binder_trace.ndjson \
 # AIDL method codes per destination
 jq -r 'select(.type == "binder") | "\(.to_proc) code=\(.code)"' binder_trace.ndjson \
   | sort | uniq -c | sort -rn
+
+# Synthesised binder_call pairs (caller↔callee matched by debug_id) with
+# completion latency. Sprint-2 PR 2.
+jq -r 'select(.type == "binder_call") |
+  "\(.caller_pid)→\(.callee_pid) code=\(.code) status=\(.status) lat=\(.latency_us // "-")us"' \
+  binder_trace.ndjson | sort | uniq -c | sort -rn
+
+# Calls in flight when the callee crashed (R004 evidence).
+jq -c 'select(.type == "binder_call" and .status == "callee_crashed")' \
+  binder_trace.ndjson
 ```
+
+## Crash Investigation
+
+Sprint-2 PR 1 introduced `process_exit` events from three independent
+sources (BPF tracepoint, logcat, tombstones) and a `crash_context`
+lookback ring buffer. Combined with sprint-2 PR 2 binder causality and
+sprint-2 PR 3 `neutron window`, this gives a self-contained triage
+workflow:
+
+```bash
+# Capture with all sources enabled (binder + crash + fdgraph all on by
+# default in 1.1.0).
+$TRACER "/data/local/tmp/neutron \
+  --pid 0 \
+  --binder \
+  --json \
+  --output /data/local/tmp/full_trace.ndjson"
+adb pull /data/local/tmp/full_trace.ndjson
+
+# Every crash with its in-flight binder context (R004 finding).
+jq -c 'select(.type == "finding" and .rule_id == "R004_binder_callee_crash")' \
+  full_trace.ndjson
+
+# All process_exit lines + their crash_context (last N events before exit).
+jq -c 'select(.type == "process_exit" and .classification == "crash") |
+  {pid, comm, signal_name, ctx_count: (.crash_context | length)}' \
+  full_trace.ndjson
+
+# Cut a 5-second window around every crash for triage as a standalone
+# NDJSON file that can be re-fed to the rule engine.
+neutron window full_trace.ndjson \
+  --anchor crash --around 5s \
+  > crash_windows.ndjson
+
+# The same windows in summary form (one line per merged window):
+neutron window full_trace.ndjson \
+  --anchor crash --around 5s --summary
+```
+
+For the full anchor + window reference see
+[docs/guides/window.md](window.md).
 
 ## Memory Integrity Analysis
 

@@ -154,6 +154,83 @@ The rule excludes `netd` and other system service comms via `comm_not_in`.
 
 ---
 
+## R001 — `fd_table_exhaustion`
+
+Rule: a `fd_snapshot` with `fd_pct_of_rlimit > 90`. Sprint-1 PR 4.
+
+**Known false positives:**
+
+- **Daemons that intentionally hold many connections** — proxies,
+  message brokers, `system_server` under heavy IPC load. The default
+  `RLIMIT_NOFILE` for some HALs is genuinely tight; sustained
+  near-rlimit operation is normal for them.
+- **Misconfigured rlimit** — a process granted too few FDs for its
+  workload. The rule fires correctly; the bug is elsewhere.
+
+**Tactics neutron applies:** `aggregate: per_process` collapses
+sustained pressure into a single finding per PID, so a long-running
+daemon at 95% utilisation produces one finding, not one per poller
+tick.
+
+---
+
+## R002 — `dma_heap_allocation_burst`
+
+Rule: 50+ `DMA_HEAP_IOCTL_ALLOC` ioctls within a 5-second window per
+process. Sprint-1 PR 4.
+
+**Known false positives:**
+
+- **Genuine high-throughput camera capture** or video encoding — both
+  legitimately allocate many DMA buffers in a short burst.
+- **App start-up phase** that preallocates many surfaces (compositor
+  initialisation, codec session setup).
+
+**Tactics neutron applies:** the threshold (50/5s) is calibrated for
+sustained leaks rather than start-up bursts. Short transient bursts
+during app launch are typically below the floor.
+
+---
+
+## R003 — `process_crash`
+
+Rule: `type:"process_exit"` with `classification:"crash"`. Sprint-2 PR 1.
+
+**Known false positives:**
+
+- **Debug builds intentionally `abort()`** on assertion failures during
+  testing — these are real SIGABRTs but expected.
+- **Native unit tests that exercise crash recovery** — the rule will
+  fire for each crash test case.
+
+**Tactics neutron applies:** the rule emits a finding with
+`crash_context` (the last N events neutron observed for the PID),
+making it possible to distinguish a real crash from a test-driven one
+by inspecting the lookback. Adding a `comm_not_contains` filter for
+known test runners suppresses noise from CI workloads.
+
+---
+
+## R004 — `binder_callee_crash`
+
+Rule: `type:"binder_call"` with `status:"callee_crashed"`. Sprint-2 PR 2.
+
+**Known false positives:**
+
+- **The callee was being intentionally killed** — system shutdown,
+  OOM kill of a non-essential service. The crash isn't bug-related;
+  the in-flight transaction is incidental.
+- **The in-flight transaction is incidental** — callee was already
+  dying for unrelated reasons; the caller's request just happened to
+  be in flight.
+
+**Tactics neutron applies:** R004 reports the AIDL `code` of the
+in-flight call. When triaging, cross-reference with
+`R003_process_crash` for the same `callee_pid` to confirm the crash
+was bug-driven (e.g. SIGSEGV) rather than user-initiated SIGKILL.
+
+---
+
 ## How to add a false-positive note to a custom rule
 
 When authoring a YAML rule, declare known FP scenarios under the
