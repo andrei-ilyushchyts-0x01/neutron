@@ -36,7 +36,9 @@ use neutron::format::{
     format_binder_call_json_with_service, format_event_json_full, format_event_text_with_stack,
     format_fd_snapshot_json, format_process_exit_json, FdHint,
 };
-use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
+use neutron::health::{
+    format_capture_health_json, format_summary_with, CaptureHealth, UserspaceHealth,
+};
 use neutron::matcher::{self, MatchSpec, SyscallEventLens};
 use neutron::predicate;
 use neutron::rules::{build_rule_engine, emit_findings_with};
@@ -1585,6 +1587,14 @@ fn run_trace(mut args: Args) -> Result<()> {
                     "{}",
                     format_summary_with(&health, &user_health, total_events)
                 );
+                // Phase 5c — machine-readable counterpart on the NDJSON
+                // stream. Lets downstream tools see the same counters
+                // without scraping stderr prose. Stderr block stays
+                // intact for human readers.
+                if args.json {
+                    let line = format_capture_health_json(&health, &user_health, total_events);
+                    let _ = writeln!(out, "{line}");
+                }
             }
             Err(e) => {
                 eprintln!("\nneutron: COUNTERS map present but unreadable: {e}");

@@ -172,6 +172,41 @@ pub fn format_summary_with(
     out
 }
 
+/// Phase 5c — render the capture-health snapshot as a single NDJSON
+/// line tagged `type:"capture_health"`. Emitted on shutdown when
+/// `--json` is on so downstream consumers see the same counters that
+/// go to stderr without scraping prose. Field set is stable; new
+/// counters are added at the tail.
+pub fn format_capture_health_json(
+    health: &CaptureHealth,
+    user: &UserspaceHealth,
+    total_userspace_events: u64,
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(256);
+    let _ = write!(
+        s,
+        r#"{{"type":"capture_health","events_userspace":{}"#,
+        total_userspace_events,
+    );
+    for (idx, label, _) in COUNTER_LABELS {
+        // Field name = label with spaces → underscores.
+        let key: String = label
+            .chars()
+            .map(|c| if c.is_ascii_whitespace() { '_' } else { c })
+            .collect();
+        let _ = write!(s, r#","{key}":{}"#, health.get(*idx));
+    }
+    let _ = write!(
+        s,
+        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"degraded":{}}}"#,
+        user.fd_graph_miss,
+        user.fd_graph_backfilled,
+        health.has_degradation()
+    );
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +278,34 @@ mod tests {
         let user = UserspaceHealth::default();
         let s = format_summary_with(&h, &user, 100);
         assert!(!s.contains("fd graph:"));
+    }
+
+    #[test]
+    fn capture_health_json_round_trips_to_known_fields() {
+        let mut h = CaptureHealth::default();
+        h.slots[COUNTER_EVENTS_SUBMITTED as usize] = 12_345;
+        h.slots[COUNTER_RINGBUF_RESERVE_FAILED as usize] = 7;
+        let user = UserspaceHealth {
+            fd_graph_miss: 3,
+            fd_graph_backfilled: 2,
+        };
+        let line = format_capture_health_json(&h, &user, 99_999);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(v["type"], "capture_health");
+        assert_eq!(v["events_userspace"], 99_999u64);
+        assert_eq!(v["events_submitted"], 12_345u64);
+        assert_eq!(v["ringbuf_reserve_failed"], 7u64);
+        assert_eq!(v["fd_graph_miss"], 3u64);
+        assert_eq!(v["fd_graph_backfilled"], 2u64);
+        assert_eq!(v["degraded"], true);
+    }
+
+    #[test]
+    fn capture_health_json_marks_clean_capture_not_degraded() {
+        let h = CaptureHealth::default();
+        let user = UserspaceHealth::default();
+        let line = format_capture_health_json(&h, &user, 0);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["degraded"], false);
     }
 }
