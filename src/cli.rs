@@ -405,4 +405,13 @@ pub struct Args {
     /// 1-Hz fdgraph poller misses. Best-effort: a failed read is silent.
     #[arg(long)]
     pub fd_snapshot_on_finding: bool,
+
+    // ── Phase 4b — binder service descriptor map ───────────────────────────
+    /// Path to a JSON file mapping `(callee_pid, target_node)` to a
+    /// human service name. When set, every emitted `binder_call` line
+    /// gains a `"service":"<name>"` field for known pairs. See
+    /// `docs/guides/binder-service-map.md` for the format. Unknown
+    /// pairs surface no service field — never a placeholder.
+    #[arg(long, value_name = "FILE")]
+    pub binder_services: Option<String>,
 }

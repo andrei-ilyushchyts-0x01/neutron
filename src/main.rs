@@ -25,6 +25,7 @@ use aya::programs::TracePoint;
 use aya::Ebpf;
 use clap::Parser;
 
+use neutron::binder_services::BinderServiceMap;
 use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
 use neutron::cli::{Args, Cli, Command};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
@@ -32,7 +33,7 @@ use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
 use neutron::fdgraph::FdGraph;
 use neutron::format::{
-    format_binder_call_json, format_event_json_full, format_event_text_with_stack,
+    format_binder_call_json_with_service, format_event_json_full, format_event_text_with_stack,
     format_fd_snapshot_json, format_process_exit_json, FdHint,
 };
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
@@ -673,6 +674,7 @@ fn emit_process_exit(
 /// and (optionally) push it into the lookback ring buffer for the caller's
 /// PID so subsequent crash events surface the binder activity in their
 /// `crash_context`.
+#[allow(clippy::too_many_arguments)]
 fn emit_binder_call(
     pair: &neutron::sources::binder_tracker::BinderCallEvent,
     lookback: Option<&mut RingBufferStore>,
@@ -681,9 +683,11 @@ fn emit_binder_call(
     suppress_raw: bool,
     json_mode: bool,
     event_id_counter: &mut u64,
+    services: Option<&BinderServiceMap>,
 ) {
     *event_id_counter = event_id_counter.wrapping_add(1);
-    let line = format_binder_call_json(pair, Some(*event_id_counter));
+    let service = services.and_then(|m| m.lookup(pair.callee_pid, pair.target_node));
+    let line = format_binder_call_json_with_service(pair, Some(*event_id_counter), service);
     if let Some(eng) = engine.as_mut() {
         if let Some(owned) = neutron_rules::Event::parse_line(&line) {
             if let Some(view) = owned.view() {
@@ -844,6 +848,17 @@ fn run_trace(mut args: Args) -> Result<()> {
     // bypass both inside `SamplerChain`, so fdgraph stays consistent
     // regardless of the configured probability or QPS cap.
     let mut sampler = SamplerChain::from_args(args.sample, args.rate_limit)?;
+
+    // 2e. Phase 4b — optional binder service descriptor map for
+    // `binder_call` enrichment.
+    let binder_services: Option<BinderServiceMap> = match &args.binder_services {
+        Some(path) => {
+            let m = BinderServiceMap::load_file(path)?;
+            eprintln!("  binder service map: {} entries from {path}", m.len());
+            Some(m)
+        }
+        None => None,
+    };
     if !sampler.is_passthrough() {
         if let Some(p) = args.sample {
             eprintln!("  sample: p={p:.3} (state-tracking syscalls exempt)");
@@ -1103,6 +1118,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                     suppress_raw,
                                     args.json,
                                     &mut event_id_counter,
+                                    binder_services.as_ref(),
                                 );
                             }
                         }
@@ -1143,6 +1159,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                             args_arr[1] as u32,
                             args_arr[2] as u32,
                             args_arr[4] != 0,
+                            args_arr[5] as i32,
                             ts,
                         );
                     }
@@ -1159,6 +1176,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 suppress_raw,
                                 args.json,
                                 &mut event_id_counter,
+                                binder_services.as_ref(),
                             );
                         }
                     }
@@ -1441,6 +1459,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 suppress_raw,
                                 args.json,
                                 &mut event_id_counter,
+                                binder_services.as_ref(),
                             );
                         }
                     }
@@ -1469,6 +1488,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 suppress_raw,
                                 args.json,
                                 &mut event_id_counter,
+                                binder_services.as_ref(),
                             );
                         }
                     }

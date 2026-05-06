@@ -394,6 +394,18 @@ pub fn format_binder_call_json(
     pair: &crate::sources::binder_tracker::BinderCallEvent,
     event_id: Option<u64>,
 ) -> String {
+    format_binder_call_json_with_service(pair, event_id, None)
+}
+
+/// Phase 4b — same as [`format_binder_call_json`] but optionally splices a
+/// `service` field when the operator-supplied
+/// [`crate::binder_services::BinderServiceMap`] knows the
+/// `(callee_pid, target_node)` pair.
+pub fn format_binder_call_json_with_service(
+    pair: &crate::sources::binder_tracker::BinderCallEvent,
+    event_id: Option<u64>,
+    service: Option<&str>,
+) -> String {
     let escaped_comm = pair.caller_comm.replace('\\', "\\\\").replace('"', "\\\"");
     let event_id_json = match event_id {
         Some(id) => format!(r#","event_id":{}"#, id),
@@ -407,8 +419,15 @@ pub fn format_binder_call_json(
         Some(r) => format!(r#","received_ts_ns":{}"#, r),
         None => String::new(),
     };
+    let service_json = match service {
+        Some(name) => {
+            let esc = name.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(r#","service":"{esc}""#)
+        }
+        None => String::new(),
+    };
     format!(
-        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"sent_ts_ns":{}{}{},"status":"{}"{}}}"#,
+        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":"{}"{}{}}}"#,
         pair.sent_ts_ns,
         pair.debug_id,
         pair.caller_pid,
@@ -418,10 +437,12 @@ pub fn format_binder_call_json(
         pair.code,
         pair.flags,
         pair.reply,
+        pair.target_node,
         pair.sent_ts_ns,
         received_json,
         latency_json,
         pair.status.as_str(),
+        service_json,
         event_id_json,
     )
 }
@@ -442,6 +463,7 @@ mod binder_call_json_tests {
             code: 7,
             flags: 0x10,
             reply: false,
+            target_node: 1,
             sent_ts_ns: 1_000_000,
             received_ts_ns: Some(1_500_000),
             status: BinderCallStatus::Completed,

@@ -39,6 +39,11 @@ pub struct BinderCallEvent {
     pub code: u32,
     pub flags: u32,
     pub reply: bool,
+    /// Phase 4b — binder handle (`target_node` field of the kernel
+    /// tracepoint). Combined with `callee_pid`, identifies a specific
+    /// service/interface in the callee process. `0` when the BPF
+    /// captured no value (legacy traces from before Phase 4b).
+    pub target_node: i32,
     pub sent_ts_ns: u64,
     /// `Some(ts)` when matched against a received event; `None` when the
     /// callee crashed before dequeueing the transaction.
@@ -65,6 +70,7 @@ struct Inflight {
     code: u32,
     flags: u32,
     reply: bool,
+    target_node: i32,
     sent_ts_ns: u64,
     /// LRU tick — bumped on every operation that touches this entry.
     lru: u64,
@@ -117,6 +123,7 @@ impl BinderTracker {
         code: u32,
         flags: u32,
         reply: bool,
+        target_node: i32,
         sent_ts_ns: u64,
     ) {
         if debug_id == 0 || caller_pid == 0 {
@@ -131,6 +138,7 @@ impl BinderTracker {
             code,
             flags,
             reply,
+            target_node,
             sent_ts_ns,
             lru: self.tick,
         };
@@ -172,6 +180,7 @@ impl BinderTracker {
             code: inflight.code,
             flags: inflight.flags,
             reply: inflight.reply,
+            target_node: inflight.target_node,
             sent_ts_ns: inflight.sent_ts_ns,
             received_ts_ns: Some(received_ts_ns),
             status: BinderCallStatus::Completed,
@@ -203,6 +212,7 @@ impl BinderTracker {
                     code: entry.code,
                     flags: entry.flags,
                     reply: entry.reply,
+                    target_node: entry.target_node,
                     sent_ts_ns: entry.sent_ts_ns,
                     received_ts_ns: None,
                     status: BinderCallStatus::CalleeCrashed,
@@ -218,7 +228,7 @@ mod tests {
     use super::*;
 
     fn record_call(t: &mut BinderTracker, debug_id: i32, caller: u32, callee: u32, ts: u64) {
-        t.record_caller(debug_id, caller, 1000, "caller", callee, 7, 0, false, ts);
+        t.record_caller(debug_id, caller, 1000, "caller", callee, 7, 0, false, 0, ts);
     }
 
     #[test]
@@ -294,7 +304,7 @@ mod tests {
     #[test]
     fn crashed_pair_carries_caller_metadata() {
         let mut t = BinderTracker::new(64);
-        t.record_caller(7, 100, 1000, "myapp", 200, 13, 1, false, 1_000_000);
+        t.record_caller(7, 100, 1000, "myapp", 200, 13, 1, false, 5, 1_000_000);
         let drained = t.on_callee_crash(200);
         assert_eq!(drained.len(), 1);
         let p = &drained[0];
