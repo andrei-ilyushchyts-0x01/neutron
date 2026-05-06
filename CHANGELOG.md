@@ -5,6 +5,155 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-05-06
+
+Additive release driven by the 2026-05-06 LWIS / GXP / Camera2 assessment.
+Wire format unchanged (`SyscallEvent` still 257 bytes); the BPF
+`FILTER_MAP` array grows from 2 to 16 slots (existing slots stay at
+their indices). JSON schema gains two new event types (`marker`,
+`capture_health`), a `target_node` field on `binder_call`, and an
+optional `service` field on `binder_call`. Three new host-side
+subcommands.
+
+### Phase 1 — Predicate-based capture reduction with conservative BPF prefiltering
+
+- **Generic capture predicates.** New `--match-pid`, `--match-uid`,
+  `--match-syscall`, `--match-ioctl-cmd`, `--match-ioctl-type`,
+  `--match-ioctl-nr`, `--match-ioctl-dir`, `--match-ret`,
+  `--match-latency-min`, `--match-prot-rwx`, `--match-prot-wx`,
+  `--match-fd`, `--match-comm`, `--match-arg-{u8,u16,u32,u64}`,
+  `--match-binder-{code,flags,to_proc,to_thread,target_node,reply}`.
+  All AND-conjoined. The cheap subset (pid/uid/syscall/ioctl
+  shape/ret/latency/`arg.u32@N`) lowers into BPF maps so unmatched
+  events drop before ringbuf reservation; the rest filters userspace
+  on every surviving event.
+- **`--match <expr>` mini-language.** Tiny recursive-descent parser
+  for `AND` / `OR` / `NOT` / parens, `=` / `!=` / `<` / `<=` / `>`
+  / `>=` / `IN` / `GLOB` over the same field vocabulary. Compiler
+  produces a **safe over-approximation** for the BPF prefilter:
+  top-level AND-of-atoms with BPF-evaluable fields lower into
+  `MatchSpec`; anything inside an `OR` or `NOT` (or touching
+  userspace-only fields) contributes no kernel-side filtering and
+  evaluates strictly userspace. Mutually exclusive with the
+  individual `--match-*` flags. Audit-print at startup labels each
+  clause `[bpf]` or `[user]` so volume reduction is visible.
+- **Enter/exit decoupling.** BPF `try_sys_enter` now updates
+  `INFLIGHT` unconditionally after `pid_matches`; the ringbuf emit
+  decision is a separate gate. Exit-time predicates (ret class,
+  latency threshold) can fire on syscalls whose enter was filtered
+  from output without losing args / data / stack / enter_ts.
+- **State-tracking always-emit.** When a predicate references
+  `fd_path` (or other fdgraph-state-dependent clauses), the BPF
+  prefilter lets `openat`/`openat2`/`dup`/`dup3`/`close`/`socket`/
+  `socketpair`/`accept`/`accept4`/`pipe2`/`eventfd2`/`memfd_create`/
+  `clone` bypass the predicate so userspace fdgraph stays consistent.
+  Exposed via `FILTER_KEY_STATE_EMIT_REQUIRED` (slot 7 of
+  `FILTER_MAP`).
+- **`--capture matched+context=<DUR>` mode.** Always-on userspace
+  ring of recently-rejected events; on a predicate match the ring
+  flushes (the previous `<DUR>` of context) and arms a forward window
+  (the next `<DUR>` of events emit unconditionally regardless of
+  match). Useful for "I don't know exactly when the bug fires".
+  `<DUR>` capped at 30 seconds; ring count capped at 100k entries.
+- **Sampling and rate limiting.** `--sample <p>` (uniform Bernoulli
+  drop, dependency-free xorshift PRNG) and `--rate-limit <N>` (leaky
+  token bucket). Both bypass state-tracking syscalls so fdgraph and
+  the binder correlator never lose their pair halves to a stochastic
+  drop.
+
+### Phase 2 — Host-side post-processors
+
+- **`neutron summarize <capture> --by <fields> [--samples N] [--top K]`**.
+  Streaming NDJSON aggregator. Group keys: `syscall`, `pid`, `tid`,
+  `uid`, `comm`, `fd_path`, `ioctl_cmd`, `ioctl_name`, `ioctl_family`,
+  `ret`, `ret_class` (`ok`/`errno`/`ok_nonzero`/`unset`), `type`,
+  `is_enter`. Optional reservoir of raw exemplar lines per group.
+  Prints a sorted `count + group fields` table and a one-line
+  total.
+- **`neutron diff <baseline> <test> --by <fields> [--top K] [--show-same]`**.
+  Same aggregator on two captures; prints `added` / `removed` /
+  `changed` rows sorted by `|delta|` descending. Enables the
+  negative-evidence workflow: "scenario A vs B both ran the camera,
+  what specifically shifted?".
+- **`neutron mark <name> [--phase start|end] [--meta k=v]
+  [--output FILE]`**. Append a single `type:"marker"` NDJSON line.
+  Operators bracket external scenarios with two `mark` calls;
+  downstream `neutron window --anchor marker:<name>` cuts a window
+  around the bracketed range. With `--output` the line is appended
+  with `O_APPEND` (atomic on Linux for ≤PIPE_BUF) so two concurrent
+  writers don't interleave.
+
+### Phase 3 — Pixel-camera ioctl decoder expansion
+
+- **LWIS family.** `_IOC_TYPE = 0x4c` ('L') now classifies as
+  `ioctl_family:"lwis"`. `LWIS_CMD_PACKET` (`_IOWR('L', 100,
+  lwis_cmd_pkt)`) decodes the first u32 of the arg buffer as the
+  LWIS command-packet ID; known IDs surface as
+  `lwis.cmd_id_name` (`DEVICE_ENABLE`, `DEVICE_DISABLE`,
+  `DMA_BUFFER_ALLOC`, `DMA_BUFFER_FREE`, `DMA_BUFFER_ENROLL`,
+  `REG_IO`, `TRANSACTION_SUBMIT`, `TRANSACTION_CANCEL`). Unnamed
+  IDs keep `cmd_id` searchable by hex without a misleading label.
+- **GXP family.** `_IOC_TYPE = 0x47` ('G', upstream) and `0xee`
+  (Pixel out-of-tree) classify as `ioctl_family:"gxp"`. No name
+  resolution yet — header drift between upstream and Pixel makes
+  static cmd-name mapping unreliable.
+
+### Phase 4 — Per-finding enrichment
+
+- **`--fd-snapshot-on-finding`.** When a finding fires with ioctl
+  evidence, neutron reads `/proc/<pid>/fdinfo/<fd>` synchronously
+  and embeds it as `fdinfo_at_event` on the JSON line. Fields:
+  `pos`, `flags` (kernel hex string), `mnt_id`, `ino`. Closes the
+  transient-fd gap that the 1 Hz fdgraph poller misses.
+- **Binder `target_node` + service map.** `binder_call` JSON now
+  includes the `target_node` handle (always available from the BPF
+  tracepoint; previously dropped). New `--binder-services <FILE>`
+  loads a JSON `(callee_pid, target_node) → service_name` map (typically
+  populated from `service list -p`); known pairs surface a `service`
+  field on the binder_call line.
+
+### Phase 5 — Markers + symbols + capture health
+
+- **`neutron mark` + `marker:<name>` window anchor.** See Phase 2 for
+  the subcommand. `neutron window` gains a new anchor type that
+  matches `type:"marker"` lines whose `name` field equals
+  `<name>`.
+- **Module-relative kernel symbols.** When `kptr_restrict` masks
+  `/proc/kallsyms`, neutron now reads `/proc/modules` (which is
+  not masked under the same restriction) and renders kernel frames
+  inside loaded modules as `[<ko>]+0x<offset>`. Bare hex stays the
+  fallback for IPs outside any loaded module.
+- **`capture_health` JSON line on shutdown.** In `--json` mode
+  neutron emits one final
+  `{"type":"capture_health","events_userspace":N,...,"degraded":bool}`
+  line so downstream NDJSON consumers see the same counters that go
+  to the stderr summary block. The `degraded` flag mirrors the
+  stderr WARNING banner predicate, making "absence of finding is
+  conclusive" machine-checkable.
+
+### Schema additions (1.2.0)
+
+- New event types: `marker`, `capture_health`.
+- `binder_call`: added `target_node`; optional `service`.
+- `syscall` (ioctl): added `lwis` nested object (`cmd_id`,
+  `cmd_id_name`); `ioctl_family` extended with `lwis`, `gxp`.
+- Finding: optional `fdinfo_at_event` map keyed by fd.
+
+### CLI additions (1.2.0)
+
+`--match-pid`, `--match-uid`, `--match-syscall`, `--match-fd`,
+`--match-comm`, `--match-ioctl-cmd`, `--match-ioctl-type`,
+`--match-ioctl-nr`, `--match-ioctl-dir`, `--match-ret`,
+`--match-latency-min`, `--match-prot-rwx`, `--match-prot-wx`,
+`--match-arg-u8`, `--match-arg-u16`, `--match-arg-u32`,
+`--match-arg-u64`, `--match-binder-code`, `--match-binder-flags`,
+`--match-binder-to-proc`, `--match-binder-to-thread`,
+`--match-binder-target-node`, `--match-binder-reply`, `--match`,
+`--capture`, `--sample`, `--rate-limit`,
+`--fd-snapshot-on-finding`, `--binder-services`.
+
+New subcommands: `summarize`, `diff`, `mark`.
+
 ## [1.1.0] — 2026-05-05
 
 Two-sprint additive release. Wire format is unchanged (`SyscallEvent` is

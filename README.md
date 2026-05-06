@@ -121,6 +121,61 @@ hardened banking app that calls a remote attestation service) may notice
 these and refuse to run. neutron is meant for authorized assessment of
 applications you own or have written permission to test.
 
+## What's new in 1.2.0
+
+- **Predicate-based capture reduction.** New `--match-*` flags and
+  `--match '<expr>'` mini-language (AND/OR/NOT/parens, `=`/`!=`/`<`/
+  `<=`/`>`/`>=`/`IN`/`GLOB`) push the cheap subset
+  (pid/uid/syscall/ioctl-shape/ret/latency/`arg.u32@N`) into BPF maps
+  for kernel-side pre-drop, while userspace evaluates the full
+  predicate exactly. Compiler is a **safe over-approximation**: any
+  clause inside an `OR` or `NOT` that touches userspace-only fields
+  (fd_path, comm, prot, binder, arg.u8/u16/u64) contributes no kernel
+  filtering — correctness over volume reduction. State-tracking
+  syscalls (open/close/dup/socket/...) bypass the predicate when fd
+  fields are referenced so `FdGraph` stays consistent.
+- **`--capture matched+context=<DUR>`.** Always-on userspace ring of
+  recently-rejected events; on a match, flushes the previous `<DUR>`
+  of context and arms a forward window for the next `<DUR>`. The
+  "I don't know exactly when the bug fires" workflow.
+- **`--sample <p>` and `--rate-limit <N>`.** Probabilistic and
+  token-bucket volume controls; both bypass state-tracking and
+  binder/process_exit sentinels so `FdGraph` and the binder
+  correlator never lose pair halves.
+- **`neutron summarize` + `neutron diff` host-side subcommands.**
+  Streaming NDJSON aggregator (`--by syscall,fd_path,ret_class,...`)
+  and a delta comparator for negative-evidence workflows ("scenario A
+  vs B both ran the camera, what's different?").
+- **`neutron mark <name>` + `marker:<name>` window anchor.** Append
+  one `type:"marker"` NDJSON line so external scenarios bracket the
+  live trace; `neutron window --anchor marker:<name>` cuts the
+  bracketed window without timestamp grep'ing.
+- **LWIS / GXP ioctl decoder.** `ioctl_family` now classifies
+  `0x4c` ('L') as `lwis` and `0x47` / `0xee` as `gxp`.
+  `LWIS_CMD_PACKET` decodes the first u32 of the arg snapshot as a
+  human-readable command-packet ID name (e.g. `DEVICE_ENABLE`,
+  `DMA_BUFFER_ALLOC`).
+- **`--fd-snapshot-on-finding`.** Findings whose ioctl evidence
+  carries a usable fd get an `fdinfo_at_event` enrichment from a
+  synchronous `/proc/<pid>/fdinfo/<fd>` read at emit time.
+  Catches transient fds the 1-Hz poller misses.
+- **Binder service-map enrichment.** `binder_call` events now carry
+  the `target_node` handle. With `--binder-services <FILE>` (a JSON
+  `{callee_pid: {target_node: service_name}}` map dumped from
+  `service list -p`), known pairs gain a `service` field.
+- **Module-relative kernel symbols.** When `kptr_restrict` masks
+  `/proc/kallsyms`, `/proc/modules` is still readable —
+  kernel frames inside loaded modules render as `[<ko>]+0x<offset>`
+  instead of bare hex.
+- **`capture_health` JSON line on shutdown** in `--json` mode.
+  Mirrors the stderr summary block in machine-readable form, with
+  `degraded:bool` so consumers can gate "absence of finding is
+  conclusive" on a single field.
+
+Wire format unchanged (still 257 bytes). `FILTER_MAP` array bumps
+from 2 to 16 slots; existing slot indices stay in place. See
+[CHANGELOG.md](CHANGELOG.md) for the full delta.
+
 ## What's new in 1.1.0
 
 - **Crash correlation.** Three independent sources feed a unified
@@ -291,15 +346,19 @@ reference.
 ## Architecture
 
 ```
-┌────────────────────────────────────────┐  ring buffer  ┌──────────────────────────┐
-│ neutron-ebpf (aya-ebpf, Rust)          │──events─────▶ │ neutron (Aya loader)     │
+┌────────────────────────────────────────┐               ┌──────────────────────────┐
+│ neutron-ebpf (aya-ebpf, Rust)          │               │ neutron (Aya loader)     │
 │ tracepoints:                           │               │ src/main.rs              │
 │   raw_syscalls/sys_{enter,exit}        │               │ ┌──────────────────────┐ │
-│   sched/sched_process_exit             │               │ │ FD-graph poller      │ │
-│   binder/binder_transaction            │               │ │ Binder tracker       │ │
-│   binder/binder_transaction_received   │               │ │ Tombstone watcher    │ │
-└────────────────────────────────────────┘               │ │ Logcat tail          │ │
-                                                         │ │ Lookback ring buffer │ │
+│   sched/sched_process_exit             │               │ │ Predicate eval (full)│ │
+│   binder/binder_transaction            │               │ │ Capture context ring │ │
+│   binder/binder_transaction_received   │  ringbuf      │ │ Sampler + rate limit │ │
+│                                        │  (events  )   │ │ FD-graph + fdinfo    │ │
+│ Stage 1 — BPF prefilter (Phase 1):     │──────────────▶│ │ Binder tracker       │ │
+│   pid/uid/syscall/ioctl-shape/         │               │ │ Tombstone + Logcat   │ │
+│   ret/latency/arg.u32@N (safe          │               │ │ Lookback ring buffer │ │
+│   over-approximation; AND-only)        │               │ │ Kernel resolver      │ │
+└────────────────────────────────────────┘               │ │  (kallsyms+modules)  │ │
                                                          │ └──────────┬───────────┘ │
                                                          └────────────┼─────────────┘
                                                                       │ events (JSON)
@@ -309,31 +368,55 @@ reference.
                                                             │ MatchCondition →    │
                                                             │ Finding queue +     │
                                                             │ aggregates +        │
-                                                            │ raw_window          │
+                                                            │ raw_window +        │
+                                                            │ fdinfo_at_event     │
                                                             └─────────┬───────────┘
                                                                       │ findings
                                                                       ▼
                                                                  text / NDJSON
                                                                       │
                                                                       ▼
-                                                            ┌─────────────────────┐
-                                                            │ neutron window      │
-                                                            │ (host-side post-    │
-                                                            │  processor)         │
-                                                            └─────────────────────┘
+                                                       ┌──────────────────────────────┐
+                                                       │ Host-side post-processors    │
+                                                       │  neutron window              │
+                                                       │  neutron summarize --by …    │
+                                                       │  neutron diff a b --by …     │
+                                                       │  neutron mark <name>         │
+                                                       └──────────────────────────────┘
 ```
 
 - `neutron-ebpf/` — Aya BPF programs compiled to `bpfel-unknown-none`.
   RingBuf for output, `bpf_get_stackid` for stacks, modern user/kernel
-  read helpers (112/113/114).
+  read helpers (112/113/114). Phase 1 added predicate-driven prefilter
+  maps (`MATCH_UID_SET`, `MATCH_IOCTL_{CMD,TYPE,NR}_SET`,
+  `MATCH_ARG_U32_VALS`) plus a 16-slot `FILTER_MAP` for predicate
+  scalars and the `STATE_EMIT_REQUIRED` toggle.
 - `src/main.rs` — userspace loader. Aya handles ELF parsing, relocation,
   map creation, program load, tracepoint attach, and BTF/CO-RE.
+- `src/matcher.rs` + `src/predicate.rs` — Phase 1 capture predicate. The
+  matcher is the AND-of-flags builder + evaluator; the predicate is the
+  recursive-descent parser for `--match <expr>` and the safe-BPF
+  lowering compiler.
+- `src/capture.rs` — Phase 1c context-window ring buffer for
+  `--capture matched+context=<DUR>`.
+- `src/sampler.rs` — Phase 1d probability + token-bucket sampler with
+  state-tracking exemption.
+- `src/summarize.rs` + `src/diff.rs` — Phase 2 host-side NDJSON
+  aggregator and delta comparator.
+- `src/mark.rs` — Phase 5a `neutron mark` scenario-marker emitter.
+- `src/fdinfo.rs` — Phase 4a synchronous `/proc/<pid>/fdinfo/<fd>`
+  reader for finding enrichment.
+- `src/binder_services.rs` — Phase 4b optional
+  `(callee_pid, target_node) → service_name` map for `binder_call`
+  enrichment.
 - `src/symbolize/` — `ProcSymbolizer` (per-PID `/proc/<pid>/maps` + ELF
-  symbols + ART JIT detection) and `KernelSymbolizer` (`/proc/kallsyms`).
+  symbols + ART JIT detection), `KernelSymbolizer` (`/proc/kallsyms`),
+  and Phase 5b `KernelModules` (`/proc/modules` fallback when
+  kallsyms is masked). The bundled `KernelResolver` chains them.
 - `neutron-rules/` — declarative rule engine. Decoupled from the tracer so
   the same ruleset applies to live events or offline NDJSON captures.
 - `neutron-common/` — shared `no_std` wire types (`SyscallEvent`, filter
-  keys).
+  keys, predicate match-bits, state-tracking syscall list).
 
 For deeper details see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

@@ -1,6 +1,6 @@
 # Architecture
 
-neutron 1.1 is a four-crate Rust workspace that runs an Aya-loaded eBPF
+neutron 1.2 is a four-crate Rust workspace that runs an Aya-loaded eBPF
 program against a kernel 6.1+ Android device. There is no C BPF source, no
 custom ELF parser, no hand-rolled relocation engine, and no per-CPU perf
 ring buffer — Aya owns all of that.
@@ -24,14 +24,19 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 │                                            │                           │
 │              ┌─────────────────────────────▼─────┐                     │
 │              │ Maps (declared in neutron-ebpf):  │                     │
-│              │   FILTER_MAP     Array<u32>        │                     │
-│              │   EVENTS         RingBuf 1 MiB     │                     │
-│              │   INFLIGHT       HashMap           │                     │
-│              │   SYSCALL_FILTER HashMap           │                     │
-│              │   PID_WHITELIST  HashMap           │                     │
-│              │   WATCH_FDS      HashMap           │                     │
-│              │   STACK_TRACES   StackTrace        │                     │
-│              │   COUNTERS       Array<u64>        │                     │
+│              │   FILTER_MAP            Array<u32, 16>  (1.2: 16 slots) │
+│              │   EVENTS                RingBuf 1 MiB                   │
+│              │   INFLIGHT              HashMap                         │
+│              │   SYSCALL_FILTER        HashMap                         │
+│              │   PID_WHITELIST         HashMap                         │
+│              │   WATCH_FDS             HashMap                         │
+│              │   STACK_TRACES          StackTrace                      │
+│              │   COUNTERS              Array<u64>                      │
+│              │   MATCH_UID_SET         HashMap   (1.2)                 │
+│              │   MATCH_IOCTL_CMD_SET   HashMap   (1.2)                 │
+│              │   MATCH_IOCTL_TYPE_SET  HashMap   (1.2)                 │
+│              │   MATCH_IOCTL_NR_SET    HashMap   (1.2)                 │
+│              │   MATCH_ARG_U32_VALS    HashMap   (1.2)                 │
 │              └────────────────┬───────────────────┘                     │
 │                               │  RingBuf reservation                    │
 └───────────────────────────────│────────────────────────────────────────┘
@@ -42,12 +47,17 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 │  Ebpf::load(bytes) → program_mut(name) → load() → attach()             │
 │  bpf.take_map("EVENTS") → RingBuf::try_from(...)                       │
 │                                                                        │
-│  Userspace sources (sprint-2):                                         │
+│  Userspace sources (sprint-2 + 1.2):                                   │
 │    FdGraphPoller   thread → /proc/<pid>/fd  → fd_snapshot lines       │
 │    BinderTracker   in-flight LRU keyed by debug_id → binder_call lines │
 │    LogcatReader    `logcat -v threadtime *:F` → process_exit lines    │
 │    TombstoneWatcher poll /data/tombstones/   → process_exit lines     │
 │    RingBufferStore per-PID lookback ring → crash_context dump         │
+│    CapturePredicate (1.2)  matcher::MatchSpec | predicate::Expr        │
+│    ContextRing      (1.2)  --capture matched+context=<DUR>             │
+│    SamplerChain     (1.2)  --sample p + --rate-limit N                 │
+│    BinderServiceMap (1.2)  --binder-services <FILE>                    │
+│    KernelResolver   (1.2)  kallsyms ⊕ /proc/modules fallback           │
 │                                                                        │
 │  Event loop:                                                           │
 │    1. ring.next() → &[u8] → read_unaligned::<SyscallEvent>             │
@@ -58,18 +68,23 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 │         -3  process_exit     → BinderTracker.on_callee_crash + emit    │
 │         -4  binder received  → BinderTracker.record_received           │
 │         else syscall         → format + engine + lookback              │
-│    4. resolve stack via STACK_TRACES + ProcSymbolizer + KernelSymbolizer│
+│    4. resolve stack via STACK_TRACES + ProcSymbolizer + KernelResolver │
 │    5. format JSON (always) + optional text                             │
-│    6. RuleEngine::feed → drain_ready                                    │
-│    7. follow_children / capture_reads side effects                     │
-│    8. emit                                                             │
+│    6. CapturePredicate.evaluate(...)                                   │
+│       → SamplerChain.keep(ts, nr) (state-tracking exempt)              │
+│       → ContextRing.observe(...) when --capture matched+context        │
+│    7. RuleEngine::feed → drain_ready (matched events only)             │
+│       (--fd-snapshot-on-finding splices fdinfo_at_event on emit)       │
+│    8. follow_children / capture_reads side effects                     │
+│    9. emit (or park in ContextRing for backward dump)                  │
 │  poll(2) on the ring fd when empty.                                    │
 └────────────────────────────────────────────────────────────────────────┘
 
-Host-side post-processor (`neutron window`, sprint-2): an offline tool
-that reads NDJSON capture files, anchors on findings / crashes / pids /
-binder calls, and emits time- or event-bounded windows for triage. See
-docs/guides/window.md.
+Host-side post-processors:
+  neutron window     anchor → time/event window cut (sprint-2)
+  neutron summarize  --by <fields> → group counts + exemplars (1.2)
+  neutron diff       baseline vs test on a shared key (1.2)
+  neutron mark       append a type:"marker" NDJSON line (1.2)
 ```
 
 ## BPF Programs (`neutron-ebpf`)

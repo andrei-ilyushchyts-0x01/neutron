@@ -5,7 +5,7 @@
 .\"   sudo install -m 0644 man/man1/neutron.1 /usr/local/share/man/man1/
 .\"   sudo mandb        # rebuild the man index
 .\"
-.TH NEUTRON 1 "2026-05-05" "neutron 1.1.0" "User Commands"
+.TH NEUTRON 1 "2026-05-06" "neutron 1.2.0" "User Commands"
 .\" -----------------------------------------------------------------
 .SH NAME
 neutron \- low-intrusion eBPF syscall tracer for authorized Android
@@ -33,6 +33,27 @@ security assessment
 .B \-\-anchor
 .IR SPEC
 .RI [ WINDOW\ OPTIONS ]
+.PP
+.B neutron summarize
+.I CAPTURE
+.B \-\-by
+.IR FIELDS
+.RI [ \-\-samples\ N ]
+.RI [ \-\-top\ K ]
+.PP
+.B neutron diff
+.I BASELINE
+.I TEST
+.B \-\-by
+.IR FIELDS
+.RI [ \-\-top\ K ]
+.RI [ \-\-show\-same ]
+.PP
+.B neutron mark
+.I NAME
+.RI [ \-\-phase\ start | end ]
+.RI [ \-\-meta\ K=V ]
+.RI [ \-\-output\ FILE ]
 .\" -----------------------------------------------------------------
 .SH DESCRIPTION
 .B neutron
@@ -110,6 +131,62 @@ anchor from a previously-captured trace file. Reads
 for stdin) and writes the merged windows to standard output.
 See the
 .B WINDOW SUBCOMMAND
+section.
+.TP
+.BI summarize " CAPTURE \-\-by FIELDS " [\fB\-\-samples\fR " N" "] [\fB\-\-top\fR " K" "]"
+Streaming NDJSON aggregator (1.2.0). Counts events grouped by
+.IR FIELDS
+(comma-separated; supported keys:
+.BR syscall ", " pid ", " tid ", " uid ", " comm ", " fd_path ", "
+.BR ioctl_cmd ", " ioctl_name ", " ioctl_family ", " ret ", " ret_class ", "
+.BR type ", " is_enter ).
+Optional
+.B \-\-samples N
+keeps up to
+.I N
+raw exemplar lines per group;
+.B \-\-top K
+limits to the loudest
+.I K
+groups by count. Reads
+.I CAPTURE
+(or
+.B -
+for stdin); writes a sorted table to standard output.
+.TP
+.BI diff " BASELINE TEST \-\-by FIELDS " [\fB\-\-top\fR " K" "] [\fB\-\-show\-same\fR ]"
+Compare two NDJSON captures aggregated on the same key (1.2.0).
+Prints rows in
+.IR |\(De|
+descending order categorised
+.BR added " / " removed " / " changed
+(plus
+.B same
+when
+.B \-\-show\-same
+is set). Useful for negative-evidence workflows: "scenario A and B
+both ran the camera, what specifically shifted?". Only one of
+.IR BASELINE / TEST
+may be
+.B -
+(stdin).
+.TP
+.BI mark " NAME " [\fB\-\-phase\fR " start" | "end" "] [\fB\-\-meta\fR " K=V" "] [\fB\-\-output\fR " FILE" "]"
+Append one
+.B type:"marker"
+NDJSON line (1.2.0). Operators bracket external scenarios with two
+.B mark
+calls; downstream
+.B neutron window \-\-anchor marker:\fINAME
+cuts a window around the bracketed range. With
+.B \-\-output FILE
+the line is appended via
+.B O_APPEND
+(atomic on Linux for \(<= PIPE_BUF), so two concurrent writers do not
+interleave; without
+.B \-\-output
+the line goes to standard output. See the
+.B MARKER WORKFLOW
 section.
 .PP
 When no subcommand is given,
@@ -366,6 +443,212 @@ Default
 .B 0
 disables the correlator (raw binder / binder_received events still flow).
 LRU eviction when the cap is exceeded.
+.SS Capture predicates (1.2.0)
+.PP
+A two-stage filter. The cheap subset
+.RB ( pid ", " uid ", " syscall ", " ioctl-shape ", " ret ", " latency ", and "
+single-offset
+.BR arg.u32@N )
+lowers into BPF maps so the kernel pre-drops events before ringbuf
+reservation. The remainder
+.RB ( fd_path " globs, " comm " globs, " arg.u8/u16/u64 ", " binder " fields)
+runs userspace-side on every event that survived the BPF stage.
+The two stages share a single AND-conjunction; everything inside an
+.B OR
+or
+.B NOT
+in
+.B \-\-match \fIEXPR\fR
+falls through to userspace as a safe over-approximation.
+.PP
+Per the assessment workflow:
+.BR \-\-match-fd " toggles " STATE_EMIT_REQUIRED
+so kernel-side state-tracking syscalls
+.RB ( open ", " close ", " dup ", " dup3 ", " socket ", " pipe2 ", "
+.BR memfd_create ", " clone )
+bypass the predicate and keep the userspace
+.B FdGraph
+consistent. Sampling and rate-limiting also bypass these so the
+binder correlator never loses pair halves.
+.TP
+.BI \-\-match-pid " LIST"
+Multi-PID match (comma-separated u32). BPF-evaluable.
+.TP
+.BI \-\-match-uid " LIST"
+UID match (comma-separated; accepts
+.IR LO..HI
+ranges, capped at 1024 expanded entries). BPF-evaluable.
+.TP
+.BI \-\-match-syscall " LIST"
+aarch64 syscall numbers (comma-separated). BPF-evaluable; reuses the
+.B SYSCALL_FILTER
+map.
+.TP
+.BI \-\-match-fd " LIST"
+Glob-matched fd path (e.g.
+.BR '/dev/lwis*,/dev/gxp' ).
+Userspace-only; toggles
+.B STATE_EMIT_REQUIRED
+so kernel-side fd-state syscalls bypass the predicate.
+.TP
+.BI \-\-match-comm " LIST"
+Glob-matched
+.B comm
+(e.g.
+.BR 'cameraserver*,*provider' ).
+Userspace-only.
+.TP
+.BI \-\-match-ioctl-cmd " LIST"
+ioctl
+.I cmd
+32-bit word. BPF-evaluable.
+.TP
+.BI \-\-match-ioctl-type " LIST"
+.B _IOC_TYPE
+byte (e.g.
+.B 0x4c
+for LWIS). BPF-evaluable.
+.TP
+.BI \-\-match-ioctl-nr " LIST"
+.B _IOC_NR
+byte. BPF-evaluable.
+.TP
+.BI \-\-match-ioctl-dir " VALUE"
+.B _IOC_DIR
+=
+.BR none "/" r "/" w "/" rw .
+BPF-evaluable.
+.TP
+.BI \-\-match-ret " VALUE"
+Discrete ret-class on exit events:
+.BR any "/" nonzero "/" negative "/" zero .
+BPF-evaluable.
+.TP
+.BI \-\-match-latency-min " DUR"
+Minimum exit-side latency (
+.BR 100us ", " 5ms ", " 2s ", or bare integer µs).
+BPF-evaluable.
+.TP
+.B \-\-match-prot-rwx
+Match
+.BR mmap (2)/ mprotect (2)
+events with
+.BR PROT_READ|PROT_WRITE|PROT_EXEC .
+Userspace-only.
+.TP
+.B \-\-match-prot-wx
+Match
+.BR PROT_WRITE|PROT_EXEC
+without
+.BR PROT_READ .
+Userspace-only.
+.TP
+.BI \-\-match-arg-u32 " 'OFF=V[,V...]'"
+Typed equality / IN-set on the captured ioctl arg snapshot. Reads
+.B u32
+LE at byte offset
+.IR OFF
+of
+.IR data[4..]
+and matches against the value set. Single-offset BPF-evaluable
+.RB ( MATCH_ARG_U32_VALS ");"
+multiple offsets degrade to userspace-only.
+.B \-\-match-arg-u8 ", " \-\-match-arg-u16 ", " \-\-match-arg-u64
+mirror the same shape with narrower / wider widths
+(userspace-only).
+.TP
+.BI \-\-match-binder-{code,flags,to-proc,to-thread,target-node,reply} " VALUE"
+Match individual fields on
+.B type:"binder"
+and
+.B type:"binder_call"
+events. All userspace-only.
+.B \-\-match-binder-target-node
+accepts signed values.
+.TP
+.BI \-\-match " EXPR"
+Boolean expression over the same field vocabulary. Grammar:
+.BR AND " / " OR " / " NOT
++ parens, comparators
+.BR = " / " != " / " < " / " <= " / " > " / " >= " / " IN " / " GLOB .
+Top-level AND-of-atoms with BPF-evaluable fields lower into
+.BR MatchSpec ;
+clauses inside an
+.B OR
+or
+.B NOT
+contribute no kernel filtering. Mutually exclusive with the
+individual
+.BR \-\-match-* " flags."
+Audit-print at startup labels each clause
+.B [bpf]
+or
+.B [user]
+so volume reduction is visible.
+.SS Capture mode (1.2.0)
+.TP
+.BI \-\-capture " MODE"
+.BR matched+context= \fIDUR\fR
+arms a backward+forward window of
+.IR DUR
+around every match: the previous
+.IR DUR
+of rejected events flushes on the match, and the next
+.IR DUR
+emits unconditionally.
+.IR DUR
+accepts the same unit suffixes as
+.B \-\-match-latency-min
+and is capped at
+.BR 30s .
+.B default
+or
+.B matched
+preserves Phase 1a/1b emit-on-match-only behaviour.
+.SS Sampling (1.2.0)
+.TP
+.BI \-\-sample " P"
+Uniform Bernoulli drop with probability
+.IR 1-P .
+.I P
+in
+.BR [0.0,\ 1.0] ;
+.B 1.0
+keeps everything,
+.B 0.0
+drops every non-exempt event. State-tracking syscalls
+.RB ( open ", " close ", " dup ", " socket ", \&… ), the
+.B sched_process_exit
+sentinel, and binder caller / received sentinels always bypass.
+.TP
+.BI \-\-rate-limit " N"
+Token-bucket cap of
+.I N
+events per second across the matched stream. Same exemption set as
+.BR \-\-sample .
+.SS Finding enrichment (1.2.0)
+.TP
+.B \-\-fd-snapshot-on-finding
+When a finding fires with
+.BR ioctl
+evidence, read
+.IR /proc/<pid>/fdinfo/<fd>
+synchronously and embed as
+.B fdinfo_at_event
+on the JSON line. Useful for transient fds the 1-Hz fdgraph poller
+misses. Best-effort: failed reads are silent.
+.TP
+.BI \-\-binder-services " FILE"
+Path to a JSON
+.RB { callee_pid : { target_node : service_name }}
+map. Known
+.RB ( callee_pid ", " target_node )
+pairs surface a
+.B service
+field on
+.B binder_call
+events. Typically populated from
+.BR "service list -p" .
 .SS Build artefacts
 .TP
 .BI \-\-object " PATH"
@@ -441,6 +724,14 @@ contains the substring.
 with matching
 .B status
 .RB ( completed ", " callee_crashed ", " unmatched ).
+.IP \(bu
+.BR marker: \fINAME\fR
+\(em (1.2.0)
+.B type:"marker"
+with matching
+.BR name .
+Pair with
+.BR "neutron mark" .
 .SS Window sizing
 Time-based and event-count windows are mutually exclusive \(em pick one.
 .TP
@@ -567,9 +858,26 @@ add
 .BR rule_id ", " rule_name ", " severity ", " category ", " event_count ", "
 .BR first_seen_ms ", " last_seen_ms ", " period_ms ", " evidence ", " behavior ", "
 .BR "interpretation[]" ", " confidence ", " false_positives ", " evidence_quality ", "
-.BR capture_health ", " aggregates ", and " raw_window .
-The last two are populated by the engine at flush time \(em see
+.BR capture_health ", " aggregates ", " raw_window ", and (1.2.0) " fdinfo_at_event .
+The last three are populated by the engine at flush time \(em see
 .BR "FINDING AGGREGATES" .
+.PP
+.B Marker events
+.RB ( "type:\(dqmarker\(dq" ", " 1.2.0 )
+are emitted by
+.B neutron mark
+and carry
+.BR name ", optional " phase ", and optional " meta .
+.PP
+.B Capture-health events
+.RB ( "type:\(dqcapture_health\(dq" ", " 1.2.0 )
+fire once on shutdown in
+.B \-\-json
+mode and mirror the stderr capture-summary block. Carry
+.BR events_userspace ", " events_submitted ", "
+the per-cause degradation counters, and a
+.B degraded:bool
+flag identical to the WARNING-banner predicate.
 .PP
 For full schema tables see
 .IR docs/REFERENCE.md " and " docs/guides/output-formats.md .
@@ -737,6 +1045,64 @@ banner is printed if any drop or degradation counter is non-zero, with the
 text
 .RB \(lq "absence of a finding is NOT conclusive" \(rq.
 Treat findings derived from a degraded run as suggestive, not conclusive.
+.\" -----------------------------------------------------------------
+.SH MARKER WORKFLOW
+.B neutron mark
+appends a single
+.B type:"marker"
+NDJSON line so external scenarios bracket the live trace, and
+.B neutron window \-\-anchor marker:\fINAME
+cuts the bracketed window without manual timestamp grep'ing.
+.PP
+.EX
+\&# tracer in background
+neutron \-\-json \-\-output trace.ndjson &
+
+\&# bracket the stimulus
+neutron mark scenario \-\-phase start \-\-output trace.ndjson
+\&./trigger\-camera\-extension\-night
+neutron mark scenario \-\-phase end   \-\-output trace.ndjson
+
+kill %1
+neutron window trace.ndjson \-\-anchor marker:scenario \-\-around 5s
+.EE
+.PP
+With
+.B \-\-output FILE
+the line is appended via
+.B O_APPEND
+\(em atomic on Linux for writes \(<= PIPE_BUF \(em so two concurrent
+writers do not interleave. Without
+.B \-\-output
+the line goes to standard output.
+.\" -----------------------------------------------------------------
+.SH KERNEL SYMBOL RESOLUTION
+With
+.BR \-\-stacks ,
+neutron resolves kernel-side IPs through a two-layer pipeline (1.2.0):
+.IP \(bu
+.B kallsyms
+(/proc/kallsyms) gives full
+.IB name + 0x offset
+when the kernel's
+.B kptr_restrict
+allows reading symbol addresses.
+.IP \(bu
+.B /proc/modules
+gives
+.RB [ \fIko_name \fR]+0x offset
+for IPs inside loaded modules. Not masked by
+.BR kptr_restrict ,
+so it stays useful when the kallsyms layer is blinded.
+.PP
+Bare hex stays the fallback for IPs outside any loaded module
+when both layers miss.
+Verbose mode logs which layers were available, e.g.
+.IP
+.EX
+kernel resolver: 0 kallsyms + 92 module ranges \\
+  (kallsyms masked; modules\-only fallback)
+.EE
 .\" -----------------------------------------------------------------
 .SH FD-GRAPH
 .B neutron
@@ -912,6 +1278,41 @@ adb shell su -c "/data/local/tmp/neutron \\
 .EX
 adb shell su -c "/data/local/tmp/neutron --pid $PID --alert-rwx --raw"
 .EE
+.SS Predicate-driven LWIS capture (1.2.0)
+.PP
+.EX
+\&# Match LWIS command-packet ioctls only; expression form.
+adb shell su -c "/data/local/tmp/neutron --pid 0 --json \\
+    --match 'syscall = 29 AND ioctl.cmd = 0xc0104c64 \\
+             AND fd_path GLOB \(dq/dev/lwis*\(dq \\
+             AND arg.u32@0 IN (0x10100, 0x10200, 0x20300, 0x20400)'"
+.EE
+.SS Summarise an existing capture
+.PP
+.EX
+\&# Group counts by syscall + fd_path + ret_class
+neutron summarize trace.ndjson --by syscall,fd_path,ret_class --top 20
+
+\&# Compare two scenarios
+neutron diff baseline.ndjson test.ndjson \\
+    --by syscall,fd_path,ioctl_name --top 30
+.EE
+.SS Bracket a scenario with markers (1.2.0)
+.PP
+.EX
+adb shell su -c "/data/local/tmp/neutron --json \\
+    --output /data/local/tmp/trace.ndjson" &
+
+adb shell su -c "/data/local/tmp/neutron mark scenario \\
+    --phase start --output /data/local/tmp/trace.ndjson"
+adb shell './trigger-camera-night'
+adb shell su -c "/data/local/tmp/neutron mark scenario \\
+    --phase end --output /data/local/tmp/trace.ndjson"
+
+kill %1
+adb pull /data/local/tmp/trace.ndjson .
+neutron window trace.ndjson --anchor marker:scenario --around 5s
+.EE
 .\" -----------------------------------------------------------------
 .SH WIRE FORMAT
 The single source of truth is
@@ -939,6 +1340,28 @@ and
 .RB ( binder_transaction_received ).
 .B \-1
 remains the legacy binder caller sentinel.
+.PP
+Phase 1 (1.2.0) extended the BPF
+.B FILTER_MAP
+array from 2 to 16 slots; existing slot indices stay in place. New
+slots:
+.B FILTER_KEY_MATCH_BITS
+(2),
+.B FILTER_KEY_RET_CLASS
+(3),
+.B FILTER_KEY_LATENCY_MIN_US
+(4),
+.B FILTER_KEY_ARG_U32_OFF
+(5),
+.B FILTER_KEY_IOCTL_DIR
+(6),
+.B FILTER_KEY_STATE_EMIT_REQUIRED
+(7). New BPF maps:
+.BR MATCH_UID_SET ", " MATCH_IOCTL_CMD_SET ", " MATCH_IOCTL_TYPE_SET ", "
+.BR MATCH_IOCTL_NR_SET ", " MATCH_ARG_U32_VALS .
+The wire
+.B SyscallEvent
+struct itself is unchanged.
 .PP
 The
 .B pid

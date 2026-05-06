@@ -186,10 +186,12 @@ see low-level detail.
   "code":           7,
   "flags":          16,
   "reply":          false,
+  "target_node":    1,
   "sent_ts_ns":     1234567890,
   "received_ts_ns": 1234568390,
   "latency_us":     500,
   "status":         "completed",
+  "service":        "android.hardware.camera2",
   "event_id":       18234
 }
 ```
@@ -202,13 +204,47 @@ see low-level detail.
 | `callee_pid`     | u32       | Receiving process — taken from caller-side `to_proc`.                  |
 | `code`           | u32       | AIDL transaction code.                                                 |
 | `flags`          | u32       | TF_* flags (`0x01` = TF_ONE_WAY async).                               |
+| `target_node`    | i32       | Binder handle. Combined with `callee_pid`, identifies a specific service. (1.2.0) |
 | `received_ts_ns` | u64       | Omitted for `callee_crashed` pairs.                                    |
 | `latency_us`     | u64       | Omitted when `received_ts_ns` is absent.                               |
 | `status`         | string    | `"completed"`, `"callee_crashed"`, or `"unmatched"`.                  |
+| `service`        | string    | Optional. Surfaces when `--binder-services <FILE>` was supplied and the `(callee_pid, target_node)` pair is mapped. (1.2.0) |
 
 Disable the correlator with `--binder-inflight 0`. The default cap (1024
 in-flight transactions) is enough for ~steady-state Pixel HAL traffic;
 heavily multiplexed workloads can raise it.
+
+### Marker Event (`type == "marker"`, 1.2.0)
+
+Operator-supplied scenario marker emitted by `neutron mark <name>
+[--phase start|end] [--meta k=v]`. The live tracer never produces
+these on its own; they exist solely to bracket external stimuli for
+later window-cutting via `neutron window --anchor marker:<name>`.
+
+```json
+{ "type":"marker", "ts_ns":1712345678901234, "name":"scenario",
+  "phase":"start", "meta":{"build":"v1","device":"oriole"} }
+```
+
+`phase` and `meta` are both optional; omitted when not set.
+
+### Capture Health Event (`type == "capture_health"`, 1.2.0)
+
+Emitted as the final NDJSON line on shutdown when `--json` is on.
+Same counter set as the stderr capture-summary block, plus a
+`degraded:bool` flag mirroring the WARNING banner predicate.
+
+```json
+{ "type":"capture_health", "events_userspace":99999,
+  "events_submitted":99999, "ringbuf_reserve_failed":0,
+  "inflight_lookup_missed":0, "user_stack_failed":0,
+  "kernel_stack_failed":0, "path_truncated":0,
+  "fd_lookup_missed":0, "fd_graph_miss":0,
+  "fd_graph_backfilled":0, "degraded":false }
+```
+
+A downstream pipeline gating on "absence of finding is conclusive"
+should require `degraded:false`.
 
 ### Process Exit Event (`type == "process_exit"`)
 
@@ -255,7 +291,7 @@ with `--tombstone-dir ""` and the logcat tail with `--no-logcat`.
 
 | Field      | JSON type | Notes                                                                      |
 |------------|-----------|----------------------------------------------------------------------------|
-| `type`     | string    | Event class: `"syscall"`, `"binder"`, or `"finding"`. Stable identifier.   |
+| `type`     | string    | Event class: `"syscall"`, `"binder"`, `"binder_received"`, `"binder_call"`, `"fd_snapshot"`, `"process_exit"`, `"finding"`, `"marker"` (1.2.0), `"capture_health"` (1.2.0). Stable identifier. |
 | `ts_ns`    | number    | Kernel monotonic nanoseconds since boot                                    |
 | `pid`      | number    | Linux PID (= POSIX process ID = `tgid`)                                    |
 | `tid`      | number    | Linux TID (= POSIX thread ID = kernel `pid`)                               |

@@ -37,6 +37,7 @@ Reads from `-` for stdin: `cat capture.ndjson | neutron window - --anchor crash`
 | `event_id:<N>`             | single event with the matching `event_id` correlation token    |
 | `comm:<substring>`         | any event whose `comm` (or `caller_comm`) contains the string  |
 | `binder_call:<status>`     | `type:"binder_call"` with `status == <status>`                 |
+| `marker:<name>` (1.2.0)    | `type:"marker"` with `name == <name>`. Pair with `neutron mark`. |
 
 Multiple `--anchor` flags can be combined; each match becomes its own
 anchor and the resulting windows are merged.
@@ -115,3 +116,26 @@ neutron window capture.ndjson \
 neutron window capture.ndjson --anchor crash --around 5s \
   | neutron --raw --json --rules custom-rules.yaml
 ```
+
+### Bracket an external scenario with markers (1.2.0)
+
+`neutron mark` lets the operator stamp scenario boundaries into the
+trace; `neutron window --anchor marker:<name>` then cuts the
+relevant window without manual timestamp grep'ing.
+
+```bash
+# Tracer in background.
+neutron --json --output trace.ndjson &
+
+# Bracket the stimulus.
+neutron mark scenario --phase start --output trace.ndjson
+./trigger-camera-extension-night
+neutron mark scenario --phase end --output trace.ndjson
+
+kill %1
+neutron window trace.ndjson --anchor marker:scenario --around 5s
+```
+
+The marker write uses `O_APPEND`, atomic on Linux for ≤PIPE_BUF
+writes, so the `mark` command can run while the tracer is also
+writing.
