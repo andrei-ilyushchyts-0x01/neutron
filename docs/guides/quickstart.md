@@ -119,6 +119,35 @@ neutron window trace.ndjson \
 See [docs/guides/window.md](window.md) for the full anchor + window
 reference and a small cookbook.
 
+### Glob quoting over `adb shell`
+
+`--match-fd` and `--match-comm` take glob patterns. When they're passed
+through `adb shell su -c "..."`, two shells stand between your
+keystrokes and neutron — the local shell that runs `adb`, and the
+device shell that runs the `su -c` payload. Either one may expand `*`
+or `?` against its own filesystem before neutron sees argv.
+
+If neutron prints `WARNING: --match-fd arrived as N literal values …
+looks like the outer shell expanded a wildcard`, escape the `*` so it
+survives both shells:
+
+```bash
+# DOES NOT WORK in a typical adb-over-bash setup:
+adb shell su -c "/data/local/tmp/neutron --pid 0 --match-fd '/dev/lwis*'"
+
+# WORKS — the backslash survives the local bash and reaches the
+# device shell where it correctly suppresses globbing:
+adb shell su -c "/data/local/tmp/neutron --pid 0 --match-fd=/dev/lwis\\*"
+
+# Equivalent — heredoc transports argv literally:
+adb shell su -c <<'CMD'
+/data/local/tmp/neutron --pid 0 --match-fd=/dev/lwis*
+CMD
+```
+
+The same caveat applies to `--match-comm` and to fd-path globs inside
+`--match '...'`.
+
 ## Step 4: Read the Output
 
 Findings (default):

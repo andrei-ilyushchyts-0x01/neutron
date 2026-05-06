@@ -619,6 +619,57 @@ pub fn build_from_args(args: &crate::cli::Args) -> Result<MatchSpec> {
     Ok(spec)
 }
 
+/// Detect the "shell expanded my glob client-side" footgun. Returns
+/// `Some(common_prefix)` when the configured glob list looks like the
+/// result of a shell expansion: three or more entries, none containing
+/// `*` or `?`, and all sharing a non-trivial common prefix. Used by
+/// the startup warning so an operator who typed `--match-fd
+/// '/dev/lwis*'` over `adb shell su -c "..."` (where the outer shell
+/// expands the wildcard) sees what happened instead of getting a
+/// silent literal-only filter.
+///
+/// `None` means the input is plausibly a real glob set (or too small
+/// to draw a conclusion from).
+pub fn detect_likely_shell_expansion(globs: &[String]) -> Option<String> {
+    const MIN_VALUES: usize = 3;
+    const MIN_PREFIX_LEN: usize = 3;
+    if globs.len() < MIN_VALUES {
+        return None;
+    }
+    if globs.iter().any(|g| g.contains('*') || g.contains('?')) {
+        return None;
+    }
+    let prefix = common_string_prefix(globs);
+    if prefix.len() < MIN_PREFIX_LEN {
+        return None;
+    }
+    Some(prefix)
+}
+
+/// Longest common byte prefix across `values`. Bytes-aware so the
+/// caller doesn't need to worry about UTF-8 multibyte boundaries —
+/// path strings on Android are ASCII in practice.
+fn common_string_prefix(values: &[String]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    let first = values[0].as_bytes();
+    let mut len = first.len();
+    for v in &values[1..] {
+        let bytes = v.as_bytes();
+        let bound = len.min(bytes.len());
+        let mut i = 0;
+        while i < bound && first[i] == bytes[i] {
+            i += 1;
+        }
+        len = i;
+        if len == 0 {
+            return String::new();
+        }
+    }
+    String::from_utf8_lossy(&first[..len]).into_owned()
+}
+
 fn collect_globs(values: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for s in values {
@@ -1355,6 +1406,43 @@ mod tests {
         assert!(glob_match("/dev/lwis*", "/dev/lwis-top"));
         assert!(!glob_match("/dev/lwis*", "/dev/binder"));
         assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn detect_shell_expansion_flags_expanded_lwis_list() {
+        // What the device-test reported: `/dev/lwis*` over adb shell got
+        // expanded by the host shell into many literal entries.
+        let v = vec![
+            "/dev/lwis-cam".into(),
+            "/dev/lwis-isp".into(),
+            "/dev/lwis-top".into(),
+            "/dev/lwis-gtnr-merge".into(),
+        ];
+        let prefix = detect_likely_shell_expansion(&v).expect("flagged");
+        assert!(prefix.starts_with("/dev/lwis"), "got {prefix}");
+    }
+
+    #[test]
+    fn detect_shell_expansion_ignores_real_globs() {
+        let v = vec![
+            "/dev/lwis*".into(),
+            "/dev/gxp".into(),
+            "/dev/edgetpu*".into(),
+        ];
+        assert!(detect_likely_shell_expansion(&v).is_none());
+    }
+
+    #[test]
+    fn detect_shell_expansion_ignores_short_lists() {
+        let v = vec!["/dev/foo".into(), "/dev/bar".into()];
+        assert!(detect_likely_shell_expansion(&v).is_none());
+    }
+
+    #[test]
+    fn detect_shell_expansion_ignores_low_prefix() {
+        // Short shared prefix (just "/") doesn't trigger.
+        let v = vec!["/a".into(), "/b".into(), "/c".into(), "/d".into()];
+        assert!(detect_likely_shell_expansion(&v).is_none());
     }
 
     #[test]

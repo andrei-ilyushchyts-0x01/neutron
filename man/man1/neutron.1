@@ -1046,6 +1046,59 @@ text
 .RB \(lq "absence of a finding is NOT conclusive" \(rq.
 Treat findings derived from a degraded run as suggestive, not conclusive.
 .\" -----------------------------------------------------------------
+.SH GLOB QUOTING WITH ADB
+.PP
+.B \-\-match-fd
+and
+.B \-\-match-comm
+take glob patterns. When they're invoked through
+.BR "adb shell su -c """ ,
+two shells stand between your keystrokes and neutron: the local shell
+that runs
+.B adb ,
+and the on-device shell that runs the
+.B su -c
+payload. Either one may expand
+.B *
+or
+.B ?
+against its own filesystem before neutron sees argv.
+.PP
+The device test on 2026-05-06 surfaced this:
+.B \-\-match-fd '/dev/lwis*'
+arrived at neutron as a long list of expanded literal paths because the
+local
+.B /dev
+contained matching entries. neutron now prints a
+.B WARNING
+on startup when a
+.B \-\-match-fd
+/
+.B \-\-match-comm
+list looks like the result of a shell expansion (3+ literal entries
+sharing a prefix, no glob characters), but the easiest fix is to escape
+the wildcard so it survives both shells:
+.PP
+.EX
+\&# DOES NOT WORK in a typical adb-over-bash setup:
+adb shell su -c "/data/local/tmp/neutron --pid 0 --match-fd '/dev/lwis*'"
+
+\&# WORKS — the backslash survives the local bash and reaches the
+\&# device shell where it correctly suppresses globbing:
+adb shell su -c "/data/local/tmp/neutron --pid 0 --match-fd=/dev/lwis\\\\*"
+
+\&# Equivalent — heredoc keeps argv literal:
+adb shell su -c <<'CMD'
+/data/local/tmp/neutron --pid 0 --match-fd=/dev/lwis*
+CMD
+.EE
+.PP
+The same caveat applies to
+.B \-\-match-comm
+patterns and to fd-path globs inside
+.BR "\-\-match '...'" .
+Use the heredoc form when in doubt — it transports argv literally.
+.\" -----------------------------------------------------------------
 .SH MARKER WORKFLOW
 .B neutron mark
 appends a single

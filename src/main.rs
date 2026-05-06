@@ -258,6 +258,31 @@ impl CapturePredicate {
     }
 }
 
+/// Print a one-shot stderr warning when a `--match-fd` / `--match-comm`
+/// flag arrived as a list of literal entries with a strong common
+/// prefix and no glob characters — almost always the result of an
+/// outer shell having expanded the wildcard before neutron saw it.
+/// The 2026-05-06 device-test report flagged this as the loudest
+/// remaining UX rough edge: `--match-fd '/dev/lwis*'` over `adb shell
+/// su -c "..."` got expanded against the host's `/dev` and arrived
+/// as a noisy literal list. See man page `GLOB QUOTING WITH ADB`
+/// for the working escape pattern.
+fn warn_likely_shell_expansion(label: &str, globs: &[String]) {
+    if let Some(prefix) = matcher::detect_likely_shell_expansion(globs) {
+        eprintln!(
+            "neutron: WARNING: {label} arrived as {} literal values sharing prefix \
+             {prefix:?} with no glob characters — looks like the outer shell expanded \
+             a wildcard. If you intended a glob, escape the asterisk so the device \
+             shell sees it (see `GLOB QUOTING WITH ADB` in the man page):",
+            globs.len()
+        );
+        eprintln!(
+            r#"    adb shell su -c "...{label}={}\\*""#,
+            prefix.trim_end_matches('-')
+        );
+    }
+}
+
 /// True iff any individual `--match-*` flag was provided. Used by
 /// `build_capture_predicate` to enforce mutual exclusivity with
 /// `--match <expr>`.
@@ -842,6 +867,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                 "    [bpf]  state-tracking syscalls always-emit (fd_path \
                  enrichment requires fdgraph state)"
             );
+        }
+        if let Some(spec) = capture_predicate.bpf_spec() {
+            warn_likely_shell_expansion("--match-fd", &spec.fd_globs);
+            warn_likely_shell_expansion("--match-comm", &spec.comm_globs);
         }
     }
 
