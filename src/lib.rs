@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod cli;
 pub mod decode;
+pub mod diff;
 pub mod doctor;
 pub mod fdgraph;
 pub mod format;

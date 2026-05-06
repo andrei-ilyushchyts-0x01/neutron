@@ -40,6 +40,11 @@ pub enum Command {
     /// sorted table of `count + group fields`, optionally with raw
     /// exemplars per group. Phase 2.
     Summarize(crate::summarize::SummarizeArgs),
+
+    /// Compare two NDJSON captures aggregated on a shared key. Useful
+    /// for negative-evidence workflows ("scenario A and scenario B
+    /// both ran, what's different?"). Phase 2.
+    Diff(crate::diff::DiffArgs),
 }
 
 #[derive(Parser, Debug)]
