@@ -1200,8 +1200,10 @@ mod tests {
 
     #[test]
     fn ret_class_negative_matches_negative_only() {
-        let mut s = MatchSpec::default();
-        s.ret_class = RetClass::Negative;
+        let s = MatchSpec {
+            ret_class: RetClass::Negative,
+            ..MatchSpec::default()
+        };
         let ok = TestEvent {
             nr: 29,
             is_enter: false,
@@ -1220,8 +1222,10 @@ mod tests {
 
     #[test]
     fn latency_min_filters_exit_only() {
-        let mut s = MatchSpec::default();
-        s.latency_min_us = Some(1_000);
+        let s = MatchSpec {
+            latency_min_us: Some(1_000),
+            ..MatchSpec::default()
+        };
         let slow = TestEvent {
             nr: 29,
             is_enter: false,

@@ -69,6 +69,13 @@ impl ContextRing {
         self.events.len()
     }
 
+    /// `true` when the ring has no buffered events. Pairs with
+    /// [`Self::len`] to satisfy the `len_without_is_empty` contract.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     /// Wall-clock until which the forward window is open. Test helper.
     #[cfg(test)]
     pub fn forward_until_ns(&self) -> u64 {
