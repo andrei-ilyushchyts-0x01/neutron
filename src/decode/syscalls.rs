@@ -352,6 +352,32 @@ pub fn syscall_name(nr: i32) -> &'static str {
     }
 }
 
+/// Reverse lookup: symbolic name → aarch64 syscall number. Returns
+/// `None` for names we don't carry. Used by `--match-syscall` so
+/// operators can write `--match-syscall ioctl,openat` instead of
+/// `--match-syscall 29,56`. Linear scan over the full nr range; the
+/// table is fixed-size so the cost is bounded and parsing happens
+/// once at CLI parse time.
+pub fn syscall_nr(name: &str) -> Option<i32> {
+    if name.is_empty() {
+        return None;
+    }
+    // Sentinels first — short-circuit rather than fall through 500+ nrs.
+    let sentinel = match name {
+        "BINDER_TXN" | "binder_txn" | "binder" => Some(-1),
+        "BINDER_RECEIVED" | "binder_received" => Some(-4),
+        "FD_SNAPSHOT" | "fd_snapshot" => Some(-2),
+        "PROCESS_EXIT" | "process_exit" => Some(-3),
+        _ => None,
+    };
+    if sentinel.is_some() {
+        return sentinel;
+    }
+    // Brute-force scan. The aarch64 generic ABI tops out around 460;
+    // we go a little past for new kernels. Stops at the first hit.
+    (0..=470i32).find(|&nr| syscall_name(nr) == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

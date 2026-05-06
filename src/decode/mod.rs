@@ -17,7 +17,7 @@ pub use ioctl::{
     IoctlFields,
 };
 pub use sockaddr::{format_sockaddr, lookup_socket_by_inode, parse_net_addr, read_socket_inode};
-pub use syscalls::syscall_name;
+pub use syscalls::{syscall_name, syscall_nr};
 
 /// True if `nr` carries a NUL-terminated path in `data[128]`.
 ///

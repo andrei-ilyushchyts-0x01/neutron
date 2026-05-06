@@ -86,9 +86,16 @@ impl KeyField {
         const NONE: &str = "<none>";
         match self {
             KeyField::Syscall => obj
-                .get("syscall")
+                // Live `--json` output uses `"name":"ioctl"`. The
+                // legacy `"syscall":"…"` key was hypothetical and does
+                // not appear on real captures — accept it as a
+                // fallback so synthetic test fixtures keep working,
+                // but read `name` first.
+                .get("name")
                 .and_then(Value::as_str)
                 .map(String::from)
+                .or_else(|| obj.get("syscall").and_then(Value::as_str).map(String::from))
+                .or_else(|| obj.get("nr").and_then(Value::as_i64).map(|n| n.to_string()))
                 .or_else(|| {
                     obj.get("syscall_nr")
                         .and_then(Value::as_i64)
@@ -394,6 +401,38 @@ mod tests {
     fn rejects_empty_by_list() {
         assert!(parse_by("").is_err());
         assert!(parse_by(",,,").is_err());
+    }
+
+    #[test]
+    fn syscall_key_reads_name_field_from_live_schema() {
+        // Live `--json` output puts the syscall name under "name", not
+        // "syscall". The 2026-05-06 device test surfaced this: every
+        // group landed in the `<none>` bucket. Verify we now read
+        // "name" first.
+        let lines = r#"{"type":"syscall","name":"ioctl","pid":970,"phase":"exit"}
+{"type":"syscall","name":"ioctl","pid":970,"phase":"exit"}
+{"type":"syscall","name":"openat","pid":1234,"phase":"exit"}"#;
+        let keys = parse_by("syscall").unwrap();
+        let agg = summarize(s(lines), &keys, 0).unwrap();
+        let by_label: BTreeMap<String, u64> =
+            agg.iter().map(|(k, v)| (k[0].clone(), v.count)).collect();
+        assert_eq!(by_label.get("ioctl").copied(), Some(2));
+        assert_eq!(by_label.get("openat").copied(), Some(1));
+        assert!(!by_label.contains_key("<none>"), "name field must resolve");
+    }
+
+    #[test]
+    fn syscall_key_falls_back_to_nr_when_no_name() {
+        // Capture lines that carry only `nr` (e.g. legacy or unrecognised
+        // syscalls): we still surface a usable group key.
+        let lines = r#"{"type":"syscall","nr":29}
+{"type":"syscall","nr":222}"#;
+        let keys = parse_by("syscall").unwrap();
+        let agg = summarize(s(lines), &keys, 0).unwrap();
+        let by_label: BTreeMap<String, u64> =
+            agg.iter().map(|(k, v)| (k[0].clone(), v.count)).collect();
+        assert_eq!(by_label.get("29").copied(), Some(1));
+        assert_eq!(by_label.get("222").copied(), Some(1));
     }
 
     #[test]

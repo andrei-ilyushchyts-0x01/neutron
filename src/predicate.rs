@@ -813,14 +813,19 @@ fn eval_atom(c: &AtomicClause, ev: &dyn EventLens) -> bool {
             None => false,
         },
         Field::Ret => {
+            // ret is meaningful only on sys_exit events. Returning true
+            // for enters would short-circuit the AND/OR/NOT engine into
+            // accepting every enter event — the exact `--match-ret
+            // negative` bug the field test surfaced. Fail enter events
+            // outright so the user gets exit-only output.
             if ev.is_enter() {
-                return true; // ret only meaningful at exit
+                return false;
             }
             eval_int_cmp(c, ev.ret() as u64)
         }
         Field::LatencyUs => match ev.latency_us() {
             Some(l) => eval_int_cmp(c, l),
-            None => ev.is_enter(),
+            None => false, // enters and lost-correlation exits both fail
         },
         Field::ProtRwx => ev.rwx_marker() == Some(1),
         Field::ProtWx => ev.rwx_marker() == Some(2),
@@ -1250,6 +1255,48 @@ mod tests {
         };
         assert!(evaluate(&e, &on));
         assert!(!evaluate(&e, &off));
+    }
+
+    #[test]
+    fn ret_atom_drops_enter_events() {
+        let e = parse("ret < 0").unwrap();
+        let enter_neg = Ev {
+            nr: 29,
+            is_enter: true,
+            ret: -22,
+            ..Ev::default()
+        };
+        let exit_neg = Ev {
+            nr: 29,
+            is_enter: false,
+            ret: -22,
+            ..Ev::default()
+        };
+        // Enter events must fail even when ret would otherwise match —
+        // ret is exit-only, and the previous `if is_enter() { return
+        // true }` short-circuit was the source of the field-test
+        // 321k-enter leak.
+        assert!(!evaluate(&e, &enter_neg));
+        assert!(evaluate(&e, &exit_neg));
+    }
+
+    #[test]
+    fn latency_atom_drops_enter_events() {
+        let e = parse("latency_us >= 5000").unwrap();
+        let enter = Ev {
+            nr: 29,
+            is_enter: true,
+            latency_us: None,
+            ..Ev::default()
+        };
+        let exit_slow = Ev {
+            nr: 29,
+            is_enter: false,
+            latency_us: Some(10_000),
+            ..Ev::default()
+        };
+        assert!(!evaluate(&e, &enter));
+        assert!(evaluate(&e, &exit_slow));
     }
 
     #[test]

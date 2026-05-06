@@ -380,9 +380,21 @@ fn exit_predicate_match(nr: i32, uid: u32, saved: *const SyscallEvent, ret: i64,
 /// 1. Legacy `syscall_allowed` whitelist (gated by `FILTER_KEY_ACTIVE`).
 /// 2. Predicate AND-conjunction across configured `MATCH_*` clauses.
 /// 3. Always-pass for state-tracking syscalls when userspace requested it.
+/// 4. When an exit-only predicate (`MATCH_BIT_RET` / `MATCH_BIT_LATENCY`)
+///    is configured, drop enter events outright before ringbuf
+///    reservation. The matching exit will still emit if it satisfies
+///    the predicate; INFLIGHT was populated unconditionally so the
+///    exit retains args/data/stack. Saves the ringbuf bandwidth that
+///    the 2026-05-06 device test surfaced as 321k unwanted enter
+///    events under `--match-ret negative`.
 #[inline(always)]
 fn should_submit_enter(nr: i32, uid: u32, ev: *const SyscallEvent) -> bool {
     if !syscall_allowed(nr) {
+        return false;
+    }
+    let bits = match_bits();
+    let exit_only = (bits & (MATCH_BIT_RET | MATCH_BIT_LATENCY)) != 0;
+    if exit_only && !(state_emit_required() && is_state_tracking_nr(nr)) {
         return false;
     }
     if enter_predicate_match(nr, uid, ev) {
@@ -392,7 +404,7 @@ fn should_submit_enter(nr: i32, uid: u32, ev: *const SyscallEvent) -> bool {
         return true;
     }
     // No predicate active and no state-tracking opt-in: legacy fast path.
-    match_bits() == 0
+    bits == 0
 }
 
 /// Phase 1 emit gate for `sys_exit`. Same composition as the enter gate but

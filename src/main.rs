@@ -85,23 +85,30 @@ const POLL_TIMEOUT_MS: i32 = 100;
 
 static RUNNING_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-extern "C" fn sigint_handler(_sig: libc::c_int) {
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
     let ptr = RUNNING_PTR.load(Ordering::SeqCst);
     if ptr != 0 {
-        // SAFETY: pointer was set from a leaked Arc<AtomicBool> in install_sigint.
+        // SAFETY: pointer was set from a leaked Arc<AtomicBool> in
+        // `install_shutdown_signals`.
         let running = unsafe { &*(ptr as *const Arc<AtomicBool>) };
         running.store(false, Ordering::SeqCst);
     }
 }
 
-fn install_sigint(running: Arc<AtomicBool>) {
+/// Install graceful-shutdown signal handlers. Both SIGINT and SIGTERM
+/// flip the `running` flag so the event loop can drain in-flight
+/// findings, print the capture summary, and emit the `capture_health`
+/// JSON line. Without the SIGTERM handler the kernel default kills the
+/// process abruptly — which is what `timeout 3 neutron …` does by
+/// default and why the 2026-05-06 device test reported a missing
+/// health line (only `timeout -s INT 3` worked).
+fn install_shutdown_signals(running: Arc<AtomicBool>) {
     let leaked = Box::into_raw(Box::new(running)) as usize;
     RUNNING_PTR.store(leaked, Ordering::SeqCst);
     unsafe {
-        libc::signal(
-            libc::SIGINT,
-            sigint_handler as *const () as libc::sighandler_t,
-        );
+        let h = shutdown_signal_handler as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, h);
+        libc::signal(libc::SIGTERM, h);
     }
 }
 
@@ -902,7 +909,7 @@ fn run_trace(mut args: Args) -> Result<()> {
 
     // 7. Ctrl-C handler.
     let running = Arc::new(AtomicBool::new(true));
-    install_sigint(running.clone());
+    install_shutdown_signals(running.clone());
 
     eprintln!("  tracing… Ctrl-C to stop\n");
 
@@ -952,6 +959,14 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
     }
     let mut total_events: u64 = 0;
+    // Phase-1 pipeline counters surfaced in the final capture summary
+    // and the `capture_health` JSON line. The 2026-05-06 device test
+    // asked for matched / sampled-out / emitted as separate buckets so
+    // an operator can see how a `--match-*` configuration shaped the
+    // trace.
+    let mut events_matched: u64 = 0;
+    let mut events_sampled_out: u64 = 0;
+    let mut events_emitted: u64 = 0;
     // Session-scoped monotonic correlation token stamped onto every emitted
     // JSON line as `"event_id":N`. Resets on neutron restart — consumers must
     // not assume cross-session uniqueness. Used by the rule engine and (in
@@ -1298,6 +1313,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                     );
                     capture_predicate.evaluate(&lens)
                 };
+                if post_filter_ok {
+                    events_matched = events_matched.saturating_add(1);
+                }
 
                 // Always compute the JSON form: cheap and fed to the rule engine.
                 event_id_counter = event_id_counter.wrapping_add(1);
@@ -1316,6 +1334,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                 let nr_for_sampler = { ev.syscall_nr };
                 let ts_ns = { ev.timestamp_ns };
                 let sampler_keep = sampler.keep(ts_ns, nr_for_sampler);
+                if !sampler_keep {
+                    events_sampled_out = events_sampled_out.saturating_add(1);
+                }
 
                 // Phase 1c — context-window dispatch. The post-filter +
                 // sampler verdicts feed the ring (or the simple emit
@@ -1356,6 +1377,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     }
 
                     if !suppress_raw {
+                        events_emitted = events_emitted.saturating_add(lines.len() as u64);
                         for line in &lines {
                             // For text mode we still render the live event
                             // via the existing text formatter; backward-flush
@@ -1578,6 +1600,9 @@ fn run_trace(mut args: Args) -> Result<()> {
     let user_health = UserspaceHealth {
         fd_graph_miss: fd_graph.miss_count(),
         fd_graph_backfilled: fd_graph.backfill_count(),
+        events_matched,
+        events_sampled_out,
+        events_emitted,
     };
     if let Some(map) = bpf.map("COUNTERS") {
         match Array::<_, u64>::try_from(map) {

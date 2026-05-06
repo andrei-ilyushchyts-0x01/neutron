@@ -367,6 +367,33 @@ pub fn parse_u32_list(s: &str) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+/// Parse a `--match-syscall` value. Each entry is either a numeric
+/// syscall nr (decimal / `0x` hex) or a symbolic name resolved through
+/// [`crate::decode::syscall_nr`]. Mixed lists are allowed:
+/// `--match-syscall ioctl,222` accepts both shapes side-by-side. Empty
+/// entries are skipped.
+pub fn parse_syscall_list(s: &str) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    for raw in s.split(',') {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Numeric form first; on failure, try symbolic resolution.
+        match parse_u32_one(t) {
+            Ok(v) => out.push(v as i32),
+            Err(_) => match crate::decode::syscall_nr(t) {
+                Some(nr) => out.push(nr),
+                None => bail!(
+                    "--match-syscall: '{t}' is neither a valid number nor a known \
+                     syscall name (try `ioctl`, `openat`, `mmap`, …, or the numeric nr)"
+                ),
+            },
+        }
+    }
+    Ok(out)
+}
+
 /// Parse a comma-separated list of u32 values, supporting `LO..HI`
 /// inclusive ranges (e.g. `--match-uid 10100..10199`).
 pub fn parse_u32_list_with_ranges(s: &str) -> Result<Vec<u32>> {
@@ -505,9 +532,8 @@ pub fn build_from_args(args: &crate::cli::Args) -> Result<MatchSpec> {
     spec.uids = uids.into_iter().collect();
 
     for s in &args.match_syscall {
-        for v in parse_u32_list(s)? {
-            // Re-cast as i32 — syscall numbers are signed (sentinels exist).
-            spec.syscalls.insert(v as i32);
+        for nr in parse_syscall_list(s)? {
+            spec.syscalls.insert(nr);
         }
     }
 
@@ -874,19 +900,24 @@ pub fn evaluate(spec: &MatchSpec, ev: &dyn EventLens) -> bool {
             }
         }
     }
-    if spec.ret_class != RetClass::Any && !ev.is_enter() {
-        // Only meaningful for exit events. Enter events pass through; the
-        // pair-event for the exit will be evaluated separately.
-        if !spec.ret_class.matches(ev.ret()) {
-            return false;
-        }
+    // ret / latency are exit-only fields — they only carry meaning on
+    // sys_exit events. When either predicate is configured we must drop
+    // every enter event outright; the user explicitly asked for an
+    // exit-side condition. Letting enters slip through silently turns
+    // `--match-ret negative` into a near-passthrough capture (the bug
+    // the 2026-05-06 device test surfaced: 321k enters survived a 3s
+    // run alongside 899 negative exits).
+    let is_exit_only_predicate = spec.ret_class != RetClass::Any || spec.latency_min_us.is_some();
+    if is_exit_only_predicate && ev.is_enter() {
+        return false;
+    }
+    if spec.ret_class != RetClass::Any && !spec.ret_class.matches(ev.ret()) {
+        return false;
     }
     if let Some(min_us) = spec.latency_min_us {
-        if !ev.is_enter() {
-            match ev.latency_us() {
-                Some(l) if l >= min_us => {}
-                _ => return false,
-            }
+        match ev.latency_us() {
+            Some(l) if l >= min_us => {}
+            _ => return false,
         }
     }
     if spec.prot_rwx || spec.prot_wx {
@@ -1246,8 +1277,33 @@ mod tests {
         };
         assert!(evaluate(&s, &slow));
         assert!(!evaluate(&s, &fast));
-        // enter events should not be filtered by latency (it's exit-only).
-        assert!(evaluate(&s, &enter));
+        // Enter events must fail when an exit-only predicate is configured,
+        // otherwise `--match-latency-min` leaks every enter into output.
+        assert!(!evaluate(&s, &enter));
+    }
+
+    #[test]
+    fn ret_class_drops_enter_events_when_configured() {
+        let s = MatchSpec {
+            ret_class: RetClass::Negative,
+            ..MatchSpec::default()
+        };
+        let enter_neg = TestEvent {
+            nr: 29,
+            is_enter: true,
+            ret: -22, // would match if we ran the comparator
+            ..TestEvent::default()
+        };
+        let exit_neg = TestEvent {
+            nr: 29,
+            is_enter: false,
+            ret: -22,
+            ..TestEvent::default()
+        };
+        // Even with ret == -22, the enter event must fail because the
+        // predicate is exit-only.
+        assert!(!evaluate(&s, &enter_neg));
+        assert!(evaluate(&s, &exit_neg));
     }
 
     #[test]
@@ -1299,6 +1355,26 @@ mod tests {
         assert!(glob_match("/dev/lwis*", "/dev/lwis-top"));
         assert!(!glob_match("/dev/lwis*", "/dev/binder"));
         assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn parse_syscall_list_accepts_symbolic_and_numeric_mix() {
+        let v = parse_syscall_list("ioctl,222,openat,29").unwrap();
+        // ioctl=29, openat=56; raw 222=mmap; 29 already given. Order
+        // preserved.
+        assert_eq!(v, vec![29, 222, 56, 29]);
+    }
+
+    #[test]
+    fn parse_syscall_list_accepts_binder_sentinels() {
+        let v = parse_syscall_list("binder,binder_received,process_exit").unwrap();
+        assert_eq!(v, vec![-1, -4, -3]);
+    }
+
+    #[test]
+    fn parse_syscall_list_rejects_unknown_name() {
+        let err = parse_syscall_list("garbage").unwrap_err();
+        assert!(format!("{err:#}").contains("neither a valid number nor a known"));
     }
 
     #[test]

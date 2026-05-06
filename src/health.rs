@@ -125,11 +125,27 @@ impl CaptureHealth {
     }
 }
 
-/// Userspace counters not tracked by BPF. Today: FD-graph miss + backfill.
+/// Userspace counters not tracked by BPF. Track everything that
+/// shapes the userspace stage of the predicate / sampler / capture
+/// pipeline so an operator can audit "where did my events go?" from
+/// one block instead of three subsystems.
 #[derive(Debug, Clone, Default)]
 pub struct UserspaceHealth {
     pub fd_graph_miss: u64,
     pub fd_graph_backfilled: u64,
+    /// Events that survived the BPF prefilter and the userspace
+    /// post-filter (Phase 1a/1b match). Equal to `events_userspace`
+    /// when no `--match-*` flag is configured.
+    pub events_matched: u64,
+    /// Events the Phase 1d sampler dropped (uniform Bernoulli /
+    /// rate-limit). State-tracking and sentinel events are exempt by
+    /// construction so they're never counted here.
+    pub events_sampled_out: u64,
+    /// Lines actually written to the output sink. With
+    /// `--capture matched+context=<DUR>` this can exceed
+    /// `events_matched` because backward+forward ring flushes emit
+    /// multiple lines per match.
+    pub events_emitted: u64,
 }
 
 /// Render the capture summary as a single block of text, suitable for stderr.
@@ -158,6 +174,15 @@ pub fn format_summary_with(
         out.push_str(&format!(
             "  fd graph: {} miss(es), {} resolved via /proc/<pid>/fd\n",
             user.fd_graph_miss, user.fd_graph_backfilled
+        ));
+    }
+    // Predicate / sampler / context-window pipeline counters. Always
+    // shown when the loop ran for at least one event so operators can
+    // see how a `--match-*` configuration thinned the trace.
+    if total_userspace_events > 0 {
+        out.push_str(&format!(
+            "  matched: {}  sampled-out: {}  emitted: {}\n",
+            user.events_matched, user.events_sampled_out, user.events_emitted
         ));
     }
     if health.has_degradation() {
@@ -199,9 +224,12 @@ pub fn format_capture_health_json(
     }
     let _ = write!(
         s,
-        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"degraded":{}}}"#,
+        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"degraded":{}}}"#,
         user.fd_graph_miss,
         user.fd_graph_backfilled,
+        user.events_matched,
+        user.events_sampled_out,
+        user.events_emitted,
         health.has_degradation()
     );
     s
@@ -267,9 +295,25 @@ mod tests {
         let user = UserspaceHealth {
             fd_graph_miss: 12,
             fd_graph_backfilled: 9,
+            ..UserspaceHealth::default()
         };
         let s = format_summary_with(&h, &user, 100);
         assert!(s.contains("fd graph: 12 miss(es), 9 resolved"));
+    }
+
+    #[test]
+    fn format_summary_emits_pipeline_counters_when_events_seen() {
+        let h = CaptureHealth::default();
+        let user = UserspaceHealth {
+            events_matched: 50,
+            events_sampled_out: 30,
+            events_emitted: 70,
+            ..UserspaceHealth::default()
+        };
+        let s = format_summary_with(&h, &user, 100);
+        assert!(s.contains("matched: 50"));
+        assert!(s.contains("sampled-out: 30"));
+        assert!(s.contains("emitted: 70"));
     }
 
     #[test]
@@ -288,6 +332,9 @@ mod tests {
         let user = UserspaceHealth {
             fd_graph_miss: 3,
             fd_graph_backfilled: 2,
+            events_matched: 50,
+            events_sampled_out: 5,
+            events_emitted: 60,
         };
         let line = format_capture_health_json(&h, &user, 99_999);
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
@@ -297,6 +344,9 @@ mod tests {
         assert_eq!(v["ringbuf_reserve_failed"], 7u64);
         assert_eq!(v["fd_graph_miss"], 3u64);
         assert_eq!(v["fd_graph_backfilled"], 2u64);
+        assert_eq!(v["events_matched"], 50u64);
+        assert_eq!(v["events_sampled_out"], 5u64);
+        assert_eq!(v["events_emitted"], 60u64);
         assert_eq!(v["degraded"], true);
     }
 
