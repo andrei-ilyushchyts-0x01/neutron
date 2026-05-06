@@ -340,4 +340,19 @@ pub struct Args {
     /// Binder `reply` flag — one of `true|false`.
     #[arg(long)]
     pub match_binder_reply: Option<bool>,
+
+    // ── Phase 1b — `--match` boolean expression ────────────────────────────
+    //
+    // Recursive-descent parser for AND/OR/NOT over the same field
+    // vocabulary as the individual `--match-*` flags. Mutually exclusive
+    // with the individual flags: pick the expression form for power, the
+    // individual flags for terse one-clause filters.
+    //
+    // Example:
+    //   --match 'syscall = 29 AND fd_path GLOB "/dev/lwis*"'
+    //   --match 'ret < 0 OR latency_us >= 5000'
+    //   --match 'pid = 970 AND (ioctl.cmd IN (0xc0104c64, 0xc0084c01))'
+    /// Boolean predicate expression. See man page for grammar.
+    #[arg(long, value_name = "EXPR")]
+    pub match_expr: Option<String>,
 }

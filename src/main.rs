@@ -36,6 +36,7 @@ use neutron::format::{
 };
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
 use neutron::matcher::{self, MatchSpec, SyscallEventLens};
+use neutron::predicate;
 use neutron::rules::{build_rule_engine, emit_findings};
 use neutron::sources::binder_tracker::BinderTracker;
 use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
@@ -188,6 +189,117 @@ fn populate_filter_map(bpf: &mut Ebpf, pid: u32) -> Result<()> {
         .set(FILTER_KEY_ACTIVE, 0u32, 0)
         .context("setting FILTER_MAP[ACTIVE]")?;
     Ok(())
+}
+
+/// Unified capture-predicate carrier. Phase 1a populates this from
+/// individual `--match-*` flags; Phase 1b populates it from a parsed
+/// `--match '<expr>'` AST. The runtime hot-path consults the same
+/// `evaluate` method either way, so the post-filter loop stays unchanged.
+enum CapturePredicate {
+    Empty,
+    Spec(MatchSpec),
+    Expr {
+        ast: predicate::Expr,
+        bpf_spec: MatchSpec,
+        ast_mentions_fd_path: bool,
+    },
+}
+
+impl CapturePredicate {
+    fn bpf_spec(&self) -> Option<&MatchSpec> {
+        match self {
+            CapturePredicate::Empty => None,
+            CapturePredicate::Spec(s) => Some(s),
+            CapturePredicate::Expr { bpf_spec, .. } => Some(bpf_spec),
+        }
+    }
+
+    fn evaluate(&self, lens: &dyn matcher::EventLens) -> bool {
+        match self {
+            CapturePredicate::Empty => true,
+            CapturePredicate::Spec(s) => matcher::evaluate(s, lens),
+            CapturePredicate::Expr { ast, .. } => predicate::evaluate(ast, lens),
+        }
+    }
+
+    fn audit_lines(&self) -> Vec<String> {
+        match self {
+            CapturePredicate::Empty => Vec::new(),
+            CapturePredicate::Spec(s) => s.audit_lines(),
+            CapturePredicate::Expr { ast, .. } => predicate::audit_lines(ast),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, CapturePredicate::Empty)
+    }
+
+    fn needs_state_events_via_ast(&self) -> bool {
+        match self {
+            CapturePredicate::Expr {
+                ast_mentions_fd_path,
+                bpf_spec,
+                ..
+            } => *ast_mentions_fd_path && !bpf_spec.needs_state_events(),
+            _ => false,
+        }
+    }
+}
+
+/// True iff any individual `--match-*` flag was provided. Used by
+/// `build_capture_predicate` to enforce mutual exclusivity with
+/// `--match <expr>`.
+fn any_individual_match_flag(args: &Args) -> bool {
+    !args.match_pid.is_empty()
+        || !args.match_uid.is_empty()
+        || !args.match_syscall.is_empty()
+        || !args.match_fd.is_empty()
+        || !args.match_comm.is_empty()
+        || !args.match_ioctl_cmd.is_empty()
+        || !args.match_ioctl_type.is_empty()
+        || !args.match_ioctl_nr.is_empty()
+        || args.match_ioctl_dir.is_some()
+        || args.match_ret.is_some()
+        || args.match_latency_min.is_some()
+        || args.match_prot_rwx
+        || args.match_prot_wx
+        || !args.match_arg_u8.is_empty()
+        || !args.match_arg_u16.is_empty()
+        || !args.match_arg_u32.is_empty()
+        || !args.match_arg_u64.is_empty()
+        || !args.match_binder_code.is_empty()
+        || !args.match_binder_flags.is_empty()
+        || !args.match_binder_to_proc.is_empty()
+        || !args.match_binder_to_thread.is_empty()
+        || !args.match_binder_target_node.is_empty()
+        || args.match_binder_reply.is_some()
+}
+
+fn build_capture_predicate(args: &Args) -> Result<CapturePredicate> {
+    let has_individual = any_individual_match_flag(args);
+    let has_expr = args.match_expr.is_some();
+    if has_individual && has_expr {
+        bail!(
+            "--match <expr> is mutually exclusive with --match-* individual flags; \
+             pick one form"
+        );
+    }
+    if let Some(s) = &args.match_expr {
+        let ast = predicate::parse(s).with_context(|| format!("--match {s:?}"))?;
+        let bpf_spec = predicate::extract_bpf_spec(&ast);
+        let ast_mentions_fd_path = predicate::mentions_fd_path(&ast);
+        return Ok(CapturePredicate::Expr {
+            ast,
+            bpf_spec,
+            ast_mentions_fd_path,
+        });
+    }
+    let spec = matcher::build_from_args(args)?;
+    if spec.is_empty() {
+        Ok(CapturePredicate::Empty)
+    } else {
+        Ok(CapturePredicate::Spec(spec))
+    }
 }
 
 /// Phase 1a — push every BPF-evaluable clause of `spec` into its kernel
@@ -674,16 +786,36 @@ fn run_trace(mut args: Args) -> Result<()> {
     // 2. Populate filter map.
     populate_filter_map(&mut bpf, args.pid)?;
 
-    // 2b. Phase 1a — build the predicate spec, push the BPF-evaluable
-    // subset down to the kernel, and print the audit.
-    let match_spec = matcher::build_from_args(&args)?;
-    if !match_spec.is_empty() {
-        populate_match_maps(&mut bpf, &match_spec)?;
-        eprintln!("  match predicate (Phase 1a):");
-        for line in match_spec.audit_lines() {
+    // 2b. Phase 1a/1b — build the capture predicate. `--match <expr>`
+    // takes precedence over the individual `--match-*` flags; the two
+    // forms are mutually exclusive (using both at once is rejected).
+    let capture_predicate = build_capture_predicate(&args)?;
+    if let Some(bpf_spec) = capture_predicate.bpf_spec() {
+        populate_match_maps(&mut bpf, bpf_spec)?;
+    }
+    if capture_predicate.needs_state_events_via_ast() {
+        // Fallback path: the AST mentions fd_path even though the BPF
+        // lowering couldn't capture it (e.g. inside an OR). Toggle
+        // STATE_EMIT_REQUIRED so kernel-side fd-state syscalls still
+        // bypass the prefilter and userspace fdgraph stays consistent.
+        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+        filter
+            .set(FILTER_KEY_STATE_EMIT_REQUIRED, 1u32, 0)
+            .context("FILTER_MAP[STATE_EMIT_REQUIRED]=1")?;
+    }
+    let audit = capture_predicate.audit_lines();
+    if !audit.is_empty() {
+        eprintln!("  match predicate (Phase 1):");
+        for line in audit {
             eprintln!("    {line}");
         }
-        if match_spec.needs_state_events() {
+        if capture_predicate
+            .bpf_spec()
+            .is_some_and(|s| s.needs_state_events())
+            || capture_predicate.needs_state_events_via_ast()
+        {
             eprintln!(
                 "    [bpf]  state-tracking syscalls always-emit (fd_path \
                  enrichment requires fdgraph state)"
@@ -1062,17 +1194,18 @@ fn run_trace(mut args: Args) -> Result<()> {
                     })
                 });
 
-                // Phase 1a — userspace post-filter. The BPF prefilter is a
+                // Phase 1a/1b — userspace post-filter. The BPF prefilter is a
                 // safe over-approximation; here we apply the full predicate
-                // (including userspace-only clauses) to decide whether to
-                // emit the event line, feed the rule engine, and record into
-                // the crash-context lookback.
+                // (including userspace-only clauses, OR / NOT branches, and
+                // `--match <expr>` AST nodes) to decide whether to emit the
+                // event line, feed the rule engine, and record into the
+                // crash-context lookback.
                 //
                 // fdgraph state has already been updated above so we can
                 // reject state-tracking events without losing fd→path
-                // information; the matcher's `--match-fd` clause then has
-                // current data when it evaluates a later ioctl.
-                let post_filter_ok = if match_spec.is_empty() {
+                // information; a later ioctl whose match depends on the
+                // resolved path then sees the up-to-date entry.
+                let post_filter_ok = if capture_predicate.is_empty() {
                     true
                 } else {
                     let lens = SyscallEventLens::new(
@@ -1081,7 +1214,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                         fd_hint.as_ref().map(|h| h.path.as_str()),
                         compute_latency_us(&ev),
                     );
-                    matcher::evaluate(&match_spec, &lens)
+                    capture_predicate.evaluate(&lens)
                 };
 
                 // Always compute the JSON form: cheap and fed to the rule engine.
