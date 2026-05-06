@@ -39,6 +39,7 @@ use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
 use neutron::matcher::{self, MatchSpec, SyscallEventLens};
 use neutron::predicate;
 use neutron::rules::{build_rule_engine, emit_findings};
+use neutron::sampler::SamplerChain;
 use neutron::sources::binder_tracker::BinderTracker;
 use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
 use neutron::sources::lookback::RingBufferStore;
@@ -837,6 +838,19 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
     };
 
+    // 2d. Phase 1d — sampling and rate limiting. State-tracking syscalls
+    // bypass both inside `SamplerChain`, so fdgraph stays consistent
+    // regardless of the configured probability or QPS cap.
+    let mut sampler = SamplerChain::from_args(args.sample, args.rate_limit)?;
+    if !sampler.is_passthrough() {
+        if let Some(p) = args.sample {
+            eprintln!("  sample: p={p:.3} (state-tracking syscalls exempt)");
+        }
+        if let Some(n) = args.rate_limit {
+            eprintln!("  rate-limit: {n} events/sec (state-tracking syscalls exempt)");
+        }
+    }
+
     // 3. Build rule engine.
     let mut engine = build_rule_engine(&args)?;
     let suppress_raw = engine.is_some() && !args.raw;
@@ -1241,25 +1255,32 @@ fn run_trace(mut args: Args) -> Result<()> {
                     Some(event_id_counter),
                 );
 
-                // Phase 1c — context-window dispatch.
-                //
-                // Default mode: emit only when post_filter_ok (preserves
-                // Phase 1a/1b behaviour).
-                // matched+context: feed every event through the ring; the
-                // ring decides whether to emit (current event only),
-                // emit-with-backward-flush, emit-as-forward-window, or
-                // park. Returned vec is in chronological order.
-                let lines: Vec<String> = match context_ring.as_mut() {
-                    None => {
-                        if post_filter_ok {
-                            vec![json_line.clone()]
-                        } else {
-                            Vec::new()
+                // Phase 1d — sampling decision. State-tracking syscalls
+                // (open/close/dup/socket/...) and synthetic sentinels
+                // bypass the chain so fdgraph and crash correlation stay
+                // intact even at p=0.0 / rate=1.
+                let nr_for_sampler = { ev.syscall_nr };
+                let ts_ns = { ev.timestamp_ns };
+                let sampler_keep = sampler.keep(ts_ns, nr_for_sampler);
+
+                // Phase 1c — context-window dispatch. The post-filter +
+                // sampler verdicts feed the ring (or the simple emit
+                // path) together. State-tracking events that the sampler
+                // exempts will reach the ring as `matched=false` if the
+                // predicate also rejected them — so they sit in the
+                // backward window without firing it themselves.
+                let lines: Vec<String> = if !sampler_keep {
+                    Vec::new()
+                } else {
+                    match context_ring.as_mut() {
+                        None => {
+                            if post_filter_ok {
+                                vec![json_line.clone()]
+                            } else {
+                                Vec::new()
+                            }
                         }
-                    }
-                    Some(ring) => {
-                        let ts_ns = { ev.timestamp_ns };
-                        ring.observe(ts_ns, post_filter_ok, &json_line)
+                        Some(ring) => ring.observe(ts_ns, post_filter_ok, &json_line),
                     }
                 };
 

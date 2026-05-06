@@ -370,4 +370,21 @@ pub struct Args {
     /// which case every BPF-surviving event matches vacuously).
     #[arg(long, value_name = "MODE")]
     pub capture: Option<String>,
+
+    // ── Phase 1d — sampling ────────────────────────────────────────────────
+    /// Uniform Bernoulli sample probability in `[0.0, 1.0]`. `1.0`
+    /// (default) keeps every event; `0.01` keeps 1%. State-tracking
+    /// syscalls (open/close/dup/socket/...) are NEVER sampled — their
+    /// drop would silently break userspace fdgraph and downstream
+    /// `fd_path` matching. `--match`-rejected events are decided before
+    /// sampling, so this flag only thins the matched stream.
+    #[arg(long, value_name = "P")]
+    pub sample: Option<f64>,
+
+    /// Cap on emitted events per second across the matched stream.
+    /// Implements a leaky token-bucket: when the bucket is empty, the
+    /// excess is dropped. State-tracking syscalls bypass this cap for
+    /// the same fdgraph-consistency reason as `--sample`.
+    #[arg(long, value_name = "N")]
+    pub rate_limit: Option<u64>,
 }
