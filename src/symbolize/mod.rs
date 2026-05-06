@@ -12,11 +12,13 @@ pub mod art;
 pub mod elf;
 pub mod kallsyms;
 pub mod proc_maps;
+pub mod proc_modules;
 
 use std::collections::HashMap;
 
 pub use kallsyms::KernelSymbolizer;
 pub use proc_maps::{parse_proc_maps, MapEntry};
+pub use proc_modules::KernelModules;
 
 use elf::ElfSymbols;
 
@@ -141,6 +143,121 @@ fn basename(path: &str) -> &str {
     match path.rsplit_once('/') {
         Some((_, b)) => b,
         None => path,
+    }
+}
+
+// ─── Kernel resolver: kallsyms + modules ───────────────────────────────────
+
+/// Two-layer kernel symbolisation. The kallsyms layer gives full
+/// `name+0x<offset>` resolution when available; the modules layer
+/// provides `[<ko>]+0x<offset>` even when `kptr_restrict` masks
+/// kallsyms. Phase 5b.
+#[derive(Default)]
+pub struct KernelResolver {
+    pub kallsyms: Option<KernelSymbolizer>,
+    pub modules: Option<KernelModules>,
+}
+
+impl KernelResolver {
+    /// Build with both layers populated when available. Either may be
+    /// `None`; callers detect "fully blind" via [`Self::is_blind`].
+    pub fn load() -> Self {
+        Self {
+            kallsyms: KernelSymbolizer::from_kallsyms(),
+            modules: KernelModules::load(),
+        }
+    }
+
+    /// `true` when neither layer can resolve anything. The caller may
+    /// then suppress stack output entirely, or just emit hex.
+    pub fn is_blind(&self) -> bool {
+        self.kallsyms.is_none() && self.modules.is_none()
+    }
+
+    /// Symbolise `ip`. Returns the best label available, or the bare
+    /// hex form when both layers miss. Outputs are stable across runs:
+    /// `name+0x<offset>` (kallsyms hit), `[<ko>]+0x<offset>` (module
+    /// fallback), or `0x<addr>` (no resolution).
+    pub fn resolve(&self, ip: u64) -> String {
+        if let Some(k) = self.kallsyms.as_ref() {
+            let s = k.symbolize(ip);
+            // KernelSymbolizer prints "0x<addr>" on miss; forward to the
+            // module layer in that case rather than accepting the hex.
+            if !s.starts_with("0x") {
+                return s;
+            }
+        }
+        if let Some(m) = self.modules.as_ref() {
+            if let Some(s) = m.resolve(ip) {
+                return s;
+            }
+        }
+        format!("{:#x}", ip)
+    }
+}
+
+#[cfg(test)]
+mod kernel_resolver_tests {
+    use super::*;
+
+    fn build(kallsyms_text: Option<&str>, modules_text: Option<&str>) -> KernelResolver {
+        KernelResolver {
+            kallsyms: kallsyms_text.and_then(KernelSymbolizer::from_text),
+            modules: modules_text.map(KernelModules::from_text),
+        }
+    }
+
+    #[test]
+    fn prefers_kallsyms_when_resolved() {
+        // Use addresses below 0xffff... so kallsyms doesn't see "above first"
+        // miss. Builders accept any sorted set.
+        let kallsyms = "\
+0001000000000000 T do_sys_open
+0001000000000100 T sys_openat
+";
+        let modules = "myko 4096 0 - Live 0x0001000000000000\n";
+        let r = build(Some(kallsyms), Some(modules));
+        // Prefer kallsyms over modules when both can resolve.
+        let s = r.resolve(0x0001000000000010);
+        assert_eq!(s, "do_sys_open+0x10");
+    }
+
+    #[test]
+    fn falls_through_to_modules_when_kallsyms_misses() {
+        // Empty kallsyms (all-zero) → returns None; modules then
+        // resolves the address.
+        let kallsyms = "0 T sys_openat\n";
+        let modules = "ip_tables 4096 0 - Live 0xffffffffc09f0000\n";
+        let r = build(Some(kallsyms), Some(modules));
+        let s = r.resolve(0xffffffffc09f0010);
+        assert_eq!(s, "[ip_tables]+0x10");
+    }
+
+    #[test]
+    fn falls_through_to_modules_when_kallsyms_address_below_first() {
+        let kallsyms = "ffffffffd0000000 T late_symbol\n";
+        let modules = "ip_tables 4096 0 - Live 0xffffffffc09f0000\n";
+        let r = build(Some(kallsyms), Some(modules));
+        // ip < lowest kallsyms entry → kallsyms returns "0x..." → fall through.
+        let s = r.resolve(0xffffffffc09f0010);
+        assert_eq!(s, "[ip_tables]+0x10");
+    }
+
+    #[test]
+    fn returns_hex_when_both_layers_miss() {
+        let r = build(Some("ffffffffd0000000 T x\n"), Some(""));
+        let s = r.resolve(0x10);
+        assert!(s.starts_with("0x"));
+    }
+
+    #[test]
+    fn is_blind_only_when_both_layers_absent() {
+        let r = build(None, None);
+        assert!(r.is_blind());
+        let r = build(Some("ffffffffd0000000 T x\n"), None);
+        assert!(!r.is_blind());
+        let r = build(None, Some("m 4096 0 - Live 0xffff000000000000\n"));
+        assert!(!r.is_blind());
     }
 }
 

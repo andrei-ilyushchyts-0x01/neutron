@@ -46,7 +46,7 @@ use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
 use neutron::sources::lookback::RingBufferStore;
 use neutron::sources::tombstone::{RealTombstoneWatcher, TombstoneWatcher};
 use neutron::sources::ProcessExitEvent;
-use neutron::symbolize::{is_kernel_addr, KernelSymbolizer, ProcSymbolizer};
+use neutron::symbolize::{is_kernel_addr, KernelResolver, ProcSymbolizer};
 use neutron::SyscallEvent;
 use neutron_common::{
     ExitSource, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF, FILTER_KEY_IOCTL_DIR,
@@ -496,7 +496,7 @@ fn format_stack(
     stack_traces: &StackTraceMap<&aya::maps::MapData>,
     stackid: i32,
     proc_sym: Option<&mut ProcSymbolizer>,
-    kernel_sym: Option<&KernelSymbolizer>,
+    kernel_resolver: Option<&KernelResolver>,
 ) -> Option<String> {
     if stackid < 0 {
         return None;
@@ -513,8 +513,12 @@ fn format_stack(
     for f in frames.iter() {
         let ip = f.ip;
         let s = if is_kernel_addr(ip) {
-            match kernel_sym {
-                Some(k) => k.symbolize(ip),
+            // KernelResolver bundles kallsyms + /proc/modules. When
+            // kallsyms is masked by kptr_restrict, modules still gives
+            // a `[<ko>]+0x<offset>` label for IPs inside loaded
+            // modules. Both layers absent → bare hex.
+            match kernel_resolver {
+                Some(r) => r.resolve(ip),
                 None => format!("{:#x}", ip),
             }
         } else {
@@ -909,17 +913,40 @@ fn run_trace(mut args: Args) -> Result<()> {
     // Per-PID symbolizer cache. `None` means we tried and failed to read
     // `/proc/<pid>/maps` (process exited, or insufficient permissions).
     let mut proc_sym_cache: HashMap<u32, Option<ProcSymbolizer>> = HashMap::new();
-    // Build the kernel symbolizer once. None when kallsyms is masked.
-    let kernel_sym: Option<KernelSymbolizer> = if args.stacks {
-        KernelSymbolizer::from_kallsyms()
+    // Build the kernel-side resolver once. Two layers: kallsyms gives
+    // `name+0x<offset>` when readable; /proc/modules still gives
+    // `[<ko>]+0x<offset>` when kptr_restrict masks kallsyms. Phase 5b.
+    let kernel_resolver: Option<KernelResolver> = if args.stacks {
+        let r = KernelResolver::load();
+        if r.is_blind() {
+            None
+        } else {
+            Some(r)
+        }
     } else {
         None
     };
     if args.verbose {
-        if let Some(k) = kernel_sym.as_ref() {
-            eprintln!("  kallsyms: {} symbols loaded", k.len());
-        } else if args.stacks {
-            eprintln!("  kallsyms: unavailable (kptr_restrict?) — kernel frames stay hex");
+        match kernel_resolver.as_ref() {
+            Some(r) => {
+                let k = r.kallsyms.as_ref().map(|k| k.len()).unwrap_or(0);
+                let m = r.modules.as_ref().map(|m| m.len()).unwrap_or(0);
+                eprintln!(
+                    "  kernel resolver: {k} kallsyms + {m} module ranges{}",
+                    if k == 0 {
+                        " (kallsyms masked; modules-only fallback)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            None if args.stacks => {
+                eprintln!(
+                    "  kernel resolver: unavailable (kptr_restrict + no modules) — \
+                     kernel frames stay hex"
+                );
+            }
+            _ => {}
         }
     }
     let mut total_events: u64 = 0;
@@ -1197,8 +1224,12 @@ fn run_trace(mut args: Args) -> Result<()> {
                         if let Some(stmap) = bpf.map("STACK_TRACES") {
                             if let Ok(stack_traces) = StackTraceMap::try_from(stmap) {
                                 let proc_sym_mut = proc_sym_opt.as_mut();
-                                let kernel_str =
-                                    format_stack(&stack_traces, kstk, None, kernel_sym.as_ref());
+                                let kernel_str = format_stack(
+                                    &stack_traces,
+                                    kstk,
+                                    None,
+                                    kernel_resolver.as_ref(),
+                                );
                                 let user_str =
                                     format_stack(&stack_traces, ustk, proc_sym_mut, None);
                                 match (kernel_str, user_str) {
