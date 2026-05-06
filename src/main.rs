@@ -725,6 +725,7 @@ fn main() -> Result<()> {
             std::process::exit(doctor::run());
         }
         Some(Command::Window(args)) => neutron::window::run(args),
+        Some(Command::Summarize(args)) => neutron::summarize::run(args),
         None => run_trace(cli.args),
     }
 }

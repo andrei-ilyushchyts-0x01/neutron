@@ -35,6 +35,11 @@ pub enum Command {
     /// (finding, crash, pid, etc.) from a previously-captured NDJSON file.
     /// Sprint-2 PR 3.
     Window(WindowArgs),
+
+    /// Aggregate an NDJSON capture by a user-chosen group key. Emits a
+    /// sorted table of `count + group fields`, optionally with raw
+    /// exemplars per group. Phase 2.
+    Summarize(crate::summarize::SummarizeArgs),
 }
 
 #[derive(Parser, Debug)]

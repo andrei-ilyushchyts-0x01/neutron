@@ -12,6 +12,7 @@ pub mod predicate;
 pub mod rules;
 pub mod sampler;
 pub mod sources;
+pub mod summarize;
 pub mod symbolize;
 pub mod util;
 pub mod window;
