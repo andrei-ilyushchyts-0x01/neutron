@@ -45,6 +45,12 @@ pub enum Command {
     /// for negative-evidence workflows ("scenario A and scenario B
     /// both ran, what's different?"). Phase 2.
     Diff(crate::diff::DiffArgs),
+
+    /// Append a `type:"marker"` NDJSON line to an output file (or
+    /// stdout). Used to correlate external scenarios with the live
+    /// trace; downstream `neutron window --anchor marker:<name>` cuts
+    /// a window around the marker. Phase 5a.
+    Mark(crate::mark::MarkArgs),
 }
 
 #[derive(Parser, Debug)]

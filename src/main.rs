@@ -731,6 +731,7 @@ fn main() -> Result<()> {
         Some(Command::Window(args)) => neutron::window::run(args),
         Some(Command::Summarize(args)) => neutron::summarize::run(args),
         Some(Command::Diff(args)) => neutron::diff::run(args),
+        Some(Command::Mark(args)) => neutron::mark::run(args),
         None => run_trace(cli.args),
     }
 }

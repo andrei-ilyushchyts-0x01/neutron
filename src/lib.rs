@@ -10,6 +10,7 @@ pub mod fdgraph;
 pub mod fdinfo;
 pub mod format;
 pub mod health;
+pub mod mark;
 pub mod matcher;
 pub mod predicate;
 pub mod rules;

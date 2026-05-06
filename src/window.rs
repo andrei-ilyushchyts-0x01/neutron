@@ -11,6 +11,8 @@
 //! - `event_id:<N>` — single event by `event_id`.
 //! - `comm:<substring>` — every event whose `comm` contains the substring.
 //! - `binder_call:<status>` — every `type:"binder_call"` with matching `status`.
+//! - `marker:<name>` — every `type:"marker"` line whose `name` field
+//!   equals `<name>` (Phase 5a; emitted by `neutron mark`).
 //!
 //! # Windows
 //!
@@ -50,6 +52,9 @@ struct ParsedLine {
     classification: Option<String>,
     comm: Option<String>,
     status: Option<String>,
+    /// Phase 5a — `name` field on `type:"marker"` lines emitted by
+    /// `neutron mark`.
+    marker_name: Option<String>,
 }
 
 impl ParsedLine {
@@ -64,6 +69,7 @@ impl ParsedLine {
             classification: None,
             comm: None,
             status: None,
+            marker_name: None,
         };
         if let Ok(v) = serde_json::from_str::<Value>(&p.raw) {
             if let Some(obj) = v.as_object() {
@@ -97,6 +103,9 @@ impl ParsedLine {
                     .get("status")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                if p.type_str.as_deref() == Some("marker") {
+                    p.marker_name = obj.get("name").and_then(Value::as_str).map(str::to_string);
+                }
             }
         }
         p
@@ -112,6 +121,9 @@ pub enum Anchor {
     EventId(u64),
     Comm(String),
     BinderCall(String),
+    /// Phase 5a — `marker:<name>` matches `type:"marker"` lines whose
+    /// `name` field equals `<name>`. Empty name means "any marker".
+    Marker(String),
 }
 
 impl Anchor {
@@ -140,6 +152,7 @@ impl Anchor {
             }
             "comm" => Ok(Anchor::Comm(value.to_string())),
             "binder_call" => Ok(Anchor::BinderCall(value.to_string())),
+            "marker" => Ok(Anchor::Marker(value.to_string())),
             other => bail!("unknown anchor kind '{other}' in '{spec}'"),
         }
     }
@@ -166,6 +179,10 @@ impl Anchor {
                 line.type_str.as_deref() == Some("binder_call")
                     && line.status.as_deref() == Some(want_status.as_str())
             }
+            Anchor::Marker(name) => {
+                line.type_str.as_deref() == Some("marker")
+                    && line.marker_name.as_deref() == Some(name.as_str())
+            }
         }
     }
 
@@ -178,6 +195,7 @@ impl Anchor {
             Anchor::EventId(id) => format!("event_id:{id}"),
             Anchor::Comm(c) => format!("comm:{c}"),
             Anchor::BinderCall(s) => format!("binder_call:{s}"),
+            Anchor::Marker(s) => format!("marker:{s}"),
         }
     }
 }
