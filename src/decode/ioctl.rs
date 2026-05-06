@@ -71,6 +71,16 @@ pub enum IoctlFamily {
     DmaBuf,
     Binder,
     Ashmem,
+    /// Pixel's LWIS camera HAL surface — type byte `'L'` (0x4c). The
+    /// command-packet ioctl (`_IOWR('L', 100, lwis_cmd_pkt)`) carries an
+    /// opaque `cmd_id` in `data[4..8]`; the decoder maps known IDs to
+    /// human names. Phase 3.
+    Lwis,
+    /// Pixel Tensor's GXP accelerator driver — type byte `'G'` (0x47 in
+    /// upstream; the Pixel out-of-tree driver uses 0xee but we accept
+    /// either since the decoded family is the same logical attack
+    /// surface). Phase 3.
+    Gxp,
     Unknown,
 }
 
@@ -81,6 +91,8 @@ impl IoctlFamily {
             IoctlFamily::DmaBuf => "dma_buf",
             IoctlFamily::Binder => "binder",
             IoctlFamily::Ashmem => "ashmem",
+            IoctlFamily::Lwis => "lwis",
+            IoctlFamily::Gxp => "gxp",
             IoctlFamily::Unknown => "unknown",
         }
     }
@@ -98,10 +110,20 @@ impl IoctlFamily {
                 _ => IoctlFamily::DmaBuf,
             },
             t if t == neutron_common::IOCTL_TYPE_ASHMEM => IoctlFamily::Ashmem,
+            t if t == IOCTL_TYPE_LWIS => IoctlFamily::Lwis,
+            t if t == IOCTL_TYPE_GXP_UPSTREAM || t == IOCTL_TYPE_GXP_PIXEL => IoctlFamily::Gxp,
             _ => IoctlFamily::Unknown,
         }
     }
 }
+
+/// `_IOC_TYPE` byte for LWIS ioctls (`'L'`).
+const IOCTL_TYPE_LWIS: u32 = 0x4c;
+/// Upstream GXP `_IOC_TYPE` byte (`'G'`).
+const IOCTL_TYPE_GXP_UPSTREAM: u32 = 0x47;
+/// Pixel out-of-tree GXP type byte. Drift between upstream and Pixel
+/// repos is well-known; accept both so the decoder works on either.
+const IOCTL_TYPE_GXP_PIXEL: u32 = 0xee;
 
 /// Output of [`decode_ioctl`]. `family` is always set; `name` is the
 /// human-readable command identifier when recognised; `fields` is the
@@ -134,12 +156,25 @@ pub enum IoctlFields {
         fd_flags: u32,
         heap_flags: u64,
     },
+    /// LWIS command-packet (`_IOWR('L', 100, lwis_cmd_pkt)`). The first
+    /// `u32` of the arg buffer is the LWIS-internal command ID; userspace
+    /// resolves it to a human name when known. `cmd_id_name` is `None`
+    /// for IDs we don't have a label for (rather than a placeholder
+    /// string, so downstream filters can still target them by hex value).
+    LwisCmdPkt {
+        cmd_id: u32,
+        cmd_id_name: Option<&'static str>,
+    },
     None,
 }
 
 /// `_IOC` command for `DMA_HEAP_IOCTL_ALLOC = _IOWR('H', 0x0, struct dma_heap_allocation_data)`.
 /// `dir = 3 (RW), size = 24, type = 0x48 ('H'), nr = 0`.
 const DMA_HEAP_IOCTL_ALLOC: u32 = 0xC018_4800;
+
+/// `_IOC` for `LWIS_CMD_PACKET = _IOWR('L', 100, struct lwis_cmd_pkt)`:
+/// `dir = 3 (RW), size = 16, type = 0x4c ('L'), nr = 100 (0x64)`.
+const LWIS_CMD_PACKET: u32 = 0xC010_4C64;
 
 /// Decode a captured ioctl `cmd`/`arg` pair into a typed [`DecodedIoctl`].
 ///
@@ -154,12 +189,46 @@ pub fn decode_ioctl(cmd: u32, payload: &[u8], _ret: i64, fd_kind: Option<FdKind>
     let family = IoctlFamily::from_cmd(cmd, fd_kind);
     let (name, fields) = match cmd {
         DMA_HEAP_IOCTL_ALLOC => (Some("DMA_HEAP_IOCTL_ALLOC"), decode_dma_heap_alloc(payload)),
+        LWIS_CMD_PACKET => (Some("LWIS_CMD_PACKET"), decode_lwis_cmd_pkt(payload)),
         _ => (None, IoctlFields::None),
     };
     DecodedIoctl {
         family,
         name,
         fields,
+    }
+}
+
+/// LWIS command-packet ID → human name. Built from the assessment's own
+/// observed-id set plus the explicitly-named flows the LWIS userspace
+/// HAL uses on Pixel 8 Pro. IDs we haven't pinned to a documented name
+/// (e.g. `0x20200`, `0x40200`, `0x50006`) come back as `None` so they
+/// stay searchable by hex value without a misleading label.
+const LWIS_CMD_NAMES: &[(u32, &str)] = &[
+    (0x10100, "DEVICE_ENABLE"),
+    (0x10200, "DEVICE_DISABLE"),
+    (0x20100, "DMA_BUFFER_ENROLL"),
+    (0x20300, "DMA_BUFFER_ALLOC"),
+    (0x20400, "DMA_BUFFER_FREE"),
+    (0x30100, "REG_IO"),
+    (0x40100, "TRANSACTION_SUBMIT"),
+    (0x40300, "TRANSACTION_CANCEL"),
+];
+
+fn lwis_cmd_id_name(cmd_id: u32) -> Option<&'static str> {
+    LWIS_CMD_NAMES
+        .iter()
+        .find_map(|(id, name)| (*id == cmd_id).then_some(*name))
+}
+
+fn decode_lwis_cmd_pkt(payload: &[u8]) -> IoctlFields {
+    if payload.len() < 4 {
+        return IoctlFields::None;
+    }
+    let cmd_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    IoctlFields::LwisCmdPkt {
+        cmd_id,
+        cmd_id_name: lwis_cmd_id_name(cmd_id),
     }
 }
 
@@ -229,6 +298,16 @@ pub fn render_decoded_ioctl_json(d: &DecodedIoctl) -> String {
                 fd_flags_as_str(*fd_flags),
                 heap_flags,
             ));
+        }
+        IoctlFields::LwisCmdPkt {
+            cmd_id,
+            cmd_id_name,
+        } => {
+            out.push_str(&format!(r#","lwis":{{"cmd_id":{cmd_id}"#));
+            if let Some(name) = cmd_id_name {
+                out.push_str(&format!(r#","cmd_id_name":"{name}""#));
+            }
+            out.push('}');
         }
         IoctlFields::None => {}
     }
@@ -442,5 +521,129 @@ mod tests {
         assert_eq!(fd_flags_as_str(0x80002), "O_RDWR|O_CLOEXEC");
         assert_eq!(fd_flags_as_str(0x80000), "O_RDONLY|O_CLOEXEC");
         assert_eq!(fd_flags_as_str(1), "O_WRONLY");
+    }
+
+    // ── Decoder pack expansion (Phase 3) ─────────────────────────────────────
+
+    fn lwis_payload(cmd_id: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 16];
+        p[..4].copy_from_slice(&cmd_id.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn ioctl_family_classifies_lwis_by_type_byte() {
+        // Any cmd with type=0x4c classifies as Lwis regardless of fd_kind.
+        let cmd = LWIS_CMD_PACKET;
+        assert_eq!(IoctlFamily::from_cmd(cmd, None), IoctlFamily::Lwis);
+        assert_eq!(
+            IoctlFamily::from_cmd(cmd, Some(FdKind::Binder)),
+            IoctlFamily::Lwis,
+        );
+    }
+
+    #[test]
+    fn ioctl_family_classifies_gxp_for_both_type_bytes() {
+        // Upstream 'G' (0x47) and Pixel 0xee both surface as Gxp.
+        let cmd_upstream = (3u32 << 30) | (16u32 << 16) | (0x47u32 << 8) | 1;
+        let cmd_pixel = (3u32 << 30) | (16u32 << 16) | (0xeeu32 << 8) | 1;
+        assert_eq!(IoctlFamily::from_cmd(cmd_upstream, None), IoctlFamily::Gxp);
+        assert_eq!(IoctlFamily::from_cmd(cmd_pixel, None), IoctlFamily::Gxp);
+    }
+
+    #[test]
+    fn decode_lwis_cmd_packet_resolves_known_id() {
+        let payload = lwis_payload(0x10100);
+        let decoded = decode_ioctl(LWIS_CMD_PACKET, &payload, 0, None);
+        assert_eq!(decoded.family, IoctlFamily::Lwis);
+        assert_eq!(decoded.name, Some("LWIS_CMD_PACKET"));
+        match decoded.fields {
+            IoctlFields::LwisCmdPkt {
+                cmd_id,
+                cmd_id_name,
+            } => {
+                assert_eq!(cmd_id, 0x10100);
+                assert_eq!(cmd_id_name, Some("DEVICE_ENABLE"));
+            }
+            other => panic!("expected LwisCmdPkt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_lwis_cmd_packet_keeps_unknown_id_as_none_name() {
+        // 0x20200 was observed in the assessment but isn't on the
+        // documented-name list — we keep the raw id, name=None.
+        let payload = lwis_payload(0x20200);
+        let decoded = decode_ioctl(LWIS_CMD_PACKET, &payload, 0, None);
+        match decoded.fields {
+            IoctlFields::LwisCmdPkt {
+                cmd_id,
+                cmd_id_name,
+            } => {
+                assert_eq!(cmd_id, 0x20200);
+                assert_eq!(cmd_id_name, None);
+            }
+            other => panic!("expected LwisCmdPkt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_lwis_handles_truncated_payload() {
+        let decoded = decode_ioctl(LWIS_CMD_PACKET, &[0u8; 2], 0, None);
+        assert_eq!(decoded.family, IoctlFamily::Lwis);
+        assert_eq!(decoded.name, Some("LWIS_CMD_PACKET"));
+        assert_eq!(decoded.fields, IoctlFields::None);
+    }
+
+    #[test]
+    fn render_decoded_lwis_emits_nested_object_with_known_name() {
+        let payload = lwis_payload(0x10200);
+        let decoded = decode_ioctl(LWIS_CMD_PACKET, &payload, 0, None);
+        let json_suffix = render_decoded_ioctl_json(&decoded);
+        let line = format!("{{\"x\":1{}}}", json_suffix);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(v.get("ioctl_family").and_then(|x| x.as_str()), Some("lwis"));
+        assert_eq!(
+            v.get("ioctl_name").and_then(|x| x.as_str()),
+            Some("LWIS_CMD_PACKET"),
+        );
+        let lwis = v
+            .get("lwis")
+            .and_then(|x| x.as_object())
+            .expect("lwis object");
+        assert_eq!(lwis.get("cmd_id").and_then(|x| x.as_u64()), Some(0x10200));
+        assert_eq!(
+            lwis.get("cmd_id_name").and_then(|x| x.as_str()),
+            Some("DEVICE_DISABLE"),
+        );
+    }
+
+    #[test]
+    fn render_decoded_lwis_omits_name_when_unknown() {
+        let payload = lwis_payload(0x40200);
+        let decoded = decode_ioctl(LWIS_CMD_PACKET, &payload, 0, None);
+        let json_suffix = render_decoded_ioctl_json(&decoded);
+        let line = format!("{{\"x\":1{}}}", json_suffix);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        let lwis = v.get("lwis").and_then(|x| x.as_object()).unwrap();
+        assert_eq!(lwis.get("cmd_id").and_then(|x| x.as_u64()), Some(0x40200));
+        assert!(
+            lwis.get("cmd_id_name").is_none(),
+            "unknown id must not synthesise a placeholder name"
+        );
+    }
+
+    #[test]
+    fn lwis_cmd_id_name_covers_documented_set() {
+        // Names lifted directly from the assessment / Pixel LWIS userspace HAL.
+        for (id, expected) in [
+            (0x10100, "DEVICE_ENABLE"),
+            (0x10200, "DEVICE_DISABLE"),
+            (0x20300, "DMA_BUFFER_ALLOC"),
+            (0x20400, "DMA_BUFFER_FREE"),
+        ] {
+            assert_eq!(lwis_cmd_id_name(id), Some(expected));
+        }
+        assert_eq!(lwis_cmd_id_name(0xdead_beef), None);
     }
 }
