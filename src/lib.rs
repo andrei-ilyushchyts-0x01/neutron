@@ -1,5 +1,6 @@
 //! Reusable building blocks for the neutron Aya-based loader binary.
 
+pub mod capture;
 pub mod cli;
 pub mod decode;
 pub mod doctor;

@@ -25,6 +25,7 @@ use aya::programs::TracePoint;
 use aya::Ebpf;
 use clap::Parser;
 
+use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
 use neutron::cli::{Args, Cli, Command};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
 use neutron::doctor;
@@ -823,6 +824,19 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
     }
 
+    // 2c. Phase 1c — capture mode (`--capture matched+context=<DUR>`).
+    let capture_mode = CaptureMode::from_cli(args.capture.as_deref())?;
+    let mut context_ring: Option<ContextRing> = match capture_mode {
+        CaptureMode::Default => None,
+        CaptureMode::MatchedWithContext { duration_ns } => {
+            eprintln!(
+                "  capture mode: matched+context={}ms (forward+backward)",
+                duration_ns / 1_000_000
+            );
+            Some(ContextRing::new(duration_ns, DEFAULT_MAX_EVENTS))
+        }
+    };
+
     // 3. Build rule engine.
     let mut engine = build_rule_engine(&args)?;
     let suppress_raw = engine.is_some() && !args.raw;
@@ -1227,27 +1241,66 @@ fn run_trace(mut args: Args) -> Result<()> {
                     Some(event_id_counter),
                 );
 
-                if post_filter_ok {
-                    if let Some(eng) = engine.as_mut() {
-                        if let Some(owned) = neutron_rules::Event::parse_line(&json_line) {
-                            if let Some(view) = owned.view() {
-                                eng.feed(&view);
+                // Phase 1c — context-window dispatch.
+                //
+                // Default mode: emit only when post_filter_ok (preserves
+                // Phase 1a/1b behaviour).
+                // matched+context: feed every event through the ring; the
+                // ring decides whether to emit (current event only),
+                // emit-with-backward-flush, emit-as-forward-window, or
+                // park. Returned vec is in chronological order.
+                let lines: Vec<String> = match context_ring.as_mut() {
+                    None => {
+                        if post_filter_ok {
+                            vec![json_line.clone()]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    Some(ring) => {
+                        let ts_ns = { ev.timestamp_ns };
+                        ring.observe(ts_ns, post_filter_ok, &json_line)
+                    }
+                };
+
+                if !lines.is_empty() {
+                    // Always feed the rule engine the *currently observed*
+                    // event when the post-filter agrees — flushing context
+                    // into the engine as if it were live would re-fire
+                    // rules on stale events. Backward-context lines from the
+                    // ring are write-only (they go to the output and the
+                    // lookback, but not the engine).
+                    if post_filter_ok {
+                        if let Some(eng) = engine.as_mut() {
+                            if let Some(owned) = neutron_rules::Event::parse_line(&json_line) {
+                                if let Some(view) = owned.view() {
+                                    eng.feed(&view);
+                                }
                             }
                         }
                     }
 
                     if !suppress_raw {
-                        let line = if args.json {
-                            json_line.clone()
-                        } else {
-                            format_event_text_with_stack(
-                                &ev,
-                                args.resolve_paths,
-                                stack_str.as_deref(),
-                            )
-                        };
-                        let _ = writeln!(out, "{line}");
+                        for line in &lines {
+                            // For text mode we still render the live event
+                            // via the existing text formatter; backward-flush
+                            // lines from the ring stay in JSON to preserve
+                            // their original shape (mixing modes inside one
+                            // capture is unavoidable when the ring buffers
+                            // JSON).
+                            if args.json || line != &json_line {
+                                let _ = writeln!(out, "{line}");
+                            } else {
+                                let text = format_event_text_with_stack(
+                                    &ev,
+                                    args.resolve_paths,
+                                    stack_str.as_deref(),
+                                );
+                                let _ = writeln!(out, "{text}");
+                            }
+                        }
                     }
+
                     // Lookback: record the JSON form (not the text form — JSON
                     // round-trips losslessly into the crash_context array).
                     if let Some(lb) = lookback.as_mut() {

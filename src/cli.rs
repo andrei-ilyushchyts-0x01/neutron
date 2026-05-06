@@ -355,4 +355,19 @@ pub struct Args {
     /// Boolean predicate expression. See man page for grammar.
     #[arg(long, value_name = "EXPR")]
     pub match_expr: Option<String>,
+
+    // ── Phase 1c — capture mode ────────────────────────────────────────────
+    /// Capture mode: when set to `matched+context=<DUR>`, neutron keeps a
+    /// rolling buffer of recently-rejected events and, on the first
+    /// matching event, flushes the previous `<DUR>` of context plus the
+    /// next `<DUR>` of forward window. `<DUR>` accepts the same unit
+    /// suffixes as `--match-latency-min` (`100ms`, `2s`, `5000` is
+    /// microseconds). Capped at 30 seconds — anything larger is rejected
+    /// to keep the in-memory ring bounded.
+    ///
+    /// When unset, neutron emits only events that match the predicate
+    /// (which is also the default when no `--match-*` flag is in use, in
+    /// which case every BPF-surviving event matches vacuously).
+    #[arg(long, value_name = "MODE")]
+    pub capture: Option<String>,
 }
