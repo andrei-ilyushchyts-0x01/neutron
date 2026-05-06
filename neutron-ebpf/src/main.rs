@@ -33,9 +33,13 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use neutron_common::{
-    ExitSource, SyscallEvent, COUNTER_EVENTS_SUBMITTED, COUNTER_INFLIGHT_LOOKUP_MISSED,
-    COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
-    COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED, FILTER_KEY_ACTIVE, FILTER_KEY_PID,
+    is_state_tracking_nr, ret_matches_class, ExitSource, SyscallEvent, COUNTER_EVENTS_SUBMITTED,
+    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_RINGBUF_RESERVE_FAILED,
+    COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED, FILTER_KEY_ACTIVE,
+    FILTER_KEY_ARG_U32_OFF, FILTER_KEY_IOCTL_DIR, FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS,
+    FILTER_KEY_PID, FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED, FILTER_MAP_SLOT_COUNT,
+    MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR,
+    MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
     SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
 };
 
@@ -48,8 +52,13 @@ use neutron_common::{
 
 /// `filter_map[FILTER_KEY_PID]`    = target PID (0 = all)
 /// `filter_map[FILTER_KEY_ACTIVE]` = syscall filter active (0 = off, 1 = on)
+///
+/// Phase 1a extends the array with predicate-driven slots — see the
+/// `FILTER_KEY_*` constants in `neutron-common`. The size matches
+/// `FILTER_MAP_SLOT_COUNT` so future Phase-1 slots can be added without a
+/// wire bump.
 #[map]
-static FILTER_MAP: Array<u32> = Array::with_max_entries(2, 0);
+static FILTER_MAP: Array<u32> = Array::with_max_entries(FILTER_MAP_SLOT_COUNT, 0);
 
 /// Single multi-producer ring buffer for syscall events.
 /// Size: 1 MiB — must be a power of two and at least one page. At ~241 bytes
@@ -78,6 +87,40 @@ static WATCH_FDS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 /// Stack trace map. 127 frames * 8 bytes = 1016 bytes per slot.
 #[map]
 static STACK_TRACES: StackTrace = StackTrace::with_max_entries(16384, 0);
+
+// ── Phase 1a — predicate-set maps ────────────────────────────────────────────
+//
+// These maps materialise the BPF-evaluable subset of `--match-*` flags. A
+// map being non-empty is meaningless on its own; the corresponding bit in
+// `FILTER_MAP[FILTER_KEY_MATCH_BITS]` is the authoritative "active"
+// indicator. Userspace populates one or both atomically when configuring.
+
+/// UID values matching `--match-uid`. Active when `MATCH_BIT_UID` is set.
+#[map]
+static MATCH_UID_SET: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
+
+/// ioctl `cmd` values matching `--match-ioctl-cmd`. Compared against the
+/// 32-bit cmd word as the kernel sees it. Gated by `MATCH_BIT_IOCTL_CMD`.
+#[map]
+static MATCH_IOCTL_CMD_SET: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
+
+/// `_IOC_TYPE` byte values matching `--match-ioctl-type`. Gated by
+/// `MATCH_BIT_IOCTL_TYPE`. Stored as u32 because BPF HashMap keys must be
+/// at least 4 bytes.
+#[map]
+static MATCH_IOCTL_TYPE_SET: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
+
+/// `_IOC_NR` byte values matching `--match-ioctl-nr`. Gated by
+/// `MATCH_BIT_IOCTL_NR`.
+#[map]
+static MATCH_IOCTL_NR_SET: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
+
+/// u32 LE values matching `--match-arg-u32-vals`. The BPF programs read a
+/// u32 from the captured ioctl payload at offset
+/// `FILTER_MAP[FILTER_KEY_ARG_U32_OFF]` (relative to `data[4..]`) and look
+/// up the value here. Gated by `MATCH_BIT_ARG_U32`.
+#[map]
+static MATCH_ARG_U32_VALS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 
 /// Capture-health counters. Slot indices are defined in `neutron_common::COUNTER_*`.
 /// Userspace polls this map periodically and prints a capture summary on exit.
@@ -171,27 +214,205 @@ fn syscall_allowed(nr: i32) -> bool {
     unsafe { SYSCALL_FILTER.get(&key).is_some() }
 }
 
+// ── Phase 1a — predicate evaluators ──────────────────────────────────────────
+
+/// Read a `MATCH_BITS` flag. Defaults to "no predicate active" if the
+/// FILTER_MAP slot is unreadable — fail-open keeps existing flows working.
+#[inline(always)]
+fn match_bits() -> u32 {
+    FILTER_MAP.get(FILTER_KEY_MATCH_BITS).copied().unwrap_or(0)
+}
+
+#[inline(always)]
+fn match_active(bit: u32) -> bool {
+    (match_bits() & bit) != 0
+}
+
+#[inline(always)]
+fn state_emit_required() -> bool {
+    matches!(
+        FILTER_MAP.get(FILTER_KEY_STATE_EMIT_REQUIRED).copied(),
+        Some(v) if v != 0
+    )
+}
+
+#[inline(always)]
+fn uid_matches_predicate(uid: u32) -> bool {
+    if !match_active(MATCH_BIT_UID) {
+        return true;
+    }
+    // SAFETY: same map-borrow rules as `pid_matches`.
+    unsafe { MATCH_UID_SET.get(&uid).is_some() }
+}
+
+/// ioctl-shape predicates. `cmd` is the 32-bit cmd word from `args[1]`,
+/// `payload_ptr` is the captured arg snapshot starting at `data[4..]`.
+/// Returns `true` when every active ioctl predicate matches; vacuously
+/// `true` when no ioctl predicate is configured.
+#[inline(always)]
+fn ioctl_matches_predicate(cmd: u32, payload_ptr: *const u8) -> bool {
+    if match_active(MATCH_BIT_IOCTL_CMD) {
+        if unsafe { MATCH_IOCTL_CMD_SET.get(&cmd) }.is_none() {
+            return false;
+        }
+    }
+    if match_active(MATCH_BIT_IOCTL_TYPE) {
+        let ty = (cmd >> 8) & 0xff;
+        if unsafe { MATCH_IOCTL_TYPE_SET.get(&ty) }.is_none() {
+            return false;
+        }
+    }
+    if match_active(MATCH_BIT_IOCTL_NR) {
+        let nr = cmd & 0xff;
+        if unsafe { MATCH_IOCTL_NR_SET.get(&nr) }.is_none() {
+            return false;
+        }
+    }
+    if match_active(MATCH_BIT_IOCTL_DIR) {
+        let dir = (cmd >> 30) & 0x3;
+        let want = FILTER_MAP.get(FILTER_KEY_IOCTL_DIR).copied().unwrap_or(0);
+        if dir != want {
+            return false;
+        }
+    }
+    if match_active(MATCH_BIT_ARG_U32) {
+        let off = FILTER_MAP.get(FILTER_KEY_ARG_U32_OFF).copied().unwrap_or(0);
+        // `data[4..128]` holds 124 bytes. We need 4 bytes at `off`, so the
+        // valid range for `off` is `0..=120`. Userspace bounds-checks at
+        // configuration time but we re-check defensively — a verifier-friendly
+        // bound here also satisfies the "constant max-offset" pattern the
+        // BPF verifier wants.
+        if off > 120 {
+            return false;
+        }
+        let mut buf = [0u8; 4];
+        // SAFETY: `payload_ptr` is the address of the captured `data[4..]`
+        // window inside the on-stack `SyscallEvent`. `off + 4 <= 124` is
+        // bounded above. We use the kernel-buf helper because the data lives
+        // in BPF stack memory by the time we read it back during enter. See
+        // `try_sys_enter` for the population path.
+        let src = unsafe { payload_ptr.add(off as usize) };
+        if unsafe { bpf_probe_read_kernel_buf(src, &mut buf) }.is_err() {
+            return false;
+        }
+        let v = u32::from_le_bytes(buf);
+        if unsafe { MATCH_ARG_U32_VALS.get(&v) }.is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Combined enter-side predicate. Evaluates the BPF-evaluable AND-conjunction
+/// of `--match-*` flags. Returns `true` when all configured predicates
+/// match — or when the syscall is in the state-tracking set and userspace
+/// requested state events. The userspace post-filter still applies the
+/// remaining (non-BPF-evaluable) clauses on its side.
+#[inline(always)]
+fn enter_predicate_match(nr: i32, uid: u32, ev: *const SyscallEvent) -> bool {
+    if !uid_matches_predicate(uid) {
+        return false;
+    }
+    if nr == 29 {
+        // SAFETY: `ev` points to the on-stack `SyscallEvent` populated by
+        // `capture_syscall_data`. `data` is a `[u8; 128]` inside that struct;
+        // `data[4..]` is the captured arg snapshot.
+        let cmd = unsafe { core::ptr::addr_of!((*ev).args).read_unaligned() }[1] as u32;
+        let payload_ptr = unsafe { (core::ptr::addr_of!((*ev).data) as *const u8).add(4) };
+        if !ioctl_matches_predicate(cmd, payload_ptr) {
+            return false;
+        }
+    } else {
+        // Non-ioctl events: ioctl-shape predicates are inapplicable. If the
+        // user configured them, they implicitly restrict to ioctl events.
+        // `arg.u32@N` is also ioctl-only because the offset is relative to
+        // the ioctl arg snapshot.
+        if match_active(MATCH_BIT_IOCTL_CMD)
+            || match_active(MATCH_BIT_IOCTL_TYPE)
+            || match_active(MATCH_BIT_IOCTL_NR)
+            || match_active(MATCH_BIT_IOCTL_DIR)
+            || match_active(MATCH_BIT_ARG_U32)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Combined exit-side predicate. Layers ret-class and latency thresholds on
+/// top of the enter-side predicate; reuses [`enter_predicate_match`] via
+/// the saved INFLIGHT entry. `saved` must be non-null (callers handle the
+/// null case before getting here).
+#[inline(always)]
+fn exit_predicate_match(nr: i32, uid: u32, saved: *const SyscallEvent, ret: i64, now: u64) -> bool {
+    if !enter_predicate_match(nr, uid, saved) {
+        return false;
+    }
+    if match_active(MATCH_BIT_RET) {
+        let class = FILTER_MAP.get(FILTER_KEY_RET_CLASS).copied().unwrap_or(0);
+        if !ret_matches_class(ret, class) {
+            return false;
+        }
+    }
+    if match_active(MATCH_BIT_LATENCY) {
+        let min_us = FILTER_MAP
+            .get(FILTER_KEY_LATENCY_MIN_US)
+            .copied()
+            .unwrap_or(0) as u64;
+        let enter_ts = unsafe { core::ptr::addr_of!((*saved).enter_timestamp_ns).read_unaligned() };
+        if enter_ts == 0 || now < enter_ts {
+            return false;
+        }
+        let lat_us = (now - enter_ts) / 1_000;
+        if lat_us < min_us {
+            return false;
+        }
+    }
+    true
+}
+
 /// Phase 1 emit gate for `sys_enter`. Returns true when the event should be
 /// submitted to the ringbuf. Independent of INFLIGHT update — by the time
 /// this is checked, INFLIGHT has already been populated unconditionally so
 /// exit-time predicates (ret/latency) keep working.
 ///
-/// Today this is just `syscall_allowed` (the legacy enter/exit-symmetric
-/// whitelist). Phase 1a extends it with predicate-driven filters and the
-/// `is_state_tracking` always-pass list.
+/// Composition (safe over-approximation):
+/// 1. Legacy `syscall_allowed` whitelist (gated by `FILTER_KEY_ACTIVE`).
+/// 2. Predicate AND-conjunction across configured `MATCH_*` clauses.
+/// 3. Always-pass for state-tracking syscalls when userspace requested it.
 #[inline(always)]
-fn should_submit_enter(nr: i32) -> bool {
-    syscall_allowed(nr)
+fn should_submit_enter(nr: i32, uid: u32, ev: *const SyscallEvent) -> bool {
+    if !syscall_allowed(nr) {
+        return false;
+    }
+    if enter_predicate_match(nr, uid, ev) {
+        return true;
+    }
+    if state_emit_required() && is_state_tracking_nr(nr) {
+        return true;
+    }
+    // No predicate active and no state-tracking opt-in: legacy fast path.
+    match_bits() == 0
 }
 
-/// Phase 1 emit gate for `sys_exit`. Mirrors `should_submit_enter` so the
-/// two sides stay symmetric: under today's semantics, a syscall is either
-/// fully whitelisted (both enter and exit emit) or fully filtered (neither
-/// emits, but INFLIGHT still cycles through enter/exit so the cap stays
-/// healthy). Phase 1a layers ret/latency-class predicates on top.
+/// Phase 1 emit gate for `sys_exit`. Same composition as the enter gate but
+/// also evaluates `MATCH_BIT_RET` / `MATCH_BIT_LATENCY` against the saved
+/// INFLIGHT entry. `saved` may be null when the matching enter was lost
+/// (capture started after enter, INFLIGHT cap evicted the entry, etc.); in
+/// that case ioctl-shape and ret/latency predicates cannot be evaluated and
+/// we fall back to the same composition as the enter gate sans predicate.
 #[inline(always)]
-fn should_submit_exit(nr: i32) -> bool {
-    syscall_allowed(nr)
+fn should_submit_exit(nr: i32, uid: u32, saved: *const SyscallEvent, ret: i64, now: u64) -> bool {
+    if !syscall_allowed(nr) {
+        return false;
+    }
+    if !saved.is_null() && exit_predicate_match(nr, uid, saved, ret, now) {
+        return true;
+    }
+    if state_emit_required() && is_state_tracking_nr(nr) {
+        return true;
+    }
+    match_bits() == 0
 }
 
 // ── Raw event helpers ────────────────────────────────────────────────────────
@@ -471,7 +692,8 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
         // Emit gate. Independent of INFLIGHT update: when this returns false,
         // the ringbuf submission is skipped but the INFLIGHT entry survives
         // for the matching sys_exit.
-        if !should_submit_enter(nr) {
+        let uid_field = addr_of!((*ev).uid).read_unaligned();
+        if !should_submit_enter(nr, uid_field, ev) {
             return Ok(());
         }
 
@@ -515,7 +737,20 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
         Err(_) => return Err(()),
     };
 
-    if !should_submit_exit(nr) {
+    let ret = unsafe { ctx.read_at::<i64>(SYS_EXIT_RET) }.unwrap_or(0);
+    let now = unsafe { bpf_ktime_get_ns() };
+    let uid_now = bpf_get_current_uid_gid() as u32;
+
+    // Peek the saved INFLIGHT entry without removing it — the predicate
+    // evaluator needs to read saved args (for ioctl-shape) and the saved
+    // enter timestamp (for latency). The borrow is released before the
+    // ringbuf reservation.
+    let saved_ptr: *const SyscallEvent = match INFLIGHT.get_ptr(&pid_tgid) {
+        Some(p) => p as *const SyscallEvent,
+        None => core::ptr::null(),
+    };
+
+    if !should_submit_exit(nr, uid_now, saved_ptr, ret, now) {
         // Reclaim the INFLIGHT entry that the unconditional enter-side
         // insertion left behind. Without this, filtered syscalls would
         // gradually fill the cap and trigger LRU evictions that hurt
@@ -523,9 +758,6 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
         let _ = INFLIGHT.remove(&pid_tgid);
         return Err(());
     }
-
-    let ret = unsafe { ctx.read_at::<i64>(SYS_EXIT_RET) }.unwrap_or(0);
-    let now = unsafe { bpf_ktime_get_ns() };
 
     // Reserve directly into the ring — no INFLIGHT insertion on exit, so we
     // can skip the stack scratch and write the event into the ring entry.

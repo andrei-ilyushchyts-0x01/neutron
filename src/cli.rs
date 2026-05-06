@@ -225,4 +225,119 @@ pub struct Args {
     /// (raw `binder` / `binder_received` events still flow). Default 1024.
     #[arg(long, default_value_t = 1024)]
     pub binder_inflight: usize,
+
+    // ── Phase 1a — generic capture predicates ──────────────────────────────
+    //
+    // Each `--match-*` flag is one clause of an AND-conjunction. The
+    // BPF-evaluable subset (pid/uid/syscall/ioctl-shape/ret/latency/
+    // arg.u32@N) is pushed into the kernel-side filter so events are
+    // dropped before the ringbuf; the rest (fd path globs, comm globs,
+    // arg.u8/u16/u64, binder fields) is applied by the userspace
+    // post-filter on every event that survives the BPF pre-filter.
+    //
+    // All flags accept comma-separated values. Numeric values accept
+    // decimal, `0x` hex, `0b` binary, `0o` octal. UID flag also accepts
+    // inclusive `LO..HI` ranges (capped at 1024 entries per range).
+    /// Multi-PID match. Equivalent to `--pid` for one PID; for several,
+    /// passes the extra PIDs through the existing `PID_WHITELIST` map.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_pid: Vec<String>,
+
+    /// UID match (single, comma-separated, or `LO..HI` ranges).
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_uid: Vec<String>,
+
+    /// Syscall whitelist by aarch64 generic syscall number. Reuses the
+    /// existing `SYSCALL_FILTER` BPF map.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_syscall: Vec<String>,
+
+    /// Glob-matched fd path (e.g. `'/dev/lwis*'`). Userspace-only — needs
+    /// `--resolve-paths` or an established fdgraph entry to match.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_fd: Vec<String>,
+
+    /// Glob-matched comm name (e.g. `'cameraserver*'`). Userspace-only.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_comm: Vec<String>,
+
+    /// ioctl `cmd` word (32-bit). Multiple values OR'd together.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_ioctl_cmd: Vec<String>,
+
+    /// `_IOC_TYPE` byte, e.g. `0x4c` for LWIS.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_ioctl_type: Vec<String>,
+
+    /// `_IOC_NR` byte.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_ioctl_nr: Vec<String>,
+
+    /// `_IOC_DIR`: one of `none|r|w|rw`.
+    #[arg(long)]
+    pub match_ioctl_dir: Option<String>,
+
+    /// Return-code class: one of `any|nonzero|negative|zero`. Default
+    /// `any`. Exit-only.
+    #[arg(long)]
+    pub match_ret: Option<String>,
+
+    /// Minimum exit-side latency. Accepts `100us`, `5ms`, `2s`, or a bare
+    /// integer (microseconds).
+    #[arg(long)]
+    pub match_latency_min: Option<String>,
+
+    /// Match `mmap`/`mprotect` events with `PROT_READ|PROT_WRITE|PROT_EXEC`.
+    #[arg(long)]
+    pub match_prot_rwx: bool,
+
+    /// Match `mmap`/`mprotect` with `PROT_WRITE|PROT_EXEC` (no read).
+    #[arg(long)]
+    pub match_prot_wx: bool,
+
+    /// Typed equality on a slice of the captured ioctl arg snapshot. Form:
+    /// `<width>@<offset>=<v>[,<v>...]` — for example
+    /// `--match-arg-u32 '0=0x20200,0x40200'` reads `data[4..8]` as u32 LE
+    /// and compares against the value set. Width is one of
+    /// `u8`/`u16`/`u32`/`u64`. The flag may be repeated for AND-joined
+    /// clauses at different offsets (multi-offset cases evaluate
+    /// userspace-side).
+    #[arg(long, num_args = 1..)]
+    pub match_arg_u32: Vec<String>,
+
+    /// Same as `--match-arg-u32` but with `u8` width.
+    #[arg(long, num_args = 1..)]
+    pub match_arg_u8: Vec<String>,
+
+    /// Same as `--match-arg-u32` but with `u16` width.
+    #[arg(long, num_args = 1..)]
+    pub match_arg_u16: Vec<String>,
+
+    /// Same as `--match-arg-u32` but with `u64` width.
+    #[arg(long, num_args = 1..)]
+    pub match_arg_u64: Vec<String>,
+
+    /// Binder `code` (request ID). Comma-separated u32 set.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_binder_code: Vec<String>,
+
+    /// Binder `flags` (transaction flags). Comma-separated u32 set.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_binder_flags: Vec<String>,
+
+    /// Binder `to_proc` (callee PID). Comma-separated.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_binder_to_proc: Vec<String>,
+
+    /// Binder `to_thread` (callee TID). Comma-separated.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_binder_to_thread: Vec<String>,
+
+    /// Binder `target_node` (handle). Comma-separated, signed.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_binder_target_node: Vec<String>,
+
+    /// Binder `reply` flag — one of `true|false`.
+    #[arg(long)]
+    pub match_binder_reply: Option<bool>,
 }

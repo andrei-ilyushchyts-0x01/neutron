@@ -26,7 +26,7 @@ use aya::Ebpf;
 use clap::Parser;
 
 use neutron::cli::{Args, Cli, Command};
-use neutron::decode::{format_comm, format_data_field, resolve_path_from_fd};
+use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
 use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
 use neutron::fdgraph::FdGraph;
@@ -35,6 +35,7 @@ use neutron::format::{
     format_fd_snapshot_json, format_process_exit_json, FdHint,
 };
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
+use neutron::matcher::{self, MatchSpec, SyscallEventLens};
 use neutron::rules::{build_rule_engine, emit_findings};
 use neutron::sources::binder_tracker::BinderTracker;
 use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
@@ -44,8 +45,11 @@ use neutron::sources::ProcessExitEvent;
 use neutron::symbolize::{is_kernel_addr, KernelSymbolizer, ProcSymbolizer};
 use neutron::SyscallEvent;
 use neutron_common::{
-    ExitSource, FILTER_KEY_ACTIVE, FILTER_KEY_PID, SYSCALL_NR_BINDER_RECEIVED,
-    SYSCALL_NR_PROCESS_EXIT,
+    ExitSource, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF, FILTER_KEY_IOCTL_DIR,
+    FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_PID, FILTER_KEY_RET_CLASS,
+    FILTER_KEY_STATE_EMIT_REQUIRED, MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR,
+    MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
+    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -183,6 +187,177 @@ fn populate_filter_map(bpf: &mut Ebpf, pid: u32) -> Result<()> {
     filter
         .set(FILTER_KEY_ACTIVE, 0u32, 0)
         .context("setting FILTER_MAP[ACTIVE]")?;
+    Ok(())
+}
+
+/// Phase 1a — push every BPF-evaluable clause of `spec` into its kernel
+/// map, compute the `MATCH_BITS` mask, and toggle
+/// `STATE_EMIT_REQUIRED` if any clause depends on userspace fdgraph state.
+///
+/// Idempotent: setting a slot to its default zero value is the
+/// authoritative "off" signal. Userspace clauses (fd globs, comm globs,
+/// non-u32 arg widths, binder fields) leave no kernel residue.
+fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
+    let mut bits: u32 = 0;
+
+    // Multi-PID via existing PID_WHITELIST. The single --pid case is still
+    // handled by FILTER_KEY_PID and stays the fast path; --match-pid only
+    // populates the whitelist when there are extra PIDs.
+    if !spec.pids.is_empty() {
+        let map = bpf
+            .map_mut("PID_WHITELIST")
+            .context("PID_WHITELIST missing")?;
+        let mut wl: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("PID_WHITELIST is not HashMap<u32,u8>")?;
+        for pid in &spec.pids {
+            wl.insert(pid, 1u8, 0)
+                .with_context(|| format!("PID_WHITELIST.insert({pid})"))?;
+        }
+    }
+
+    // UID set.
+    if !spec.uids.is_empty() {
+        let map = bpf
+            .map_mut("MATCH_UID_SET")
+            .context("MATCH_UID_SET missing from BPF object")?;
+        let mut uids: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("MATCH_UID_SET is not HashMap<u32,u8>")?;
+        for u in &spec.uids {
+            uids.insert(u, 1u8, 0)
+                .with_context(|| format!("MATCH_UID_SET.insert({u})"))?;
+        }
+        bits |= MATCH_BIT_UID;
+    }
+
+    // Syscall whitelist via existing SYSCALL_FILTER. Toggling
+    // FILTER_KEY_ACTIVE is what the BPF-side `syscall_allowed` consults.
+    if !spec.syscalls.is_empty() {
+        let map = bpf
+            .map_mut("SYSCALL_FILTER")
+            .context("SYSCALL_FILTER missing")?;
+        let mut sf: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("SYSCALL_FILTER is not HashMap<u32,u8>")?;
+        for nr in &spec.syscalls {
+            sf.insert(*nr as u32, 1u8, 0)
+                .with_context(|| format!("SYSCALL_FILTER.insert({nr})"))?;
+        }
+        // Toggle the legacy active flag.
+        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+        filter
+            .set(FILTER_KEY_ACTIVE, 1u32, 0)
+            .context("FILTER_MAP[ACTIVE]=1")?;
+    }
+
+    if !spec.ioctl_cmds.is_empty() {
+        let map = bpf
+            .map_mut("MATCH_IOCTL_CMD_SET")
+            .context("MATCH_IOCTL_CMD_SET missing")?;
+        let mut m: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("MATCH_IOCTL_CMD_SET is not HashMap<u32,u8>")?;
+        for v in &spec.ioctl_cmds {
+            m.insert(v, 1u8, 0)
+                .with_context(|| format!("MATCH_IOCTL_CMD_SET.insert({v:#x})"))?;
+        }
+        bits |= MATCH_BIT_IOCTL_CMD;
+    }
+    if !spec.ioctl_types.is_empty() {
+        let map = bpf
+            .map_mut("MATCH_IOCTL_TYPE_SET")
+            .context("MATCH_IOCTL_TYPE_SET missing")?;
+        let mut m: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("MATCH_IOCTL_TYPE_SET is not HashMap<u32,u8>")?;
+        for v in &spec.ioctl_types {
+            m.insert(v, 1u8, 0)
+                .with_context(|| format!("MATCH_IOCTL_TYPE_SET.insert({v:#x})"))?;
+        }
+        bits |= MATCH_BIT_IOCTL_TYPE;
+    }
+    if !spec.ioctl_nrs.is_empty() {
+        let map = bpf
+            .map_mut("MATCH_IOCTL_NR_SET")
+            .context("MATCH_IOCTL_NR_SET missing")?;
+        let mut m: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("MATCH_IOCTL_NR_SET is not HashMap<u32,u8>")?;
+        for v in &spec.ioctl_nrs {
+            m.insert(v, 1u8, 0)
+                .with_context(|| format!("MATCH_IOCTL_NR_SET.insert({v:#x})"))?;
+        }
+        bits |= MATCH_BIT_IOCTL_NR;
+    }
+    if let Some(dir) = spec.ioctl_dir {
+        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+        filter
+            .set(FILTER_KEY_IOCTL_DIR, dir.as_u32(), 0)
+            .context("FILTER_MAP[IOCTL_DIR]")?;
+        bits |= MATCH_BIT_IOCTL_DIR;
+    }
+
+    if spec.ret_class != matcher::RetClass::Any {
+        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+        filter
+            .set(FILTER_KEY_RET_CLASS, spec.ret_class.as_u32(), 0)
+            .context("FILTER_MAP[RET_CLASS]")?;
+        bits |= MATCH_BIT_RET;
+    }
+    if let Some(min_us) = spec.latency_min_us {
+        // Clamp into u32 — values above u32::MAX µs are pathological
+        // (>71 minutes per syscall) and certainly user error.
+        let v: u32 = min_us.try_into().unwrap_or(u32::MAX);
+        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+        filter
+            .set(FILTER_KEY_LATENCY_MIN_US, v, 0)
+            .context("FILTER_MAP[LATENCY_MIN_US]")?;
+        bits |= MATCH_BIT_LATENCY;
+    }
+
+    // Single BPF-evaluable u32 arg clause. Multi-offset stays userspace-only.
+    if let Some(c) = spec.bpf_arg_u32() {
+        let map = bpf
+            .map_mut("MATCH_ARG_U32_VALS")
+            .context("MATCH_ARG_U32_VALS missing")?;
+        let mut m: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("MATCH_ARG_U32_VALS is not HashMap<u32,u8>")?;
+        for v in &c.values {
+            let v32: u32 = (*v).try_into().context("arg.u32 value exceeds u32::MAX")?;
+            m.insert(v32, 1u8, 0)
+                .with_context(|| format!("MATCH_ARG_U32_VALS.insert({v32:#x})"))?;
+        }
+        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+        filter
+            .set(FILTER_KEY_ARG_U32_OFF, c.offset, 0)
+            .context("FILTER_MAP[ARG_U32_OFF]")?;
+        bits |= MATCH_BIT_ARG_U32;
+    }
+
+    // STATE_EMIT_REQUIRED bit — flip on whenever userspace will need state
+    // events to keep fdgraph consistent.
+    let state_required = if spec.needs_state_events() {
+        1u32
+    } else {
+        0u32
+    };
+    let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+    let mut filter: Array<_, u32> = Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+    filter
+        .set(FILTER_KEY_STATE_EMIT_REQUIRED, state_required, 0)
+        .context("FILTER_MAP[STATE_EMIT_REQUIRED]")?;
+
+    // Authoritative MATCH_BITS write last so a partial population can
+    // never accidentally activate a half-configured predicate.
+    filter
+        .set(FILTER_KEY_MATCH_BITS, bits, 0)
+        .context("FILTER_MAP[MATCH_BITS]")?;
+
     Ok(())
 }
 
@@ -498,6 +673,23 @@ fn run_trace(mut args: Args) -> Result<()> {
 
     // 2. Populate filter map.
     populate_filter_map(&mut bpf, args.pid)?;
+
+    // 2b. Phase 1a — build the predicate spec, push the BPF-evaluable
+    // subset down to the kernel, and print the audit.
+    let match_spec = matcher::build_from_args(&args)?;
+    if !match_spec.is_empty() {
+        populate_match_maps(&mut bpf, &match_spec)?;
+        eprintln!("  match predicate (Phase 1a):");
+        for line in match_spec.audit_lines() {
+            eprintln!("    {line}");
+        }
+        if match_spec.needs_state_events() {
+            eprintln!(
+                "    [bpf]  state-tracking syscalls always-emit (fd_path \
+                 enrichment requires fdgraph state)"
+            );
+        }
+    }
 
     // 3. Build rule engine.
     let mut engine = build_rule_engine(&args)?;
@@ -870,6 +1062,28 @@ fn run_trace(mut args: Args) -> Result<()> {
                     })
                 });
 
+                // Phase 1a — userspace post-filter. The BPF prefilter is a
+                // safe over-approximation; here we apply the full predicate
+                // (including userspace-only clauses) to decide whether to
+                // emit the event line, feed the rule engine, and record into
+                // the crash-context lookback.
+                //
+                // fdgraph state has already been updated above so we can
+                // reject state-tracking events without losing fd→path
+                // information; the matcher's `--match-fd` clause then has
+                // current data when it evaluates a later ioctl.
+                let post_filter_ok = if match_spec.is_empty() {
+                    true
+                } else {
+                    let lens = SyscallEventLens::new(
+                        &ev,
+                        format_comm(&{ ev.comm }),
+                        fd_hint.as_ref().map(|h| h.path.as_str()),
+                        compute_latency_us(&ev),
+                    );
+                    matcher::evaluate(&match_spec, &lens)
+                };
+
                 // Always compute the JSON form: cheap and fed to the rule engine.
                 event_id_counter = event_id_counter.wrapping_add(1);
                 let json_line = format_event_json_full(
@@ -880,27 +1094,33 @@ fn run_trace(mut args: Args) -> Result<()> {
                     Some(event_id_counter),
                 );
 
-                if let Some(eng) = engine.as_mut() {
-                    if let Some(owned) = neutron_rules::Event::parse_line(&json_line) {
-                        if let Some(view) = owned.view() {
-                            eng.feed(&view);
+                if post_filter_ok {
+                    if let Some(eng) = engine.as_mut() {
+                        if let Some(owned) = neutron_rules::Event::parse_line(&json_line) {
+                            if let Some(view) = owned.view() {
+                                eng.feed(&view);
+                            }
                         }
                     }
-                }
 
-                if !suppress_raw {
-                    let line = if args.json {
-                        json_line.clone()
-                    } else {
-                        format_event_text_with_stack(&ev, args.resolve_paths, stack_str.as_deref())
-                    };
-                    let _ = writeln!(out, "{line}");
-                }
-                // Lookback: record the JSON form (not the text form — JSON
-                // round-trips losslessly into the crash_context array).
-                if let Some(lb) = lookback.as_mut() {
-                    let pid = { ev.pid };
-                    lb.record(pid, &json_line);
+                    if !suppress_raw {
+                        let line = if args.json {
+                            json_line.clone()
+                        } else {
+                            format_event_text_with_stack(
+                                &ev,
+                                args.resolve_paths,
+                                stack_str.as_deref(),
+                            )
+                        };
+                        let _ = writeln!(out, "{line}");
+                    }
+                    // Lookback: record the JSON form (not the text form — JSON
+                    // round-trips losslessly into the crash_context array).
+                    if let Some(lb) = lookback.as_mut() {
+                        let pid = { ev.pid };
+                        lb.record(pid, &json_line);
+                    }
                 }
 
                 events_since_drain += 1;

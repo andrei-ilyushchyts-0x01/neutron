@@ -67,9 +67,122 @@ impl Default for SyscallEvent {
     }
 }
 
-/// Keys for filter_map (BPF_MAP_TYPE_ARRAY, 2 entries)
+// ── filter_map (BPF_MAP_TYPE_ARRAY) ──────────────────────────────────────────
+//
+// Slot indices are stable — they may be added at the end but never reordered.
+// The BPF object must declare `Array::with_max_entries(FILTER_MAP_SLOT_COUNT,
+// ..)`; userspace must keep `populate_filter_map` aligned with this list.
+
+/// Target PID. `0` means "match all PIDs". Phase 1a additionally consults
+/// `PID_WHITELIST` for multi-PID matches.
 pub const FILTER_KEY_PID: u32 = 0;
+/// Legacy syscall-filter active flag (gates the `SYSCALL_FILTER` HashMap).
+/// Kept for backward compatibility with existing `--profile` entry points.
 pub const FILTER_KEY_ACTIVE: u32 = 1;
+/// Phase 1a — bitmask of which `MATCH_*` predicates are configured. See
+/// the `MATCH_BIT_*` constants below.
+pub const FILTER_KEY_MATCH_BITS: u32 = 2;
+/// Phase 1a — `RetClass` discriminant. Only consulted when `MATCH_BIT_RET`
+/// is set on `MATCH_BITS`.
+pub const FILTER_KEY_RET_CLASS: u32 = 3;
+/// Phase 1a — minimum `latency_us` for an exit event to match. `0` disables
+/// the check; gated by `MATCH_BIT_LATENCY`.
+pub const FILTER_KEY_LATENCY_MIN_US: u32 = 4;
+/// Phase 1a — byte offset (within the post-cmd `arg` snapshot, i.e.
+/// `data[4..]`) at which the BPF programs read a u32 LE value to compare
+/// against `MATCH_ARG_U32_VALS`. Gated by `MATCH_BIT_ARG_U32`.
+pub const FILTER_KEY_ARG_U32_OFF: u32 = 5;
+/// Phase 1a — required `_IOC_DIR` value (`0..=3`). Gated by
+/// `MATCH_BIT_IOCTL_DIR`.
+pub const FILTER_KEY_IOCTL_DIR: u32 = 6;
+/// Phase 1a — when set to `1`, BPF programs let
+/// state-tracking syscalls (see [`is_state_tracking_nr`]) bypass the
+/// predicate filter. Userspace flips this on whenever a feature relies on
+/// `FdGraph` state (e.g. `--match-fd`, `--resolve-paths`,
+/// `--follow-children`).
+pub const FILTER_KEY_STATE_EMIT_REQUIRED: u32 = 7;
+/// Allocate generously so future Phase-1 extensions don't require a wire
+/// bump. Existing slots stay at their current indices.
+pub const FILTER_MAP_SLOT_COUNT: u32 = 16;
+
+// ── MATCH_BITS — bitfield in FILTER_MAP[FILTER_KEY_MATCH_BITS] ───────────────
+//
+// Each bit gates one predicate evaluator BPF-side. Userspace sets the bit
+// when it populates the corresponding map / scalar slot, and clears it
+// otherwise. PID and SYSCALL predicates ride on the legacy
+// `FILTER_KEY_PID` / `FILTER_KEY_ACTIVE` toggles, so they have no bit.
+
+pub const MATCH_BIT_UID: u32 = 1 << 0;
+pub const MATCH_BIT_IOCTL_CMD: u32 = 1 << 1;
+pub const MATCH_BIT_IOCTL_TYPE: u32 = 1 << 2;
+pub const MATCH_BIT_IOCTL_NR: u32 = 1 << 3;
+pub const MATCH_BIT_IOCTL_DIR: u32 = 1 << 4;
+pub const MATCH_BIT_RET: u32 = 1 << 5;
+pub const MATCH_BIT_LATENCY: u32 = 1 << 6;
+pub const MATCH_BIT_ARG_U32: u32 = 1 << 7;
+
+// ── ret-class discriminant (FILTER_KEY_RET_CLASS) ────────────────────────────
+
+pub const RET_CLASS_ANY: u32 = 0;
+pub const RET_CLASS_NONZERO: u32 = 1;
+pub const RET_CLASS_NEGATIVE: u32 = 2;
+pub const RET_CLASS_ZERO: u32 = 3;
+
+/// Returns `true` if the given ret value matches the configured class.
+/// Pure function; safe to use from both BPF and userspace.
+#[inline]
+pub const fn ret_matches_class(ret: i64, class: u32) -> bool {
+    match class {
+        RET_CLASS_NONZERO => ret != 0,
+        RET_CLASS_NEGATIVE => ret < 0,
+        RET_CLASS_ZERO => ret == 0,
+        _ => true, // RET_CLASS_ANY and unknown values pass through.
+    }
+}
+
+// ── State-tracking syscalls (Phase 1a) ───────────────────────────────────────
+//
+// These syscalls drive the userspace `FdGraph`: openat, dup, close, socket,
+// pipe, eventfd, memfd_create, accept, clone (for follow-children). When a
+// `--match-fd` / `--resolve-paths` / `--follow-children` feature is active,
+// `FILTER_KEY_STATE_EMIT_REQUIRED` is set and BPF lets these syscalls
+// bypass the predicate filter so userspace fdgraph stays consistent. The
+// matching userspace post-filter still decides whether the event is
+// written to NDJSON or only consumed for state.
+//
+// Numbers are aarch64 generic (kernel/uapi/asm-generic/unistd.h). They
+// must stay in sync with `src/decode/syscalls.rs`.
+
+/// Authoritative list of state-tracking syscall numbers. Userspace iterates
+/// this slice to populate `SYSCALL_FILTER` when `--match-syscall` is in use
+/// alongside fd-aware features. BPF uses [`is_state_tracking_nr`] for the
+/// same predicate via a `match` expression that compiles to a jump table.
+pub const STATE_TRACKING_NRS: &[i32] = &[
+    19,  // eventfd2
+    23,  // dup
+    24,  // dup3
+    56,  // openat
+    57,  // close
+    59,  // pipe2
+    198, // socket
+    199, // socketpair
+    202, // accept
+    220, // clone
+    242, // accept4
+    279, // memfd_create
+    437, // openat2
+];
+
+/// `true` when the syscall number drives userspace fdgraph state. Kept as a
+/// `match` expression so the BPF compiler emits a jump table instead of an
+/// O(N) slice scan. Must enumerate the same numbers as `STATE_TRACKING_NRS`.
+#[inline]
+pub const fn is_state_tracking_nr(nr: i32) -> bool {
+    matches!(
+        nr,
+        19 | 23 | 24 | 56 | 57 | 59 | 198 | 199 | 202 | 220 | 242 | 279 | 437
+    )
+}
 
 /// Maximum number of stack frames stored per stack trace
 pub const STACK_FRAMES: u32 = 127;
@@ -331,6 +444,73 @@ mod exit_classification_tests {
             assert_eq!(ExitSource::from_u8(src as u8), Some(src));
         }
         assert_eq!(ExitSource::from_u8(99), None);
+    }
+}
+
+#[cfg(test)]
+mod state_tracking_tests {
+    use super::*;
+
+    #[test]
+    fn is_state_tracking_nr_matches_listed_set() {
+        for &nr in STATE_TRACKING_NRS {
+            assert!(
+                is_state_tracking_nr(nr),
+                "STATE_TRACKING_NRS slice contains nr={nr} but predicate disagrees"
+            );
+        }
+    }
+
+    #[test]
+    fn is_state_tracking_nr_rejects_arbitrary_syscalls() {
+        // ioctl=29, mmap=222, futex=98 — none should appear in the list.
+        assert!(!is_state_tracking_nr(29));
+        assert!(!is_state_tracking_nr(222));
+        assert!(!is_state_tracking_nr(98));
+        assert!(!is_state_tracking_nr(-1)); // binder sentinel
+    }
+
+    #[test]
+    fn ret_matches_class_covers_known_values() {
+        assert!(ret_matches_class(0, RET_CLASS_ANY));
+        assert!(ret_matches_class(-1, RET_CLASS_ANY));
+
+        assert!(!ret_matches_class(0, RET_CLASS_NONZERO));
+        assert!(ret_matches_class(1, RET_CLASS_NONZERO));
+        assert!(ret_matches_class(-1, RET_CLASS_NONZERO));
+
+        assert!(!ret_matches_class(0, RET_CLASS_NEGATIVE));
+        assert!(!ret_matches_class(1, RET_CLASS_NEGATIVE));
+        assert!(ret_matches_class(-22, RET_CLASS_NEGATIVE));
+
+        assert!(ret_matches_class(0, RET_CLASS_ZERO));
+        assert!(!ret_matches_class(1, RET_CLASS_ZERO));
+    }
+
+    #[test]
+    fn ret_matches_class_treats_unknown_class_as_any() {
+        assert!(ret_matches_class(0, 99));
+        assert!(ret_matches_class(-1, 99));
+    }
+
+    #[test]
+    fn match_bits_are_distinct_powers_of_two() {
+        let bits = [
+            MATCH_BIT_UID,
+            MATCH_BIT_IOCTL_CMD,
+            MATCH_BIT_IOCTL_TYPE,
+            MATCH_BIT_IOCTL_NR,
+            MATCH_BIT_IOCTL_DIR,
+            MATCH_BIT_RET,
+            MATCH_BIT_LATENCY,
+            MATCH_BIT_ARG_U32,
+        ];
+        let mut seen: u32 = 0;
+        for b in bits {
+            assert!(b.is_power_of_two(), "{b:#x} is not a single bit");
+            assert_eq!(seen & b, 0, "{b:#x} collides with already-seen bits");
+            seen |= b;
+        }
     }
 }
 

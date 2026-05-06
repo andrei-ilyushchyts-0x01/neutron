@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod fdgraph;
 pub mod format;
 pub mod health;
+pub mod matcher;
 pub mod rules;
 pub mod sources;
 pub mod symbolize;
