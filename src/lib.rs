@@ -6,6 +6,7 @@ pub mod decode;
 pub mod diff;
 pub mod doctor;
 pub mod fdgraph;
+pub mod fdinfo;
 pub mod format;
 pub mod health;
 pub mod matcher;

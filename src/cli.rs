@@ -397,4 +397,12 @@ pub struct Args {
     /// the same fdgraph-consistency reason as `--sample`.
     #[arg(long, value_name = "N")]
     pub rate_limit: Option<u64>,
+
+    // ── Phase 4a — fd snapshot on finding ──────────────────────────────────
+    /// When enabled, every finding whose contributing evidence includes an
+    /// ioctl event is enriched with a synchronous read of
+    /// `/proc/<pid>/fdinfo/<fd>`. Useful for transient fds that the
+    /// 1-Hz fdgraph poller misses. Best-effort: a failed read is silent.
+    #[arg(long)]
+    pub fd_snapshot_on_finding: bool,
 }

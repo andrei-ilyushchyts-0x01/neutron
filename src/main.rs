@@ -38,7 +38,7 @@ use neutron::format::{
 use neutron::health::{format_summary_with, CaptureHealth, UserspaceHealth};
 use neutron::matcher::{self, MatchSpec, SyscallEventLens};
 use neutron::predicate;
-use neutron::rules::{build_rule_engine, emit_findings};
+use neutron::rules::{build_rule_engine, emit_findings_with};
 use neutron::sampler::SamplerChain;
 use neutron::sources::binder_tracker::BinderTracker;
 use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
@@ -1338,7 +1338,12 @@ fn run_trace(mut args: Args) -> Result<()> {
                     if let Some(eng) = engine.as_mut() {
                         let findings = eng.drain_ready();
                         if !findings.is_empty() {
-                            emit_findings(&findings, &mut *out, args.json);
+                            emit_findings_with(
+                                &findings,
+                                &mut *out,
+                                args.json,
+                                args.fd_snapshot_on_finding,
+                            );
                         }
                     }
                 }
@@ -1506,7 +1511,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     if let Some(eng) = engine.take() {
         let pending = eng.flush_all();
         if !pending.is_empty() {
-            emit_findings(&pending, &mut *out, args.json);
+            emit_findings_with(&pending, &mut *out, args.json, args.fd_snapshot_on_finding);
         }
     }
 
