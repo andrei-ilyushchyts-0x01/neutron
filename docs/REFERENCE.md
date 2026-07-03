@@ -10,10 +10,13 @@
 | `summarize`   | Aggregate an NDJSON capture by `--by <fields>` and print a sorted count table. (1.2.0) |
 | `diff`        | Compare two captures aggregated on the same key; print added/removed/Δ rows. (1.2.0)  |
 | `mark`        | Append one `type:"marker"` NDJSON line. Pair with `neutron window --anchor marker:<name>`. (1.2.0) |
+| `recipes`     | Print built-in workflow recipes, e.g. `neutron recipes android-content-provider`. |
 
 For `window`, see [docs/guides/window.md](guides/window.md). For
 `summarize` / `diff`, see the per-subcommand `--help`. For `mark`, see
-the **Marker workflow** section below.
+the **Marker workflow** section below. For Android provider work, use
+`neutron recipes android-content-provider` or
+[guides/android-content-provider.md](guides/android-content-provider.md).
 
 ## CLI Flags
 
@@ -27,6 +30,8 @@ the **Marker workflow** section below.
 | `-v, --verbose`                   | flag             | off                                      | Print diagnostic information to stderr: attached programs, kallsyms status, follow-children / capture-reads decisions, Aya verifier log on a failed `prog.load()`. |
 | `--exclude-comm LIST`             | comma-separated  | empty                                    | Exclude events whose `comm` field contains any of the listed substrings. Applied in userspace after reading from the ring buffer. |
 | `--output PATH`                   | String           | stdout                                   | Write event output to a file instead of stdout. |
+| `--max-output-size SIZE`          | String           | unset                                    | Stop capture after the output stream reaches SIZE. Accepts bytes or binary suffixes (`kb`, `mb`, `gb`). |
+| `--rotate-output-size SIZE`       | String           | unset                                    | Rotate file output after SIZE bytes per segment. Requires `--output`; writes `PATH`, `PATH.1`, `PATH.2`, ... Mutually exclusive with `--max-output-size`. |
 | `--json`                          | flag             | off                                      | Emit events and findings as NDJSON (one JSON object per line). |
 | `--profile security`              | String           | off                                      | Enable BPF-side syscall whitelisting: only security-relevant syscalls are captured. Also captures file paths via `bpf_probe_read_user_str_bytes` and auto-populates `--exclude-comm` with kernel-worker noise. |
 | `--binder`                        | flag             | off                                      | Enable binder transaction tracing via the `binder/binder_transaction` tracepoint. Emits events with `syscall_nr = -1`. |
@@ -55,6 +60,8 @@ the **Marker workflow** section below.
 |-----------------------------------|------------------|------------------------------------------|-------------|
 | `--match-pid LIST`                | comma-separated  | empty                                    | Multi-PID match. Pushed into BPF (`PID_WHITELIST` map). Combine with `--pid` for the kernel-side fast path. |
 | `--match-uid LIST`                | comma-separated, accepts `LO..HI` | empty               | UID match. Range expansion capped at 1024 entries. BPF-evaluable (`MATCH_UID_SET`). |
+| `--match-package LIST`            | comma-separated  | empty                                    | Android package-name match. Resolved on-device to UID(s) through `cmd package` / `pm`, then applied through the BPF UID prefilter. |
+| `--match-android-provider LIST`   | comma-separated  | empty                                    | Android content-provider authority match. Accepts `authority` or `content://authority/path`, resolves through `dumpsys package providers` to the provider package, then applies the package UID through the BPF UID prefilter. |
 | `--match-syscall LIST`            | comma-separated  | empty                                    | Syscall whitelist by aarch64 nr. Reuses `SYSCALL_FILTER`. BPF-evaluable. |
 | `--match-fd LIST`                 | comma-separated  | empty                                    | Glob-matched fd path (e.g. `'/dev/lwis*,/dev/gxp'`). Userspace-only — needs `--resolve-paths` or an established fdgraph entry. Toggles `STATE_EMIT_REQUIRED` so kernel-side state syscalls bypass the predicate. |
 | `--match-comm LIST`               | comma-separated  | empty                                    | Glob-matched `comm`. Userspace-only. |

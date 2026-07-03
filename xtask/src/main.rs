@@ -81,6 +81,72 @@ fn workspace_root() -> PathBuf {
         .to_owned()
 }
 
+fn command_ok(program: &str, args: &[&str]) -> std::result::Result<(), String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{program} {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(format!(
+        "{program} {} exited with {}{}",
+        args.join(" "),
+        output.status,
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    ))
+}
+
+fn format_ebpf_preflight_error(
+    cargo_nightly: std::result::Result<(), String>,
+    bpf_linker: std::result::Result<(), String>,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Err(detail) = cargo_nightly {
+        lines.push(format!(
+            "- cargo +nightly is unavailable or unusable ({detail}). \
+             Install it with: rustup toolchain install nightly"
+        ));
+    }
+    if let Err(detail) = bpf_linker {
+        lines.push(format!(
+            "- bpf-linker is unavailable ({detail}). Install it with: \
+             cargo install bpf-linker"
+        ));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "BPF build preflight failed:\n{}\n\n\
+             neutron builds eBPF with `cargo +nightly -Z build-std=core` \
+             for target bpfel-unknown-none.",
+            lines.join("\n")
+        ))
+    }
+}
+
+fn preflight_ebpf_build() -> Result<()> {
+    let cargo_nightly = command_ok("cargo", &["+nightly", "--version"]);
+    let bpf_linker = command_ok("bpf-linker", &["--version"]);
+    if let Some(msg) = format_ebpf_preflight_error(cargo_nightly, bpf_linker) {
+        bail!("{msg}");
+    }
+    Ok(())
+}
+
 fn build_ebpf(release: bool) -> Result<()> {
     let root = workspace_root();
     let ebpf_dir = root.join("neutron-ebpf");
@@ -89,6 +155,7 @@ fn build_ebpf(release: bool) -> Result<()> {
         "=== Building BPF programs ({}) ===",
         if release { "release" } else { "debug" }
     );
+    preflight_ebpf_build()?;
 
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
@@ -571,4 +638,30 @@ fn deploy() -> Result<()> {
     println!("  adb shell su -c '/data/local/tmp/neutron --pid <PID>'");
     println!("  # default --object is /data/local/tmp/neutron.bpf.elf");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ebpf_preflight_mentions_nightly_install_when_missing() {
+        let err = format_ebpf_preflight_error(
+            Err("cargo +nightly --version exited with status 1".into()),
+            Ok(()),
+        )
+        .expect("missing nightly should produce an error");
+
+        assert!(err.contains("cargo +nightly"));
+        assert!(err.contains("rustup toolchain install nightly"));
+    }
+
+    #[test]
+    fn ebpf_preflight_mentions_bpf_linker_install_when_missing() {
+        let err = format_ebpf_preflight_error(Ok(()), Err("bpf-linker not found in PATH".into()))
+            .expect("missing bpf-linker should produce an error");
+
+        assert!(err.contains("bpf-linker"));
+        assert!(err.contains("cargo install bpf-linker"));
+    }
 }

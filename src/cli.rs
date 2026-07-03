@@ -51,6 +51,11 @@ pub enum Command {
     /// trace; downstream `neutron window --anchor marker:<name>` cuts
     /// a window around the marker. Phase 5a.
     Mark(crate::mark::MarkArgs),
+
+    /// Print built-in workflow recipes for common Android security
+    /// research tasks.
+    #[command(subcommand)]
+    Recipes(crate::recipes::RecipesCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -60,7 +65,7 @@ pub struct WindowArgs {
 
     /// Anchor specification. One of:
     /// `finding:<RULE_ID>`, `crash`, `pid:<N>`, `event_id:<N>`,
-    /// `comm:<substring>`, or `binder_call:<status>`.
+    /// `comm:<substring>`, `binder_call:<status>`, or `marker:<name>`.
     /// Multiple `--anchor` flags are AND-joined inside one window per match
     /// (i.e. each matching event becomes its own anchor; windows are then
     /// merged across all anchors).
@@ -127,6 +132,16 @@ pub struct Args {
     /// Write output to file instead of stdout
     #[arg(long)]
     pub output: Option<String>,
+
+    /// Stop capture after writing this many bytes to the output stream.
+    /// Accepts bare bytes or binary suffixes like `500mb`, `1gb`.
+    #[arg(long, value_name = "SIZE")]
+    pub max_output_size: Option<String>,
+
+    /// Rotate file output into numbered segments after this many bytes.
+    /// Requires `--output`; writes PATH, PATH.1, PATH.2, ...
+    #[arg(long, value_name = "SIZE")]
+    pub rotate_output_size: Option<String>,
 
     /// Output events as NDJSON
     #[arg(long)]
@@ -262,6 +277,17 @@ pub struct Args {
     /// UID match (single, comma-separated, or `LO..HI` ranges).
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub match_uid: Vec<String>,
+
+    /// Android package-name match. Resolved on-device to UID(s), then
+    /// applied through the same BPF UID prefilter as `--match-uid`.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_package: Vec<String>,
+
+    /// Android content-provider authority match. Accepts a bare authority
+    /// or `content://authority/path`, resolves it on-device to the
+    /// provider package UID, then applies the BPF UID prefilter.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub match_android_provider: Vec<String>,
 
     /// Syscall whitelist by aarch64 generic syscall number. Reuses the
     /// existing `SYSCALL_FILTER` BPF map.
@@ -420,4 +446,49 @@ pub struct Args {
     /// pairs surface no service field — never a placeholder.
     #[arg(long, value_name = "FILE")]
     pub binder_services: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn window_help_lists_marker_anchor() {
+        let mut cmd = Cli::command();
+        let window = cmd
+            .find_subcommand_mut("window")
+            .expect("window subcommand registered");
+        let mut help = Vec::new();
+        window.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("marker:<name>"),
+            "window help should document marker anchors:\n{help}"
+        );
+    }
+
+    #[test]
+    fn top_level_help_lists_output_bounds() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("--max-output-size") && help.contains("--rotate-output-size"),
+            "top-level help should document output bounding flags:\n{help}"
+        );
+    }
+
+    #[test]
+    fn top_level_help_lists_recipes_subcommand() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("recipes"),
+            "top-level help should list recipes subcommand:\n{help}"
+        );
+    }
 }

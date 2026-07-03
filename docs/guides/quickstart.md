@@ -83,6 +83,7 @@ adb shell su -c '/data/local/tmp/neutron \
 adb shell su -c '/data/local/tmp/neutron \
   --pid <PID> \
   --raw --json \
+  --max-output-size 250mb \
   --output /data/local/tmp/trace.ndjson'
 
 # Pull the file
@@ -92,6 +93,55 @@ adb pull /data/local/tmp/trace.ndjson
 `--raw` includes the per-event stream; without it, only rule-engine
 findings are emitted. `--no-findings` suppresses findings (useful with
 `--raw` to reproduce the legacy per-event-only behavior).
+
+For Android app workflows, prefer package-scoped capture when possible:
+
+```bash
+adb shell su -c '/data/local/tmp/neutron \
+  --pid 0 \
+  --raw --json --no-findings \
+  --match-package com.example.app \
+  --max-output-size 250mb \
+  --output /data/local/tmp/app_trace.ndjson'
+```
+
+`--match-package` resolves the installed package to its UID on-device and
+uses the BPF UID prefilter. `--max-output-size` stops runaway captures
+before they fill `/data/local/tmp`.
+
+For longer sessions where stopping at the cap is not acceptable, rotate
+bounded NDJSON segments instead:
+
+```bash
+adb shell su -c '/data/local/tmp/neutron \
+  --pid 0 \
+  --raw --json --no-findings \
+  --match-package com.example.app \
+  --rotate-output-size 250mb \
+  --output /data/local/tmp/app_trace.ndjson'
+```
+
+This writes `/data/local/tmp/app_trace.ndjson`,
+`/data/local/tmp/app_trace.ndjson.1`, and so on. `--rotate-output-size`
+requires `--output` and cannot be combined with `--max-output-size`.
+
+For content-provider research, scope the caller package and provider
+authority together:
+
+```bash
+adb shell su -c '/data/local/tmp/neutron \
+  --pid 0 \
+  --raw --json --no-findings \
+  --match-package com.example.probe \
+  --match-android-provider content://com.android.contacts/contacts \
+  --rate-limit 1000 \
+  --max-output-size 250mb \
+  --output /data/local/tmp/provider_trace.ndjson'
+```
+
+`--match-android-provider` resolves the authority to the declaring
+provider package UID on-device, then reuses the same BPF UID prefilter as
+`--match-uid`.
 
 ### Investigate a captured trace with `neutron window`
 

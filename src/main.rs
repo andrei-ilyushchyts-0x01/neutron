@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{self, Write as IoWrite};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use aya::programs::TracePoint;
 use aya::Ebpf;
 use clap::Parser;
 
+use neutron::android;
 use neutron::binder_services::BinderServiceMap;
 use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
 use neutron::cli::{Args, Cli, Command};
@@ -289,6 +290,8 @@ fn warn_likely_shell_expansion(label: &str, globs: &[String]) {
 fn any_individual_match_flag(args: &Args) -> bool {
     !args.match_pid.is_empty()
         || !args.match_uid.is_empty()
+        || !args.match_package.is_empty()
+        || !args.match_android_provider.is_empty()
         || !args.match_syscall.is_empty()
         || !args.match_fd.is_empty()
         || !args.match_comm.is_empty()
@@ -310,6 +313,55 @@ fn any_individual_match_flag(args: &Args) -> bool {
         || !args.match_binder_to_thread.is_empty()
         || !args.match_binder_target_node.is_empty()
         || args.match_binder_reply.is_some()
+}
+
+fn has_capture_predicate_flags(args: &Args) -> bool {
+    any_individual_match_flag(args) || args.match_expr.is_some()
+}
+
+fn capture_guardrail_warnings(args: &Args) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if args.pid == 0 && args.binder && args.raw && args.rate_limit.is_none() {
+        warnings.push(
+            "broad capture: --pid 0 with --binder and --raw can produce very large traces; \
+             consider --match-* filters, --rate-limit, --sample, or a narrower --pid"
+                .to_string(),
+        );
+    }
+    if args.output.is_some()
+        && args.max_output_size.is_none()
+        && args.rotate_output_size.is_none()
+        && args.raw
+        && args.pid == 0
+    {
+        warnings.push(
+            "uncapped output: --output with --pid 0 and --raw can grow quickly; set \
+             --max-output-size or --rotate-output-size (for example 250mb), add \
+             --rate-limit/--sample, or narrow the capture with --match-* filters"
+                .to_string(),
+        );
+    }
+    if args.pid == 0
+        && args
+            .capture
+            .as_deref()
+            .is_some_and(|c| c.trim().starts_with("matched+context="))
+    {
+        warnings.push(
+            "broad context capture: --capture matched+context=<DUR> under --pid 0 buffers \
+             rejected system-wide events; keep DUR small and prefer UID/PID/syscall filters"
+                .to_string(),
+        );
+    }
+    if args.binder && has_capture_predicate_flags(args) && args.binder_inflight > 0 {
+        warnings.push(
+            "binder context: synthesized type:\"binder_call\" lines come from the global \
+             Binder correlator and may include caller/callee pairs outside strict \
+             --match-* filters; use --binder-inflight 0 to suppress correlation context"
+                .to_string(),
+        );
+    }
+    warnings
 }
 
 fn build_capture_predicate(args: &Args) -> Result<CapturePredicate> {
@@ -337,6 +389,37 @@ fn build_capture_predicate(args: &Args) -> Result<CapturePredicate> {
     } else {
         Ok(CapturePredicate::Spec(spec))
     }
+}
+
+fn resolve_match_packages(args: &mut Args) -> Result<()> {
+    for package in args.match_package.clone() {
+        let uid = android::resolve_package_uid(&package)
+            .with_context(|| format!("resolving --match-package {package}"))?;
+        eprintln!("  match package: {package} -> uid {uid}");
+        args.match_uid.push(uid.to_string());
+    }
+    Ok(())
+}
+
+fn resolve_match_android_providers(args: &mut Args) -> Result<()> {
+    for authority in args.match_android_provider.clone() {
+        let provider = android::resolve_provider_authority(&authority)
+            .with_context(|| format!("resolving --match-android-provider {authority}"))?;
+        let uid = android::resolve_package_uid(&provider.package)
+            .with_context(|| format!("resolving provider package {}", provider.package))?;
+        match provider.component.as_deref() {
+            Some(component) => eprintln!(
+                "  match android provider: {} -> {} ({component}) uid {uid}",
+                provider.authority, provider.package
+            ),
+            None => eprintln!(
+                "  match android provider: {} -> {} uid {uid}",
+                provider.authority, provider.package
+            ),
+        }
+        args.match_uid.push(uid.to_string());
+    }
+    Ok(())
 }
 
 /// Phase 1a — push every BPF-evaluable clause of `spec` into its kernel
@@ -512,13 +595,200 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
 
 // ── Output sink ──────────────────────────────────────────────────────────────
 
-fn open_output(path: Option<&String>) -> Result<Box<dyn IoWrite>> {
-    match path {
-        Some(p) => {
-            let f = fs::File::create(p).with_context(|| format!("cannot create {p}"))?;
-            Ok(Box::new(std::io::BufWriter::new(f)))
+fn parse_size_bytes(raw: Option<&str>, flag_name: &str) -> Result<Option<u64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "off" || s == "none" {
+        return Ok(None);
+    }
+    let (num, mult) = if let Some(n) = s.strip_suffix("kb") {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix('k') {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix("mb") {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix("gb") {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('g') {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid {flag_name} value: {raw}"))?;
+    if n == 0 {
+        bail!("{flag_name} must be > 0 when set");
+    }
+    n.checked_mul(mult)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("{flag_name} overflows u64: {raw}"))
+}
+
+fn parse_output_size_bytes(raw: Option<&str>) -> Result<Option<u64>> {
+    parse_size_bytes(raw, "--max-output-size")
+}
+
+fn parse_rotate_output_size_bytes(raw: Option<&str>) -> Result<Option<u64>> {
+    parse_size_bytes(raw, "--rotate-output-size")
+}
+
+struct CappedWriter {
+    inner: Box<dyn IoWrite>,
+    written: u64,
+    max_bytes: u64,
+    hit: Arc<AtomicBool>,
+}
+
+impl CappedWriter {
+    fn new(inner: Box<dyn IoWrite>, max_bytes: u64, hit: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            written: 0,
+            max_bytes,
+            hit,
         }
-        None => Ok(Box::new(std::io::BufWriter::new(std::io::stdout()))),
+    }
+}
+
+impl IoWrite for CappedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.hit.load(Ordering::Relaxed)
+            || self.written.saturating_add(buf.len() as u64) > self.max_bytes
+        {
+            self.hit.store(true, Ordering::Relaxed);
+            return Err(io::Error::other(format!(
+                "max output size {} bytes reached",
+                self.max_bytes
+            )));
+        }
+        let n = self.inner.write(buf)?;
+        self.written = self.written.saturating_add(n as u64);
+        if self.written >= self.max_bytes {
+            self.hit.store(true, Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct RotatingWriter {
+    base_path: String,
+    segment_idx: u64,
+    segment_bytes: u64,
+    max_segment_bytes: u64,
+    inner: std::io::LineWriter<fs::File>,
+}
+
+impl RotatingWriter {
+    fn new(path: &str, max_segment_bytes: u64) -> Result<Self> {
+        if max_segment_bytes == 0 {
+            bail!("--rotate-output-size must be > 0 when set");
+        }
+        let file = fs::File::create(path).with_context(|| format!("cannot create {path}"))?;
+        Ok(Self {
+            base_path: path.to_string(),
+            segment_idx: 0,
+            segment_bytes: 0,
+            max_segment_bytes,
+            inner: std::io::LineWriter::new(file),
+        })
+    }
+
+    fn segment_path(&self) -> String {
+        if self.segment_idx == 0 {
+            self.base_path.clone()
+        } else {
+            format!("{}.{}", self.base_path, self.segment_idx)
+        }
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        self.segment_idx = self.segment_idx.saturating_add(1);
+        self.segment_bytes = 0;
+        let path = self.segment_path();
+        let file = fs::File::create(&path)?;
+        self.inner = std::io::LineWriter::new(file);
+        eprintln!("neutron: rotated output to {path}");
+        Ok(())
+    }
+}
+
+impl IoWrite for RotatingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.segment_bytes > 0
+            && self.segment_bytes.saturating_add(buf.len() as u64) > self.max_segment_bytes
+        {
+            self.rotate()?;
+        }
+        let n = self.inner.write(buf)?;
+        self.segment_bytes = self.segment_bytes.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn stop_if_output_cap_hit(cap_hit: &AtomicBool, reported: &mut bool, running: &AtomicBool) -> bool {
+    if !cap_hit.load(Ordering::Relaxed) {
+        return false;
+    }
+    if !*reported {
+        eprintln!("neutron: WARNING: --max-output-size reached; stopping capture");
+        *reported = true;
+    }
+    running.store(false, Ordering::Relaxed);
+    true
+}
+
+fn open_output(
+    path: Option<&String>,
+    max_bytes: Option<u64>,
+    rotate_bytes: Option<u64>,
+    cap_hit: Arc<AtomicBool>,
+) -> Result<Box<dyn IoWrite>> {
+    if max_bytes.is_some() && rotate_bytes.is_some() {
+        bail!("--max-output-size and --rotate-output-size are mutually exclusive");
+    }
+    if rotate_bytes.is_some() && path.is_none() {
+        bail!("--rotate-output-size requires --output");
+    }
+    if let (Some(p), Some(max)) = (path, rotate_bytes) {
+        return Ok(Box::new(RotatingWriter::new(p, max)?));
+    }
+
+    let base: Box<dyn IoWrite> = match path {
+        Some(p) => {
+            // Start each trace with a fresh file, then reopen in O_APPEND
+            // mode so `neutron mark --output <same-file>` cannot be
+            // overwritten by this long-lived writer's file offset.
+            fs::File::create(p).with_context(|| format!("cannot create {p}"))?;
+            let f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .with_context(|| format!("cannot open {p} for append"))?;
+            Box::new(std::io::LineWriter::new(f))
+        }
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    if let Some(max) = max_bytes {
+        Ok(Box::new(CappedWriter::new(base, max, cap_hit)))
+    } else {
+        Ok(base)
     }
 }
 
@@ -770,12 +1040,21 @@ fn main() -> Result<()> {
         Some(Command::Summarize(args)) => neutron::summarize::run(args),
         Some(Command::Diff(args)) => neutron::diff::run(args),
         Some(Command::Mark(args)) => neutron::mark::run(args),
+        Some(Command::Recipes(command)) => neutron::recipes::run(command),
         None => run_trace(cli.args),
     }
 }
 
 fn run_trace(mut args: Args) -> Result<()> {
     apply_profile(&mut args)?;
+    let max_output_bytes = parse_output_size_bytes(args.max_output_size.as_deref())?;
+    let rotate_output_bytes = parse_rotate_output_size_bytes(args.rotate_output_size.as_deref())?;
+    if max_output_bytes.is_some() && rotate_output_bytes.is_some() {
+        bail!("--max-output-size and --rotate-output-size are mutually exclusive");
+    }
+    if rotate_output_bytes.is_some() && args.output.is_none() {
+        bail!("--rotate-output-size requires --output");
+    }
 
     print_banner();
     eprintln!("  loading {}", args.object);
@@ -789,6 +1068,11 @@ fn run_trace(mut args: Args) -> Result<()> {
     );
     if args.pid == 0 {
         eprintln!("  note: tracing all processes; inflight map may overflow under heavy load");
+    }
+    resolve_match_android_providers(&mut args)?;
+    resolve_match_packages(&mut args)?;
+    for warning in capture_guardrail_warnings(&args) {
+        eprintln!("neutron: WARNING: {warning}");
     }
     // `--pages` is deprecated as of CORE V1 (RingBuf size is fixed in the BPF
     // object). Silently ignored — kept only for CLI backward compatibility.
@@ -934,7 +1218,14 @@ fn run_trace(mut args: Args) -> Result<()> {
     //    loop we keep a re-acquired binding per drain to avoid holding `bpf`.
 
     // 6. Output sink.
-    let mut out = open_output(args.output.as_ref())?;
+    let output_cap_hit = Arc::new(AtomicBool::new(false));
+    let mut output_cap_reported = false;
+    let mut out = open_output(
+        args.output.as_ref(),
+        max_output_bytes,
+        rotate_output_bytes,
+        output_cap_hit.clone(),
+    )?;
 
     // 7. Ctrl-C handler.
     let running = Arc::new(AtomicBool::new(true));
@@ -1481,6 +1772,14 @@ fn run_trace(mut args: Args) -> Result<()> {
                     handle_capture_reads(&ev, &mut watch_fds, &mut *out, args.verbose)?;
                 }
 
+                if stop_if_output_cap_hit(
+                    &output_cap_hit,
+                    &mut output_cap_reported,
+                    running.as_ref(),
+                ) {
+                    break;
+                }
+
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1517,6 +1816,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                 }
                 if let Some(lb) = lookback.as_mut() {
                     lb.record(sample.pid, &line);
+                }
+                if stop_if_output_cap_hit(
+                    &output_cap_hit,
+                    &mut output_cap_reported,
+                    running.as_ref(),
+                ) {
+                    break;
                 }
             }
         }
@@ -1558,6 +1864,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                     args.json,
                     &mut event_id_counter,
                 );
+                if stop_if_output_cap_hit(
+                    &output_cap_hit,
+                    &mut output_cap_reported,
+                    running.as_ref(),
+                ) {
+                    break;
+                }
             }
         }
         if let Some(r) = logcat_reader.as_mut() {
@@ -1587,6 +1900,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                     args.json,
                     &mut event_id_counter,
                 );
+                if stop_if_output_cap_hit(
+                    &output_cap_hit,
+                    &mut output_cap_reported,
+                    running.as_ref(),
+                ) {
+                    break;
+                }
             }
         }
 
@@ -1659,4 +1979,200 @@ fn run_trace(mut args: Args) -> Result<()> {
         eprintln!("\nneutron: exiting (events={total_events})");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neutron::mark::{self, MarkArgs};
+    use std::io::Write;
+
+    #[test]
+    fn output_sink_preserves_marker_appends_while_tracer_is_running() {
+        let path =
+            std::env::temp_dir().join(format!("neutron-output-append-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_s = path.to_string_lossy().into_owned();
+
+        {
+            let mut out = open_output(Some(&path_s), None, None, Arc::new(AtomicBool::new(false)))
+                .expect("open trace output");
+            writeln!(out, r#"{{"type":"syscall","event_id":1}}"#).unwrap();
+
+            mark::run(MarkArgs {
+                name: "scenario".into(),
+                phase: Some("start".into()),
+                meta: vec![],
+                output: Some(path_s.clone()),
+                ts_ns: Some(42),
+            })
+            .expect("append marker while trace output is open");
+
+            writeln!(out, r#"{{"type":"syscall","event_id":2}}"#).unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).expect("read output");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            content.contains(r#""type":"marker""#),
+            "marker append must survive tracer writes; got:\n{content}"
+        );
+        assert!(
+            content.contains(r#""name":"scenario""#),
+            "marker name should remain readable; got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn parse_output_size_accepts_binary_suffixes() {
+        assert_eq!(parse_output_size_bytes(None).unwrap(), None);
+        assert_eq!(parse_output_size_bytes(Some("off")).unwrap(), None);
+        assert_eq!(parse_output_size_bytes(Some("512")).unwrap(), Some(512));
+        assert_eq!(parse_output_size_bytes(Some("2kb")).unwrap(), Some(2048));
+        assert_eq!(
+            parse_output_size_bytes(Some("3mb")).unwrap(),
+            Some(3 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn capped_writer_sets_flag_without_exceeding_limit() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let inner: Box<dyn IoWrite> = Box::new(Vec::<u8>::new());
+        let mut writer = CappedWriter::new(inner, 4, hit.clone());
+
+        writer.write_all(b"abcd").unwrap();
+        assert!(hit.load(Ordering::Relaxed));
+        assert!(writer.write_all(b"e").is_err());
+    }
+
+    #[test]
+    fn rotating_writer_rolls_to_numbered_segments() {
+        let base = std::env::temp_dir().join(format!("neutron-rotate-test-{}", std::process::id()));
+        let base_s = base.to_string_lossy().into_owned();
+        let rotated_s = format!("{base_s}.1");
+        let _ = std::fs::remove_file(&base_s);
+        let _ = std::fs::remove_file(&rotated_s);
+
+        {
+            let mut writer = RotatingWriter::new(&base_s, 6).expect("open rotating writer");
+            writer.write_all(b"aaaa\n").unwrap();
+            writer.write_all(b"bbbb\n").unwrap();
+            writer.flush().unwrap();
+        }
+
+        let first = std::fs::read_to_string(&base_s).expect("read base segment");
+        let second = std::fs::read_to_string(&rotated_s).expect("read rotated segment");
+        let _ = std::fs::remove_file(&base_s);
+        let _ = std::fs::remove_file(&rotated_s);
+
+        assert_eq!(first, "aaaa\n");
+        assert_eq!(second, "bbbb\n");
+    }
+
+    #[test]
+    fn open_output_rejects_rotation_without_file_output() {
+        let err = match open_output(None, None, Some(1024), Arc::new(AtomicBool::new(false))) {
+            Ok(_) => panic!("rotation without --output should fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("--rotate-output-size requires --output"));
+    }
+
+    #[test]
+    fn open_output_rejects_cap_and_rotation_together() {
+        let path =
+            std::env::temp_dir().join(format!("neutron-rotate-conflict-{}", std::process::id()));
+        let path_s = path.to_string_lossy().into_owned();
+        let err = match open_output(
+            Some(&path_s),
+            Some(1024),
+            Some(1024),
+            Arc::new(AtomicBool::new(false)),
+        ) {
+            Ok(_) => panic!("cap and rotation together should fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn guardrails_warn_on_broad_raw_binder_capture_without_rate_limit() {
+        let args = Args {
+            pid: 0,
+            binder: true,
+            raw: true,
+            no_findings: true,
+            ..Args::default()
+        };
+
+        let warnings = capture_guardrail_warnings(&args);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--pid 0") && w.contains("--binder") && w.contains("--raw")),
+            "expected broad raw binder warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn guardrails_explain_binder_context_with_match_filters() {
+        let args = Args {
+            binder: true,
+            binder_inflight: 1024,
+            match_uid: vec!["10341".into()],
+            ..Args::default()
+        };
+
+        let warnings = capture_guardrail_warnings(&args);
+        assert!(
+            warnings.iter().any(|w| w.contains("binder_call")),
+            "expected binder_call context warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn guardrails_warn_on_uncapped_broad_file_output() {
+        let args = Args {
+            pid: 0,
+            raw: true,
+            output: Some("/data/local/tmp/trace.ndjson".into()),
+            ..Args::default()
+        };
+
+        let warnings = capture_guardrail_warnings(&args);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--max-output-size") && w.contains("--output")),
+            "expected uncapped output warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn guardrails_treat_rotation_as_output_bound() {
+        let args = Args {
+            pid: 0,
+            raw: true,
+            output: Some("/data/local/tmp/trace.ndjson".into()),
+            rotate_output_size: Some("250mb".into()),
+            ..Args::default()
+        };
+
+        let warnings = capture_guardrail_warnings(&args);
+        assert!(
+            warnings.iter().all(|w| !w.contains("uncapped output")),
+            "rotation should suppress uncapped output warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn android_provider_match_counts_as_capture_predicate_flag() {
+        let args = Args {
+            match_android_provider: vec!["com.android.contacts".into()],
+            ..Args::default()
+        };
+
+        assert!(any_individual_match_flag(&args));
+    }
 }

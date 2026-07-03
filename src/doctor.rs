@@ -96,17 +96,61 @@ impl Env for RealEnv {
 
 // ── Individual checks ────────────────────────────────────────────────────────
 
+const CAP_SYS_ADMIN: u8 = 21;
+const CAP_BPF: u8 = 39;
+
+fn parse_cap_eff(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("CapEff:")?;
+        u64::from_str_radix(rest.trim(), 16).ok()
+    })
+}
+
+fn has_cap(mask: u64, bit: u8) -> bool {
+    (mask & (1u64 << bit)) != 0
+}
+
 pub fn check_privilege<E: Env>(env: &E) -> CheckResult {
     let euid = env.euid();
-    if euid == 0 {
-        return CheckResult::pass("privilege", "running as root (euid=0)");
+    let cap_eff = env
+        .read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| parse_cap_eff(&s));
+
+    if let Some(caps) = cap_eff {
+        let has_bpf = has_cap(caps, CAP_BPF);
+        let has_sys_admin = has_cap(caps, CAP_SYS_ADMIN);
+        if has_bpf && has_sys_admin {
+            return CheckResult::pass(
+                "privilege",
+                format!("effective caps include CAP_BPF + CAP_SYS_ADMIN (euid={euid})"),
+            );
+        }
+        if euid == 0 {
+            return CheckResult::fail(
+                "privilege",
+                format!(
+                    "euid=0 but CapEff={caps:#x} lacks required BPF capabilities \
+                     (need CAP_BPF + CAP_SYS_ADMIN); BPF load will fail"
+                ),
+            );
+        }
+        return CheckResult::fail(
+            "privilege",
+            format!("non-root (euid={euid}) and CapEff={caps:#x} lacks CAP_BPF + CAP_SYS_ADMIN"),
+        );
     }
-    // Non-root: CAP_BPF + CAP_SYS_ADMIN may still allow loading. We can't
-    // probe capabilities portably without libcap, so warn rather than fail.
+
+    if euid == 0 {
+        return CheckResult::warn(
+            "privilege",
+            "running as root (euid=0) but cannot read CapEff from /proc/self/status",
+        );
+    }
     CheckResult::warn(
         "privilege",
         format!(
-            "non-root (euid={euid}); need CAP_BPF + CAP_SYS_ADMIN \
+            "non-root (euid={euid}) and cannot read CapEff; need CAP_BPF + CAP_SYS_ADMIN \
              — run via `adb shell su -c …` on a rooted device"
         ),
     )
@@ -392,9 +436,23 @@ mod tests {
     }
 
     #[test]
-    fn privilege_pass_for_root() {
-        let env = FakeEnv::new();
+    fn privilege_pass_for_root_with_bpf_caps() {
+        let env = FakeEnv::new().with_file("/proc/self/status", "CapEff:\t000001ffffffffff\n");
         assert_eq!(check_privilege(&env).status, Status::Pass);
+    }
+
+    #[test]
+    fn privilege_warn_for_root_when_cap_eff_unreadable() {
+        let env = FakeEnv::new();
+        assert_eq!(check_privilege(&env).status, Status::Warn);
+    }
+
+    #[test]
+    fn privilege_fails_for_root_without_effective_caps() {
+        let env = FakeEnv::new().with_file("/proc/self/status", "CapEff:\t0000000000000000\n");
+        let result = check_privilege(&env);
+        assert_eq!(result.status, Status::Fail);
+        assert!(result.reason.contains("CapEff=0x0"));
     }
 
     #[test]

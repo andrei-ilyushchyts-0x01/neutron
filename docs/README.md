@@ -18,6 +18,7 @@ Targets kernel 6.1+ / Pixel 8 Pro / Android 14 GKI.
 | Guide | Description |
 |-------|-------------|
 | [guides/quickstart.md](guides/quickstart.md) | Build, deploy, capture your first trace in minutes |
+| [guides/android-content-provider.md](guides/android-content-provider.md) | Low-noise Android content-provider research workflow |
 | [guides/bpf-tracing.md](guides/bpf-tracing.md) | Tracing concepts, profiles, filtering, stack traces |
 | [guides/security-assessment.md](guides/security-assessment.md) | End-to-end assessment workflow |
 | [guides/output-formats.md](guides/output-formats.md) | Text and NDJSON formats with parsing examples |
@@ -51,4 +52,4 @@ adb shell su -c '/data/local/tmp/neutron \
 | Kernel | 6.1+ aarch64 (verified: 6.1.145-android14-11) |
 | Host build | rust nightly + `bpfel-unknown-none` target + `bpf-linker` + `aarch64-linux-gnu-gcc` |
 | Runtime | Root shell (`adb shell su`) — KernelSU or Magisk |
-| BPF caps | `CAP_SYS_ADMIN` (via root) |
+| BPF caps | Effective `CAP_BPF` + `CAP_SYS_ADMIN` in the `su` domain |
