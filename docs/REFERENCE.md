@@ -155,10 +155,14 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
 | `errno`           | u32 (optional)      | `-ret` for failed exit events (when `ok:false`); omitted otherwise. |
 | `args`            | u64[6]              | Syscall arguments. All six positions reflect the actual ABI args. |
 | `data`            | String (optional)   | Decoded `data[128]`: path, sockaddr, hex; omitted if empty   |
-| `data_phase`      | String              | `"enter"` when `data[]` is the pre-call buffer; `"exit"` when the BPF program refreshed it post-call (for `ioctl(2)` cmds with `_IOC_DIR ∈ {R,RW}` and `_IOC_TYPE ∈ {'H','b','w'}`). |
-| `ioctl_family`    | String (optional)   | `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"lwis"` (1.2.0), `"gxp"` (1.2.0), or `"unknown"`. Emitted for `ioctl(2)` events. |
-| `ioctl_name`      | String (optional)   | Human cmd name (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"LWIS_CMD_PACKET"`) when the decoder registry recognises it. |
+| `data_phase`      | String              | `"enter"` when `data[]` is the pre-call buffer; `"exit"` when the BPF program refreshed it post-call. Built-in refresh covers dma-heap/binder/dma-buf/ashmem; `--driver-pack` can enable runtime refresh for KGSL, Mali, ALSA, LWIS, and GXP families. |
+| `ioctl_family`    | String (optional)   | `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"` (1.2.0), `"gxp"` (1.2.0), or `"unknown"`. Emitted for `ioctl(2)` events. |
+| `ioctl_name`      | String (optional)   | Human cmd name (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"BINDER_WRITE_READ"`, `"LWIS_CMD_PACKET"`) when the decoder registry recognises it. |
 | `dma_heap`        | Object (optional)   | Decoded `struct dma_heap_allocation_data`. Fields: `len`, `returned_fd`, `fd_flags`, `fd_flags_str`, `heap_flags`. |
+| `binder_write_read` | Object (optional) | Scalar `BINDER_WRITE_READ` header: `write_size`, `write_consumed`, `read_size`, `read_consumed`. |
+| `kgsl` / `mali`   | Object (optional)   | First four captured scalar words as `arg0..arg3`; nested pointers are not followed. |
+| `alsa`            | Object (optional)   | ALSA scalar marker with `compat_candidate`, `arg0`, and `arg1`. |
+| `unix_msg_control` | Object (optional)  | Bounded sendmsg/recvmsg control metadata: `flags`, `controllen`, first `cmsg_len`/`cmsg_level`/`cmsg_type`, bounded `scm_rights_fds`, and `msg_peek`. |
 | `lwis`            | Object (optional)   | LWIS command-packet payload (1.2.0). Fields: `cmd_id` (u32 from `data[4..8]`); `cmd_id_name` is set for documented IDs (`DEVICE_ENABLE`, `DMA_BUFFER_ALLOC`, `TRANSACTION_SUBMIT`, …) and omitted for unnamed IDs so they stay searchable by hex. |
 | `rwx_alert`       | `"RWX" \| "WX" \| null` | Set on mmap/mprotect with PROT_EXEC                      |
 | `kernel_stackid`  | i32 (optional)      | Key into `STACK_TRACES` map; omitted if both ids are negative |
@@ -347,9 +351,17 @@ finding is conclusive" on a single field instead of grepping prose.
   "path_truncated":          0,
   "fd_lookup_missed":        0,
   "symbolization_failed":    0,
+  "ioctl_refresh_missed":    0,
+  "unix_msg_control_truncated": 0,
+  "unix_msg_control_nested": 0,
   "fd_graph_miss":           0,
   "fd_graph_backfilled":     0,
-  "degraded":                false
+  "degraded":                false,
+  "driver_packs":            ["kgsl"],
+  "kprobe_packs":            [],
+  "attached_programs":       ["trace_sys_enter","trace_sys_exit"],
+  "ioctl_refresh_cmds":      [],
+  "ioctl_refresh_types":     ["0x9"]
 }
 ```
 
@@ -362,6 +374,9 @@ finding is conclusive" on a single field instead of grepping prose.
 | `fd_graph_miss`    | u64  | `(pid, fd)` pairs the userspace FD-graph couldn't resolve.                 |
 | `fd_graph_backfilled` | u64 | Misses that `--resolve-paths` recovered via `/proc/<pid>/fd/<fd>`.         |
 | `degraded`         | bool | `true` when any drop or degradation counter is non-zero. Mirrors the stderr WARNING banner predicate. |
+| `driver_packs` / `kprobe_packs` | string[] | Active BPF-oriented decoder/kprobe packs requested for the capture. |
+| `attached_programs` | string[] | BPF programs successfully attached in this session. |
+| `ioctl_refresh_cmds` / `ioctl_refresh_types` | string[] | Runtime ioctl post-exit refresh coverage, rendered as hex strings. |
 
 Field set is stable; new counters extend the tail without renaming
 existing fields.

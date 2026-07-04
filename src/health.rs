@@ -13,9 +13,10 @@
 
 use neutron_common::{
     COUNTER_EVENTS_SUBMITTED, COUNTER_FD_LOOKUP_MISSED, COUNTER_INFLIGHT_LOOKUP_MISSED,
-    COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_PATH_READ_FAILED, COUNTER_PATH_TRUNCATED,
-    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED,
-    COUNTER_STACK_USER_FAILED, COUNTER_SYMBOLIZATION_FAILED,
+    COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED, COUNTER_PATH_READ_FAILED,
+    COUNTER_PATH_TRUNCATED, COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
+    COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED, COUNTER_SYMBOLIZATION_FAILED,
+    COUNTER_UNIX_MSG_CONTROL_NESTED, COUNTER_UNIX_MSG_CONTROL_TRUNCATED,
 };
 
 /// Human-readable labels for each counter slot, in display order.
@@ -71,6 +72,21 @@ pub const COUNTER_LABELS: &[(u32, &str, CounterKind)] = &[
     (
         COUNTER_SYMBOLIZATION_FAILED,
         "symbolization failed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_IOCTL_REFRESH_MISSED,
+        "ioctl refresh missed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_UNIX_MSG_CONTROL_TRUNCATED,
+        "unix msg control truncated",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_UNIX_MSG_CONTROL_NESTED,
+        "unix msg control nested",
         CounterKind::Degradation,
     ),
 ];
@@ -148,6 +164,16 @@ pub struct UserspaceHealth {
     pub events_emitted: u64,
 }
 
+/// Static capture configuration surfaced in the shutdown health event.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureMetadata {
+    pub driver_packs: Vec<String>,
+    pub kprobe_packs: Vec<String>,
+    pub attached_programs: Vec<String>,
+    pub ioctl_refresh_cmds: Vec<u32>,
+    pub ioctl_refresh_types: Vec<u32>,
+}
+
 /// Render the capture summary as a single block of text, suitable for stderr.
 /// Includes the warning banner when any drop or degradation counter is > 0.
 pub fn format_summary(health: &CaptureHealth, total_userspace_events: u64) -> String {
@@ -207,6 +233,20 @@ pub fn format_capture_health_json(
     user: &UserspaceHealth,
     total_userspace_events: u64,
 ) -> String {
+    format_capture_health_json_with_metadata(
+        health,
+        user,
+        total_userspace_events,
+        &CaptureMetadata::default(),
+    )
+}
+
+pub fn format_capture_health_json_with_metadata(
+    health: &CaptureHealth,
+    user: &UserspaceHealth,
+    total_userspace_events: u64,
+    meta: &CaptureMetadata,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(256);
     let _ = write!(
@@ -224,7 +264,7 @@ pub fn format_capture_health_json(
     }
     let _ = write!(
         s,
-        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"degraded":{}}}"#,
+        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"degraded":{}"#,
         user.fd_graph_miss,
         user.fd_graph_backfilled,
         user.events_matched,
@@ -232,7 +272,38 @@ pub fn format_capture_health_json(
         user.events_emitted,
         health.has_degradation()
     );
+    write_string_array(&mut s, "driver_packs", &meta.driver_packs);
+    write_string_array(&mut s, "kprobe_packs", &meta.kprobe_packs);
+    write_string_array(&mut s, "attached_programs", &meta.attached_programs);
+    write_u32_array_hex(&mut s, "ioctl_refresh_cmds", &meta.ioctl_refresh_cmds);
+    write_u32_array_hex(&mut s, "ioctl_refresh_types", &meta.ioctl_refresh_types);
+    s.push('}');
     s
+}
+
+fn write_string_array(s: &mut String, key: &str, values: &[String]) {
+    use std::fmt::Write as _;
+    let _ = write!(s, r#","{key}":["#);
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            s.push(',');
+        }
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = write!(s, r#""{escaped}""#);
+    }
+    s.push(']');
+}
+
+fn write_u32_array_hex(s: &mut String, key: &str, values: &[u32]) {
+    use std::fmt::Write as _;
+    let _ = write!(s, r#","{key}":["#);
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, r#""{value:#x}""#);
+    }
+    s.push(']');
 }
 
 #[cfg(test)]

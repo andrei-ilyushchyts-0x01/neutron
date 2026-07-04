@@ -10,6 +10,11 @@ pub fn syscall_name(nr: i32) -> &'static str {
     match nr {
         // Binder kprobe sentinel
         -1 => "BINDER_TXN",
+        neutron_common::SYSCALL_NR_KPROBE_BINDER => "KPROBE_BINDER",
+        neutron_common::SYSCALL_NR_KPROBE_KGSL => "KPROBE_KGSL",
+        neutron_common::SYSCALL_NR_KPROBE_MALI => "KPROBE_MALI",
+        neutron_common::SYSCALL_NR_KPROBE_ALSA => "KPROBE_ALSA",
+        neutron_common::SYSCALL_NR_KPROBE_UNIX_SOCKET => "KPROBE_UNIX_SOCKET",
 
         // ── async I/O ──────────────────────────────────────────────────────
         0 => "io_setup",

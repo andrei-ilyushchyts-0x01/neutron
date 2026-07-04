@@ -13,8 +13,8 @@ pub use args::{
 };
 pub use binder::{format_binder_event, format_binder_event_json, format_binder_received_json};
 pub use ioctl::{
-    decode_ioctl, format_ioctl_deep, render_decoded_ioctl_json, DecodedIoctl, IoctlFamily,
-    IoctlFields,
+    decode_ioctl, decode_ioctl_with_context, format_ioctl_deep, render_decoded_ioctl_json,
+    DecodedIoctl, IoctlFamily, IoctlFields,
 };
 pub use sockaddr::{format_sockaddr, lookup_socket_by_inode, parse_net_addr, read_socket_inode};
 pub use syscalls::{syscall_name, syscall_nr};
@@ -57,6 +57,47 @@ pub fn format_data_as_path(raw: &[u8; 128]) -> Option<String> {
     Some(String::from_utf8_lossy(&raw[..end]).into_owned())
 }
 
+/// Bounded control-message summary captured for sendmsg/recvmsg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixMsgControl {
+    pub flags: u64,
+    pub controllen: u64,
+    pub cmsg_len: u64,
+    pub cmsg_level: i32,
+    pub cmsg_type: i32,
+    pub scm_rights_fds: u32,
+    pub msg_peek: bool,
+}
+
+/// Decode the sendmsg/recvmsg control metadata that the BPF program stores
+/// in `data[64..100]`. Returns `None` when no control buffer was present.
+pub fn decode_unix_msg_control(ev: &SyscallEvent) -> Option<UnixMsgControl> {
+    let nr = { ev.syscall_nr };
+    if !matches!(nr, 211 | 212) {
+        return None;
+    }
+    let data = { ev.data };
+    let args = { ev.args };
+    let controllen = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
+    if controllen == 0 {
+        return None;
+    }
+    let cmsg_len = u64::from_le_bytes(data[80..88].try_into().unwrap_or([0u8; 8]));
+    let cmsg_level = i32::from_le_bytes(data[88..92].try_into().unwrap_or([0u8; 4]));
+    let cmsg_type = i32::from_le_bytes(data[92..96].try_into().unwrap_or([0u8; 4]));
+    let scm_rights_fds = u32::from_le_bytes(data[96..100].try_into().unwrap_or([0u8; 4]));
+    let flags = args[2];
+    Some(UnixMsgControl {
+        flags,
+        controllen,
+        cmsg_len,
+        cmsg_level,
+        cmsg_type,
+        scm_rights_fds,
+        msg_peek: (flags & 0x2) != 0,
+    })
+}
+
 /// Format the `comm[16]` field of a `SyscallEvent` as a `String`.
 pub fn format_comm(raw: &[u8; 16]) -> String {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(16);
@@ -83,11 +124,29 @@ pub fn format_data_field(ev: &SyscallEvent) -> Option<String> {
         // sendmsg/recvmsg: sockaddr from msg_name + controllen at data[64..72]
         211 | 212 => {
             let addr = format_sockaddr(&data);
-            let controllen = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
+            let ctrl = decode_unix_msg_control(ev);
+            let controllen = ctrl.map(|c| c.controllen).unwrap_or(0);
+            let ctrl_suffix = ctrl
+                .map(|c| {
+                    let mut parts = vec![
+                        format!("ctrl_len={}", c.controllen),
+                        format!("cmsg_len={}", c.cmsg_len),
+                        format!("cmsg_level={}", c.cmsg_level),
+                        format!("cmsg_type={}", c.cmsg_type),
+                    ];
+                    if c.scm_rights_fds > 0 {
+                        parts.push(format!("scm_rights={}", c.scm_rights_fds));
+                    }
+                    if c.msg_peek {
+                        parts.push("MSG_PEEK".to_string());
+                    }
+                    parts.join(" ")
+                })
+                .unwrap_or_default();
             match (addr, controllen) {
                 (Some(a), 0) => Some(a),
-                (Some(a), n) => Some(format!("{} ctrl_len={}", a, n)),
-                (None, n) if n > 0 => Some(format!("ctrl_len={}", n)),
+                (Some(a), _) => Some(format!("{} {}", a, ctrl_suffix)),
+                (None, n) if n > 0 => Some(ctrl_suffix),
                 _ => None,
             }
         }

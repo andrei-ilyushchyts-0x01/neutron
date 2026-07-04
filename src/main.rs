@@ -9,7 +9,7 @@
 //! Targets: kernel 6.1+ (Pixel 8 Pro). The legacy raw-`bpf()`-syscall loader
 //! that targeted kernel 4.14 lives in git history before this commit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write as IoWrite};
 use std::str::FromStr;
@@ -21,7 +21,7 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{bail, Context, Result};
 use aya::maps::{Array, HashMap as AyaHashMap, RingBuf, StackTraceMap};
-use aya::programs::TracePoint;
+use aya::programs::{KProbe, TracePoint};
 use aya::Ebpf;
 use clap::Parser;
 
@@ -38,7 +38,8 @@ use neutron::format::{
     format_fd_snapshot_json, format_process_exit_json, FdHint,
 };
 use neutron::health::{
-    format_capture_health_json, format_summary_with, CaptureHealth, UserspaceHealth,
+    format_capture_health_json_with_metadata, format_summary_with, CaptureHealth, CaptureMetadata,
+    UserspaceHealth,
 };
 use neutron::matcher::{self, MatchSpec, SyscallEventLens};
 use neutron::predicate;
@@ -154,16 +155,184 @@ fn apply_profile(args: &mut Args) -> Result<()> {
     let Some(profile) = args.profile.as_deref() else {
         return Ok(());
     };
-    if profile != SECURITY_PROFILE {
-        bail!("unknown profile '{profile}' (available: {SECURITY_PROFILE})");
-    }
-    if args.exclude_comm.is_empty() {
-        args.exclude_comm = SECURITY_EXCLUDE_COMM
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+    match profile {
+        SECURITY_PROFILE => {
+            if args.exclude_comm.is_empty() {
+                args.exclude_comm = SECURITY_EXCLUDE_COMM
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect();
+            }
+        }
+        "kernel-lpe" => {
+            add_match_syscalls_if_empty(
+                args,
+                &[
+                    29, 56, 57, 23, 24, 98, 198, 199, 211, 212, 20, 21, 22, 220, 222, 226, 280,
+                ],
+            );
+        }
+        "driver-harness" => {
+            add_match_syscalls_if_empty(args, &[29, 56, 57, 23, 24, 73, 20, 21, 22, 222, 226]);
+        }
+        _ => {
+            bail!(
+                "unknown profile '{profile}' (available: {SECURITY_PROFILE}, kernel-lpe, driver-harness)"
+            );
+        }
     }
     Ok(())
+}
+
+fn add_match_syscalls_if_empty(args: &mut Args, nrs: &[i32]) {
+    if args.match_syscall.is_empty() {
+        args.match_syscall = nrs.iter().map(|nr| nr.to_string()).collect();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DriverPackConfig {
+    names: Vec<String>,
+    refresh_cmds: BTreeSet<u32>,
+    refresh_types: BTreeSet<u32>,
+}
+
+fn normalize_pack_name(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn push_unique(v: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !v.iter().any(|x| x == &value) {
+        v.push(value);
+    }
+}
+
+fn push_unique_syscalls(args: &mut Args, nrs: &[i32]) {
+    let mut existing = BTreeSet::new();
+    for raw in &args.match_syscall {
+        if let Ok(parsed) = matcher::parse_syscall_list(raw) {
+            for nr in parsed {
+                existing.insert(nr);
+            }
+        }
+    }
+    for nr in nrs {
+        if existing.insert(*nr) {
+            args.match_syscall.push(nr.to_string());
+        }
+    }
+}
+
+fn push_unique_ioctl_types(args: &mut Args, types: &[u32]) {
+    let mut existing = BTreeSet::new();
+    for raw in &args.match_ioctl_type {
+        if let Ok(parsed) = matcher::parse_u32_list(raw) {
+            for ty in parsed {
+                existing.insert(ty);
+            }
+        }
+    }
+    for ty in types {
+        if existing.insert(*ty) {
+            args.match_ioctl_type.push(format!("{ty:#x}"));
+        }
+    }
+}
+
+#[cfg(test)]
+fn apply_driver_packs(args: &mut Args) -> Result<DriverPackConfig> {
+    let allow_defaults = !has_capture_predicate_flags(args);
+    apply_driver_packs_with_defaults(args, allow_defaults)
+}
+
+fn apply_driver_packs_with_defaults(
+    args: &mut Args,
+    allow_defaults: bool,
+) -> Result<DriverPackConfig> {
+    let mut cfg = DriverPackConfig::default();
+    for raw in args.driver_pack.clone() {
+        let pack = normalize_pack_name(&raw);
+        match pack.as_str() {
+            "binder" => {
+                args.binder = true;
+                cfg.refresh_cmds.insert(0xC030_6201);
+                cfg.refresh_types
+                    .insert(neutron_common::IOCTL_TYPE_BINDER_OR_DMA_BUF);
+                if allow_defaults {
+                    push_unique_syscalls(args, &[29]);
+                    push_unique_ioctl_types(args, &[neutron_common::IOCTL_TYPE_BINDER_OR_DMA_BUF]);
+                    push_unique(&mut args.match_fd, "/dev/binder*");
+                    push_unique(&mut args.match_fd, "/dev/vndbinder*");
+                }
+            }
+            "kgsl" => {
+                cfg.refresh_types.insert(neutron_common::IOCTL_TYPE_KGSL);
+                if allow_defaults {
+                    push_unique_syscalls(args, &[29, 56, 57, 23, 24, 73, 20, 21, 22, 222, 226]);
+                    push_unique_ioctl_types(args, &[neutron_common::IOCTL_TYPE_KGSL]);
+                    push_unique(&mut args.match_fd, "/dev/kgsl*");
+                }
+            }
+            "mali" => {
+                cfg.refresh_types
+                    .insert(neutron_common::IOCTL_TYPE_MALI_KBASE);
+                if allow_defaults {
+                    push_unique_syscalls(args, &[29, 56, 57, 23, 24, 73, 20, 21, 22, 222, 226]);
+                    push_unique_ioctl_types(args, &[neutron_common::IOCTL_TYPE_MALI_KBASE]);
+                    push_unique(&mut args.match_fd, "/dev/mali*");
+                }
+            }
+            "alsa" => {
+                let types = [
+                    neutron_common::IOCTL_TYPE_ALSA_PCM,
+                    neutron_common::IOCTL_TYPE_ALSA_CTL,
+                    neutron_common::IOCTL_TYPE_ALSA_HWDEP,
+                    neutron_common::IOCTL_TYPE_ALSA_RAWMIDI,
+                    neutron_common::IOCTL_TYPE_ALSA_TIMER,
+                    neutron_common::IOCTL_TYPE_ALSA_SEQ,
+                    neutron_common::IOCTL_TYPE_ALSA_COMPRESS,
+                ];
+                cfg.refresh_types.extend(types);
+                if allow_defaults {
+                    push_unique_syscalls(args, &[29, 56, 57, 23, 24, 73, 20, 21, 22]);
+                    push_unique_ioctl_types(args, &types);
+                    push_unique(&mut args.match_fd, "/dev/snd/*");
+                }
+            }
+            "unix-socket" => {
+                if allow_defaults {
+                    push_unique_syscalls(args, &[57, 23, 24, 98, 198, 199, 202, 211, 212, 20, 21, 22]);
+                }
+            }
+            "media-hal" => {
+                let types = [
+                    neutron_common::IOCTL_TYPE_LWIS,
+                    neutron_common::IOCTL_TYPE_GXP_UPSTREAM,
+                    neutron_common::IOCTL_TYPE_GXP_PIXEL,
+                ];
+                cfg.refresh_types.extend(types);
+                if allow_defaults {
+                    push_unique_syscalls(args, &[29, 56, 57, 23, 24, 73, 20, 21, 22, 222, 226]);
+                    push_unique_ioctl_types(args, &types);
+                    for glob in [
+                        "/dev/lwis*",
+                        "/dev/gxp*",
+                        "/dev/media*",
+                        "/dev/video*",
+                        "/dev/v4l-subdev*",
+                    ] {
+                        push_unique(&mut args.match_fd, glob);
+                    }
+                }
+            }
+            _ => bail!(
+                "unknown driver pack '{raw}' (available: binder, kgsl, mali, alsa, unix-socket, media-hal)"
+            ),
+        }
+        push_unique(&mut cfg.names, pack);
+    }
+    Ok(cfg)
 }
 
 // ── BPF load + attach ────────────────────────────────────────────────────────
@@ -184,6 +353,68 @@ fn attach_tracepoint(bpf: &mut Ebpf, name: &str, category: &str, event: &str) ->
         .with_context(|| format!("loading program {name}"))?;
     prog.attach(category, event)
         .with_context(|| format!("attaching {name} to {category}/{event}"))?;
+    Ok(())
+}
+
+fn attach_kprobe_if_present(bpf: &mut Ebpf, program_name: &str, symbol: &str) -> Result<bool> {
+    let Some(program) = bpf.program_mut(program_name) else {
+        return Ok(false);
+    };
+    let prog: &mut KProbe = program
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("{program_name}: not a KProbe: {e}"))?;
+    prog.load()
+        .with_context(|| format!("loading kprobe program {program_name}"))?;
+    prog.attach(symbol, 0)
+        .with_context(|| format!("attaching {program_name} to kprobe/{symbol}"))?;
+    Ok(true)
+}
+
+fn attach_kprobe_packs(
+    bpf: &mut Ebpf,
+    packs: &[String],
+    attached: &mut Vec<&'static str>,
+) -> Result<()> {
+    for raw in packs {
+        let pack = normalize_pack_name(raw);
+        let candidates: &[(&str, &str)] = match pack.as_str() {
+            "binder" => &[("kprobe_binder_ioctl", "binder_ioctl")],
+            "kgsl" => &[("kprobe_kgsl_ioctl", "kgsl_ioctl")],
+            "mali" => &[("kprobe_mali_ioctl", "kbase_ioctl")],
+            "alsa" => &[("kprobe_alsa_ioctl", "snd_ctl_ioctl")],
+            "unix-socket" => &[
+                ("kprobe_unix_stream_sendmsg", "unix_stream_sendmsg"),
+                ("kprobe_unix_stream_recvmsg", "unix_stream_recvmsg"),
+            ],
+            _ => bail!(
+                "unknown kprobe pack '{raw}' (available: binder, kgsl, mali, alsa, unix-socket)"
+            ),
+        };
+        let mut any = false;
+        for (program, symbol) in candidates {
+            match attach_kprobe_if_present(bpf, program, symbol) {
+                Ok(true) => {
+                    any = true;
+                    attached.push(*program);
+                }
+                Ok(false) => {
+                    eprintln!(
+                        "neutron: warn: kprobe pack {pack}: BPF program {program} not present; skipping {symbol}"
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "neutron: warn: kprobe pack {pack}: {program}/{symbol} attach failed: {e}; continuing"
+                    );
+                }
+            }
+        }
+        if !any {
+            eprintln!(
+                "neutron: warn: kprobe pack {pack}: no kprobes attached; syscall tracepoints remain active"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -590,6 +821,32 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
         .set(FILTER_KEY_MATCH_BITS, bits, 0)
         .context("FILTER_MAP[MATCH_BITS]")?;
 
+    Ok(())
+}
+
+fn populate_ioctl_refresh_maps(bpf: &mut Ebpf, cfg: &DriverPackConfig) -> Result<()> {
+    if !cfg.refresh_cmds.is_empty() {
+        let map = bpf
+            .map_mut("IOCTL_REFRESH_CMD_SET")
+            .context("IOCTL_REFRESH_CMD_SET missing")?;
+        let mut m: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("IOCTL_REFRESH_CMD_SET is not HashMap<u32,u8>")?;
+        for cmd in &cfg.refresh_cmds {
+            m.insert(*cmd, 1u8, 0)
+                .with_context(|| format!("IOCTL_REFRESH_CMD_SET.insert({cmd:#x})"))?;
+        }
+    }
+    if !cfg.refresh_types.is_empty() {
+        let map = bpf
+            .map_mut("IOCTL_REFRESH_TYPE_SET")
+            .context("IOCTL_REFRESH_TYPE_SET missing")?;
+        let mut m: AyaHashMap<_, u32, u8> =
+            AyaHashMap::try_from(map).context("IOCTL_REFRESH_TYPE_SET is not HashMap<u32,u8>")?;
+        for ty in &cfg.refresh_types {
+            m.insert(*ty, 1u8, 0)
+                .with_context(|| format!("IOCTL_REFRESH_TYPE_SET.insert({ty:#x})"))?;
+        }
+    }
     Ok(())
 }
 
@@ -1046,7 +1303,9 @@ fn main() -> Result<()> {
 }
 
 fn run_trace(mut args: Args) -> Result<()> {
+    let user_supplied_match = has_capture_predicate_flags(&args);
     apply_profile(&mut args)?;
+    let driver_packs = apply_driver_packs_with_defaults(&mut args, !user_supplied_match)?;
     let max_output_bytes = parse_output_size_bytes(args.max_output_size.as_deref())?;
     let rotate_output_bytes = parse_rotate_output_size_bytes(args.rotate_output_size.as_deref())?;
     if max_output_bytes.is_some() && rotate_output_bytes.is_some() {
@@ -1068,6 +1327,9 @@ fn run_trace(mut args: Args) -> Result<()> {
     );
     if args.pid == 0 {
         eprintln!("  note: tracing all processes; inflight map may overflow under heavy load");
+    }
+    if !driver_packs.names.is_empty() {
+        eprintln!("  driver packs: {}", driver_packs.names.join(", "));
     }
     resolve_match_android_providers(&mut args)?;
     resolve_match_packages(&mut args)?;
@@ -1113,9 +1375,11 @@ fn run_trace(mut args: Args) -> Result<()> {
             }
         }
     }
+    attach_kprobe_packs(&mut bpf, &args.kprobe_pack, &mut attached)?;
 
     // 2. Populate filter map.
     populate_filter_map(&mut bpf, args.pid)?;
+    populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
 
     // 2b. Phase 1a/1b — build the capture predicate. `--match <expr>`
     // takes precedence over the individual `--match-*` flags; the two
@@ -1966,7 +2230,23 @@ fn run_trace(mut args: Args) -> Result<()> {
                 // without scraping stderr prose. Stderr block stays
                 // intact for human readers.
                 if args.json {
-                    let line = format_capture_health_json(&health, &user_health, total_events);
+                    let capture_meta = CaptureMetadata {
+                        driver_packs: driver_packs.names.clone(),
+                        kprobe_packs: args
+                            .kprobe_pack
+                            .iter()
+                            .map(|s| normalize_pack_name(s))
+                            .collect(),
+                        attached_programs: attached.iter().map(|s| (*s).to_string()).collect(),
+                        ioctl_refresh_cmds: driver_packs.refresh_cmds.iter().copied().collect(),
+                        ioctl_refresh_types: driver_packs.refresh_types.iter().copied().collect(),
+                    };
+                    let line = format_capture_health_json_with_metadata(
+                        &health,
+                        &user_health,
+                        total_events,
+                        &capture_meta,
+                    );
                     let _ = writeln!(out, "{line}");
                 }
             }
@@ -2159,7 +2439,9 @@ mod tests {
         assert!(spec.syscalls.contains(&29));
         assert!(spec.ioctl_types.contains(&neutron_common::IOCTL_TYPE_KGSL));
         assert_eq!(spec.fd_globs, vec!["/dev/kgsl*"]);
-        assert!(packs.refresh_types.contains(&neutron_common::IOCTL_TYPE_KGSL));
+        assert!(packs
+            .refresh_types
+            .contains(&neutron_common::IOCTL_TYPE_KGSL));
     }
 
     #[test]

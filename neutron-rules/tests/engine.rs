@@ -325,7 +325,7 @@ fn gpu_ioctl_failure_burst_fires_on_kgsl_errors() {
     let mut lines: Vec<String> = Vec::new();
     for i in 0..3 {
         lines.push(format!(
-            r#"{{"type":"syscall","ts_ns":{},"pid":77,"tid":77,"uid":1000,"nr":29,"name":"ioctl","comm":"kgsl-harness","enter":false,"phase":"exit","ret":-22,"args":[3,0xc020092f,0,0,0,0],"ioctl_family":"kgsl","ioctl_name":"IOCTL_KGSL_GPUMEM_ALLOC"}}"#,
+            r#"{{"type":"syscall","ts_ns":{},"pid":77,"tid":77,"uid":1000,"nr":29,"name":"ioctl","comm":"kgsl-harness","enter":false,"phase":"exit","ret":-22,"args":[3,3223324975,0,0,0,0],"ioctl_family":"kgsl","ioctl_name":"IOCTL_KGSL_GPUMEM_ALLOC"}}"#,
             1_000_000_000u64 + i * 100_000_000
         ));
     }

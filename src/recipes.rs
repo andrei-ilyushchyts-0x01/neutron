@@ -9,6 +9,16 @@ use clap::Subcommand;
 pub enum RecipesCommand {
     /// Print a low-noise Android content-provider research workflow.
     AndroidContentProvider,
+    /// Binder LPE observation workflow using BPF syscall and binder tracepoints.
+    BinderLpe,
+    /// GPU driver harness workflow for KGSL/Mali ioctl observation.
+    GpuDriverHarness,
+    /// ALSA + Mali chain workflow for audio/GPU ioctl timelines.
+    AlsaMaliChain,
+    /// Unix-domain socket race workflow for MSG_PEEK and SCM_RIGHTS.
+    UnixSocketRace,
+    /// Media service crash workflow using media HAL driver packs.
+    MediaServiceCrash,
 }
 
 pub fn android_content_provider_recipe() -> &'static str {
@@ -71,12 +81,108 @@ Notes:
 "#
 }
 
+pub fn binder_lpe_recipe() -> &'static str {
+    r#"# Binder LPE Recipe
+
+adb shell su -c '/data/local/tmp/neutron \
+  --profile kernel-lpe --driver-pack binder \
+  --json --raw --binder --capture matched+context=2s \
+  --output /data/local/tmp/binder_lpe.ndjson'
+
+Review with:
+
+adb shell /data/local/tmp/neutron window /data/local/tmp/binder_lpe.ndjson \
+  --anchor binder_call:callee_crashed --around 3s --summary
+"#
+}
+
+pub fn gpu_driver_harness_recipe() -> &'static str {
+    r#"# GPU Driver Harness Recipe
+
+adb shell su -c '/data/local/tmp/neutron \
+  --profile driver-harness --driver-pack kgsl,mali \
+  --json --raw --fdgraph-interval 500ms \
+  --capture matched+context=1s \
+  --output /data/local/tmp/gpu_driver_harness.ndjson'
+
+Review with:
+
+adb shell /data/local/tmp/neutron summarize \
+  --by comm,ioctl_family,ioctl_name,ret_class \
+  /data/local/tmp/gpu_driver_harness.ndjson
+"#
+}
+
+pub fn alsa_mali_chain_recipe() -> &'static str {
+    r#"# ALSA + Mali Chain Recipe
+
+adb shell su -c '/data/local/tmp/neutron \
+  --profile driver-harness --driver-pack alsa,mali \
+  --json --raw --capture matched+context=2s \
+  --output /data/local/tmp/alsa_mali_chain.ndjson'
+
+Review with:
+
+adb shell /data/local/tmp/neutron window /data/local/tmp/alsa_mali_chain.ndjson \
+  --anchor finding:R008_alsa_compat_candidate_errors --around 2s --summary
+"#
+}
+
+pub fn unix_socket_race_recipe() -> &'static str {
+    r#"# Unix Socket Race Recipe
+
+adb shell su -c '/data/local/tmp/neutron \
+  --profile kernel-lpe --driver-pack unix-socket \
+  --json --raw --capture matched+context=1s \
+  --output /data/local/tmp/unix_socket_race.ndjson'
+
+Review with:
+
+adb shell /data/local/tmp/neutron window /data/local/tmp/unix_socket_race.ndjson \
+  --anchor finding:R009_unix_socket_rights_peek_race --around 1s
+"#
+}
+
+pub fn media_service_crash_recipe() -> &'static str {
+    r#"# Media Service Crash Recipe
+
+adb shell su -c '/data/local/tmp/neutron \
+  --profile driver-harness --driver-pack media-hal,binder \
+  --json --raw --binder --fd-snapshot-on-finding \
+  --output /data/local/tmp/media_service_crash.ndjson'
+
+Review with:
+
+adb shell /data/local/tmp/neutron window /data/local/tmp/media_service_crash.ndjson \
+  --anchor crash --around 5s --summary
+"#
+}
+
 pub fn run(command: RecipesCommand) -> Result<()> {
     let mut stdout = io::stdout().lock();
     match command {
         RecipesCommand::AndroidContentProvider => {
             writeln!(stdout, "{}", android_content_provider_recipe())
                 .context("writing android-content-provider recipe")?;
+        }
+        RecipesCommand::BinderLpe => {
+            writeln!(stdout, "{}", binder_lpe_recipe()).context("writing binder-lpe recipe")?;
+        }
+        RecipesCommand::GpuDriverHarness => {
+            writeln!(stdout, "{}", gpu_driver_harness_recipe())
+                .context("writing gpu-driver-harness recipe")?;
+        }
+        RecipesCommand::AlsaMaliChain => {
+            writeln!(stdout, "{}", alsa_mali_chain_recipe())
+                .context("writing alsa-mali-chain recipe")?;
+        }
+        RecipesCommand::UnixSocketRace => {
+            writeln!(stdout, "{}", unix_socket_race_recipe())
+                .context("writing unix-socket-race recipe")?;
+        }
+        RecipesCommand::MediaServiceCrash => {
+            writeln!(stdout, "{}", media_service_crash_recipe())
+                .context("writing media-service-crash recipe")?;
         }
     }
     Ok(())
@@ -85,6 +191,7 @@ pub fn run(command: RecipesCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn android_content_provider_recipe_mentions_key_flags() {

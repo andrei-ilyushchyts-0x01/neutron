@@ -70,6 +70,9 @@ pub enum IoctlFamily {
     DmaHeap,
     DmaBuf,
     Binder,
+    Kgsl,
+    Mali,
+    Alsa,
     Ashmem,
     /// Pixel's LWIS camera HAL surface — type byte `'L'` (0x4c). The
     /// command-packet ioctl (`_IOWR('L', 100, lwis_cmd_pkt)`) carries an
@@ -90,6 +93,9 @@ impl IoctlFamily {
             IoctlFamily::DmaHeap => "dma_heap",
             IoctlFamily::DmaBuf => "dma_buf",
             IoctlFamily::Binder => "binder",
+            IoctlFamily::Kgsl => "kgsl",
+            IoctlFamily::Mali => "mali",
+            IoctlFamily::Alsa => "alsa",
             IoctlFamily::Ashmem => "ashmem",
             IoctlFamily::Lwis => "lwis",
             IoctlFamily::Gxp => "gxp",
@@ -102,6 +108,28 @@ impl IoctlFamily {
     /// the file_operations of the target fd. We use the FD-graph kind as the
     /// disambiguator: `Binder` fd → binder, anything else → dma-buf.
     pub fn from_cmd(cmd: u32, fd_kind: Option<FdKind>) -> Self {
+        Self::from_cmd_with_path(cmd, fd_kind, None)
+    }
+
+    /// Classify with optional fd path context. Driver packs intentionally
+    /// avoid arbitrary pointer walking; the fd graph path is the safest way
+    /// to disambiguate ioctl magic collisions (`'H'` dma-heap vs ALSA hwdep,
+    /// `'b'` binder vs dma-buf) when it is available.
+    pub fn from_cmd_with_path(cmd: u32, fd_kind: Option<FdKind>, fd_path: Option<&str>) -> Self {
+        if let Some(path) = fd_path {
+            if path.starts_with("/dev/snd/") || path == "/dev/snd" {
+                return IoctlFamily::Alsa;
+            }
+            if path.starts_with("/dev/kgsl") {
+                return IoctlFamily::Kgsl;
+            }
+            if path.starts_with("/dev/mali") {
+                return IoctlFamily::Mali;
+            }
+            if path.starts_with("/dev/binder") || path.starts_with("/dev/vndbinder") {
+                return IoctlFamily::Binder;
+            }
+        }
         let ty = neutron_common::ioctl_type(cmd);
         match ty {
             t if t == neutron_common::IOCTL_TYPE_DMA_HEAP => IoctlFamily::DmaHeap,
@@ -110,20 +138,32 @@ impl IoctlFamily {
                 _ => IoctlFamily::DmaBuf,
             },
             t if t == neutron_common::IOCTL_TYPE_ASHMEM => IoctlFamily::Ashmem,
-            t if t == IOCTL_TYPE_LWIS => IoctlFamily::Lwis,
-            t if t == IOCTL_TYPE_GXP_UPSTREAM || t == IOCTL_TYPE_GXP_PIXEL => IoctlFamily::Gxp,
+            t if t == neutron_common::IOCTL_TYPE_KGSL => IoctlFamily::Kgsl,
+            t if t == neutron_common::IOCTL_TYPE_MALI_KBASE => IoctlFamily::Mali,
+            t if is_alsa_type(t) => IoctlFamily::Alsa,
+            t if t == neutron_common::IOCTL_TYPE_LWIS => IoctlFamily::Lwis,
+            t if t == neutron_common::IOCTL_TYPE_GXP_UPSTREAM
+                || t == neutron_common::IOCTL_TYPE_GXP_PIXEL =>
+            {
+                IoctlFamily::Gxp
+            }
             _ => IoctlFamily::Unknown,
         }
     }
 }
 
-/// `_IOC_TYPE` byte for LWIS ioctls (`'L'`).
-const IOCTL_TYPE_LWIS: u32 = 0x4c;
-/// Upstream GXP `_IOC_TYPE` byte (`'G'`).
-const IOCTL_TYPE_GXP_UPSTREAM: u32 = 0x47;
-/// Pixel out-of-tree GXP type byte. Drift between upstream and Pixel
-/// repos is well-known; accept both so the decoder works on either.
-const IOCTL_TYPE_GXP_PIXEL: u32 = 0xee;
+fn is_alsa_type(ty: u32) -> bool {
+    matches!(
+        ty,
+        neutron_common::IOCTL_TYPE_ALSA_PCM
+            | neutron_common::IOCTL_TYPE_ALSA_CTL
+            | neutron_common::IOCTL_TYPE_ALSA_HWDEP
+            | neutron_common::IOCTL_TYPE_ALSA_RAWMIDI
+            | neutron_common::IOCTL_TYPE_ALSA_TIMER
+            | neutron_common::IOCTL_TYPE_ALSA_SEQ
+            | neutron_common::IOCTL_TYPE_ALSA_COMPRESS
+    )
+}
 
 /// Output of [`decode_ioctl`]. `family` is always set; `name` is the
 /// human-readable command identifier when recognised; `fields` is the
@@ -156,6 +196,33 @@ pub enum IoctlFields {
         fd_flags: u32,
         heap_flags: u64,
     },
+    /// `struct binder_write_read` scalar header. Nested `write_buffer` /
+    /// `read_buffer` command streams are deliberately not dereferenced by
+    /// default; the sizes and consumed offsets are enough to detect bursts
+    /// and stalled reads without parsing arbitrary AIDL Parcels.
+    BinderWriteRead {
+        write_size: u64,
+        write_consumed: u64,
+        read_size: u64,
+        read_consumed: u64,
+    },
+    /// Generic scalar snapshot for driver ioctl packs where the first
+    /// words carry stable enough metadata to support timeline/rule matching
+    /// but the nested pointers remain out of scope.
+    DriverScalars {
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+    },
+    /// ALSA ioctl scalar marker. `compat_candidate` is intentionally broad:
+    /// negative returns on ALSA family ioctls are useful when looking for
+    /// 32/64-bit compat races and control-path confusion.
+    Alsa {
+        compat_candidate: bool,
+        arg0: u64,
+        arg1: u64,
+    },
     /// LWIS command-packet (`_IOWR('L', 100, lwis_cmd_pkt)`). The first
     /// `u32` of the arg buffer is the LWIS-internal command ID; userspace
     /// resolves it to a human name when known. `cmd_id_name` is `None`
@@ -172,6 +239,9 @@ pub enum IoctlFields {
 /// `dir = 3 (RW), size = 24, type = 0x48 ('H'), nr = 0`.
 const DMA_HEAP_IOCTL_ALLOC: u32 = 0xC018_4800;
 
+/// `_IOC` command for `BINDER_WRITE_READ = _IOWR('b', 1, struct binder_write_read)`.
+const BINDER_WRITE_READ: u32 = 0xC030_6201;
+
 /// `_IOC` for `LWIS_CMD_PACKET = _IOWR('L', 100, struct lwis_cmd_pkt)`:
 /// `dir = 3 (RW), size = 16, type = 0x4c ('L'), nr = 100 (0x64)`.
 const LWIS_CMD_PACKET: u32 = 0xC010_4C64;
@@ -186,11 +256,34 @@ const LWIS_CMD_PACKET: u32 = 0xC010_4C64;
 /// any unrecognised cmd, and [`IoctlFields::None`] when the payload is
 /// shorter than the decoder's expected struct size (truncated capture).
 pub fn decode_ioctl(cmd: u32, payload: &[u8], _ret: i64, fd_kind: Option<FdKind>) -> DecodedIoctl {
-    let family = IoctlFamily::from_cmd(cmd, fd_kind);
+    decode_ioctl_with_context(cmd, payload, _ret, fd_kind, None)
+}
+
+/// Decode with optional fd path context from the userspace fd graph.
+pub fn decode_ioctl_with_context(
+    cmd: u32,
+    payload: &[u8],
+    ret: i64,
+    fd_kind: Option<FdKind>,
+    fd_path: Option<&str>,
+) -> DecodedIoctl {
+    let family = IoctlFamily::from_cmd_with_path(cmd, fd_kind, fd_path);
     let (name, fields) = match cmd {
-        DMA_HEAP_IOCTL_ALLOC => (Some("DMA_HEAP_IOCTL_ALLOC"), decode_dma_heap_alloc(payload)),
-        LWIS_CMD_PACKET => (Some("LWIS_CMD_PACKET"), decode_lwis_cmd_pkt(payload)),
-        _ => (None, IoctlFields::None),
+        DMA_HEAP_IOCTL_ALLOC if family == IoctlFamily::DmaHeap => {
+            (Some("DMA_HEAP_IOCTL_ALLOC"), decode_dma_heap_alloc(payload))
+        }
+        BINDER_WRITE_READ if family == IoctlFamily::Binder => {
+            (Some("BINDER_WRITE_READ"), decode_binder_write_read(payload))
+        }
+        LWIS_CMD_PACKET if family == IoctlFamily::Lwis => {
+            (Some("LWIS_CMD_PACKET"), decode_lwis_cmd_pkt(payload))
+        }
+        _ => match family {
+            IoctlFamily::Kgsl => (kgsl_ioctl_name(cmd), decode_driver_scalars(payload)),
+            IoctlFamily::Mali => (mali_ioctl_name(cmd), decode_driver_scalars(payload)),
+            IoctlFamily::Alsa => (alsa_ioctl_name(cmd), decode_alsa(payload, ret)),
+            _ => (None, IoctlFields::None),
+        },
     };
     DecodedIoctl {
         family,
@@ -229,6 +322,94 @@ fn decode_lwis_cmd_pkt(payload: &[u8]) -> IoctlFields {
     IoctlFields::LwisCmdPkt {
         cmd_id,
         cmd_id_name: lwis_cmd_id_name(cmd_id),
+    }
+}
+
+fn kgsl_ioctl_name(cmd: u32) -> Option<&'static str> {
+    match cmd & 0xff {
+        0x02 => Some("IOCTL_KGSL_DEVICE_GETPROPERTY"),
+        0x07 => Some("IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID"),
+        0x10 => Some("IOCTL_KGSL_RINGBUFFER_ISSUEIBCMDS"),
+        0x13 => Some("IOCTL_KGSL_DRAWCTXT_CREATE"),
+        0x2f => Some("IOCTL_KGSL_GPUMEM_ALLOC"),
+        0x33 => Some("IOCTL_KGSL_GPUOBJ_ALLOC"),
+        0x34 => Some("IOCTL_KGSL_GPUOBJ_FREE"),
+        0x35 => Some("IOCTL_KGSL_GPU_COMMAND"),
+        _ => None,
+    }
+}
+
+fn mali_ioctl_name(cmd: u32) -> Option<&'static str> {
+    match cmd & 0xff {
+        0x00 => Some("KBASE_IOCTL_VERSION_CHECK"),
+        0x01 => Some("KBASE_IOCTL_SET_FLAGS"),
+        0x02 => Some("KBASE_IOCTL_MEM_ALLOC"),
+        0x03 => Some("KBASE_IOCTL_MEM_QUERY"),
+        0x04 => Some("KBASE_IOCTL_MEM_FREE"),
+        0x05 => Some("KBASE_IOCTL_HWCNT_READER_SETUP"),
+        0x06 => Some("KBASE_IOCTL_TLSTREAM_ACQUIRE"),
+        0x07 => Some("KBASE_IOCTL_TLSTREAM_FLUSH"),
+        0x08 => Some("KBASE_IOCTL_JIT_INIT"),
+        0x09 => Some("KBASE_IOCTL_MEM_JIT_INIT"),
+        _ => None,
+    }
+}
+
+fn alsa_ioctl_name(cmd: u32) -> Option<&'static str> {
+    let nr = cmd & 0xff;
+    match neutron_common::ioctl_type(cmd) {
+        neutron_common::IOCTL_TYPE_ALSA_PCM => match nr {
+            0x00 => Some("SNDRV_PCM_IOCTL_PVERSION"),
+            0x10 => Some("SNDRV_PCM_IOCTL_INFO"),
+            0x11 => Some("SNDRV_PCM_IOCTL_TSTAMP"),
+            0x20 => Some("SNDRV_PCM_IOCTL_HW_REFINE"),
+            0x21 => Some("SNDRV_PCM_IOCTL_HW_PARAMS"),
+            0x22 => Some("SNDRV_PCM_IOCTL_HW_FREE"),
+            _ => Some("SNDRV_PCM_IOCTL"),
+        },
+        neutron_common::IOCTL_TYPE_ALSA_CTL => Some("SNDRV_CTL_IOCTL"),
+        neutron_common::IOCTL_TYPE_ALSA_HWDEP => Some("SNDRV_HWDEP_IOCTL"),
+        neutron_common::IOCTL_TYPE_ALSA_RAWMIDI => Some("SNDRV_RAWMIDI_IOCTL"),
+        neutron_common::IOCTL_TYPE_ALSA_TIMER => Some("SNDRV_TIMER_IOCTL"),
+        neutron_common::IOCTL_TYPE_ALSA_SEQ => Some("SNDRV_SEQ_IOCTL"),
+        neutron_common::IOCTL_TYPE_ALSA_COMPRESS => Some("SNDRV_COMPRESS_IOCTL"),
+        _ => None,
+    }
+}
+
+fn read_u64_at(payload: &[u8], off: usize) -> u64 {
+    if payload.len() < off + 8 {
+        return 0;
+    }
+    u64::from_le_bytes(payload[off..off + 8].try_into().unwrap())
+}
+
+fn decode_binder_write_read(payload: &[u8]) -> IoctlFields {
+    if payload.len() < 40 {
+        return IoctlFields::None;
+    }
+    IoctlFields::BinderWriteRead {
+        write_size: read_u64_at(payload, 0),
+        write_consumed: read_u64_at(payload, 8),
+        read_size: read_u64_at(payload, 24),
+        read_consumed: read_u64_at(payload, 32),
+    }
+}
+
+fn decode_driver_scalars(payload: &[u8]) -> IoctlFields {
+    IoctlFields::DriverScalars {
+        arg0: read_u64_at(payload, 0),
+        arg1: read_u64_at(payload, 8),
+        arg2: read_u64_at(payload, 16),
+        arg3: read_u64_at(payload, 24),
+    }
+}
+
+fn decode_alsa(payload: &[u8], ret: i64) -> IoctlFields {
+    IoctlFields::Alsa {
+        compat_candidate: ret < 0,
+        arg0: read_u64_at(payload, 0),
+        arg1: read_u64_at(payload, 8),
     }
 }
 
@@ -297,6 +478,43 @@ pub fn render_decoded_ioctl_json(d: &DecodedIoctl) -> String {
                 fd_flags,
                 fd_flags_as_str(*fd_flags),
                 heap_flags,
+            ));
+        }
+        IoctlFields::BinderWriteRead {
+            write_size,
+            write_consumed,
+            read_size,
+            read_consumed,
+        } => {
+            out.push_str(&format!(
+                r#","binder_write_read":{{"write_size":{},"write_consumed":{},"read_size":{},"read_consumed":{}}}"#,
+                write_size, write_consumed, read_size, read_consumed,
+            ));
+        }
+        IoctlFields::DriverScalars {
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+        } => {
+            let key = match d.family {
+                IoctlFamily::Kgsl => "kgsl",
+                IoctlFamily::Mali => "mali",
+                _ => "driver_ioctl",
+            };
+            out.push_str(&format!(
+                r#","{}":{{"arg0":{},"arg1":{},"arg2":{},"arg3":{}}}"#,
+                key, arg0, arg1, arg2, arg3,
+            ));
+        }
+        IoctlFields::Alsa {
+            compat_candidate,
+            arg0,
+            arg1,
+        } => {
+            out.push_str(&format!(
+                r#","alsa":{{"compat_candidate":{},"arg0":{},"arg1":{}}}"#,
+                compat_candidate, arg0, arg1,
             ));
         }
         IoctlFields::LwisCmdPkt {
@@ -507,9 +725,9 @@ mod tests {
 
     #[test]
     fn render_decoded_family_only_emits_just_family() {
-        // BINDER_WRITE_READ classified via fd_kind=Binder, no payload decoder yet.
+        // A non-BWR binder ioctl still renders as family-only.
         let cmd = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
-        let decoded = decode_ioctl(cmd, &[0u8; 48], 0, Some(FdKind::Binder));
+        let decoded = decode_ioctl(cmd + 1, &[0u8; 48], 0, Some(FdKind::Binder));
         let json = render_decoded_ioctl_json(&decoded);
         assert_eq!(json, r#","ioctl_family":"binder""#);
     }

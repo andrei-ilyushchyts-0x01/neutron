@@ -603,3 +603,137 @@
     - binder_call: true
       binder_status_in: [callee_crashed]
   aggregate: per_process
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BPF driver-pack rules — syscall/ioctl/control-message observability only.
+# These intentionally avoid firmware, radio, DRAM, Frida/JVMTI, and fuzzing
+# integrations. They consume fields emitted by the BPF-first decoder packs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: R005_gpu_ioctl_failure_burst
+  name: GPU driver ioctl failure burst
+  description: >-
+    KGSL or Mali ioctls are failing repeatedly in a short window. In a driver
+    harness this often marks a tight mutation loop or a boundary-condition
+    probe against GPU memory/object lifetimes. The rule keys only on decoded
+    ioctl family plus negative return codes, so it remains BPF-first and does
+    not infer nested driver state.
+  severity: medium
+  category: resource_exhaustion
+  behavior: gpu_ioctl_failure_burst
+  interpretation:
+    - possible GPU driver harness probing invalid memory/object state
+    - possible legitimate workload hitting driver back-pressure or bad input
+  confidence: 0.65
+  false_positives:
+    - debug GPU workloads intentionally exercising invalid ioctl arguments
+    - transient device reset or suspend/resume failures
+  conditions:
+    - syscall_in: [29]
+      ioctl_family_in: [kgsl, mali]
+      ret_lt: 0
+  frequency:
+    window_ms: 2000
+    min_count: 3
+  aggregate: per_process
+
+- id: R006_dma_dmabuf_ioctl_churn
+  name: DMA/dmabuf ioctl churn
+  description: >-
+    Repeated dma-heap or dma-buf ioctls in a short window. This catches
+    allocator / importer churn that commonly appears in graphics, camera,
+    and codec harnesses before fd leaks, memory pressure, or stale-handle
+    bugs surface elsewhere.
+  severity: medium
+  category: resource_exhaustion
+  behavior: dma_dmabuf_ioctl_churn
+  interpretation:
+    - possible DMA buffer lifecycle churn in a media or GPU path
+    - possible legitimate high-throughput camera/codec workload
+  confidence: 0.6
+  false_positives:
+    - normal camera preview startup
+    - video encoder warm-up and surface reconfiguration
+  conditions:
+    - syscall_in: [29]
+      ioctl_family_in: [dma_heap, dma_buf]
+  frequency:
+    window_ms: 5000
+    min_count: 25
+  aggregate: per_process
+
+- id: R007_mali_tlstream_or_jit_activity
+  name: Mali TLStream/JIT ioctl activity
+  description: >-
+    A Mali kbase ioctl associated with TLStream or JIT setup was observed.
+    These controls are useful markers when reconstructing GPU-driver exploit
+    chains because they bracket telemetry, allocation, and just-in-time memory
+    setup phases without needing to parse nested Mali structures.
+  severity: low
+  category: ipc
+  behavior: mali_tlstream_or_jit_ioctl
+  interpretation:
+    - Mali telemetry or JIT setup phase in a GPU harness
+    - legitimate graphics stack initialization
+  confidence: 0.55
+  false_positives:
+    - normal Mali userspace driver startup
+    - profiling tools enabling TLStream intentionally
+  conditions:
+    - syscall_in: [29]
+      ioctl_family_in: [mali]
+      ioctl_name_in:
+        - KBASE_IOCTL_TLSTREAM_ACQUIRE
+        - KBASE_IOCTL_TLSTREAM_FLUSH
+        - KBASE_IOCTL_JIT_INIT
+        - KBASE_IOCTL_MEM_JIT_INIT
+  aggregate: per_process
+
+- id: R008_alsa_compat_candidate_errors
+  name: ALSA compat-candidate ioctl errors
+  description: >-
+    ALSA-family ioctls returned errors repeatedly. The decoder marks negative
+    ALSA ioctl returns as compat candidates because mixed-width control paths
+    and audio HAL retry loops are common places to inspect for race windows.
+  severity: low
+  category: ipc
+  behavior: alsa_compat_candidate_ioctl_errors
+  interpretation:
+    - possible ALSA compat/control ioctl race window
+    - possible benign audio HAL retry loop
+  confidence: 0.5
+  false_positives:
+    - audio policy probing unavailable devices
+    - vendor HALs retrying during route changes
+  conditions:
+    - syscall_in: [29]
+      ioctl_family_in: [alsa]
+      ret_lt: 0
+  frequency:
+    window_ms: 3000
+    min_count: 2
+  aggregate: per_process
+
+- id: R009_unix_socket_rights_peek_race
+  name: Unix socket SCM_RIGHTS with MSG_PEEK
+  description: >-
+    sendmsg/recvmsg carried SCM_RIGHTS control data while MSG_PEEK was set.
+    Peeking descriptor-passing messages is a useful race-window marker:
+    ownership and lifetime can be inspected without consuming the queued
+    message. The evidence is limited to bounded cmsghdr metadata and fd count.
+  severity: medium
+  category: ipc
+  behavior: unix_socket_msg_peek_scm_rights
+  interpretation:
+    - possible fd-passing race-window probe
+    - possible broker deliberately inspecting pending descriptor messages
+  confidence: 0.7
+  false_positives:
+    - diagnostic brokers that intentionally peek descriptor traffic
+    - compatibility shims that inspect queue state before consuming messages
+  conditions:
+    - syscall_in: [211, 212]
+      unix_msg_control: true
+      unix_scm_rights_fds_gte: 1
+      unix_msg_peek: true
+  aggregate: every_event

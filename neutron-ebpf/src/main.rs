@@ -34,12 +34,13 @@ use aya_ebpf::{
 };
 use neutron_common::{
     is_state_tracking_nr, ret_matches_class, ExitSource, SyscallEvent, COUNTER_EVENTS_SUBMITTED,
-    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_RINGBUF_RESERVE_FAILED,
-    COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED, FILTER_KEY_ACTIVE,
-    FILTER_KEY_ARG_U32_OFF, FILTER_KEY_IOCTL_DIR, FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS,
-    FILTER_KEY_PID, FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED, FILTER_MAP_SLOT_COUNT,
-    MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR,
-    MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
+    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
+    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED,
+    COUNTER_STACK_USER_FAILED, COUNTER_UNIX_MSG_CONTROL_NESTED, COUNTER_UNIX_MSG_CONTROL_TRUNCATED,
+    FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF, FILTER_KEY_IOCTL_DIR, FILTER_KEY_LATENCY_MIN_US,
+    FILTER_KEY_MATCH_BITS, FILTER_KEY_PID, FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED,
+    FILTER_MAP_SLOT_COUNT, MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR,
+    MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
     SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
 };
 
@@ -122,6 +123,17 @@ static MATCH_IOCTL_NR_SET: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 #[map]
 static MATCH_ARG_U32_VALS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 
+/// Runtime ioctl post-exit refresh allowlist keyed by full cmd word.
+/// Populated by userspace when `--driver-pack` enables a decoder whose
+/// meaningful scalar fields are written back on exit.
+#[map]
+static IOCTL_REFRESH_CMD_SET: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
+
+/// Runtime ioctl post-exit refresh allowlist keyed by `_IOC_TYPE` byte.
+/// Lets decoder packs opt in a family without rebuilding the BPF object.
+#[map]
+static IOCTL_REFRESH_TYPE_SET: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
+
 /// Capture-health counters. Slot indices are defined in `neutron_common::COUNTER_*`.
 /// Userspace polls this map periodically and prints a capture summary on exit.
 /// Values are u64 monotonic counters; the BPF programs increment them via the
@@ -142,6 +154,21 @@ fn bump_counter(idx: u32) {
             core::ptr::write_unaligned(slot, cur.wrapping_add(1));
         }
     }
+}
+
+#[inline(always)]
+fn ioctl_refresh_enabled(cmd: u32) -> bool {
+    if neutron_common::ioctl_post_exit_refresh(cmd) {
+        return true;
+    }
+    if unsafe { IOCTL_REFRESH_CMD_SET.get(&cmd) }.is_some() {
+        return true;
+    }
+    let ty = neutron_common::ioctl_type(cmd);
+    if unsafe { IOCTL_REFRESH_TYPE_SET.get(&ty) }.is_some() {
+        return true;
+    }
+    false
 }
 
 // ── Tracepoint field offsets (raw_syscalls/sys_*) ────────────────────────────
@@ -439,8 +466,40 @@ unsafe fn data_ptr(ev: *mut SyscallEvent, off: usize) -> *mut u8 {
 }
 
 #[inline(always)]
+unsafe fn reserved_ptr(ev: *mut SyscallEvent, off: usize) -> *mut u8 {
+    (addr_of_mut!((*ev)._reserved) as *mut u8).add(off)
+}
+
+#[inline(always)]
 unsafe fn data_write_u8(ev: *mut SyscallEvent, off: usize, v: u8) {
     *data_ptr(ev, off) = v;
+}
+
+#[inline(always)]
+unsafe fn reserved_write_u8(ev: *mut SyscallEvent, off: usize, v: u8) {
+    *reserved_ptr(ev, off) = v;
+}
+
+#[inline(always)]
+unsafe fn data_write_u32(ev: *mut SyscallEvent, off: usize, v: u32) {
+    let b = v.to_le_bytes();
+    data_write_u8(ev, off, b[0]);
+    data_write_u8(ev, off + 1, b[1]);
+    data_write_u8(ev, off + 2, b[2]);
+    data_write_u8(ev, off + 3, b[3]);
+}
+
+#[inline(always)]
+unsafe fn data_write_u64(ev: *mut SyscallEvent, off: usize, v: u64) {
+    let b = v.to_le_bytes();
+    data_write_u8(ev, off, b[0]);
+    data_write_u8(ev, off + 1, b[1]);
+    data_write_u8(ev, off + 2, b[2]);
+    data_write_u8(ev, off + 3, b[3]);
+    data_write_u8(ev, off + 4, b[4]);
+    data_write_u8(ev, off + 5, b[5]);
+    data_write_u8(ev, off + 6, b[6]);
+    data_write_u8(ev, off + 7, b[7]);
 }
 
 /// View `data[off..off+len]` as a mutable slice for use with the buf-style
@@ -541,7 +600,16 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
     // we need. msghdr layout (aarch64):
     //   void*    msg_name        @ +0  (8)
     //   socklen  msg_namelen     @ +8  (4)
+    //   void*    msg_control     @ +32 (8)
     //   size_t   msg_controllen  @ +40 (8)
+    //
+    // `data` layout for these syscalls:
+    //   [0..28]   optional sockaddr from msg_name
+    //   [64..72]  msg_controllen
+    //   [80..88]  first cmsghdr.cmsg_len
+    //   [88..92]  first cmsghdr.cmsg_level
+    //   [92..96]  first cmsghdr.cmsg_type
+    //   [96..100] bounded SCM_RIGHTS fd count
     if matches!(nr, 211 | 212) {
         let ptr = args[1];
         addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
@@ -570,9 +638,64 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
             let dst = data_slice(ev, 0, 28);
             let _ = bpf_probe_read_user_buf(name_ptr as *const u8, dst);
         }
-        // Read msg_controllen (8B) into data[64..72].
-        let dst_ctl = data_slice(ev, 64, 8);
-        let _ = bpf_probe_read_user_buf((ptr + 40) as *const u8, dst_ctl);
+        // Read msg_control pointer + msg_controllen into stack scratch.
+        let mut hdr_ctl = [0u8; 16];
+        if bpf_probe_read_user_buf((ptr + 32) as *const u8, &mut hdr_ctl).is_err() {
+            bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
+            return;
+        }
+        let control_ptr = u64::from_le_bytes([
+            hdr_ctl[0], hdr_ctl[1], hdr_ctl[2], hdr_ctl[3], hdr_ctl[4], hdr_ctl[5], hdr_ctl[6],
+            hdr_ctl[7],
+        ]);
+        let controllen = u64::from_le_bytes([
+            hdr_ctl[8],
+            hdr_ctl[9],
+            hdr_ctl[10],
+            hdr_ctl[11],
+            hdr_ctl[12],
+            hdr_ctl[13],
+            hdr_ctl[14],
+            hdr_ctl[15],
+        ]);
+        data_write_u64(ev, 64, controllen);
+        if controllen == 0 {
+            return;
+        }
+        if control_ptr == 0 || controllen < 16 {
+            bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
+            return;
+        }
+        let mut cmsg = [0u8; 16];
+        if bpf_probe_read_user_buf(control_ptr as *const u8, &mut cmsg).is_err() {
+            bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
+            return;
+        }
+        let cmsg_len = u64::from_le_bytes([
+            cmsg[0], cmsg[1], cmsg[2], cmsg[3], cmsg[4], cmsg[5], cmsg[6], cmsg[7],
+        ]);
+        let cmsg_level = u32::from_le_bytes([cmsg[8], cmsg[9], cmsg[10], cmsg[11]]);
+        let cmsg_type = u32::from_le_bytes([cmsg[12], cmsg[13], cmsg[14], cmsg[15]]);
+        data_write_u64(ev, 80, cmsg_len);
+        data_write_u32(ev, 88, cmsg_level);
+        data_write_u32(ev, 92, cmsg_type);
+        if cmsg_len < 16 || cmsg_len > controllen {
+            bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
+            return;
+        }
+        // CMSG_ALIGN(len) for 64-bit ABI: (len + 7) & !7. If there is more
+        // control data after the first aligned header, record the loss.
+        let aligned = (cmsg_len + 7) & !7;
+        if controllen > aligned {
+            bump_counter(COUNTER_UNIX_MSG_CONTROL_NESTED);
+        }
+        // SOL_SOCKET=1, SCM_RIGHTS=1. Count fds in the first control record,
+        // bounded to avoid implying we captured an arbitrary-length list.
+        if cmsg_level == 1 && cmsg_type == 1 && cmsg_len >= 16 {
+            let bytes = cmsg_len - 16;
+            let count = (bytes / 4).min(16) as u32;
+            data_write_u32(ev, 96, count);
+        }
         return;
     }
 
@@ -844,9 +967,12 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
                 // than re-reading data[0..4] so we avoid additional pointer
                 // arithmetic the verifier would have to track.
                 let cmd = saved_args[1] as u32;
-                if neutron_common::ioctl_post_exit_refresh(cmd) {
+                if ioctl_refresh_enabled(cmd) {
                     let dst = data_slice(ev, 4, 124);
                     let _ = bpf_probe_read_user_buf(saved_ptr_hint as *const u8, dst);
+                    reserved_write_u8(ev, 0, 1);
+                } else if neutron_common::ioctl_runtime_refresh_candidate(cmd) {
+                    bump_counter(COUNTER_IOCTL_REFRESH_MISSED);
                 }
             }
         } else {

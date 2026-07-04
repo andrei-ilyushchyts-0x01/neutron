@@ -80,6 +80,9 @@ in one condition entry, or use multiple condition entries.
 | `binder_call`       | `bool`         | Event is a `type:"binder_call"` synthesised pair. Sprint-2.       |
 | `binder_status_in`  | `[string]`     | binder_call's `status` ∈ list (`completed`, `callee_crashed`, `unmatched`). |
 | `binder_code_in`    | `[u32]`        | binder_call's AIDL `code` ∈ list.                                 |
+| `unix_msg_control`  | `bool`         | Event has bounded sendmsg/recvmsg control metadata.               |
+| `unix_scm_rights_fds_gte` | `u32`    | First SCM_RIGHTS message carries at least this many fds.          |
+| `unix_msg_peek`     | `bool`         | sendmsg/recvmsg flags include `MSG_PEEK`.                         |
 
 ### Frequency
 
@@ -105,7 +108,7 @@ state but does not re-emit.
 
 ## Built-in rules
 
-The bundled detector pack ships twenty-six rules. Each is described inline in
+The bundled detector pack ships thirty-one rules. Each is described inline in
 [`neutron-rules/rules/default.yaml`](../../neutron-rules/rules/default.yaml).
 Summary table:
 
@@ -137,6 +140,11 @@ Summary table:
 | R002   | resource_exhaustion  | DMA-heap allocation burst (50+ in 5 s)                  | medium   |
 | R003   | crash                | Process killed by fatal signal (SEGV/ABRT/BUS/ILL/FPE/SYS) | critical |
 | R004   | crash                | Binder callee crashed mid-transaction                   | high     |
+| R005   | resource_exhaustion  | KGSL/Mali ioctl failure burst                           | medium   |
+| R006   | resource_exhaustion  | DMA/dmabuf ioctl churn                                  | medium   |
+| R007   | ipc                  | Mali TLStream/JIT ioctl marker                          | low      |
+| R008   | ipc                  | ALSA compat-candidate ioctl errors                      | low      |
+| R009   | ipc                  | Unix socket SCM_RIGHTS with MSG_PEEK                    | medium   |
 
 ## Findings
 

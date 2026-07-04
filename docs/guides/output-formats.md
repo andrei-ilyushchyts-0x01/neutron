@@ -239,8 +239,12 @@ Same counter set as the stderr capture-summary block, plus a
   "events_submitted":99999, "ringbuf_reserve_failed":0,
   "inflight_lookup_missed":0, "user_stack_failed":0,
   "kernel_stack_failed":0, "path_truncated":0,
-  "fd_lookup_missed":0, "fd_graph_miss":0,
-  "fd_graph_backfilled":0, "degraded":false }
+  "fd_lookup_missed":0, "ioctl_refresh_missed":0,
+  "unix_msg_control_truncated":0, "unix_msg_control_nested":0,
+  "fd_graph_miss":0, "fd_graph_backfilled":0,
+  "degraded":false, "driver_packs":["kgsl"],
+  "attached_programs":["trace_sys_enter","trace_sys_exit"],
+  "ioctl_refresh_types":["0x9"] }
 ```
 
 A downstream pipeline gating on "absence of finding is conclusive"
@@ -312,10 +316,14 @@ with `--tombstone-dir ""` and the logcat tail with `--no-logcat`.
 | `errno`           | number (optional)   | `-ret` for failed exit events (`ok:false`). Omitted otherwise.             |
 | `args`            | number[6]           | Raw syscall arguments. All six positions reflect the actual ABI args (no field hijacking — the enter timestamp lives in its own field). |
 | `data`            | string (optional)   | Decoded argument data (path, sockaddr, hex, …); omitted if empty |
-| `data_phase`      | string              | `"enter"` when `data[]` carries the pre-call buffer; `"exit"` when the BPF program refreshed the buffer post-call. Today the refresh fires for `ioctl(2)` cmds whose `_IOC_DIR` is R or RW *and* whose `_IOC_TYPE` is `'H'` (`dma_heap`), `'b'` (`binder`/`dma_buf`), or `'w'` (`ashmem`). |
-| `ioctl_family`    | string (optional)   | Family classification for `ioctl(2)` events: `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, or `"unknown"`. The `'b'` magic is shared between `binder` and `dma_buf`; userspace disambiguates via the FD-graph kind of the target fd. |
-| `ioctl_name`      | string (optional)   | Human name for the cmd when the decoder registry knows it (e.g. `"DMA_HEAP_IOCTL_ALLOC"`). |
+| `data_phase`      | string              | `"enter"` when `data[]` carries the pre-call buffer; `"exit"` when the BPF program refreshed the buffer post-call. Built-in refresh covers dma-heap/binder/dma-buf/ashmem; `--driver-pack` can enable runtime refresh for KGSL, Mali, ALSA, LWIS, and GXP families. |
+| `ioctl_family`    | string (optional)   | Family classification for `ioctl(2)` events: `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"`, `"gxp"`, or `"unknown"`. Magic collisions are disambiguated with FD-graph path/kind when available. |
+| `ioctl_name`      | string (optional)   | Human name for the cmd when the decoder registry knows it (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"BINDER_WRITE_READ"`, `"IOCTL_KGSL_GPUMEM_ALLOC"`). |
 | `dma_heap`        | object (optional)   | Decoded `struct dma_heap_allocation_data`: `{ "len":N, "returned_fd":N, "fd_flags":N, "fd_flags_str":"O_RDWR\|O_CLOEXEC", "heap_flags":N }`. Meaningful only when `data_phase == "exit"` (the kernel writes `fd` post-call). |
+| `binder_write_read` | object (optional) | Scalar `BINDER_WRITE_READ` header: `write_size`, `write_consumed`, `read_size`, `read_consumed`. Nested Parcel buffers are not dereferenced. |
+| `kgsl` / `mali`   | object (optional)   | First four captured scalar words as `arg0..arg3` for driver harness timelines. Nested pointers are not followed. |
+| `alsa`            | object (optional)   | ALSA scalar marker with `compat_candidate`, `arg0`, and `arg1`. |
+| `unix_msg_control` | object (optional)  | Bounded sendmsg/recvmsg control metadata: `flags`, `controllen`, first `cmsg_len`/`cmsg_level`/`cmsg_type`, bounded `scm_rights_fds`, and `msg_peek`. |
 | `rwx_alert`       | `"RWX" \| "WX"`     | Set on `mmap`/`mprotect` with PROT_EXEC; omitted otherwise  |
 | `latency_us`      | number (optional)   | Syscall duration in µs (exit only); omitted if `INFLIGHT` evicted |
 | `kernel_stackid`  | number (optional)   | Stack trace map key; omitted if both stack ids are negative |

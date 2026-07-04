@@ -1,9 +1,10 @@
 //! NDJSON rendering of `SyscallEvent`s.
 
 use crate::decode::{
-    compute_latency_us, decode_ioctl, format_binder_event_json, format_binder_received_json,
-    format_comm, format_data_field, lookup_socket_by_inode, read_socket_inode,
-    render_decoded_ioctl_json, resolve_path_from_fd, syscall_name, IoctlFamily,
+    compute_latency_us, decode_ioctl_with_context, decode_unix_msg_control,
+    format_binder_event_json, format_binder_received_json, format_comm, format_data_field,
+    lookup_socket_by_inode, read_socket_inode, render_decoded_ioctl_json, resolve_path_from_fd,
+    syscall_name, IoctlFamily,
 };
 use crate::fdgraph::FdKind;
 use neutron_common::SyscallEvent;
@@ -215,13 +216,17 @@ pub fn format_event_json_full(
         let raw = { ev.data };
         let cmd = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         let fd_kind = fd_hint.as_ref().map(|h| h.kind);
-        let decoded = decode_ioctl(cmd, &raw[4..], ret, fd_kind);
+        let fd_path = fd_hint.as_ref().map(|h| h.path.as_str());
+        let decoded = decode_ioctl_with_context(cmd, &raw[4..], ret, fd_kind, fd_path);
         let json = if decoded.family != IoctlFamily::Unknown || decoded.name.is_some() {
             render_decoded_ioctl_json(&decoded)
         } else {
             String::new()
         };
-        let phase = if is_enter == 0 && neutron_common::ioctl_post_exit_refresh(cmd) {
+        let reserved = { ev._reserved };
+        let phase = if is_enter == 0
+            && (neutron_common::ioctl_post_exit_refresh(cmd) || reserved[0] == 1)
+        {
             r#","data_phase":"exit""#
         } else {
             r#","data_phase":"enter""#
@@ -234,9 +239,22 @@ pub fn format_event_json_full(
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
     };
+    let unix_control_json = match decode_unix_msg_control(ev) {
+        Some(c) => format!(
+            r#","unix_msg_control":{{"flags":{},"controllen":{},"cmsg_len":{},"cmsg_level":{},"cmsg_type":{},"scm_rights_fds":{},"msg_peek":{}}}"#,
+            c.flags,
+            c.controllen,
+            c.cmsg_len,
+            c.cmsg_level,
+            c.cmsg_type,
+            c.scm_rights_fds,
+            c.msg_peek,
+        ),
+        None => String::new(),
+    };
 
     format!(
-        r#"{{"type":"syscall","ts_ns":{},"pid":{},"tid":{},"uid":{},"nr":{},"name":"{}","comm":"{}","enter":{}{},"ret":{}{}{},"args":[{},{},{},{},{},{}]{}{}{}{}{}{}{}{}{}{}}}"#,
+        r#"{{"type":"syscall","ts_ns":{},"pid":{},"tid":{},"uid":{},"nr":{},"name":"{}","comm":"{}","enter":{}{},"ret":{}{}{},"args":[{},{},{},{},{},{}]{}{}{}{}{}{}{}{}{}{}{}}}"#,
         ts_ns,
         pid,
         tid,
@@ -264,6 +282,7 @@ pub fn format_event_json_full(
         latency_json,
         enter_ts_json,
         stack_field_json,
+        unix_control_json,
         event_id_json,
     )
 }

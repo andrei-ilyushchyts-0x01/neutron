@@ -213,6 +213,15 @@ pub const COUNTER_PATH_TRUNCATED: u32 = 7;
 pub const COUNTER_FD_LOOKUP_MISSED: u32 = 8;
 /// Userspace symbolizer failed to resolve a non-zero IP to a symbol.
 pub const COUNTER_SYMBOLIZATION_FAILED: u32 = 9;
+/// R/RW ioctl was a plausible driver-pack refresh candidate but neither
+/// the static whitelist nor runtime refresh maps selected it.
+pub const COUNTER_IOCTL_REFRESH_MISSED: u32 = 10;
+/// sendmsg/recvmsg control metadata was present but could not be read
+/// completely into the bounded `data[128]` summary.
+pub const COUNTER_UNIX_MSG_CONTROL_TRUNCATED: u32 = 11;
+/// sendmsg/recvmsg carried more than one control message; neutron records
+/// only the first cmsghdr and counts the rest as nested metadata.
+pub const COUNTER_UNIX_MSG_CONTROL_NESTED: u32 = 12;
 
 /// Number of slots in the COUNTERS map. New counters extend the tail; bumping
 /// requires updating the `Array::with_max_entries(...)` size in BPF and the
@@ -248,6 +257,30 @@ pub const IOCTL_TYPE_DMA_HEAP: u32 = 0x48;
 pub const IOCTL_TYPE_BINDER_OR_DMA_BUF: u32 = 0x62;
 /// `_IOC_TYPE` byte for `/dev/ashmem` ioctls (`'w'`).
 pub const IOCTL_TYPE_ASHMEM: u32 = 0x77;
+/// `_IOC_TYPE` byte used by the Qualcomm KGSL GPU driver.
+pub const IOCTL_TYPE_KGSL: u32 = 0x09;
+/// `_IOC_TYPE` byte used by the ARM Mali kbase driver.
+pub const IOCTL_TYPE_MALI_KBASE: u32 = 0x80;
+/// `_IOC_TYPE` byte for ALSA PCM ioctls used by Android audio HALs.
+pub const IOCTL_TYPE_ALSA_PCM: u32 = 0x50;
+/// `_IOC_TYPE` byte for ALSA control ioctls (`'U'`).
+pub const IOCTL_TYPE_ALSA_CTL: u32 = 0x55;
+/// `_IOC_TYPE` byte for ALSA hwdep ioctls (`'H'`), shared with dma-heap.
+pub const IOCTL_TYPE_ALSA_HWDEP: u32 = 0x48;
+/// `_IOC_TYPE` byte for ALSA rawmidi ioctls (`'W'`).
+pub const IOCTL_TYPE_ALSA_RAWMIDI: u32 = 0x57;
+/// `_IOC_TYPE` byte for ALSA timer ioctls (`'T'`).
+pub const IOCTL_TYPE_ALSA_TIMER: u32 = 0x54;
+/// `_IOC_TYPE` byte for ALSA sequencer ioctls (`'S'`).
+pub const IOCTL_TYPE_ALSA_SEQ: u32 = 0x53;
+/// `_IOC_TYPE` byte for ALSA compress-offload ioctls (`'C'`).
+pub const IOCTL_TYPE_ALSA_COMPRESS: u32 = 0x43;
+/// `_IOC_TYPE` byte for Pixel LWIS camera HAL ioctls (`'L'`).
+pub const IOCTL_TYPE_LWIS: u32 = 0x4c;
+/// Upstream GXP accelerator `_IOC_TYPE` byte (`'G'`).
+pub const IOCTL_TYPE_GXP_UPSTREAM: u32 = 0x47;
+/// Pixel out-of-tree GXP accelerator `_IOC_TYPE` byte.
+pub const IOCTL_TYPE_GXP_PIXEL: u32 = 0xee;
 
 /// Extracts the `_IOC_DIR` field (top two bits) from an ioctl `cmd`.
 #[inline]
@@ -278,6 +311,44 @@ pub const fn ioctl_post_exit_refresh(cmd: u32) -> bool {
             || ty == IOCTL_TYPE_BINDER_OR_DMA_BUF
             || ty == IOCTL_TYPE_ASHMEM)
 }
+
+/// Returns `true` for R/RW ioctl families that decoder packs can safely ask
+/// BPF to refresh at runtime via the `IOCTL_REFRESH_*` maps. The maps provide
+/// the active policy; this helper is the userspace/BPF shared coarse filter
+/// and documentation of supported driver-pack families.
+#[inline]
+pub const fn ioctl_runtime_refresh_candidate(cmd: u32) -> bool {
+    let dir = ioctl_dir(cmd);
+    if !(dir == IOCTL_DIR_R || dir == IOCTL_DIR_RW) {
+        return false;
+    }
+    let ty = ioctl_type(cmd);
+    matches!(
+        ty,
+        IOCTL_TYPE_KGSL
+            | IOCTL_TYPE_MALI_KBASE
+            | IOCTL_TYPE_ALSA_PCM
+            | IOCTL_TYPE_ALSA_CTL
+            | IOCTL_TYPE_ALSA_HWDEP
+            | IOCTL_TYPE_ALSA_RAWMIDI
+            | IOCTL_TYPE_ALSA_TIMER
+            | IOCTL_TYPE_ALSA_SEQ
+            | IOCTL_TYPE_ALSA_COMPRESS
+            | IOCTL_TYPE_LWIS
+            | IOCTL_TYPE_GXP_UPSTREAM
+            | IOCTL_TYPE_GXP_PIXEL
+    )
+}
+
+/// Synthetic event IDs reserved for optional explicit kprobe research packs.
+/// They are encoded as negative `syscall_nr` values in the existing
+/// `SyscallEvent` wire layout when a future BPF object provides the matching
+/// programs.
+pub const SYSCALL_NR_KPROBE_BINDER: i32 = -10;
+pub const SYSCALL_NR_KPROBE_KGSL: i32 = -11;
+pub const SYSCALL_NR_KPROBE_MALI: i32 = -12;
+pub const SYSCALL_NR_KPROBE_ALSA: i32 = -13;
+pub const SYSCALL_NR_KPROBE_UNIX_SOCKET: i32 = -14;
 
 // ── Process exit (sprint-2 PR 1) ─────────────────────────────────────────────
 //

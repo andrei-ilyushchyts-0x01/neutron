@@ -167,6 +167,20 @@ pub struct MatchCondition {
     /// codes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binder_code_in: Option<Vec<u32>>,
+
+    /// Match if a syscall event carries a `unix_msg_control` object
+    /// decoded from sendmsg/recvmsg control metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_msg_control: Option<bool>,
+
+    /// Match if the first SCM_RIGHTS control message carries at least this
+    /// many file descriptors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_scm_rights_fds_gte: Option<u32>,
+
+    /// Match on the MSG_PEEK bit in sendmsg/recvmsg syscall flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_msg_peek: Option<bool>,
 }
 
 impl MatchCondition {
@@ -341,6 +355,23 @@ impl MatchCondition {
         if let Some(list) = &self.binder_code_in {
             match ev.binder_code {
                 Some(c) if list.contains(&c) => {}
+                _ => return false,
+            }
+        }
+        if let Some(true) = self.unix_msg_control {
+            if !ev.unix_msg_control {
+                return false;
+            }
+        }
+        if let Some(min_fds) = self.unix_scm_rights_fds_gte {
+            match ev.unix_scm_rights_fds {
+                Some(n) if n >= min_fds => {}
+                _ => return false,
+            }
+        }
+        if let Some(want_peek) = self.unix_msg_peek {
+            match ev.unix_msg_peek {
+                Some(v) if v == want_peek => {}
                 _ => return false,
             }
         }

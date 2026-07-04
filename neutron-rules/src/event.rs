@@ -94,6 +94,15 @@ pub struct Event<'a> {
     /// Sprint-2 PR 2: callee-side PID from a `type:"binder_call"` event.
     /// `None` for non-binder_call events.
     pub binder_callee_pid: Option<u32>,
+    /// Bounded sendmsg/recvmsg control metadata object emitted by neutron
+    /// when `msg_controllen > 0`.
+    pub unix_msg_control: bool,
+    /// Number of file descriptors in the first SCM_RIGHTS control message.
+    /// `None` when the event is not sendmsg/recvmsg or no SCM_RIGHTS header
+    /// was captured.
+    pub unix_scm_rights_fds: Option<u32>,
+    /// True when sendmsg/recvmsg syscall flags included `MSG_PEEK`.
+    pub unix_msg_peek: Option<bool>,
 
     /// Owned JSON value — kept so callers can clone it into snapshots without
     /// re-parsing the raw line. Use [`Event::raw_json`] to access.
@@ -228,6 +237,15 @@ impl<'a> Event<'a> {
         } else {
             None
         };
+        let unix_ctrl = obj.get("unix_msg_control").and_then(|v| v.as_object());
+        let unix_msg_control = unix_ctrl.is_some();
+        let unix_scm_rights_fds = unix_ctrl
+            .and_then(|m| m.get("scm_rights_fds"))
+            .and_then(|v| v.as_u64())
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+        let unix_msg_peek = unix_ctrl
+            .and_then(|m| m.get("msg_peek"))
+            .and_then(|v| v.as_bool());
 
         let mut args = [0u64; 6];
         if let Some(arr) = obj.get("args").and_then(|a| a.as_array()) {
@@ -265,6 +283,9 @@ impl<'a> Event<'a> {
             binder_code,
             binder_caller_pid,
             binder_callee_pid,
+            unix_msg_control,
+            unix_scm_rights_fds,
+            unix_msg_peek,
             raw: v,
             raw_line,
         })

@@ -147,9 +147,20 @@ pub struct Args {
     #[arg(long)]
     pub json: bool,
 
-    /// Tracing profile: "security" filters to security-relevant syscalls only
+    /// Tracing profile. Available: "security", "kernel-lpe", "driver-harness".
     #[arg(long)]
     pub profile: Option<String>,
+
+    /// BPF-first decoder/matcher pack. Repeat or comma-separate.
+    /// Available: binder, kgsl, mali, alsa, unix-socket, media-hal.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub driver_pack: Vec<String>,
+
+    /// Explicit research-mode kprobe pack. Best-effort attach; missing
+    /// kernel symbols or absent BPF programs warn and capture continues.
+    /// Available: binder, kgsl, mali, alsa, unix-socket.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub kprobe_pack: Vec<String>,
 
     /// Enable binder transaction tracing via kprobe
     #[arg(long)]
@@ -451,7 +462,7 @@ pub struct Args {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn window_help_lists_marker_anchor() {
