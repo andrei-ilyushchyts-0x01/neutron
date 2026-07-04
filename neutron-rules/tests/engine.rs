@@ -320,6 +320,45 @@ fn t017_jit_cache_fires_after_threshold() {
 }
 
 #[test]
+fn gpu_ioctl_failure_burst_fires_on_kgsl_errors() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    let mut lines: Vec<String> = Vec::new();
+    for i in 0..3 {
+        lines.push(format!(
+            r#"{{"type":"syscall","ts_ns":{},"pid":77,"tid":77,"uid":1000,"nr":29,"name":"ioctl","comm":"kgsl-harness","enter":false,"phase":"exit","ret":-22,"args":[3,0xc020092f,0,0,0,0],"ioctl_family":"kgsl","ioctl_name":"IOCTL_KGSL_GPUMEM_ALLOC"}}"#,
+            1_000_000_000u64 + i * 100_000_000
+        ));
+    }
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    feed_lines(&mut engine, &refs);
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "R005_gpu_ioctl_failure_burst"),
+        "expected R005 GPU failure finding, got {findings:?}"
+    );
+}
+
+#[test]
+fn unix_socket_rights_peek_race_fires_on_scm_rights_msg_peek() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"syscall","ts_ns":1000,"pid":88,"tid":88,"uid":1000,"nr":212,"name":"recvmsg","comm":"race-probe","enter":true,"phase":"enter","ret":0,"args":[4,0,2,0,0,0],"unix_msg_control":{"flags":2,"controllen":24,"cmsg_len":24,"cmsg_level":1,"cmsg_type":1,"scm_rights_fds":2,"msg_peek":true}}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "R009_unix_socket_rights_peek_race"),
+        "expected R009 Unix socket race finding, got {findings:?}"
+    );
+}
+
+#[test]
 fn default_ruleset_has_at_least_22_rules() {
     let engine = RuleEngine::with_default_rules().unwrap();
     assert!(

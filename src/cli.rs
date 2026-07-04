@@ -491,4 +491,33 @@ mod tests {
             "top-level help should list recipes subcommand:\n{help}"
         );
     }
+
+    #[test]
+    fn top_level_help_lists_bpf_driver_pack_flags() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("--driver-pack")
+                && help.contains("--kprobe-pack")
+                && help.contains("kernel-lpe")
+                && help.contains("driver-harness"),
+            "top-level help should document BPF driver pack flags and profiles:\n{help}"
+        );
+    }
+
+    #[test]
+    fn driver_and_kprobe_packs_accept_comma_lists() {
+        let cli = Cli::try_parse_from([
+            "neutron",
+            "--driver-pack",
+            "binder,kgsl",
+            "--kprobe-pack",
+            "mali,alsa",
+        ])
+        .expect("parse driver/kprobe packs");
+        assert_eq!(cli.args.driver_pack, vec!["binder", "kgsl"]);
+        assert_eq!(cli.args.kprobe_pack, vec!["mali", "alsa"]);
+    }
 }

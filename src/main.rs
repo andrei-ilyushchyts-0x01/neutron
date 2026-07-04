@@ -2132,6 +2132,37 @@ mod tests {
     }
 
     #[test]
+    fn kernel_lpe_profile_populates_syscall_whitelist_defaults() {
+        let mut args = Args {
+            profile: Some("kernel-lpe".into()),
+            ..Args::default()
+        };
+        apply_profile(&mut args).expect("profile applies");
+        let spec = matcher::build_from_args(&args).expect("profile match spec");
+        for nr in [29, 98, 198, 211, 212, 220, 222, 226, 280] {
+            assert!(
+                spec.syscalls.contains(&nr),
+                "kernel-lpe should include syscall {nr}; got {:?}",
+                spec.syscalls
+            );
+        }
+    }
+
+    #[test]
+    fn driver_pack_defaults_scope_to_fd_and_ioctl_type_when_no_user_match() {
+        let mut args = Args {
+            driver_pack: vec!["kgsl".into()],
+            ..Args::default()
+        };
+        let packs = apply_driver_packs(&mut args).expect("driver pack applies");
+        let spec = matcher::build_from_args(&args).expect("driver pack match spec");
+        assert!(spec.syscalls.contains(&29));
+        assert!(spec.ioctl_types.contains(&neutron_common::IOCTL_TYPE_KGSL));
+        assert_eq!(spec.fd_globs, vec!["/dev/kgsl*"]);
+        assert!(packs.refresh_types.contains(&neutron_common::IOCTL_TYPE_KGSL));
+    }
+
+    #[test]
     fn guardrails_warn_on_uncapped_broad_file_output() {
         let args = Args {
             pid: 0,

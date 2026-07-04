@@ -646,4 +646,94 @@ mod tests {
         }
         assert_eq!(lwis_cmd_id_name(0xdead_beef), None);
     }
+
+    // ── BPF driver-pack decoders ────────────────────────────────────────────
+
+    fn binder_write_read_payload(
+        write_size: u64,
+        write_consumed: u64,
+        read_size: u64,
+        read_consumed: u64,
+    ) -> Vec<u8> {
+        let mut p = vec![0u8; 48];
+        p[0..8].copy_from_slice(&write_size.to_le_bytes());
+        p[8..16].copy_from_slice(&write_consumed.to_le_bytes());
+        p[24..32].copy_from_slice(&read_size.to_le_bytes());
+        p[32..40].copy_from_slice(&read_consumed.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn decode_binder_write_read_returns_scalar_summary() {
+        let cmd = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
+        let decoded = decode_ioctl(
+            cmd,
+            &binder_write_read_payload(16, 8, 32, 4),
+            0,
+            Some(FdKind::Binder),
+        );
+        assert_eq!(decoded.family, IoctlFamily::Binder);
+        assert_eq!(decoded.name, Some("BINDER_WRITE_READ"));
+        match decoded.fields {
+            IoctlFields::BinderWriteRead {
+                write_size,
+                write_consumed,
+                read_size,
+                read_consumed,
+            } => {
+                assert_eq!(write_size, 16);
+                assert_eq!(write_consumed, 8);
+                assert_eq!(read_size, 32);
+                assert_eq!(read_consumed, 4);
+            }
+            other => panic!("expected BinderWriteRead fields, got {other:?}"),
+        }
+        let json = render_decoded_ioctl_json(&decoded);
+        let v: serde_json::Value = serde_json::from_str(&format!("{{\"x\":1{json}}}")).unwrap();
+        assert_eq!(v["binder_write_read"]["write_size"], 16);
+        assert_eq!(v["binder_write_read"]["read_consumed"], 4);
+    }
+
+    #[test]
+    fn decode_kgsl_mali_and_alsa_driver_families_with_scalar_fields() {
+        let kgsl_cmd = (3u32 << 30) | (32u32 << 16) | (0x09u32 << 8) | 0x2f;
+        let mut kgsl_payload = vec![0u8; 32];
+        kgsl_payload[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+        kgsl_payload[8..16].copy_from_slice(&0x2000u64.to_le_bytes());
+        let kgsl = decode_ioctl_with_context(
+            kgsl_cmd,
+            &kgsl_payload,
+            -22,
+            Some(FdKind::Device),
+            Some("/dev/kgsl-3d0"),
+        );
+        assert_eq!(kgsl.family, IoctlFamily::Kgsl);
+        assert_eq!(kgsl.name, Some("IOCTL_KGSL_GPUMEM_ALLOC"));
+        assert!(matches!(kgsl.fields, IoctlFields::DriverScalars { .. }));
+
+        let mali_cmd = (3u32 << 30) | (16u32 << 16) | (0x80u32 << 8);
+        let mali = decode_ioctl_with_context(
+            mali_cmd,
+            &[0u8; 16],
+            0,
+            Some(FdKind::Device),
+            Some("/dev/mali0"),
+        );
+        assert_eq!(mali.family, IoctlFamily::Mali);
+        assert_eq!(mali.name, Some("KBASE_IOCTL_VERSION_CHECK"));
+
+        let alsa_cmd = (3u32 << 30) | (32u32 << 16) | (0x50u32 << 8) | 0x10;
+        let alsa = decode_ioctl_with_context(
+            alsa_cmd,
+            &[0u8; 32],
+            -25,
+            Some(FdKind::Device),
+            Some("/dev/snd/pcmC0D0p"),
+        );
+        assert_eq!(alsa.family, IoctlFamily::Alsa);
+        assert!(alsa.name.is_some());
+        let json = render_decoded_ioctl_json(&alsa);
+        let v: serde_json::Value = serde_json::from_str(&format!("{{\"x\":1{json}}}")).unwrap();
+        assert_eq!(v["alsa"]["compat_candidate"], true);
+    }
 }

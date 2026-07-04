@@ -96,4 +96,24 @@ mod tests {
         assert!(recipe.contains("summarize"));
         assert!(recipe.contains("window"));
     }
+
+    #[test]
+    fn bpf_gap_recipes_are_registered() {
+        let mut cmd = crate::cli::Cli::command();
+        let recipes = cmd
+            .find_subcommand_mut("recipes")
+            .expect("recipes subcommand");
+        let mut help = Vec::new();
+        recipes.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for name in [
+            "binder-lpe",
+            "gpu-driver-harness",
+            "alsa-mali-chain",
+            "unix-socket-race",
+            "media-service-crash",
+        ] {
+            assert!(help.contains(name), "missing recipe {name}:\n{help}");
+        }
+    }
 }

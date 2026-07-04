@@ -218,4 +218,27 @@ mod tests {
         let path = resolve_path(&ev, true).expect("resolved path");
         assert!(path.ends_with("/Cargo.toml"), "resolved path was {path}");
     }
+
+    #[test]
+    fn format_data_field_decodes_unix_control_message_metadata() {
+        let mut data = [0u8; 128];
+        // msg_controllen at data[64..72], first cmsghdr summary at 80..100.
+        data[64..72].copy_from_slice(&24u64.to_le_bytes());
+        data[80..88].copy_from_slice(&24u64.to_le_bytes()); // cmsg_len
+        data[88..92].copy_from_slice(&1u32.to_le_bytes()); // SOL_SOCKET
+        data[92..96].copy_from_slice(&1u32.to_le_bytes()); // SCM_RIGHTS
+        data[96..100].copy_from_slice(&2u32.to_le_bytes()); // two fds
+        let ev = SyscallEvent {
+            syscall_nr: 211,
+            args: [3, 0, 0x2, 0, 0, 0], // MSG_PEEK in syscall flags
+            data,
+            ..SyscallEvent::default()
+        };
+        let s = format_data_field(&ev).expect("metadata string");
+        assert!(s.contains("ctrl_len=24"), "got {s}");
+        assert!(s.contains("cmsg_level=1"), "got {s}");
+        assert!(s.contains("cmsg_type=1"), "got {s}");
+        assert!(s.contains("scm_rights=2"), "got {s}");
+        assert!(s.contains("MSG_PEEK"), "got {s}");
+    }
 }

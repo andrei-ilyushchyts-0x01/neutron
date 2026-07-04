@@ -561,6 +561,16 @@ mod ioctl_policy_tests {
     }
 
     #[test]
+    fn runtime_refresh_policy_accepts_driver_pack_types() {
+        let kgsl = ioc(IOCTL_DIR_RW, IOCTL_TYPE_KGSL, 0x2f, 32);
+        let mali = ioc(IOCTL_DIR_R, IOCTL_TYPE_MALI_KBASE, 0, 16);
+        let alsa_pcm = ioc(IOCTL_DIR_RW, IOCTL_TYPE_ALSA_PCM, 0x10, 32);
+        assert!(ioctl_runtime_refresh_candidate(kgsl));
+        assert!(ioctl_runtime_refresh_candidate(mali));
+        assert!(ioctl_runtime_refresh_candidate(alsa_pcm));
+    }
+
+    #[test]
     fn write_only_command_is_not_refreshed() {
         // _IOW means the kernel only reads the user buffer — no post-call data.
         let cmd = ioc(1, IOCTL_TYPE_BINDER_OR_DMA_BUF, 1, 32);

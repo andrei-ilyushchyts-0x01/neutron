@@ -1210,6 +1210,33 @@ mod tests {
     }
 
     #[test]
+    fn format_event_json_emits_unix_msg_control_object() {
+        let mut data = [0u8; 128];
+        data[64..72].copy_from_slice(&24u64.to_le_bytes());
+        data[80..88].copy_from_slice(&24u64.to_le_bytes());
+        data[88..92].copy_from_slice(&1u32.to_le_bytes());
+        data[92..96].copy_from_slice(&1u32.to_le_bytes());
+        data[96..100].copy_from_slice(&2u32.to_le_bytes());
+        let ev = SyscallEvent {
+            syscall_nr: 211,
+            args: [3, 0, 0x2, 0, 0, 0],
+            is_enter: 1,
+            data,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        let ctrl = v
+            .get("unix_msg_control")
+            .and_then(|x| x.as_object())
+            .expect("unix_msg_control object");
+        assert_eq!(ctrl.get("controllen").and_then(|x| x.as_u64()), Some(24));
+        assert_eq!(ctrl.get("cmsg_level").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(ctrl.get("cmsg_type").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(ctrl.get("scm_rights_fds").and_then(|x| x.as_u64()), Some(2));
+        assert_eq!(ctrl.get("msg_peek").and_then(|x| x.as_bool()), Some(true));
+    }
+
+    #[test]
     fn non_ioctl_event_omits_ioctl_fields_and_keeps_data_phase_enter() {
         let ev = SyscallEvent {
             syscall_nr: 56, // openat
