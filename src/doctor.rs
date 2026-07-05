@@ -561,4 +561,15 @@ mod tests {
         let results = vec![CheckResult::pass("a", "ok"), CheckResult::warn("b", "soft")];
         assert_eq!(print_and_exit_code(&results), 0);
     }
+
+    #[test]
+    fn stack_trace_map_create_warns_on_permission_denied() {
+        let result = stack_trace_map_create_check_from_result(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.reason.contains("STACK_TRACES"));
+        assert!(result.reason.contains("EPERM"));
+    }
 }

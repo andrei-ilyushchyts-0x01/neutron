@@ -2488,4 +2488,18 @@ mod tests {
 
         assert!(any_individual_match_flag(&args));
     }
+
+    #[test]
+    fn stack_map_warning_is_silent_when_stacks_are_not_requested() {
+        assert!(missing_stack_map_warning(false, false).is_none());
+    }
+
+    #[test]
+    fn stack_map_warning_explains_stackful_object_when_stacks_are_requested() {
+        let warning = missing_stack_map_warning(true, false)
+            .expect("stackless object with --stacks should warn");
+
+        assert!(warning.contains("--stacks"));
+        assert!(warning.contains("neutron-stacks.bpf.elf"));
+    }
 }

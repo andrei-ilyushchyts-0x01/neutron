@@ -664,4 +664,20 @@ mod tests {
         assert!(err.contains("bpf-linker"));
         assert!(err.contains("cargo install bpf-linker"));
     }
+
+    #[test]
+    fn ebpf_stackless_build_plan_is_the_default_object_without_stack_feature() {
+        let plan = EbpfBuildPlan::new(false, EbpfStackMode::Stackless);
+
+        assert_eq!(plan.output_name(), "neutron.bpf.elf");
+        assert!(plan.cargo_feature_args().is_empty());
+    }
+
+    #[test]
+    fn ebpf_stacks_build_plan_uses_separate_object_and_feature() {
+        let plan = EbpfBuildPlan::new(true, EbpfStackMode::Stacks);
+
+        assert_eq!(plan.output_name(), "neutron-stacks.bpf.elf");
+        assert_eq!(plan.cargo_feature_args(), ["--features", "stacks"]);
+    }
 }
