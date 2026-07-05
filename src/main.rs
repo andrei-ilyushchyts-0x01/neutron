@@ -63,6 +63,7 @@ use neutron_common::{
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const SECURITY_PROFILE: &str = "security";
+const STACKFUL_BPF_OBJECT: &str = "neutron-stacks.bpf.elf";
 
 const SECURITY_EXCLUDE_COMM: &[&str] = &[
     "RenderThread",
@@ -341,6 +342,17 @@ fn load_bpf(object_path: &str) -> Result<Ebpf> {
     let bytes =
         fs::read(object_path).with_context(|| format!("cannot read BPF object {object_path}"))?;
     Ebpf::load(&bytes).with_context(|| format!("Ebpf::load failed for {object_path}"))
+}
+
+fn missing_stack_map_warning(stacks_requested: bool, stack_map_present: bool) -> Option<String> {
+    if stacks_requested && !stack_map_present {
+        Some(format!(
+            "--stacks requested but this BPF object has no STACK_TRACES map; \
+             use {STACKFUL_BPF_OBJECT} or rebuild with `cargo xtask build-ebpf --stacks`"
+        ))
+    } else {
+        None
+    }
 }
 
 fn attach_tracepoint(bpf: &mut Ebpf, name: &str, category: &str, event: &str) -> Result<()> {
@@ -1345,6 +1357,10 @@ fn run_trace(mut args: Args) -> Result<()> {
 
     // 1. Load BPF and attach tracepoints.
     let mut bpf = load_bpf(&args.object)?;
+    let has_stack_map = bpf.map("STACK_TRACES").is_some();
+    if let Some(warning) = missing_stack_map_warning(args.stacks, has_stack_map) {
+        eprintln!("neutron: WARNING: {warning}");
+    }
 
     attach_tracepoint(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
     attach_tracepoint(&mut bpf, "trace_sys_exit", "raw_syscalls", "sys_exit")?;

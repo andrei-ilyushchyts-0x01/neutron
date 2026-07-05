@@ -19,6 +19,10 @@ aya-ebpf       = "0.1"
 aya-log-ebpf   = "0.1"
 neutron-common = { path = "../neutron-common" }
 
+[features]
+default = []
+stacks = []
+
 [profile.release]
 lto = true
 opt-level = 3  # required: verifier rejects unoptimized BPF bytecode patterns

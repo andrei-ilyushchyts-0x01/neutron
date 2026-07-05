@@ -10,7 +10,8 @@
 //!   `bpf_probe_read_user_str_*`) are available — used in preference to the
 //!   address-space-agnostic helpers 4 / 45.
 //! - BTF + CO-RE compatible (Aya performs runtime BTF relocation).
-//! - Stack traces via `bpf_get_stackid` + `BPF_MAP_TYPE_STACK_TRACE`.
+//! - Optional stack traces via the `stacks` feature, `bpf_get_stackid`, and
+//!   `BPF_MAP_TYPE_STACK_TRACE`.
 //! - Output via BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`, kernel 5.8+) — single
 //!   multi-producer ring, lossless, no per-CPU juggling.
 //!
@@ -22,27 +23,30 @@
 use core::mem::{size_of, MaybeUninit};
 use core::ptr::{addr_of, addr_of_mut};
 
+#[cfg(feature = "stacks")]
+use aya_ebpf::{bindings::BPF_F_USER_STACK, maps::StackTrace};
 use aya_ebpf::{
-    bindings::BPF_F_USER_STACK,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_kernel_buf, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::{Array, HashMap, RingBuf, StackTrace},
+    maps::{Array, HashMap, RingBuf},
     programs::TracePointContext,
 };
 use neutron_common::{
     is_state_tracking_nr, ret_matches_class, ExitSource, SyscallEvent, COUNTER_EVENTS_SUBMITTED,
     COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
-    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED,
-    COUNTER_STACK_USER_FAILED, COUNTER_UNIX_MSG_CONTROL_NESTED, COUNTER_UNIX_MSG_CONTROL_TRUNCATED,
-    FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF, FILTER_KEY_IOCTL_DIR, FILTER_KEY_LATENCY_MIN_US,
-    FILTER_KEY_MATCH_BITS, FILTER_KEY_PID, FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED,
-    FILTER_MAP_SLOT_COUNT, MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR,
-    MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
-    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
+    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_UNIX_MSG_CONTROL_NESTED,
+    COUNTER_UNIX_MSG_CONTROL_TRUNCATED, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF,
+    FILTER_KEY_IOCTL_DIR, FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_PID,
+    FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED, FILTER_MAP_SLOT_COUNT, MATCH_BIT_ARG_U32,
+    MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE,
+    MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID, SYSCALL_NR_BINDER_RECEIVED,
+    SYSCALL_NR_PROCESS_EXIT,
 };
+#[cfg(feature = "stacks")]
+use neutron_common::{COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED};
 
 // COUNTER_PATH_READ_FAILED and COUNTER_PATH_TRUNCATED slot indices are reserved
 // in neutron-common but not yet incremented here — wiring per-call-site error
@@ -86,6 +90,7 @@ static PID_WHITELIST: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
 static WATCH_FDS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
 /// Stack trace map. 127 frames * 8 bytes = 1016 bytes per slot.
+#[cfg(feature = "stacks")]
 #[map]
 static STACK_TRACES: StackTrace = StackTrace::with_max_entries(16384, 0);
 
@@ -727,6 +732,37 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
     }
 }
 
+#[inline(always)]
+fn capture_stack_ids(ctx: &TracePointContext) -> (i32, i32) {
+    #[cfg(feature = "stacks")]
+    unsafe {
+        // Negative return is fine; the legacy wire format stores it as-is.
+        // `get_stackid` invokes helper 27 and requires STACK_TRACES to exist
+        // in the object, so keep the whole path behind the `stacks` feature.
+        let kernel = match STACK_TRACES.get_stackid(ctx, 0) {
+            Ok(id) => id as i32,
+            Err(e) => {
+                bump_counter(COUNTER_STACK_KERNEL_FAILED);
+                e as i32
+            }
+        };
+        let user = match STACK_TRACES.get_stackid(ctx, BPF_F_USER_STACK as u64) {
+            Ok(id) => id as i32,
+            Err(e) => {
+                bump_counter(COUNTER_STACK_USER_FAILED);
+                e as i32
+            }
+        };
+        (kernel, user)
+    }
+
+    #[cfg(not(feature = "stacks"))]
+    {
+        let _ = ctx;
+        (-1, -1)
+    }
+}
+
 // ── Programs ─────────────────────────────────────────────────────────────────
 
 #[tracepoint]
@@ -794,22 +830,7 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
 
         capture_syscall_data(ev, nr, &args);
 
-        // Stack traces — negative return is fine; the legacy code stores it
-        // as-is. `get_stackid` invokes helper 27.
-        let kid = match STACK_TRACES.get_stackid(ctx, 0) {
-            Ok(id) => id as i32,
-            Err(e) => {
-                bump_counter(COUNTER_STACK_KERNEL_FAILED);
-                e as i32
-            }
-        };
-        let uid_stack = match STACK_TRACES.get_stackid(ctx, BPF_F_USER_STACK as u64) {
-            Ok(id) => id as i32,
-            Err(e) => {
-                bump_counter(COUNTER_STACK_USER_FAILED);
-                e as i32
-            }
-        };
+        let (kid, uid_stack) = capture_stack_ids(ctx);
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
         addr_of_mut!((*ev).user_stackid).write_unaligned(uid_stack);
 
@@ -1055,20 +1076,7 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
         // userspace casts back to i32.
         addr_of_mut!((*ev).ptr_hint).write_unaligned(debug_id as u32 as u64);
 
-        let kid = match STACK_TRACES.get_stackid(ctx, 0) {
-            Ok(id) => id as i32,
-            Err(e) => {
-                bump_counter(COUNTER_STACK_KERNEL_FAILED);
-                e as i32
-            }
-        };
-        let uid_stack = match STACK_TRACES.get_stackid(ctx, BPF_F_USER_STACK as u64) {
-            Ok(id) => id as i32,
-            Err(e) => {
-                bump_counter(COUNTER_STACK_USER_FAILED);
-                e as i32
-            }
-        };
+        let (kid, uid_stack) = capture_stack_ids(ctx);
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
         addr_of_mut!((*ev).user_stackid).write_unaligned(uid_stack);
 
@@ -1218,24 +1226,7 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
         let args: [u64; 6] = [0, 0, ExitSource::Tracepoint as u64, 0, 0, 0];
         addr_of_mut!((*ev).args).write_unaligned(args);
 
-        // Optional kernel/user stacks at exit time. The user stack is
-        // typically just the libc exit() trampoline, but the kernel stack
-        // can show do_exit / oom_kill_process / get_signal. Capture both
-        // for parity with the binder tracepoint path.
-        let kid = match STACK_TRACES.get_stackid(ctx, 0) {
-            Ok(id) => id as i32,
-            Err(e) => {
-                bump_counter(COUNTER_STACK_KERNEL_FAILED);
-                e as i32
-            }
-        };
-        let uid_stack = match STACK_TRACES.get_stackid(ctx, BPF_F_USER_STACK as u64) {
-            Ok(id) => id as i32,
-            Err(e) => {
-                bump_counter(COUNTER_STACK_USER_FAILED);
-                e as i32
-            }
-        };
+        let (kid, uid_stack) = capture_stack_ids(ctx);
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
         addr_of_mut!((*ev).user_stackid).write_unaligned(uid_stack);
 

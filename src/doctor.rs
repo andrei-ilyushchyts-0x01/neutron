@@ -7,6 +7,7 @@
 //!   - Kernel ≥ 6.1 with BTF, tracefs, bpffs
 //!   - BPF ringbuf support (kernel 5.8+)
 //!   - `raw_syscalls/sys_{enter,exit}` tracepoints
+//!   - Real `BPF_MAP_TYPE_STACK_TRACE` creation capability (warn if missing)
 //!   - `binder/binder_transaction` tracepoint (warn if missing)
 //!   - `/proc/kallsyms` readable (kptr_restrict)
 //!   - SELinux mode (warn if enforcing for an unprivileged caller)
@@ -17,6 +18,7 @@
 //! `Warn`, and `1` if any check is `Fail`.
 
 use std::fs;
+use std::io;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,7 @@ pub trait Env {
     fn read_to_string(&self, path: &str) -> std::io::Result<String>;
     fn path_exists(&self, path: &str) -> bool;
     fn arch(&self) -> &str;
+    fn create_stack_trace_map(&self) -> io::Result<()>;
 }
 
 pub struct RealEnv;
@@ -92,12 +95,67 @@ impl Env for RealEnv {
     fn arch(&self) -> &str {
         std::env::consts::ARCH
     }
+    fn create_stack_trace_map(&self) -> io::Result<()> {
+        try_create_stack_trace_map()
+    }
 }
 
 // ── Individual checks ────────────────────────────────────────────────────────
 
 const CAP_SYS_ADMIN: u8 = 21;
 const CAP_BPF: u8 = 39;
+const BPF_MAP_CREATE: libc::c_uint = 0;
+const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
+const STACK_TRACE_KEY_SIZE: u32 = 4;
+const STACK_TRACE_VALUE_SIZE: u32 = 127 * 8;
+
+#[repr(C)]
+#[derive(Default)]
+struct BpfMapCreateAttr {
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+    inner_map_fd: u32,
+    numa_node: u32,
+    map_name: [u8; 16],
+    map_ifindex: u32,
+    btf_fd: u32,
+    btf_key_type_id: u32,
+    btf_value_type_id: u32,
+    btf_vmlinux_value_type_id: u32,
+    map_extra: u64,
+}
+
+fn try_create_stack_trace_map() -> io::Result<()> {
+    let attr = BpfMapCreateAttr {
+        map_type: BPF_MAP_TYPE_STACK_TRACE,
+        key_size: STACK_TRACE_KEY_SIZE,
+        value_size: STACK_TRACE_VALUE_SIZE,
+        max_entries: 1,
+        ..BpfMapCreateAttr::default()
+    };
+    // SAFETY: `attr` points to a stable, zero-initialized BPF_MAP_CREATE
+    // attribute block for the duration of the syscall. The fd, when returned,
+    // is closed immediately below.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_CREATE,
+            &attr as *const BpfMapCreateAttr,
+            std::mem::size_of::<BpfMapCreateAttr>(),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was returned by the kernel and is owned by this process.
+    unsafe {
+        libc::close(fd as libc::c_int);
+    }
+    Ok(())
+}
 
 fn parse_cap_eff(status: &str) -> Option<u64> {
     status.lines().find_map(|line| {
@@ -268,6 +326,39 @@ pub fn check_raw_syscalls<E: Env>(env: &E) -> CheckResult {
     }
 }
 
+fn errno_label(err: &io::Error) -> &'static str {
+    match err.raw_os_error() {
+        Some(libc::EPERM) => "EPERM",
+        Some(libc::EACCES) => "EACCES",
+        Some(libc::EINVAL) => "EINVAL",
+        Some(libc::ENOSYS) => "ENOSYS",
+        _ if err.kind() == io::ErrorKind::PermissionDenied => "EPERM",
+        _ => "error",
+    }
+}
+
+fn stack_trace_map_create_check_from_result(result: io::Result<()>) -> CheckResult {
+    match result {
+        Ok(()) => CheckResult::pass(
+            "STACK_TRACES map",
+            "BPF_MAP_TYPE_STACK_TRACE create succeeded",
+        ),
+        Err(err) => CheckResult::warn(
+            "STACK_TRACES map",
+            format!(
+                "STACK_TRACES map create failed ({}: {err}); default stackless captures \
+                 still work, but --stacks requires neutron-stacks.bpf.elf and a domain \
+                 allowed to create BPF_MAP_TYPE_STACK_TRACE",
+                errno_label(&err)
+            ),
+        ),
+    }
+}
+
+pub fn check_stack_trace_map_create<E: Env>(env: &E) -> CheckResult {
+    stack_trace_map_create_check_from_result(env.create_stack_trace_map())
+}
+
 pub fn check_binder_tracepoint<E: Env>(env: &E) -> CheckResult {
     let p = "/sys/kernel/tracing/events/binder/binder_transaction";
     if env.path_exists(p) {
@@ -331,6 +422,7 @@ pub fn run_all<E: Env>(env: &E) -> Vec<CheckResult> {
         check_tracefs(env),
         check_bpffs(env),
         check_raw_syscalls(env),
+        check_stack_trace_map_create(env),
         check_binder_tracepoint(env),
         check_kallsyms(env),
         check_selinux(env),
@@ -432,6 +524,9 @@ mod tests {
         }
         fn arch(&self) -> &str {
             &self.arch
+        }
+        fn create_stack_trace_map(&self) -> io::Result<()> {
+            Ok(())
         }
     }
 

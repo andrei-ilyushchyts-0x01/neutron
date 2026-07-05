@@ -3,6 +3,7 @@
 //! Usage:
 //!   cargo xtask build-ebpf          # debug build
 //!   cargo xtask build-ebpf release  # release build
+//!   cargo xtask build-ebpf --stacks # stackful object for --stacks captures
 //!   cargo xtask build               # build everything (ebpf + userspace aarch64-musl)
 //!   cargo xtask deploy              # build + adb push to device
 //!   cargo xtask demo                # build + push demo target; print run instructions
@@ -21,14 +22,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const EBPF_OBJ_NAME: &str = "neutron.bpf.elf";
+const EBPF_STACKS_OBJ_NAME: &str = "neutron-stacks.bpf.elf";
 const DEMO_BIN: &str = "demo-target";
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("build-ebpf") => {
-            let release = args.next().as_deref() == Some("release");
-            build_ebpf(release)
+            let plan = parse_ebpf_build_args(args, EbpfStackMode::Stackless)?;
+            build_ebpf_plan(plan)
+        }
+        Some("build-ebpf-stacks") => {
+            let plan = parse_ebpf_build_args(args, EbpfStackMode::Stacks)?;
+            build_ebpf_plan(plan)
         }
         Some("build") => {
             build_ebpf(true)?;
@@ -65,12 +71,72 @@ fn main() -> Result<()> {
         Some(cmd) => bail!("unknown command: {cmd}"),
         None => {
             println!(
-                "Usage: cargo xtask <build-ebpf [release] | build | deploy \
+                "Usage: cargo xtask <build-ebpf [--stacks] [release] | build-ebpf-stacks [release] | build | deploy \
                 | demo | demo-hal | check-findings <file>>"
             );
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EbpfStackMode {
+    Stackless,
+    Stacks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EbpfBuildPlan {
+    release: bool,
+    stack_mode: EbpfStackMode,
+}
+
+impl EbpfBuildPlan {
+    fn new(release: bool, stack_mode: EbpfStackMode) -> Self {
+        Self {
+            release,
+            stack_mode,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self.stack_mode {
+            EbpfStackMode::Stackless => "stackless",
+            EbpfStackMode::Stacks => "stacks",
+        }
+    }
+
+    fn output_name(self) -> &'static str {
+        match self.stack_mode {
+            EbpfStackMode::Stackless => EBPF_OBJ_NAME,
+            EbpfStackMode::Stacks => EBPF_STACKS_OBJ_NAME,
+        }
+    }
+
+    fn cargo_feature_args(self) -> &'static [&'static str] {
+        match self.stack_mode {
+            EbpfStackMode::Stackless => &[],
+            EbpfStackMode::Stacks => &["--features", "stacks"],
+        }
+    }
+}
+
+fn parse_ebpf_build_args(
+    args: impl IntoIterator<Item = String>,
+    default_mode: EbpfStackMode,
+) -> Result<EbpfBuildPlan> {
+    let mut release = false;
+    let mut stack_mode = default_mode;
+    for arg in args {
+        match arg.as_str() {
+            "release" => release = true,
+            "--stacks" => stack_mode = EbpfStackMode::Stacks,
+            other => bail!(
+                "unknown build-ebpf argument `{other}`; usage: cargo xtask build-ebpf [--stacks] [release]"
+            ),
+        }
+    }
+    Ok(EbpfBuildPlan::new(release, stack_mode))
 }
 
 fn workspace_root() -> PathBuf {
@@ -148,12 +214,17 @@ fn preflight_ebpf_build() -> Result<()> {
 }
 
 fn build_ebpf(release: bool) -> Result<()> {
+    build_ebpf_plan(EbpfBuildPlan::new(release, EbpfStackMode::Stackless))
+}
+
+fn build_ebpf_plan(plan: EbpfBuildPlan) -> Result<()> {
     let root = workspace_root();
     let ebpf_dir = root.join("neutron-ebpf");
 
     println!(
-        "=== Building BPF programs ({}) ===",
-        if release { "release" } else { "debug" }
+        "=== Building BPF programs ({} {}) ===",
+        if plan.release { "release" } else { "debug" },
+        plan.label(),
     );
     preflight_ebpf_build()?;
 
@@ -172,7 +243,9 @@ fn build_ebpf(release: bool) -> Result<()> {
         .env("CARGO_PROFILE_DEV_LTO", "fat")
         .env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1");
 
-    if release {
+    cmd.args(plan.cargo_feature_args());
+
+    if plan.release {
         cmd.arg("--release");
     }
 
@@ -181,7 +254,7 @@ fn build_ebpf(release: bool) -> Result<()> {
         bail!("BPF build failed");
     }
 
-    let profile = if release { "release" } else { "debug" };
+    let profile = if plan.release { "release" } else { "debug" };
     let obj = root
         .join("target/bpfel-unknown-none")
         .join(profile)
@@ -189,7 +262,7 @@ fn build_ebpf(release: bool) -> Result<()> {
 
     println!("  BPF object: {}", obj.display());
 
-    let dest = root.join(EBPF_OBJ_NAME);
+    let dest = root.join(plan.output_name());
     std::fs::copy(&obj, &dest)
         .with_context(|| format!("copy {} -> {}", obj.display(), dest.display()))?;
     println!("  Copied to: {}", dest.display());
