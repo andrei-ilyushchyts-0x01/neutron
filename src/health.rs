@@ -162,6 +162,10 @@ pub struct UserspaceHealth {
     /// `events_matched` because backward+forward ring flushes emit
     /// multiple lines per match.
     pub events_emitted: u64,
+    /// True when `--max-output-size` stopped the primary output stream.
+    /// Important because the main NDJSON file may be missing the final
+    /// `capture_health` line unless `--health-output` was also used.
+    pub output_cap_hit: bool,
 }
 
 /// Static capture configuration surfaced in the shutdown health event.
@@ -210,6 +214,9 @@ pub fn format_summary_with(
             "  matched: {}  sampled-out: {}  emitted: {}\n",
             user.events_matched, user.events_sampled_out, user.events_emitted
         ));
+    }
+    if user.output_cap_hit {
+        out.push_str("  output cap hit: true\n");
     }
     if health.has_degradation() {
         out.push_str(
@@ -264,12 +271,13 @@ pub fn format_capture_health_json_with_metadata(
     }
     let _ = write!(
         s,
-        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"degraded":{}"#,
+        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"output_cap_hit":{},"degraded":{}"#,
         user.fd_graph_miss,
         user.fd_graph_backfilled,
         user.events_matched,
         user.events_sampled_out,
         user.events_emitted,
+        user.output_cap_hit,
         health.has_degradation()
     );
     write_string_array(&mut s, "driver_packs", &meta.driver_packs);
@@ -406,6 +414,7 @@ mod tests {
             events_matched: 50,
             events_sampled_out: 5,
             events_emitted: 60,
+            output_cap_hit: false,
         };
         let line = format_capture_health_json(&h, &user, 99_999);
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
@@ -418,6 +427,7 @@ mod tests {
         assert_eq!(v["events_matched"], 50u64);
         assert_eq!(v["events_sampled_out"], 5u64);
         assert_eq!(v["events_emitted"], 60u64);
+        assert_eq!(v["output_cap_hit"], false);
         assert_eq!(v["degraded"], true);
     }
 

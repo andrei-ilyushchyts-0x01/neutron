@@ -12,6 +12,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write as IoWrite};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -639,6 +640,9 @@ fn resolve_match_packages(args: &mut Args) -> Result<()> {
         let uid = android::resolve_package_uid(&package)
             .with_context(|| format!("resolving --match-package {package}"))?;
         eprintln!("  match package: {package} -> uid {uid}");
+        if let Some(warning) = android::match_package_uid_warning(&package, uid) {
+            eprintln!("neutron: WARNING: {warning}");
+        }
         args.match_uid.push(uid.to_string());
     }
     Ok(())
@@ -862,6 +866,86 @@ fn populate_ioctl_refresh_maps(bpf: &mut Ebpf, cfg: &DriverPackConfig) -> Result
     Ok(())
 }
 
+// ── Runtime preflight + capture lock ─────────────────────────────────────────
+
+fn capture_privilege_preflight(check: &doctor::CheckResult) -> Result<()> {
+    match check.status {
+        doctor::Status::Pass => Ok(()),
+        doctor::Status::Warn => {
+            eprintln!("neutron: WARNING: privilege preflight: {}", check.reason);
+            Ok(())
+        }
+        doctor::Status::Fail => bail!(
+            "privilege preflight failed: {}. Run `neutron doctor` for the full \
+             environment check. On rooted Android use adb shell \"su -c '...'\" \
+             so neutron runs in the privileged domain, not as shell.",
+            check.reason
+        ),
+    }
+}
+
+fn default_capture_lock_path() -> PathBuf {
+    let android_tmp = Path::new("/data/local/tmp");
+    if android_tmp.is_dir() {
+        android_tmp.join("neutron.capture.lock")
+    } else {
+        std::env::temp_dir().join("neutron.capture.lock")
+    }
+}
+
+fn resolve_capture_lock_path(raw: &str) -> Result<Option<PathBuf>> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return Ok(Some(default_capture_lock_path()));
+    }
+    if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(raw)))
+}
+
+#[derive(Debug)]
+struct CaptureLock {
+    _file: fs::File,
+}
+
+impl CaptureLock {
+    fn acquire(path: &str) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening capture lock {path}"))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Self { _file: file });
+        }
+        let err = io::Error::last_os_error();
+        let raw = err.raw_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock
+            || raw == Some(libc::EWOULDBLOCK)
+            || raw == Some(libc::EAGAIN)
+        {
+            bail!(
+                "another neutron capture appears active (lock {path}); run one capture at a time \
+                 or pass --capture-lock off for advanced debugging"
+            );
+        }
+        Err(err).with_context(|| format!("locking capture lock {path}"))
+    }
+}
+
+fn acquire_capture_lock(raw: &str) -> Result<Option<CaptureLock>> {
+    let Some(path) = resolve_capture_lock_path(raw)? else {
+        eprintln!("neutron: WARNING: capture lock disabled by --capture-lock off");
+        return Ok(None);
+    };
+    let path_s = path.to_string_lossy().into_owned();
+    Ok(Some(CaptureLock::acquire(&path_s)?))
+}
+
 // ── Output sink ──────────────────────────────────────────────────────────────
 
 fn parse_size_bytes(raw: Option<&str>, flag_name: &str) -> Result<Option<u64>> {
@@ -1059,6 +1143,18 @@ fn open_output(
     } else {
         Ok(base)
     }
+}
+
+fn write_health_sidecar<P: AsRef<Path>>(path: Option<P>, line: &str) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let path = path.as_ref();
+    let mut body = String::with_capacity(line.len() + 1);
+    body.push_str(line);
+    body.push('\n');
+    fs::write(path, body)
+        .with_context(|| format!("writing capture health sidecar {}", path.to_string_lossy()))
 }
 
 // ── Stack symbolization helper ───────────────────────────────────────────────
@@ -1328,6 +1424,9 @@ fn run_trace(mut args: Args) -> Result<()> {
     }
 
     print_banner();
+    let privilege = doctor::check_privilege(&doctor::RealEnv);
+    capture_privilege_preflight(&privilege)?;
+    let _capture_lock = acquire_capture_lock(&args.capture_lock)?;
     eprintln!("  loading {}", args.object);
     eprintln!(
         "  target pid: {}",
@@ -2232,6 +2331,7 @@ fn run_trace(mut args: Args) -> Result<()> {
         events_matched,
         events_sampled_out,
         events_emitted,
+        output_cap_hit: output_cap_hit.load(Ordering::Relaxed),
     };
     if let Some(map) = bpf.map("COUNTERS") {
         match Array::<_, u64>::try_from(map) {
@@ -2242,10 +2342,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                     format_summary_with(&health, &user_health, total_events)
                 );
                 // Phase 5c — machine-readable counterpart on the NDJSON
-                // stream. Lets downstream tools see the same counters
-                // without scraping stderr prose. Stderr block stays
-                // intact for human readers.
-                if args.json {
+                // stream and, optionally, a sidecar independent of the
+                // primary output cap. Stderr block stays intact for humans.
+                if args.json || args.health_output.is_some() {
                     let capture_meta = CaptureMetadata {
                         driver_packs: driver_packs.names.clone(),
                         kprobe_packs: args
@@ -2263,7 +2362,12 @@ fn run_trace(mut args: Args) -> Result<()> {
                         total_events,
                         &capture_meta,
                     );
-                    let _ = writeln!(out, "{line}");
+                    if let Err(e) = write_health_sidecar(args.health_output.as_deref(), &line) {
+                        eprintln!("neutron: WARNING: {e:#}");
+                    }
+                    if args.json {
+                        let _ = writeln!(out, "{line}");
+                    }
                 }
             }
             Err(e) => {
@@ -2378,8 +2482,9 @@ mod tests {
 
     #[test]
     fn match_package_shared_uid_warning_is_silent_for_app_uid() {
-        assert!(android::match_package_uid_warning("com.google.android.GoogleCamera", 10145)
-            .is_none());
+        assert!(
+            android::match_package_uid_warning("com.google.android.GoogleCamera", 10145).is_none()
+        );
     }
 
     #[test]
@@ -2399,7 +2504,8 @@ mod tests {
 
     #[test]
     fn health_sidecar_writes_even_when_primary_output_cap_is_hit() {
-        let base = std::env::temp_dir().join(format!("neutron-health-sidecar-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("neutron-health-sidecar-{}", std::process::id()));
         let out_path = base.with_extension("ndjson");
         let health_path = base.with_extension("health.ndjson");
         let out_s = out_path.to_string_lossy().into_owned();
@@ -2412,8 +2518,11 @@ mod tests {
         let _ = out.write_all(b"abcd");
         assert!(hit.load(Ordering::Relaxed));
 
-        write_health_sidecar(Some(&health_s), r#"{"type":"capture_health","output_cap_hit":true}"#)
-            .expect("write sidecar");
+        write_health_sidecar(
+            Some(&health_s),
+            r#"{"type":"capture_health","output_cap_hit":true}"#,
+        )
+        .expect("write sidecar");
 
         let health = std::fs::read_to_string(&health_path).expect("read sidecar");
         assert!(health.contains(r#""type":"capture_health""#));

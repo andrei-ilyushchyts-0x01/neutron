@@ -19,6 +19,8 @@ pub enum RecipesCommand {
     UnixSocketRace,
     /// Media service crash workflow using media HAL driver packs.
     MediaServiceCrash,
+    /// Sequential Android system-app sweep with package status and health sidecars.
+    SystemAppSweep,
 }
 
 pub fn android_content_provider_recipe() -> &'static str {
@@ -158,6 +160,110 @@ adb shell /data/local/tmp/neutron window /data/local/tmp/media_service_crash.ndj
 "#
 }
 
+pub fn system_app_sweep_recipe() -> &'static str {
+    r#"# Android System-App Sweep Recipe
+
+Run one package-scoped capture at a time and keep the final
+type:"capture_health" line in a sidecar so output caps remain auditable.
+
+adb shell 'cat > /data/local/tmp/neutron_system_app_sweep.sh' <<'EOF'
+#!/system/bin/sh
+set -u
+
+OUT_DIR="${1:-/data/local/tmp/neutron_system_app_sweep}"
+DURATION="${2:-4}"
+RATE_LIMIT="${3:-200}"
+MAX_OUTPUT="${4:-256k}"
+
+NEUTRON="/data/local/tmp/neutron"
+BPF="/data/local/tmp/neutron.bpf.elf"
+
+mkdir -p "$OUT_DIR/captures"
+PKG_LIST="$OUT_DIR/pm_list_packages_s_f_U_show_versioncode.txt"
+SUMMARY="$OUT_DIR/summary.tsv"
+
+pm list packages -s -U -f --show-versioncode > "$PKG_LIST"
+printf 'package\tuid\tversionCode\tapk_path\tmonkey_status\tneutron_status\texit_code\tbytes\tlines\thealth_output_cap_hit\n' > "$SUMMARY"
+
+cleanup_neutron() {
+  for pid in $(pidof neutron 2>/dev/null); do kill -INT "$pid" 2>/dev/null || true; done
+  sleep 1
+  for pid in $(pidof neutron 2>/dev/null); do kill -KILL "$pid" 2>/dev/null || true; done
+}
+
+while IFS= read -r line; do
+  case "$line" in package:*) ;; *) continue ;; esac
+  body="${line#package:}"
+  path_pkg="${body%% versionCode:*}"
+  rest="${body#* versionCode:}"
+  version="${rest%% uid:*}"
+  uid="${body##* uid:}"
+  pkg="${path_pkg##*=}"
+  apk_path="${path_pkg%=*}"
+  safe="$(printf '%s' "$pkg" | tr -c 'A-Za-z0-9_.-' '_')"
+  base="$OUT_DIR/captures/$safe"
+  ndjson="$base.ndjson"
+  health="$base.health.ndjson"
+  stderr="$base.stderr"
+  stdout="$base.stdout"
+  monkey_log="$base.monkey"
+  rm -f "$ndjson" "$health" "$stderr" "$stdout" "$monkey_log"
+  cleanup_neutron
+
+  timeout -s INT "$DURATION" "$NEUTRON" \
+    --object "$BPF" \
+    --json --raw --no-findings --no-logcat \
+    --fdgraph-interval off --lookback-events 0 \
+    --match-package "$pkg" \
+    --rate-limit "$RATE_LIMIT" \
+    --max-output-size "$MAX_OUTPUT" \
+    --health-output "$health" \
+    --output "$ndjson" \
+    > "$stdout" 2> "$stderr" &
+  neutron_pid="$!"
+
+  sleep 1
+  monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 > "$monkey_log" 2>&1
+  wait "$neutron_pid"
+  exit_code="$?"
+
+  if grep -q 'Events injected:' "$monkey_log" 2>/dev/null; then monkey_status="launcher_injected";
+  elif grep -q 'No activities found' "$monkey_log" 2>/dev/null; then monkey_status="no_launcher";
+  else monkey_status="monkey_other"; fi
+
+  if grep -q 'attached: trace_sys_enter' "$stderr" 2>/dev/null; then neutron_status="attached";
+  elif grep -q '^Error:' "$stderr" 2>/dev/null; then neutron_status="error";
+  else neutron_status="unknown"; fi
+
+  bytes="$(wc -c < "$ndjson" 2>/dev/null | tr -d ' ')"
+  lines="$(wc -l < "$ndjson" 2>/dev/null | tr -d ' ')"
+  cap_hit="$(grep -q '"output_cap_hit":true' "$health" 2>/dev/null && echo true || echo false)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$pkg" "$uid" "$version" "$apk_path" "$monkey_status" "$neutron_status" "$exit_code" "${bytes:-0}" "${lines:-0}" "$cap_hit" \
+    >> "$SUMMARY"
+done < "$PKG_LIST"
+
+cleanup_neutron
+EOF
+
+adb shell chmod 755 /data/local/tmp/neutron_system_app_sweep.sh
+adb shell su -c '/data/local/tmp/neutron_system_app_sweep.sh'
+
+Review:
+
+adb shell su -c "awk -F '\t' 'NR>1 && \$10==\"true\" {print}' /data/local/tmp/neutron_system_app_sweep/summary.tsv"
+
+Notes:
+- Run sequentially; neutron also holds a capture lock and exits early if a
+  second capture is active.
+- Treat low line counts as "needs targeted trigger", not as safe.
+- Treat packages resolving to shared/system UID warnings as UID-level traces,
+  not package-isolated evidence.
+- output_cap_hit in each health sidecar preserves cap accounting even when
+  the primary NDJSON cannot receive the final capture_health line.
+"#
+}
+
 pub fn run(command: RecipesCommand) -> Result<()> {
     let mut stdout = io::stdout().lock();
     match command {
@@ -183,6 +289,10 @@ pub fn run(command: RecipesCommand) -> Result<()> {
         RecipesCommand::MediaServiceCrash => {
             writeln!(stdout, "{}", media_service_crash_recipe())
                 .context("writing media-service-crash recipe")?;
+        }
+        RecipesCommand::SystemAppSweep => {
+            writeln!(stdout, "{}", system_app_sweep_recipe())
+                .context("writing system-app-sweep recipe")?;
         }
     }
     Ok(())

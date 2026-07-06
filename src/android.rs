@@ -160,6 +160,23 @@ pub fn parse_package_uid_lines(output: &str, package: &str) -> Result<u32> {
     bail!("package {package} not found in package-manager output");
 }
 
+/// Explain the ambiguity introduced when package-scoped matching resolves to
+/// an Android platform/shared AID instead of a normal app UID. Runtime events
+/// are UID-scoped, so a package name alone cannot isolate one APK under these
+/// IDs.
+pub fn match_package_uid_warning(package: &str, uid: u32) -> Option<String> {
+    if uid >= 10_000 {
+        return None;
+    }
+    Some(format!(
+        "--match-package {package} resolved to shared/system UID {uid}; \
+         runtime filtering is UID-scoped, so this capture may include other \
+         processes using uid {uid}. Add --match-pid/--match-comm, fd filters, \
+         or a scenario-specific service capture before drawing package-specific \
+         conclusions."
+    ))
+}
+
 /// Resolve an Android content-provider authority to its declaring package.
 /// Intended to run on-device, where `dumpsys package providers` is available.
 pub fn resolve_provider_authority(authority: &str) -> Result<ProviderResolution> {

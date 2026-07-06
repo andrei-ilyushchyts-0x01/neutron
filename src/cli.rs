@@ -143,6 +143,18 @@ pub struct Args {
     #[arg(long, value_name = "SIZE")]
     pub rotate_output_size: Option<String>,
 
+    /// Write the final type:"capture_health" JSON line to this separate file.
+    /// Useful with --max-output-size because the primary output cap can prevent
+    /// the shutdown health line from being appended to the main NDJSON stream.
+    #[arg(long, value_name = "PATH")]
+    pub health_output: Option<String>,
+
+    /// Inter-process capture lock path. "auto" uses /data/local/tmp on Android
+    /// when present, otherwise the host temp directory. "off" disables the
+    /// lock for advanced debugging.
+    #[arg(long, default_value = "auto", value_name = "PATH|auto|off")]
+    pub capture_lock: String,
+
     /// Output events as NDJSON
     #[arg(long)]
     pub json: bool,
