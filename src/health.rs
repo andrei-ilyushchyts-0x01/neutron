@@ -429,4 +429,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["degraded"], false);
     }
+
+    #[test]
+    fn capture_health_json_reports_output_cap_hit() {
+        let h = CaptureHealth::default();
+        let user = UserspaceHealth {
+            output_cap_hit: true,
+            ..UserspaceHealth::default()
+        };
+        let line = format_capture_health_json(&h, &user, 7);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(v["output_cap_hit"], true);
+    }
+
+    #[test]
+    fn format_summary_reports_output_cap_hit() {
+        let h = CaptureHealth::default();
+        let user = UserspaceHealth {
+            output_cap_hit: true,
+            ..UserspaceHealth::default()
+        };
+        let s = format_summary_with(&h, &user, 7);
+
+        assert!(s.contains("output cap hit: true"));
+    }
 }

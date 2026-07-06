@@ -223,4 +223,22 @@ mod tests {
             assert!(help.contains(name), "missing recipe {name}:\n{help}");
         }
     }
+
+    #[test]
+    fn system_app_sweep_recipe_mentions_health_and_cap_accounting() {
+        let mut cmd = crate::cli::Cli::command();
+        let recipes = cmd
+            .find_subcommand_mut("recipes")
+            .expect("recipes subcommand");
+        let mut help = Vec::new();
+        recipes.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("system-app-sweep"));
+
+        let recipe = system_app_sweep_recipe();
+        assert!(recipe.contains("pm list packages -s"));
+        assert!(recipe.contains("--match-package"));
+        assert!(recipe.contains("--health-output"));
+        assert!(recipe.contains("output_cap_hit"));
+    }
 }

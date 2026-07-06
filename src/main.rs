@@ -2332,6 +2332,98 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_health_output_sidecar_path() {
+        let cli = Cli::try_parse_from(["neutron", "--health-output", "/tmp/neutron.health.ndjson"])
+            .expect("parse --health-output");
+
+        assert_eq!(
+            cli.args.health_output.as_deref(),
+            Some("/tmp/neutron.health.ndjson")
+        );
+    }
+
+    #[test]
+    fn cli_accepts_capture_lock_auto_and_off_modes() {
+        let cli = Cli::try_parse_from(["neutron"]).expect("parse default capture lock");
+        assert_eq!(cli.args.capture_lock, "auto");
+
+        let cli = Cli::try_parse_from(["neutron", "--capture-lock", "off"])
+            .expect("parse disabled capture lock");
+        assert_eq!(cli.args.capture_lock, "off");
+    }
+
+    #[test]
+    fn capture_privilege_preflight_rejects_doctor_failures() {
+        let check = doctor::CheckResult::fail(
+            "privilege",
+            "non-root (euid=2000) and CapEff=0x0 lacks CAP_BPF + CAP_SYS_ADMIN",
+        );
+
+        let err = capture_privilege_preflight(&check).expect_err("privilege failure should stop");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("privilege preflight failed"));
+        assert!(msg.contains("neutron doctor"));
+        assert!(msg.contains("adb shell"));
+    }
+
+    #[test]
+    fn match_package_shared_uid_warning_flags_system_aids() {
+        let warning = android::match_package_uid_warning("com.android.settings", 1000)
+            .expect("system UID should warn");
+
+        assert!(warning.contains("shared/system UID"));
+        assert!(warning.contains("com.android.settings"));
+        assert!(warning.contains("uid 1000"));
+    }
+
+    #[test]
+    fn match_package_shared_uid_warning_is_silent_for_app_uid() {
+        assert!(android::match_package_uid_warning("com.google.android.GoogleCamera", 10145)
+            .is_none());
+    }
+
+    #[test]
+    fn capture_lock_rejects_second_owner_until_first_drops() {
+        let path = std::env::temp_dir().join(format!("neutron-lock-test-{}", std::process::id()));
+        let path_s = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+
+        let first = CaptureLock::acquire(&path_s).expect("first lock owner");
+        let err = CaptureLock::acquire(&path_s).expect_err("second owner should fail");
+        assert!(format!("{err:#}").contains("another neutron capture appears active"));
+
+        drop(first);
+        let _second = CaptureLock::acquire(&path_s).expect("lock released after drop");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn health_sidecar_writes_even_when_primary_output_cap_is_hit() {
+        let base = std::env::temp_dir().join(format!("neutron-health-sidecar-{}", std::process::id()));
+        let out_path = base.with_extension("ndjson");
+        let health_path = base.with_extension("health.ndjson");
+        let out_s = out_path.to_string_lossy().into_owned();
+        let health_s = health_path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&health_path);
+
+        let hit = Arc::new(AtomicBool::new(false));
+        let mut out = open_output(Some(&out_s), Some(4), None, hit.clone()).expect("open output");
+        let _ = out.write_all(b"abcd");
+        assert!(hit.load(Ordering::Relaxed));
+
+        write_health_sidecar(Some(&health_s), r#"{"type":"capture_health","output_cap_hit":true}"#)
+            .expect("write sidecar");
+
+        let health = std::fs::read_to_string(&health_path).expect("read sidecar");
+        assert!(health.contains(r#""type":"capture_health""#));
+        assert!(health.ends_with('\n'));
+
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&health_path);
+    }
+
+    #[test]
     fn capped_writer_sets_flag_without_exceeding_limit() {
         let hit = Arc::new(AtomicBool::new(false));
         let inner: Box<dyn IoWrite> = Box::new(Vec::<u8>::new());
