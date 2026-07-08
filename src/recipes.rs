@@ -21,6 +21,12 @@ pub enum RecipesCommand {
     MediaServiceCrash,
     /// Sequential Android system-app sweep with package status and health sidecars.
     SystemAppSweep,
+    /// App launch baseline-vs-test workflow ending in a Markdown boundary report.
+    LaunchDiff,
+    /// User-action baseline-vs-test workflow ending in a Markdown boundary report.
+    ActionDiff,
+    /// Native surface and Binder-heavy workflow ending in a Markdown boundary report.
+    NativeSurfaceAudit,
 }
 
 pub fn android_content_provider_recipe() -> &'static str {
@@ -264,6 +270,132 @@ Notes:
 "#
 }
 
+pub fn launch_diff_recipe() -> &'static str {
+    r#"# Launch Diff Recipe
+
+Capture an idle package-scoped baseline, launch the app, then render a
+Markdown boundary report with explicit package labeling.
+
+1. Baseline:
+
+adb shell su -c '/data/local/tmp/neutron \
+  --json --raw --no-findings --no-logcat \
+  --fdgraph-interval off --lookback-events 0 \
+  --match-package com.example.app \
+  --rate-limit 1000 \
+  --max-output-size 250mb \
+  --health-output /data/local/tmp/launch_baseline.health.ndjson \
+  --output /data/local/tmp/launch_baseline.ndjson'
+
+2. Launch:
+
+adb shell monkey -p com.example.app -c android.intent.category.LAUNCHER 1
+
+adb shell su -c '/data/local/tmp/neutron \
+  --json --raw --binder --driver-pack binder \
+  --match-package com.example.app \
+  --capture matched+context=2s \
+  --rate-limit 1000 \
+  --max-output-size 250mb \
+  --health-output /data/local/tmp/launch_test.health.ndjson \
+  --output /data/local/tmp/launch_test.ndjson'
+
+3. Report:
+
+neutron report /data/local/tmp/launch_test.ndjson \
+  --baseline /data/local/tmp/launch_baseline.ndjson \
+  --package com.example.app \
+  --title "Launch Boundary Report" \
+  --output launch-boundary-report.md
+"#
+}
+
+pub fn action_diff_recipe() -> &'static str {
+    r#"# Action Diff Recipe
+
+Capture before/after traces around one user action and turn the behavior
+delta into a Markdown boundary report.
+
+1. Baseline:
+
+adb shell su -c 'timeout -s INT 10 /data/local/tmp/neutron \
+  --json --raw --binder --driver-pack binder \
+  --match-package com.example.app \
+  --capture matched+context=1s \
+  --rate-limit 1000 \
+  --max-output-size 250mb \
+  --output /data/local/tmp/action_baseline.ndjson'
+
+2. Action capture:
+
+adb shell su -c 'timeout -s INT 20 /data/local/tmp/neutron \
+  --json --raw --binder --driver-pack binder \
+  --match-package com.example.app \
+  --capture matched+context=2s \
+  --rate-limit 1000 \
+  --max-output-size 250mb \
+  --output /data/local/tmp/action_test.ndjson' &
+
+adb shell su -c '/data/local/tmp/neutron mark transfer_button \
+  --phase start --output /data/local/tmp/action_test.ndjson'
+
+# Trigger the user action under test.
+
+adb shell su -c '/data/local/tmp/neutron mark transfer_button \
+  --phase end --output /data/local/tmp/action_test.ndjson'
+
+wait
+
+3. Report:
+
+neutron report /data/local/tmp/action_test.ndjson \
+  --baseline /data/local/tmp/action_baseline.ndjson \
+  --package com.example.app \
+  --title "Action Boundary Report" \
+  --output action-boundary-report.md
+"#
+}
+
+pub fn native_surface_audit_recipe() -> &'static str {
+    r#"# Native Surface Audit Recipe
+
+Capture Binder plus native driver handoffs, prepare Binder attribution
+inputs, then render the Markdown boundary report.
+
+1. Capture:
+
+adb shell su -c '/data/local/tmp/neutron \
+  --profile driver-harness \
+  --driver-pack binder,kgsl,mali,media-hal \
+  --json --raw --binder \
+  --match-package com.example.app \
+  --capture matched+context=2s \
+  --rate-limit 1000 \
+  --max-output-size 500mb \
+  --output /data/local/tmp/native_surface.ndjson'
+
+2. Binder attribution inputs:
+
+adb shell service list -p > service-list-p.txt
+
+neutron binder-map service-list \
+  --input service-list-p.txt \
+  --output binder-catalog.json
+
+neutron binder-map template /data/local/tmp/native_surface.ndjson \
+  --output binder-services.template.json
+
+3. Report:
+
+neutron report /data/local/tmp/native_surface.ndjson \
+  --package com.example.app \
+  --binder-services binder-services.template.json \
+  --binder-catalog binder-catalog.json \
+  --title "Native Surface Boundary Report" \
+  --output native-surface-boundary-report.md
+"#
+}
+
 pub fn run(command: RecipesCommand) -> Result<()> {
     let mut stdout = io::stdout().lock();
     match command {
@@ -293,6 +425,16 @@ pub fn run(command: RecipesCommand) -> Result<()> {
         RecipesCommand::SystemAppSweep => {
             writeln!(stdout, "{}", system_app_sweep_recipe())
                 .context("writing system-app-sweep recipe")?;
+        }
+        RecipesCommand::LaunchDiff => {
+            writeln!(stdout, "{}", launch_diff_recipe()).context("writing launch-diff recipe")?;
+        }
+        RecipesCommand::ActionDiff => {
+            writeln!(stdout, "{}", action_diff_recipe()).context("writing action-diff recipe")?;
+        }
+        RecipesCommand::NativeSurfaceAudit => {
+            writeln!(stdout, "{}", native_surface_audit_recipe())
+                .context("writing native-surface-audit recipe")?;
         }
     }
     Ok(())

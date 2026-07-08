@@ -1404,6 +1404,8 @@ fn main() -> Result<()> {
         Some(Command::Window(args)) => neutron::window::run(args),
         Some(Command::Summarize(args)) => neutron::summarize::run(args),
         Some(Command::Diff(args)) => neutron::diff::run(args),
+        Some(Command::Report(args)) => neutron::report::run_report(args),
+        Some(Command::BinderMap(command)) => neutron::report::run_binder_map(command),
         Some(Command::Mark(args)) => neutron::mark::run(args),
         Some(Command::Recipes(command)) => neutron::recipes::run(command),
         None => run_trace(cli.args),
@@ -2345,6 +2347,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                 // stream and, optionally, a sidecar independent of the
                 // primary output cap. Stderr block stays intact for humans.
                 if args.json || args.health_output.is_some() {
+                    let mut match_pids = args.match_pid.clone();
+                    if args.pid != 0 {
+                        push_unique(&mut match_pids, args.pid.to_string());
+                    }
                     let capture_meta = CaptureMetadata {
                         driver_packs: driver_packs.names.clone(),
                         kprobe_packs: args
@@ -2355,6 +2361,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                         attached_programs: attached.iter().map(|s| (*s).to_string()).collect(),
                         ioctl_refresh_cmds: driver_packs.refresh_cmds.iter().copied().collect(),
                         ioctl_refresh_types: driver_packs.refresh_types.iter().copied().collect(),
+                        match_packages: args.match_package.clone(),
+                        match_uids: args.match_uid.clone(),
+                        match_pids,
                     };
                     let line = format_capture_health_json_with_metadata(
                         &health,

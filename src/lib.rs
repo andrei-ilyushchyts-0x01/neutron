@@ -15,6 +15,7 @@ pub mod mark;
 pub mod matcher;
 pub mod predicate;
 pub mod recipes;
+pub mod report;
 pub mod rules;
 pub mod sampler;
 pub mod sources;

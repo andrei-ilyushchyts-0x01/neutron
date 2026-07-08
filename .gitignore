@@ -23,6 +23,18 @@ training/model/*.pkl
 training/model/*.bin
 training/model/*.onnx
 
+# Generated report / Binder attribution artifacts can contain package names,
+# device-local paths, service topology, or other assessment evidence.
+*-boundary-report.md
+*.report.md
+neutron-report*.md
+binder-services*.json
+binder-catalog*.json
+service-list-p*.txt
+
+# Local release artifacts; publish deliberately via GitHub release assets.
+/dist/
+
 # Exception: synthetic golden fixtures committed for regression tests.
 # `examples/expected/` only contains hand-crafted decoder output; never real
 # device captures.

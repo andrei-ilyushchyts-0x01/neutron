@@ -10,6 +10,34 @@ workflow.
 
 ---
 
+## When Neutron is the wrong tool
+
+Use a different primary tool when the question is not about rooted Android
+kernel-boundary behavior:
+
+- You cannot use root, BPF, tracefs, or a supported aarch64 Android kernel.
+  Neutron is not a non-root app instrumentation framework.
+- You need Java/Kotlin method decisions, UI state, business logic, crypto
+  branches, or in-process anti-tamper logic that does not cross the kernel
+  boundary. Use static analysis, Frida, JDWP, or app instrumentation.
+- You need an attestation verdict, server-side risk score, or API response
+  semantics. Neutron can show local boundary handoff, not a remote decision.
+- You need full Binder Parcel arguments or AIDL return values. Neutron reports
+  routing metadata, service attribution when supplied, transaction code, and
+  lifecycle status; it does not decode arbitrary Parcels.
+- You need broad performance profiling, scheduling analysis, frame timing, or
+  power attribution. Use Perfetto, simpleperf, systrace, or Android Studio
+  Profiler.
+- You need production monitoring, stealth, persistence, exploit delivery, or
+  automated vulnerability verdicts. Those are explicit non-goals.
+
+Neutron is strongest when the claim can be phrased as: "during this authorized
+scenario, this PID/UID/package crossed these kernel surfaces, with this capture
+health." It is weak when the claim requires intent, source-level control flow,
+or data that never reached the kernel.
+
+---
+
 ## What neutron cannot fully infer today
 
 ### 1. Java / Kotlin method-level behavior
@@ -183,7 +211,8 @@ vulnerability, a feature, or a false positive is up to the analyst.
 
 | Limitation | Tracking version | Notes |
 |------------|------------------|-------|
-| Binder Parcel decoding | v1.2 | BINDER_WRITE_READ buffer parser; service-handle table |
+| Binder service attribution | v1.2 | Exact map/template/catalog helpers; candidate catalogs are not exact attribution |
+| Binder Parcel decoding | future | Full AIDL payload decoding remains out of scope for 1.2.0 |
 | FD → device/socket attribution for ioctl | v1.1 | Userspace FD graph (landed) |
 | FD-count rules / poller / rlimit awareness | sprint-1 PR 3 | `fd_snapshot` events + `fd_count_*` predicates |
 | ioctl decoder registry | sprint-1 PR 2 | DMA_HEAP_IOCTL_ALLOC decoded; family classification for binder / dma-buf / ashmem |

@@ -46,6 +46,14 @@ pub enum Command {
     /// both ran, what's different?"). Phase 2.
     Diff(crate::diff::DiffArgs),
 
+    /// Render a Markdown kernel-boundary report from an NDJSON capture.
+    Report(crate::report::ReportArgs),
+
+    /// Build Binder attribution helper JSON files from captures and
+    /// Android `service list -p` output.
+    #[command(subcommand)]
+    BinderMap(crate::report::BinderMapCommand),
+
     /// Append a `type:"marker"` NDJSON line to an output file (or
     /// stdout). Used to correlate external scenarios with the live
     /// trace; downstream `neutron window --anchor marker:<name>` cuts

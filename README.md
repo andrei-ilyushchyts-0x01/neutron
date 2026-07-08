@@ -1,458 +1,556 @@
 # neutron
 
-> **Aya-based syscall tracer for authorized Android security assessment.**
-> Targets kernel 6.1+ (Pixel 8 Pro / Android 14 GKI). Behavior-first observer
-> using eBPF tracepoints and a rule engine that emits high-level findings —
-> not a raw event firehose.
+Rooted Android kernel-boundary tracer for security research.
 
-[![status: verified-v1](https://img.shields.io/badge/status-verified--v1-blue.svg)](#status)
+`neutron` runs on a rooted Android device, attaches eBPF programs to kernel
+tracepoints, and records what an app or system service does at the
+syscall/ioctl/Binder/FD/crash boundary. It is useful when static review is too
+slow or too incomplete and you need runtime evidence without rewriting the
+capture path around ptrace or userspace injection.
+
 [![kernel: 6.1+](https://img.shields.io/badge/kernel-6.1%2B_aarch64-blue.svg)](#requirements)
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
-> ⚠️ **Authorized testing only.** This tool is intended for security research
-> on devices and applications you own or have explicit written authorization
-> to test. See [SECURITY.md](SECURITY.md) for the acceptable-use policy.
+Authorized testing only. Use this on devices and applications you own or have
+explicit written permission to assess. See [SECURITY.md](SECURITY.md).
 
-## What it is
+## When To Use It
 
-`neutron` is a behavior-first observer for Android applications. It loads a
-small set of eBPF programs into the kernel via [Aya](https://aya-rs.dev/),
-watches the syscalls a target process makes, and runs those events through a
-**rule engine** that emits structured **findings** — "this app polled
-`/proc/self/maps` every 2 seconds", "this app probed `/system/xbin/su` from a
-libc-rooted call stack", "this app allocated RWX memory" — instead of dumping
-multi-megabyte raw event logs.
+Use neutron when you need to answer questions like:
 
-It was built to answer one specific question: *what does a hardened Android
-app actually do at runtime, when its source is obfuscated and static reverse
-engineering would take days?*
+- Which syscalls did this app make during this scenario?
+- Did this package touch `/proc`, `/sys`, root artifacts, RWX memory, sockets,
+  Binder, DMA heap, KGSL/Mali, LWIS/GXP, or other driver surfaces?
+- Did a Binder call correlate with a callee crash?
+- Which package or service changed behavior between two scenarios?
+- Did a package-scoped smoke test produce enough signal to justify deeper work?
 
-`neutron` does not attach with `ptrace`, inject libraries, or modify the
-target's mount namespace, so it avoids many common user-space debugger and
-instrumentation checks (`TracerPid`, loaded-library scans, mount-table
-inspection). It is a *low-intrusion observer* — not a stealth bypass tool.
-See [Disclosure surface](#disclosure-surface) for what neutron does **not**
-hide.
+Do not treat neutron as a vulnerability scanner. It does not prove that an app
+is secure and it does not see Java/Kotlin method calls or full Binder Parcel
+payloads. Pair it with static analysis, API probes, Frida/JDWP when needed, and
+scenario-specific stimuli.
 
-## Who this is for
+## What It Observes
 
-`neutron` is for Android security researchers, reverse engineers, RASP
-engineers, and mobile platform specialists who need to understand how a
-protected Android application interacts with the OS at runtime. It is
-**intentionally not** a general-purpose Android profiler (use Perfetto,
-systrace, simpleperf, or Android Studio profiler for that), and it is
-**not** a one-click vulnerability scanner.
+neutron can observe:
 
-It is also a complement to dynamic instrumentation, not a replacement: use
-neutron to find *what and where*, then use Frida / Ghidra / radare2 to
-inspect or modify deeper.
+- raw syscalls from a PID, UID, Android package, or content-provider package
+- file/procfs/sysfs access, socket activity, mmap/mprotect RWX/WX transitions
+- ioctl families including binder/dma-buf, dma-heap, ashmem, KGSL, Mali, ALSA,
+  LWIS, and GXP where the decoder knows the command shape
+- Binder tracepoint metadata and paired `binder_call` events with latency and
+  crash status when `--binder` is enabled
+- process exits/crashes from BPF, logcat, and tombstone sources
+- FD pressure through periodic `fd_snapshot` events
+- optional stack IDs and symbols when using `neutron-stacks.bpf.elf`
 
-## What neutron can and cannot observe
+neutron cannot observe:
 
-neutron **can** observe, on a target Android process running under a
-supported kernel:
+- Java/Kotlin method-level control flow
+- pure in-process logic that does not cross the kernel boundary
+- full Binder Parcel argument payloads
+- delegated driver work if you only trace the original app UID and the work is
+  performed by `system_server`, a media service, a HAL, or a vendor daemon
 
-- direct syscalls made by the target process (every thread under the same
-  TGID — binder pool, JIT helpers, native workers, WebView/Chromium, SDK
-  threads)
-- `procfs` / `sysfs` / filesystem probes (self-inspection and cross-process)
-- memory permission transitions (RWX/WX mmap, mprotect)
-- selected socket activity (connect, bind, sendto, recvmsg)
-- `ioctl` activity with **typed userspace decoding** for known families
-  (DMA-heap allocations, binder write-read, ashmem control), including
-  post-exit re-read of return-write buffers
-- Binder transaction tracepoint metadata, **paired caller↔callee** by
-  `debug_id` into synthesised `binder_call` events with `latency_us` and
-  a lifecycle `status` (opt-in via `--binder`)
-- **Process termination** observed from three independent sources — the
-  `sched_process_exit` BPF tracepoint, the `logcat` tail (Java FATAL
-  EXCEPTION / native debuggerd / ANR), and a `/data/tombstones/` watcher.
-  Cross-correlated with binder causality to flag callee crashes
-  mid-transaction
-- **FD-table pressure** via a periodic `/proc/<pid>/fd` poller emitting
-  `fd_snapshot` events with `fd_count`, `fd_pct_of_rlimit`, growth rate,
-  and top-N path aggregation
-- user + kernel stack context where available (`--stacks`)
-
-neutron **cannot fully infer** today:
-
-- Java / Kotlin method-level behavior (no JVMTI / instrumentation)
-- full Binder Parcel contents (only tracepoint metadata + the AIDL `code`;
-  serialized arguments are not decoded)
-- runtime behavior that stays entirely inside userspace without making
-  syscalls (pure CPU work, intra-process method calls)
-- exit_code on the BPF `sched_process_exit` path — the tracepoint
-  payload does not carry it; userspace logcat / tombstone sources fill
-  in the signal info when available
-
-These limitations are tracked in [docs/LIMITATIONS.md](docs/LIMITATIONS.md);
-the cross-process causal-tracing roadmap lives in
-[docs/ROADMAP.md](docs/ROADMAP.md).
-
-## Status
-
-This is the **V1 verified baseline**. It targets a single hardware/kernel
-profile — Pixel 8 Pro running Android 14+ on kernel 6.1.x — and uses
-Aya 0.13, BTF + CO-RE, BPF ring buffer, and modern helpers throughout.
-There is no C compiler in the build pipeline.
-
-"Verified" means: every claim in this README is backed by either a unit
-test in the workspace, an integration test in `neutron-rules/tests/`, or a
-documented on-device transcript in `docs/devices/pixel8pro.md`. We do
-**not** claim general Android compatibility — broader device support is
-deliberately deferred until the rule pack and capture-health story are
-mature.
-
-## Disclosure surface
-
-What neutron does **not** hide:
-
-- Presence of root (KernelSU / Magisk) on the device
-- The neutron BPF programs themselves (`bpftool prog list` shows them)
-- The kernel's BPF / tracing subsystem state
-- Loaded BPF maps (`bpftool map list`)
-- SELinux domain of the calling process
-- Timing side-channels caused by BPF helper overhead
-- The broader test-environment fingerprint (debug build flags, special
-  device properties, test-bench network)
-
-A target that performs full environment fingerprinting (e.g. a
-hardened banking app that calls a remote attestation service) may notice
-these and refuse to run. neutron is meant for authorized assessment of
-applications you own or have written permission to test.
-
-## What's new in 1.2.0
-
-- **Predicate-based capture reduction.** New `--match-*` flags and
-  `--match '<expr>'` mini-language (AND/OR/NOT/parens, `=`/`!=`/`<`/
-  `<=`/`>`/`>=`/`IN`/`GLOB`) push the cheap subset
-  (pid/uid/syscall/ioctl-shape/ret/latency/`arg.u32@N`) into BPF maps
-  for kernel-side pre-drop, while userspace evaluates the full
-  predicate exactly. Compiler is a **safe over-approximation**: any
-  clause inside an `OR` or `NOT` that touches userspace-only fields
-  (fd_path, comm, prot, binder, arg.u8/u16/u64) contributes no kernel
-  filtering — correctness over volume reduction. State-tracking
-  syscalls (open/close/dup/socket/...) bypass the predicate when fd
-  fields are referenced so `FdGraph` stays consistent.
-- **`--capture matched+context=<DUR>`.** Always-on userspace ring of
-  recently-rejected events; on a match, flushes the previous `<DUR>`
-  of context and arms a forward window for the next `<DUR>`. The
-  "I don't know exactly when the bug fires" workflow.
-- **`--sample <p>` and `--rate-limit <N>`.** Probabilistic and
-  token-bucket volume controls; both bypass state-tracking and
-  binder/process_exit sentinels so `FdGraph` and the binder
-  correlator never lose pair halves.
-- **`neutron summarize` + `neutron diff` host-side subcommands.**
-  Streaming NDJSON aggregator (`--by syscall,fd_path,ret_class,...`)
-  and a delta comparator for negative-evidence workflows ("scenario A
-  vs B both ran the camera, what's different?").
-- **`neutron mark <name>` + `marker:<name>` window anchor.** Append
-  one `type:"marker"` NDJSON line so external scenarios bracket the
-  live trace; `neutron window --anchor marker:<name>` cuts the
-  bracketed window without timestamp grep'ing.
-- **LWIS / GXP ioctl decoder.** `ioctl_family` now classifies
-  `0x4c` ('L') as `lwis` and `0x47` / `0xee` as `gxp`.
-  `LWIS_CMD_PACKET` decodes the first u32 of the arg snapshot as a
-  human-readable command-packet ID name (e.g. `DEVICE_ENABLE`,
-  `DMA_BUFFER_ALLOC`).
-- **`--fd-snapshot-on-finding`.** Findings whose ioctl evidence
-  carries a usable fd get an `fdinfo_at_event` enrichment from a
-  synchronous `/proc/<pid>/fdinfo/<fd>` read at emit time.
-  Catches transient fds the 1-Hz poller misses.
-- **Binder service-map enrichment.** `binder_call` events now carry
-  the `target_node` handle. With `--binder-services <FILE>` (a JSON
-  `{callee_pid: {target_node: service_name}}` map dumped from
-  `service list -p`), known pairs gain a `service` field.
-- **Module-relative kernel symbols.** When `kptr_restrict` masks
-  `/proc/kallsyms`, `/proc/modules` is still readable —
-  kernel frames inside loaded modules render as `[<ko>]+0x<offset>`
-  instead of bare hex.
-- **`capture_health` JSON line on shutdown** in `--json` mode.
-  Mirrors the stderr summary block in machine-readable form, with
-  `degraded:bool` so consumers can gate "absence of finding is
-  conclusive" on a single field.
-
-Wire format unchanged (still 257 bytes). `FILTER_MAP` array bumps
-from 2 to 16 slots; existing slot indices stay in place. See
-[CHANGELOG.md](CHANGELOG.md) for the full delta.
-
-## What's new in 1.1.0
-
-- **Crash correlation.** Three independent sources feed a unified
-  `type:"process_exit"` event: the `sched_process_exit` BPF tracepoint,
-  a logcat tail (FATAL EXCEPTION / debuggerd / ANR), and a
-  `/data/tombstones/` watcher. Each emitted line carries a
-  `crash_context` lookback (the last N raw events neutron observed for
-  the PID), making findings self-contained evidence. New rule
-  `R003_process_crash` fires on fatal POSIX signals.
-- **Binder causality.** A new `binder_transaction_received` tracepoint
-  pairs with the existing `binder_transaction` by kernel-assigned
-  `debug_id` to produce synthesised `type:"binder_call"` events with
-  `caller_pid`, `callee_pid`, `code`, `latency_us`, and a lifecycle
-  `status`. New rule `R004_binder_callee_crash` fires when a callee
-  crashed with one of our caller's transactions in flight — the
-  strongest signal that a specific AIDL method triggered a HAL crash.
-- **`neutron window` host subcommand.** Cuts NDJSON event windows around
-  an anchor (`finding:RULE`, `crash`, `pid:N`, `event_id:N`,
-  `comm:SUBSTR`, `binder_call:STATUS`) with time-based or event-count
-  bounds. See [docs/guides/window.md](docs/guides/window.md).
-- **HAL-level resource observability.** A periodic FD-graph poller emits
-  `type:"fd_snapshot"` events; a post-exit ioctl decoder registry
-  produces typed `dma_heap` JSON nested objects. Two new rules
-  (`R001_fd_table_exhaustion`, `R002_dma_heap_allocation_burst`) put
-  these signals to work.
-- **Finding aggregates + raw_window.** Findings carry an optional
-  `aggregates` block (`events_per_sec`, peak/distinct counters per
-  event kind) and an optional `raw_window` array of full NDJSON lines
-  from contributing events.
-- **Schema cleanup.** Every NDJSON line carries `"type"`; syscalls add
-  `"phase"`, exit events add `"ok"` / `"errno"`, and a monotonic
-  per-session `"event_id"` correlation token is stamped on every line.
-
-Wire format unchanged (still 257 bytes); all schema additions are
-additive. See [CHANGELOG.md](CHANGELOG.md).
-
-## What's new in 1.0.0
-
-- 100% Rust BPF (`neutron-ebpf` crate, no `clang -target bpf`).
-- Aya 0.13 replaces ~1700 lines of hand-rolled `unsafe` (custom ELF parser,
-  relocation engine, perf-buffer mmap reader, raw `bpf()` syscall wrappers).
-- `RingBuf` (kernel 5.8+) instead of per-CPU `PerfEventArray` — single
-  multi-producer ring with the kernel's `bpf_ringbuf_reserve` API. Drops
-  occur when the ring fills up; they are counted in the `COUNTERS` BPF map
-  and surfaced in the **capture summary** that prints on exit. Absence of a
-  finding is only conclusive when the summary shows zero drops.
-- Capture-health observability: per-cause counters (ringbuf reserve fail,
-  inflight lookup miss, stack-id failures) plus a one-line warning banner
-  whenever any drop or degradation occurred during capture.
-- Wire format: the `args[5]` field is no longer hijacked for the enter
-  timestamp on exit events. A dedicated `enter_timestamp_ns` wire field
-  carries it instead, so all six syscall arguments are preserved (mmap
-  offset, clone3 size, etc. now decode correctly).
-- Findings schema v2: rules can declare a `behavior` slug, candidate
-  `interpretation`s, baseline `confidence`, and known `false_positives`.
-  Findings are framed as evidence + interpretation rather than as verdicts.
-  Today four rules opt into v2 (T001, T011, T017, T019); others migrate
-  incrementally.
-- `neutron doctor` preflight subcommand verifies privilege, kernel version,
-  BTF, tracefs, bpffs, ringbuf support, raw_syscalls + binder tracepoints,
-  kallsyms, SELinux mode, and architecture before you spend time loading.
-- Stack symbolization: native ELF symbols (via `goblin`), `/proc/kallsyms`
-  for kernel frames, ART JIT region detection (`<JIT>+0xN`).
-- Default detector pack grew from 15 to 22 rules (T001–T022 plus DexProtector
-  pack `DP001`–`DP008`). Stack-aware rules cover anonymous-mapping origin
-  scans and Frida thread-comm enumeration.
-- Removed: ARM64 PAN workarounds, `process_vm_readv` BPF fallback, helper 45
-  (`bpf_probe_read_str`), `vmlinux_4_14_aarch64.h`.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full migration notes.
-
-## Quickstart
-
-```bash
-# 1. Build the BPF object (Rust) and the userspace loader. Pushes both to
-#    /data/local/tmp/ on a connected device.
-./build.sh
-
-# 2. Find your target.
-export PID=$(adb shell pidof com.example.app)
-
-# 3. Run, get findings.
-adb shell su -c "/data/local/tmp/neutron \
-  --pid $PID \
-  --profile security \
-  --resolve-paths"
-```
-
-Default output is human-readable findings:
-
-```
-[FINDING] T001_proc_self_maps_polling root_detection MEDIUM
-  rule:    Periodic /proc/self/maps inspection
-  process: example.app (pid 21093)
-  events:  130 over 260000.0ms, period 2033.000ms
-  evidence:
-    [1037686946] <- openat(/proc/self/maps) ret=79
-    ...
-```
-
-For NDJSON: add `--json`. For raw per-event tracing: add `--raw`. To use a
-custom ruleset: `--rules path/to/rules.yaml`. With `--stacks`, native ELF
-symbols and ART JIT regions are resolved inline.
-
-See [docs/guides/quickstart.md](docs/guides/quickstart.md) for a longer
-walk-through.
-
-### Verify your install with the demo target
-
-A reference target binary at `examples/demo-target.rs` exercises every
-deterministically-fireable detector in the default pack (T001–T015, T021,
-T022) plus the FD-graph enrichment, in 18 numbered phases. To run it:
-
-```bash
-cargo xtask demo                     # builds + pushes demo-target
-# then on-device, in two terminals:
-adb shell su -c '/data/local/tmp/neutron --pid 0 --json' > demo-trace.ndjson
-adb shell '/data/local/tmp/demo-target'
-# Ctrl-C neutron when the demo prints "done", then:
-cargo xtask check-findings demo-trace.ndjson
-```
-
-The expected rule list is in `examples/expected/findings.txt`. Stack-aware
-rules (T016–T020) are not exercised because their golden output depends on
-per-device library layout.
-
-## Default detector pack
-
-Twenty-six rules ship in [`neutron-rules/rules/default.yaml`](neutron-rules/rules/default.yaml),
-covering the patterns that almost always show up in hardened-app assessments:
-
-| ID    | Category             | What it catches                                           |
-|-------|----------------------|-----------------------------------------------------------|
-| T001  | root_detection       | Periodic `/proc/self/maps` polling                        |
-| T002  | root_detection       | Mount table inspection (Magisk overlay detection)         |
-| T003  | antitamper           | `/proc/self/status` (TracerPid scrape)                    |
-| T004  | root_detection       | `su` binary probe                                         |
-| T005  | root_detection       | Magisk artifact probe                                     |
-| T006  | antitamper           | Frida artifact probe                                      |
-| T007  | antitamper           | Xposed / EdXposed artifact probe                          |
-| T008  | root_detection       | `Runtime.exec` of root-related binaries                   |
-| T009  | antitamper           | `ptrace` syscall observed                                 |
-| T010  | antitamper           | `prctl(PR_GET_DUMPABLE / PR_SET_DUMPABLE)`                |
-| T011  | memory               | RWX or W^X-violating memory mapping                       |
-| T012  | network_recon        | `/proc/net/tcp*` enumeration (Frida-port scan)            |
-| T013  | antitamper           | SELinux enforcement state probe                           |
-| T014  | antitamper           | Android property service access                           |
-| T015  | recon                | Cross-process `/proc/<pid>/{maps,cmdline,exe}` reads      |
-| T016  | root_detection       | `fstatat` on `su` binary with `libc` on the stack         |
-| T017  | antitamper           | Syscalls from inside the ART JIT code cache               |
-| T018  | antitamper           | `ptrace` resolved to `sys_ptrace` from native code        |
-| T019  | recon                | `/system/lib64/*` probing excluding RenderScript / Skia   |
-| T020  | antitamper           | `/proc/self/{maps,status,...}` from anonymous executable mapping |
-| T021  | antitamper           | Frida thread-comm enumeration via `/proc/<pid>/task/<tid>/comm` |
-| T022  | antitamper           | `bpf(2)` syscall from a non-system app process            |
-| R001  | resource_exhaustion  | FD table > 90% of `RLIMIT_NOFILE` (FD-graph poller)       |
-| R002  | resource_exhaustion  | DMA-heap allocation burst (50+ in 5 s)                    |
-| R003  | crash                | Process killed by fatal signal (SEGV/ABRT/BUS/ILL/FPE/SYS)|
-| R004  | crash                | Binder callee crashed mid-transaction                     |
-
-A separate DexProtector RASP pack (`DP001`–`DP008`) is bundled at
-`neutron-rules/rules/dexprotector-rasp.yaml`.
-
-See [docs/guides/writing-rules.md](docs/guides/writing-rules.md) and
-[docs/REFERENCE.md](docs/REFERENCE.md) for the YAML schema and the full CLI
-reference.
-
-## Architecture
-
-```
-┌────────────────────────────────────────┐               ┌──────────────────────────┐
-│ neutron-ebpf (aya-ebpf, Rust)          │               │ neutron (Aya loader)     │
-│ tracepoints:                           │               │ src/main.rs              │
-│   raw_syscalls/sys_{enter,exit}        │               │ ┌──────────────────────┐ │
-│   sched/sched_process_exit             │               │ │ Predicate eval (full)│ │
-│   binder/binder_transaction            │               │ │ Capture context ring │ │
-│   binder/binder_transaction_received   │  ringbuf      │ │ Sampler + rate limit │ │
-│                                        │  (events  )   │ │ FD-graph + fdinfo    │ │
-│ Stage 1 — BPF prefilter (Phase 1):     │──────────────▶│ │ Binder tracker       │ │
-│   pid/uid/syscall/ioctl-shape/         │               │ │ Tombstone + Logcat   │ │
-│   ret/latency/arg.u32@N (safe          │               │ │ Lookback ring buffer │ │
-│   over-approximation; AND-only)        │               │ │ Kernel resolver      │ │
-└────────────────────────────────────────┘               │ │  (kallsyms+modules)  │ │
-                                                         │ └──────────┬───────────┘ │
-                                                         └────────────┼─────────────┘
-                                                                      │ events (JSON)
-                                                                      ▼
-                                                            ┌─────────────────────┐
-                                                            │   neutron-rules     │
-                                                            │ MatchCondition →    │
-                                                            │ Finding queue +     │
-                                                            │ aggregates +        │
-                                                            │ raw_window +        │
-                                                            │ fdinfo_at_event     │
-                                                            └─────────┬───────────┘
-                                                                      │ findings
-                                                                      ▼
-                                                                 text / NDJSON
-                                                                      │
-                                                                      ▼
-                                                       ┌──────────────────────────────┐
-                                                       │ Host-side post-processors    │
-                                                       │  neutron window              │
-                                                       │  neutron summarize --by …    │
-                                                       │  neutron diff a b --by …     │
-                                                       │  neutron mark <name>         │
-                                                       └──────────────────────────────┘
-```
-
-- `neutron-ebpf/` — Aya BPF programs compiled to `bpfel-unknown-none`.
-  RingBuf for output, `bpf_get_stackid` for stacks, modern user/kernel
-  read helpers (112/113/114). Phase 1 added predicate-driven prefilter
-  maps (`MATCH_UID_SET`, `MATCH_IOCTL_{CMD,TYPE,NR}_SET`,
-  `MATCH_ARG_U32_VALS`) plus a 16-slot `FILTER_MAP` for predicate
-  scalars and the `STATE_EMIT_REQUIRED` toggle.
-- `src/main.rs` — userspace loader. Aya handles ELF parsing, relocation,
-  map creation, program load, tracepoint attach, and BTF/CO-RE.
-- `src/matcher.rs` + `src/predicate.rs` — Phase 1 capture predicate. The
-  matcher is the AND-of-flags builder + evaluator; the predicate is the
-  recursive-descent parser for `--match <expr>` and the safe-BPF
-  lowering compiler.
-- `src/capture.rs` — Phase 1c context-window ring buffer for
-  `--capture matched+context=<DUR>`.
-- `src/sampler.rs` — Phase 1d probability + token-bucket sampler with
-  state-tracking exemption.
-- `src/summarize.rs` + `src/diff.rs` — Phase 2 host-side NDJSON
-  aggregator and delta comparator.
-- `src/mark.rs` — Phase 5a `neutron mark` scenario-marker emitter.
-- `src/fdinfo.rs` — Phase 4a synchronous `/proc/<pid>/fdinfo/<fd>`
-  reader for finding enrichment.
-- `src/binder_services.rs` — Phase 4b optional
-  `(callee_pid, target_node) → service_name` map for `binder_call`
-  enrichment.
-- `src/symbolize/` — `ProcSymbolizer` (per-PID `/proc/<pid>/maps` + ELF
-  symbols + ART JIT detection), `KernelSymbolizer` (`/proc/kallsyms`),
-  and Phase 5b `KernelModules` (`/proc/modules` fallback when
-  kallsyms is masked). The bundled `KernelResolver` chains them.
-- `neutron-rules/` — declarative rule engine. Decoupled from the tracer so
-  the same ruleset applies to live events or offline NDJSON captures.
-- `neutron-common/` — shared `no_std` wire types (`SyscallEvent`, filter
-  keys, predicate match-bits, state-tracking syscall list).
-
-For deeper details see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The detailed limitations are in [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
 
 ## Requirements
 
-| Component | Version                                                         |
-|-----------|-----------------------------------------------------------------|
-| Device    | Pixel 8 Pro or any Android 14+ device with kernel 6.1+ and BTF, **rooted** |
-| Kernel    | 6.1.x aarch64 GKI (verified: 6.1.145-android14-11)              |
-| Root      | KernelSU or Magisk                                              |
-| Host      | Rust nightly (pinned via `rust-toolchain.toml`), `bpf-linker`, `aarch64-linux-gnu-gcc`, `adb` |
-| BPF caps  | `CAP_SYS_ADMIN` + `CAP_BPF` (provided by root)                  |
+Device:
 
-See [docs/devices/pixel8pro.md](docs/devices/pixel8pro.md) for the
-device baseline (kernel config, mountpoints, sysctls).
+- rooted Android device
+- aarch64 kernel 6.1+
+- BTF exposed at `/sys/kernel/btf/vmlinux`
+- tracefs at `/sys/kernel/tracing`
+- bpffs at `/sys/fs/bpf`
+- `CAP_BPF` and `CAP_SYS_ADMIN` in the domain that runs neutron
 
-## Documentation
+Verified baseline:
 
-- [man/man1/neutron.1](man/man1/neutron.1) — Unix man page (CLI reference). Preview with `man -l man/man1/neutron.1`; install with `sudo install -m 0644 man/man1/neutron.1 /usr/local/share/man/man1/ && sudo mandb`.
-- [docs/guides/quickstart.md](docs/guides/quickstart.md) — first-trace tutorial
-- [docs/guides/security-assessment.md](docs/guides/security-assessment.md) — assessment workflow
-- [docs/guides/bpf-tracing.md](docs/guides/bpf-tracing.md) — profiles, filtering, capture, stacks
-- [docs/guides/writing-rules.md](docs/guides/writing-rules.md) — author your own detectors
-- [docs/guides/output-formats.md](docs/guides/output-formats.md) — text + JSON schemas
-- [docs/guides/window.md](docs/guides/window.md) — host-side `neutron window` post-processor
-- [docs/guides/frida-integration.md](docs/guides/frida-integration.md) — Frida + BPF workflows
-- [docs/REFERENCE.md](docs/REFERENCE.md) — CLI flags, JSON schema, syscall table
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — internals
-- [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — what neutron cannot observe and why
-- [docs/FALSE-POSITIVES.md](docs/FALSE-POSITIVES.md) — known FP scenarios per default rule
-- [docs/ROADMAP.md](docs/ROADMAP.md) — what's next
+- Google Pixel 8 Pro (`husky`)
+- Android 16
+- kernel `6.1.145-android14-11`
+- KernelSU, run with `adb shell "su -c '...'"`.
 
-## Contributing
+Host build tools:
 
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md). Bug fixes, new rules, tests,
-and documentation improvements are very welcome.
+- Rust nightly, pinned by [rust-toolchain.toml](rust-toolchain.toml)
+- `bpf-linker`
+- `aarch64-linux-gnu-gcc`
+- Android platform tools (`adb`)
+
+Install build prerequisites on Ubuntu-like hosts:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y gcc-aarch64-linux-gnu android-tools-adb
+cargo install bpf-linker
+```
+
+## Install
+
+### Option A: Install From A GitHub Release
+
+Use this path when a release with Android assets has been published.
+
+```bash
+VERSION=v1.2.0
+REPO=andrei-ilyushchyts-0x01/neutron
+
+curl -LO "https://github.com/${REPO}/releases/download/${VERSION}/neutron-${VERSION}-android-aarch64.tar.gz"
+curl -LO "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+
+tar -xzf "neutron-${VERSION}-android-aarch64.tar.gz"
+cd "neutron-${VERSION}-android-aarch64"
+
+adb push neutron /data/local/tmp/neutron
+adb push neutron.bpf.elf /data/local/tmp/neutron.bpf.elf
+adb shell chmod +x /data/local/tmp/neutron
+```
+
+Run the preflight:
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron doctor'"
+```
+
+Expected result: `doctor` should exit successfully. Warnings about SELinux
+enforcing or masked kallsyms are normal on Pixel; privilege/BTF/tracefs/raw
+syscall failures must be fixed before tracing.
+
+### Option B: Build And Deploy From Source
+
+```bash
+git clone https://github.com/andrei-ilyushchyts-0x01/neutron.git
+cd neutron
+
+# Builds neutron.bpf.elf and the Android aarch64 userspace binary,
+# then pushes both to /data/local/tmp if adb is connected.
+./build.sh
+```
+
+Manual equivalent:
+
+```bash
+cargo xtask build-ebpf release
+cargo build --release --target aarch64-unknown-linux-musl --bin neutron
+
+adb push neutron.bpf.elf /data/local/tmp/neutron.bpf.elf
+adb push target/aarch64-unknown-linux-musl/release/neutron /data/local/tmp/neutron
+adb shell chmod +x /data/local/tmp/neutron
+adb shell "su -c '/data/local/tmp/neutron doctor'"
+```
+
+## First Capture
+
+Package-scoped capture is usually the best first run. It works even when the
+app has many processes because Android package names resolve to UIDs.
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron \
+  --json --raw --no-findings --no-logcat \
+  --fdgraph-interval off --lookback-events 0 \
+  --match-package com.example.app \
+  --rate-limit 200 \
+  --max-output-size 64mb \
+  --health-output /data/local/tmp/neutron.health.ndjson \
+  --output /data/local/tmp/neutron.ndjson'"
+
+adb pull /data/local/tmp/neutron.ndjson
+adb pull /data/local/tmp/neutron.health.ndjson
+```
+
+Read the health line first:
+
+```bash
+jq . neutron.health.ndjson
+```
+
+If `output_cap_hit` is `true`, the main NDJSON reached
+`--max-output-size`. The health sidecar is still complete.
+
+Important: if `--match-package` resolves to a shared/system UID such as `1000`,
+neutron prints a warning. In that case the trace is UID-scoped, not
+package-isolated. Add `--match-pid`, `--match-comm`, fd filters, or a
+service-specific scenario before making package-specific claims.
+
+## Common Capture Recipes
+
+### Trace One Running PID For Findings
+
+```bash
+PID="$(adb shell pidof com.example.app | tr -d '\r')"
+
+adb shell "su -c '/data/local/tmp/neutron \
+  --pid ${PID} \
+  --profile security \
+  --resolve-paths'"
+```
+
+Without `--raw`, neutron emits rule-engine findings only.
+
+### Save Raw NDJSON For One Package
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron \
+  --json --raw --no-findings \
+  --match-package com.example.app \
+  --rate-limit 1000 \
+  --max-output-size 250mb \
+  --health-output /data/local/tmp/app.health.ndjson \
+  --output /data/local/tmp/app.ndjson'"
+```
+
+### Rotate Long Captures Instead Of Stopping At A Cap
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron \
+  --json --raw --no-findings \
+  --match-package com.example.app \
+  --rate-limit 1000 \
+  --rotate-output-size 250mb \
+  --output /data/local/tmp/app.ndjson'"
+```
+
+This writes `/data/local/tmp/app.ndjson`, `/data/local/tmp/app.ndjson.1`, and
+so on. `--rotate-output-size` and `--max-output-size` are mutually exclusive.
+
+### Camera / Media HAL Scenario
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron \
+  --profile driver-harness \
+  --driver-pack media-hal,kgsl \
+  --json --raw --no-findings \
+  --capture matched+context=1s \
+  --rate-limit 2000 \
+  --max-output-size 250mb \
+  --health-output /data/local/tmp/camera.health.ndjson \
+  --output /data/local/tmp/camera.ndjson'"
+```
+
+Start the capture, exercise Camera, then stop neutron with Ctrl-C or
+`timeout -s INT`.
+
+### Binder Crash Correlation
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron \
+  --profile kernel-lpe \
+  --driver-pack binder \
+  --binder \
+  --json --raw \
+  --capture matched+context=2s \
+  --max-output-size 250mb \
+  --health-output /data/local/tmp/binder.health.ndjson \
+  --output /data/local/tmp/binder.ndjson'"
+```
+
+Review callee-crash windows:
+
+```bash
+adb shell /data/local/tmp/neutron window /data/local/tmp/binder.ndjson \
+  --anchor binder_call:callee_crashed \
+  --around 3s \
+  --summary
+```
+
+### Content Provider Research
+
+Trace a probing app plus the provider package UID resolved from an authority:
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron \
+  --json --raw --no-findings \
+  --match-package com.example.probe \
+  --match-android-provider content://com.android.contacts/contacts \
+  --rate-limit 1000 \
+  --max-output-size 250mb \
+  --health-output /data/local/tmp/provider.health.ndjson \
+  --output /data/local/tmp/provider.ndjson'"
+```
+
+### System App Sweep
+
+Print the built-in sweep recipe:
+
+```bash
+adb shell /data/local/tmp/neutron recipes system-app-sweep
+```
+
+The recipe runs one package at a time, records `monkey` status, attach status,
+line/byte counts, and a per-package health sidecar. Treat low line counts as
+"needs a targeted trigger", not as safe.
+
+## Three Boundary Report Workflows
+
+These built-in recipes print end-to-end commands and finish with
+`neutron report`, so the final artifact is a Markdown boundary report rather
+than only a table or event window.
+
+```bash
+neutron recipes launch-diff
+neutron recipes action-diff
+neutron recipes native-surface-audit
+```
+
+- `launch-diff`: compare idle baseline vs app launch.
+- `action-diff`: compare baseline vs one marked user action.
+- `native-surface-audit`: capture Binder plus native driver handoffs and use
+  Binder attribution helpers for service labeling.
+
+## Post-Process Captures
+
+The same `neutron` binary can analyze NDJSON files offline.
+
+Summarize syscall/ioctl activity:
+
+```bash
+adb shell /data/local/tmp/neutron summarize \
+  --by comm,syscall,ret_class \
+  --top 30 \
+  /data/local/tmp/app.ndjson
+
+adb shell /data/local/tmp/neutron summarize \
+  --by comm,ioctl_family,ioctl_name,ret_class \
+  --top 50 \
+  /data/local/tmp/camera.ndjson
+```
+
+Cut a small window around crashes, findings, markers, PIDs, or comm names:
+
+```bash
+adb shell /data/local/tmp/neutron window /data/local/tmp/app.ndjson \
+  --anchor crash \
+  --before-events 100 \
+  --after-events 50
+```
+
+Compare two scenario captures:
+
+```bash
+adb shell /data/local/tmp/neutron diff \
+  /data/local/tmp/baseline.ndjson \
+  /data/local/tmp/test.ndjson \
+  --by comm,syscall,ret_class \
+  --top 40
+```
+
+Bracket a live scenario with markers:
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron mark login --phase start --output /data/local/tmp/app.ndjson'"
+# trigger the scenario
+adb shell "su -c '/data/local/tmp/neutron mark login --phase end --output /data/local/tmp/app.ndjson'"
+```
+
+Then cut windows around `marker:login`.
+
+Render a Markdown boundary report:
+
+```bash
+neutron report app.ndjson \
+  --package com.example.app \
+  --title "App Boundary Report" \
+  --output app-boundary-report.md
+```
+
+Render a baseline diff report:
+
+```bash
+neutron report launch-test.ndjson \
+  --baseline launch-baseline.ndjson \
+  --package com.example.app \
+  --title "Launch Boundary Report" \
+  --output launch-boundary-report.md
+```
+
+For Binder-heavy captures, build helper files before the report:
+
+```bash
+adb shell service list -p > service-list-p.txt
+
+neutron binder-map service-list \
+  --input service-list-p.txt \
+  --output binder-catalog.json
+
+neutron binder-map template app.ndjson \
+  --output binder-services.template.json
+
+# Edit binder-services.template.json with exact service names when known.
+
+neutron report app.ndjson \
+  --binder-services binder-services.template.json \
+  --binder-catalog binder-catalog.json \
+  --package com.example.app \
+  --output app-boundary-report.md
+```
+
+`--binder-services` is exact `(callee_pid,target_node) -> service` attribution.
+`--binder-catalog` is candidate-only PID attribution from `service list -p`;
+the report labels it as candidates and does not present it as exact.
+
+Reports and Binder helper JSON can contain package names, device-local paths,
+service topology, and other assessment evidence. Treat them like captures:
+redact before sharing and do not commit real assessment outputs.
+
+## Output Modes
+
+Default mode:
+
+- findings only
+- human-readable text
+
+Useful flags:
+
+- `--json`: emit NDJSON
+- `--raw`: include raw event lines
+- `--no-findings`: suppress findings, useful for event-only captures
+- `--health-output PATH`: write final `capture_health` line to a sidecar file
+- `--max-output-size SIZE`: stop before filling storage
+- `--rotate-output-size SIZE`: write numbered output segments
+- `--rate-limit N`: cap emitted event rate
+- `--sample P`: probabilistic event sampling
+- `--capture matched+context=2s`: keep context around matched events
+
+See [docs/guides/output-formats.md](docs/guides/output-formats.md) for the JSON
+schema.
+
+## Troubleshooting
+
+### `privilege preflight failed`
+
+You probably ran neutron as the Android `shell` user instead of through root.
+Use:
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron doctor'"
+```
+
+Bad quoting can make `su` run the wrong payload. The trace path performs the
+same privilege check as `doctor` and exits early before BPF load.
+
+### `another neutron capture appears active`
+
+Only run one capture at a time. neutron holds a lock at
+`/data/local/tmp/neutron.capture.lock` by default. Use `--capture-lock off`
+only for advanced debugging.
+
+### `--match-package ... resolved to shared/system UID`
+
+The capture is UID-scoped. For UID `1000` and other platform/shared UIDs,
+events can come from other processes sharing that UID. Add narrower filters or
+trace the service/PID that actually handles the scenario.
+
+### `output_cap_hit: true`
+
+The primary output reached `--max-output-size`. Use the health sidecar to audit
+the capture, then rerun with a narrower scope, lower rate, or
+`--rotate-output-size`.
+
+### `ioctl_family:"dma_buf"` but `data` starts with `binder:`
+
+Binder and DMA-BUF share an ioctl magic value. neutron disambiguates with
+FD hints when available. Without a binder fd hint, the family can fall back to
+`dma_buf`; inspect `data`, `fd_kind`, and `fd_path` together.
+
+### Stack traces do not work
+
+The default `neutron.bpf.elf` is stackless for compatibility. Stack tracing
+requires `neutron-stacks.bpf.elf` and a domain that can create
+`BPF_MAP_TYPE_STACK_TRACE`.
+
+## Build And Test
+
+Fast host checks:
+
+```bash
+cargo test -p neutron --lib --bin neutron
+cargo test --workspace --exclude neutron-ebpf
+cargo clippy --workspace --exclude neutron-ebpf --all-targets -- -D warnings
+```
+
+BPF build check:
+
+```bash
+cargo xtask build-ebpf release
+```
+
+Android build:
+
+```bash
+cargo build --release --target aarch64-unknown-linux-musl --bin neutron
+```
+
+Plain `cargo test --workspace` is not the supported gate because the no_std BPF
+crate is not host-testable in the normal Rust test harness.
+
+## Release Assets
+
+To prepare local assets for a GitHub release:
+
+```bash
+# Run from a clean committed tree. The source tarball is created from git HEAD.
+scripts/package-release.sh
+```
+
+The script writes:
+
+- `dist/neutron-v<VERSION>-android-aarch64.tar.gz`
+- `dist/neutron-v<VERSION>-source.tar.gz`
+- `dist/SHA256SUMS`
+
+Suggested GitHub release contents:
+
+- attach the Android aarch64 tarball and `SHA256SUMS`
+- rely on GitHub's automatic source zip/tarball, or attach the explicit
+  source tarball from `dist/`
+- include the verified device profile and the `neutron doctor` result used for
+  the release
+- document the binary SHA-256 and BPF object SHA-256
+
+Example maintainer flow:
+
+```bash
+VERSION="v$(awk -F '"' '/^version =/ { print $2; exit }' Cargo.toml)"
+
+cargo test -p neutron --lib --bin neutron
+cargo test --workspace --exclude neutron-ebpf
+cargo clippy --workspace --exclude neutron-ebpf --all-targets -- -D warnings
+
+scripts/package-release.sh
+
+git tag -a "$VERSION" -m "neutron $VERSION"
+git push origin "$VERSION"
+
+gh release create "$VERSION" \
+  "dist/neutron-${VERSION}-android-aarch64.tar.gz" \
+  "dist/neutron-${VERSION}-source.tar.gz" \
+  dist/SHA256SUMS \
+  --verify-tag \
+  --title "neutron ${VERSION}" \
+  --notes "Android aarch64 release assets for neutron ${VERSION}."
+```
+
+Publishing a release changes GitHub state. Use `gh release create ...` only
+after maintainers have approved the tag, notes, and assets.
+
+## Documentation Map
+
+- [docs/guides/quickstart.md](docs/guides/quickstart.md): longer first-trace walkthrough
+- [docs/guides/security-assessment.md](docs/guides/security-assessment.md): assessment workflow
+- [docs/guides/bpf-tracing.md](docs/guides/bpf-tracing.md): profiles, filtering, capture, stacks
+- [docs/guides/writing-rules.md](docs/guides/writing-rules.md): custom detectors
+- [docs/guides/output-formats.md](docs/guides/output-formats.md): text and JSON schemas
+- [docs/guides/window.md](docs/guides/window.md): `neutron window`
+- [docs/guides/binder-attribution.md](docs/guides/binder-attribution.md): Binder service maps, templates, and catalogs
+- [docs/guides/frida-integration.md](docs/guides/frida-integration.md): Frida plus BPF workflows
+- [docs/case-studies/wallet-boundary.md](docs/case-studies/wallet-boundary.md): redacted wallet boundary report example
+- [docs/devices/pixel8pro.md](docs/devices/pixel8pro.md): verified device profile
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md): what neutron cannot see
+- [docs/ROADMAP.md](docs/ROADMAP.md): planned work
+- [CHANGELOG.md](CHANGELOG.md): version history
 
 ## License
 

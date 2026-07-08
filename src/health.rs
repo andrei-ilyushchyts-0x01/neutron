@@ -176,6 +176,9 @@ pub struct CaptureMetadata {
     pub attached_programs: Vec<String>,
     pub ioctl_refresh_cmds: Vec<u32>,
     pub ioctl_refresh_types: Vec<u32>,
+    pub match_packages: Vec<String>,
+    pub match_uids: Vec<String>,
+    pub match_pids: Vec<String>,
 }
 
 /// Render the capture summary as a single block of text, suitable for stderr.
@@ -285,6 +288,9 @@ pub fn format_capture_health_json_with_metadata(
     write_string_array(&mut s, "attached_programs", &meta.attached_programs);
     write_u32_array_hex(&mut s, "ioctl_refresh_cmds", &meta.ioctl_refresh_cmds);
     write_u32_array_hex(&mut s, "ioctl_refresh_types", &meta.ioctl_refresh_types);
+    write_string_array(&mut s, "match_packages", &meta.match_packages);
+    write_string_array(&mut s, "match_uids", &meta.match_uids);
+    write_string_array(&mut s, "match_pids", &meta.match_pids);
     s.push('}');
     s
 }
