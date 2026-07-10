@@ -134,6 +134,27 @@ fn print_banner() {
     eprintln!();
 }
 
+fn trimmed_nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn read_boot_id() -> Option<String> {
+    let value = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    trimmed_nonempty(&value)
+}
+
+fn read_build_fingerprint() -> Option<String> {
+    let output = std::process::Command::new("/system/bin/getprop")
+        .arg("ro.build.fingerprint")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    trimmed_nonempty(&String::from_utf8_lossy(&output.stdout))
+}
+
 // ── FD-poller config helpers (sprint-1 PR 3) ────────────────────────────────
 
 /// Parse `--fdgraph-interval` (`1s`, `500ms`, `off`). `Ok(None)` means
@@ -1407,7 +1428,20 @@ fn insert_causal_root(bpf: &mut Ebpf, pid: u32, trace_id: u64, generation: u16) 
     };
     traced
         .insert(pid, process_context_bytes(&context), 0)
-        .with_context(|| format!("adding new package root PID {pid}"))
+        .with_context(|| format!("adding new causal root PID {pid}"))
+}
+
+fn discover_dynamic_roots(args: &Args, package_uid: Option<u32>) -> Result<Option<Vec<u32>>> {
+    if let Some(package) = args.package.as_deref() {
+        let uid = package_uid.context("package UID missing for causal root refresh")?;
+        return android::find_package_processes(package, uid)
+            .with_context(|| format!("finding processes for --package {package}"))
+            .map(Some);
+    }
+    args.root_uid
+        .map(android::find_uid_processes)
+        .transpose()
+        .context("finding processes for --root-uid")
 }
 
 fn read_process_context(bpf: &Ebpf, pid: u32) -> Option<ProcessTraceContext> {
@@ -1421,6 +1455,7 @@ fn causal_metadata_for_event(
     ev: &SyscallEvent,
     scenarios: &ScenarioState,
     root_package: Option<&str>,
+    root_uid: Option<u32>,
 ) -> Option<CausalMetadata> {
     let generation = { ev.maps_generation };
     if generation == 0 {
@@ -1460,6 +1495,7 @@ fn causal_metadata_for_event(
         depth: wire.depth,
         relation: wire.relation,
         root_package: root_package.map(str::to_string),
+        root_uid,
     })
 }
 
@@ -1468,6 +1504,7 @@ fn causal_metadata_for_process_exit(
     context: ProcessTraceContext,
     scenario: &ScenarioInfo,
     root_package: Option<&str>,
+    root_uid: Option<u32>,
 ) -> CausalMetadata {
     let parent_span_id = if context.binder_debug_id == 0 {
         root_process_span_id(scenario.trace_id, ev.pid)
@@ -1486,6 +1523,7 @@ fn causal_metadata_for_process_exit(
             CausalRelation::Inferred
         },
         root_package: root_package.map(str::to_string),
+        root_uid,
     }
 }
 
@@ -1494,6 +1532,7 @@ fn live_marker_line(
     scenario: &ScenarioInfo,
     ts_ns: u64,
     root_package: Option<&str>,
+    root_uid: Option<u32>,
 ) -> String {
     let mut value = serde_json::json!({
         "type": "marker",
@@ -1510,6 +1549,9 @@ fn live_marker_line(
             "root_package".into(),
             serde_json::Value::String(package.into()),
         );
+    }
+    if let (Some(uid), Some(object)) = (root_uid, value.as_object_mut()) {
+        object.insert("root_uid".into(), serde_json::Value::from(uid));
     }
     serde_json::to_string(&value).expect("serializing marker JSON cannot fail")
 }
@@ -1648,6 +1690,7 @@ fn main() -> Result<()> {
         Some(Command::BinderMap(command)) => neutron::report::run_binder_map(command),
         Some(Command::Mark(args)) => neutron::mark::run(args),
         Some(Command::Graph(args)) => neutron::graph::run(args),
+        Some(Command::Surface(command)) => neutron::surface::run(command),
         Some(Command::Recipes(command)) => neutron::recipes::run(command),
         None => run_trace(cli.args),
     }
@@ -1660,7 +1703,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     if args.follow_binder {
         args.binder = true;
     }
-    if args.package.is_some() {
+    if args.package.is_some() || args.root_uid.is_some() {
         // Causal captures are NDJSON evidence streams even when the explicit
         // example omits the legacy output-mode flags.
         args.json = true;
@@ -1682,39 +1725,51 @@ fn run_trace(mut args: Args) -> Result<()> {
     let privilege = doctor::check_privilege(&doctor::RealEnv);
     capture_privilege_preflight(&privilege)?;
     let _capture_lock = acquire_capture_lock(&args.capture_lock)?;
-    let mut package_uid = None;
-    let mut root_pids = if let Some(package) = args.package.as_deref() {
-        let uid = android::resolve_package_uid(package)
-            .with_context(|| format!("resolving --package {package}"))?;
-        let pids = android::find_package_processes(package, uid)
-            .with_context(|| format!("finding processes for --package {package}"))?;
-        if pids.is_empty() {
-            bail!("no running process matches package {package} (uid {uid})");
-        }
-        package_uid = Some(uid);
+    let capture_boot_id = read_boot_id();
+    let capture_fingerprint = read_build_fingerprint();
+    let package_uid = args
+        .package
+        .as_deref()
+        .map(|package| {
+            android::resolve_package_uid(package)
+                .with_context(|| format!("resolving --package {package}"))
+        })
+        .transpose()?;
+    let mut root_pids = if let Some(pids) = discover_dynamic_roots(&args, package_uid)? {
         pids
     } else if args.pid != 0 {
         vec![args.pid]
     } else {
         Vec::new()
     };
+    if let (Some(package), Some(uid)) = (args.package.as_deref(), package_uid) {
+        if root_pids.is_empty() {
+            bail!("no running process matches package {package} (uid {uid})");
+        }
+    }
     if root_pids.len() > args.max_processes as usize {
         bail!(
-            "package has {} root processes, exceeding --max-processes {}",
+            "causal root has {} processes, exceeding --max-processes {}",
             root_pids.len(),
             args.max_processes
         );
     }
     eprintln!("  loading {}", args.object);
-    eprintln!(
-        "  target pid: {}",
-        if args.pid == 0 {
-            "all".to_string()
-        } else {
-            args.pid.to_string()
-        }
-    );
-    if args.pid == 0 {
+    if let Some(package) = args.package.as_deref() {
+        eprintln!("  root package: {package}");
+    } else if let Some(uid) = args.root_uid {
+        eprintln!("  root uid: {uid} ({} current processes)", root_pids.len());
+    } else {
+        eprintln!(
+            "  target pid: {}",
+            if args.pid == 0 {
+                "all".to_string()
+            } else {
+                args.pid.to_string()
+            }
+        );
+    }
+    if args.pid == 0 && args.package.is_none() && args.root_uid.is_none() {
         eprintln!("  note: tracing all processes; inflight map may overflow under heavy load");
     }
     if !driver_packs.names.is_empty() {
@@ -1744,7 +1799,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     populate_filter_map(
         &mut bpf,
         args.pid,
-        args.package.is_some(),
+        args.package.is_some() || args.root_uid.is_some(),
         args.follow_binder,
         args.max_depth,
     )?;
@@ -2008,10 +2063,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     // grows; the poller drains updates non-blockingly.
     let scope = ScopePolicy::from_str(&args.fdgraph_pids).map_err(anyhow::Error::msg)?;
     let interval = parse_fdgraph_interval(&args.fdgraph_interval)?;
-    let mut active_pids: HashSet<u32> = HashSet::new();
-    if args.pid != 0 {
-        active_pids.insert(args.pid);
-    }
+    let mut active_pids: HashSet<u32> = root_pids.iter().copied().collect();
     let poller_state: Option<(_, _, _, _)> = match interval {
         Some(dt) => {
             let cfg = PollerConfig {
@@ -2125,11 +2177,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                 let request = pending.request.clone();
                 let result: Result<(ScenarioInfo, u64, String)> = (|| {
                     if request.phase == "start" {
-                        if let (Some(package), Some(uid)) = (args.package.as_deref(), package_uid) {
-                            root_pids = android::find_package_processes(package, uid)?;
+                        if let Some(discovered) = discover_dynamic_roots(&args, package_uid)? {
+                            root_pids = discovered;
                         }
                         if root_pids.is_empty() {
-                            bail!("live scenarios require --package or a non-zero --pid root");
+                            bail!(
+                                "live scenarios require --package, --root-uid, or a non-zero --pid root with a running process"
+                            );
                         }
                         if root_pids.len() > args.max_processes as usize {
                             bail!(
@@ -2149,8 +2203,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                         binder_causal.clear();
                         recent_exit_causal.clear();
                         let ts_ns = monotonic_timestamp_ns();
-                        let line =
-                            live_marker_line(&request, &scenario, ts_ns, args.package.as_deref());
+                        let line = live_marker_line(
+                            &request,
+                            &scenario,
+                            ts_ns,
+                            args.package.as_deref(),
+                            args.root_uid,
+                        );
                         Ok((scenario, ts_ns, line))
                     } else {
                         let scenario = scenarios.end(&request.name)?;
@@ -2158,8 +2217,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                         replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
                         recent_exit_causal.clear();
                         let ts_ns = monotonic_timestamp_ns();
-                        let line =
-                            live_marker_line(&request, &scenario, ts_ns, args.package.as_deref());
+                        let line = live_marker_line(
+                            &request,
+                            &scenario,
+                            ts_ns,
+                            args.package.as_deref(),
+                            args.root_uid,
+                        );
                         Ok((scenario, ts_ns, line))
                     }
                 })();
@@ -2189,9 +2253,10 @@ fn run_trace(mut args: Args) -> Result<()> {
 
         if last_root_refresh.elapsed() >= Duration::from_secs(1) {
             last_root_refresh = std::time::Instant::now();
-            if let (Some(package), Some(uid)) = (args.package.as_deref(), package_uid) {
-                match android::find_package_processes(package, uid) {
-                    Ok(discovered) if discovered.len() <= args.max_processes as usize => {
+            if args.package.is_some() || args.root_uid.is_some() {
+                match discover_dynamic_roots(&args, package_uid) {
+                    Ok(None) => {}
+                    Ok(Some(discovered)) if discovered.len() <= args.max_processes as usize => {
                         let (trace_id, generation) = scenarios
                             .active()
                             .map(|scenario| (scenario.trace_id, scenario.generation))
@@ -2206,19 +2271,19 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 insert_causal_root(&mut bpf, pid, trace_id, generation)
                             {
                                 eprintln!(
-                                    "neutron: warn: could not add new package PID {pid}: {error:#}"
+                                    "neutron: warn: could not add new causal root PID {pid}: {error:#}"
                                 );
                             }
                         }
                         root_pids = discovered;
                     }
-                    Ok(discovered) => eprintln!(
-                        "neutron: warn: package now has {} roots, above --max-processes {}",
+                    Ok(Some(discovered)) => eprintln!(
+                        "neutron: warn: causal root now has {} processes, above --max-processes {}",
                         discovered.len(),
                         args.max_processes
                     ),
                     Err(error) if args.verbose => {
-                        eprintln!("neutron: warn: package PID refresh failed: {error:#}");
+                        eprintln!("neutron: warn: causal root PID refresh failed: {error:#}");
                     }
                     Err(_) => {}
                 }
@@ -2252,8 +2317,12 @@ fn run_trace(mut args: Args) -> Result<()> {
                 if args.alert_rwx && should_skip_for_alert_rwx(&ev) {
                     continue;
                 }
-                let causal_event =
-                    causal_metadata_for_event(&ev, &scenarios, args.package.as_deref());
+                let causal_event = causal_metadata_for_event(
+                    &ev,
+                    &scenarios,
+                    args.package.as_deref(),
+                    args.root_uid,
+                );
 
                 // ── Sprint-2 PR 1: BPF sched_process_exit handoff ────
                 //
@@ -2679,6 +2748,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 context,
                                 scenario,
                                 args.package.as_deref(),
+                                args.root_uid,
                             )
                         })
                     })
@@ -2732,6 +2802,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 context,
                                 scenario,
                                 args.package.as_deref(),
+                                args.root_uid,
                             )
                         })
                     })
@@ -2850,6 +2921,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                         match_uids: args.match_uid.clone(),
                         match_pids,
                         root_package: args.package.clone(),
+                        root_uid: args.root_uid,
+                        boot_id: capture_boot_id.clone(),
+                        fingerprint: capture_fingerprint.clone(),
                         max_depth: args.max_depth,
                         max_processes: args.max_processes,
                     };
@@ -2883,6 +2957,24 @@ mod tests {
     use super::*;
     use neutron::mark::{self, MarkArgs};
     use std::io::Write;
+
+    #[test]
+    fn live_marker_includes_uid_root_metadata() {
+        let request = neutron::causal::MarkRequest {
+            name: "surface-observe".into(),
+            phase: "start".into(),
+            meta: Default::default(),
+        };
+        let scenario = ScenarioInfo {
+            scenario_id: "surface-observe".into(),
+            trace_id: 1,
+            generation: 1,
+        };
+        let line = live_marker_line(&request, &scenario, 42, None, Some(10123));
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["root_uid"], 10123);
+        assert!(value.get("root_package").is_none());
+    }
 
     #[test]
     fn output_sink_preserves_marker_appends_while_tracer_is_running() {

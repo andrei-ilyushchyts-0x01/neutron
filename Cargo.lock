@@ -504,7 +504,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "neutron"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -516,17 +516,18 @@ dependencies = [
  "log",
  "neutron-common",
  "neutron-rules",
+ "quick-xml",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "neutron-common"
-version = "1.3.0"
+version = "1.4.0"
 
 [[package]]
 name = "neutron-ebpf"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
@@ -535,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "neutron-rules"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -639,6 +640,15 @@ dependencies = [
  "quote",
  "syn",
  "version_check",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -1059,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "anyhow",
 ]

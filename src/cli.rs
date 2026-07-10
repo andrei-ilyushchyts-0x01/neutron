@@ -67,6 +67,10 @@ pub enum Command {
     /// Render a causal capture as a Mermaid flowchart.
     Graph(crate::graph::GraphArgs),
 
+    /// Build and query an Android service/HAL/device surface snapshot.
+    #[command(subcommand)]
+    Surface(crate::surface::SurfaceCommand),
+
     /// Print built-in workflow recipes for common Android security
     /// research tasks.
     #[command(subcommand)]
@@ -126,6 +130,11 @@ pub struct Args {
     /// identifies root processes by UID plus /proc/<pid>/cmdline.
     #[arg(long)]
     pub package: Option<String>,
+
+    /// Root Android UID for causal tracing. Tracks every current and newly
+    /// appearing process owned by this UID.
+    #[arg(long, conflicts_with_all = ["package", "pid"])]
+    pub root_uid: Option<u32>,
 
     /// Add Binder callees to the dynamic traced-process set.
     #[arg(

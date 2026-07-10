@@ -84,6 +84,10 @@ pub enum IoctlFamily {
     /// either since the decoded family is the same logical attack
     /// surface). Phase 3.
     Gxp,
+    /// Trusty IPC character-device UAPI (`TIPC_IOC_*`, magic `'r'`).
+    TrustyTipc,
+    /// Video4Linux2 UAPI (`VIDIOC_*`, magic `'V'`).
+    V4l2,
     Unknown,
 }
 
@@ -99,6 +103,8 @@ impl IoctlFamily {
             IoctlFamily::Ashmem => "ashmem",
             IoctlFamily::Lwis => "lwis",
             IoctlFamily::Gxp => "gxp",
+            IoctlFamily::TrustyTipc => "trusty_tipc",
+            IoctlFamily::V4l2 => "v4l2",
             IoctlFamily::Unknown => "unknown",
         }
     }
@@ -129,6 +135,15 @@ impl IoctlFamily {
             if path.starts_with("/dev/binder") || path.starts_with("/dev/vndbinder") {
                 return IoctlFamily::Binder;
             }
+            if path.starts_with("/dev/trusty-ipc") {
+                return IoctlFamily::TrustyTipc;
+            }
+            if path.starts_with("/dev/video")
+                || path.starts_with("/dev/v4l-subdev")
+                || path.starts_with("/dev/media")
+            {
+                return IoctlFamily::V4l2;
+            }
         }
         let ty = neutron_common::ioctl_type(cmd);
         match ty {
@@ -147,6 +162,8 @@ impl IoctlFamily {
             {
                 IoctlFamily::Gxp
             }
+            IOCTL_TYPE_TRUSTY_TIPC => IoctlFamily::TrustyTipc,
+            IOCTL_TYPE_V4L2 => IoctlFamily::V4l2,
             _ => IoctlFamily::Unknown,
         }
     }
@@ -246,6 +263,9 @@ const BINDER_WRITE_READ: u32 = 0xC030_6201;
 /// `dir = 3 (RW), size = 16, type = 0x4c ('L'), nr = 100 (0x64)`.
 const LWIS_CMD_PACKET: u32 = 0xC010_4C64;
 
+const IOCTL_TYPE_TRUSTY_TIPC: u32 = b'r' as u32;
+const IOCTL_TYPE_V4L2: u32 = b'V' as u32;
+
 /// Decode a captured ioctl `cmd`/`arg` pair into a typed [`DecodedIoctl`].
 ///
 /// `payload` is the buffer captured by BPF as `data[4..128]` (124 bytes
@@ -282,6 +302,8 @@ pub fn decode_ioctl_with_context(
             IoctlFamily::Kgsl => (kgsl_ioctl_name(cmd), decode_driver_scalars(payload)),
             IoctlFamily::Mali => (mali_ioctl_name(cmd), decode_driver_scalars(payload)),
             IoctlFamily::Alsa => (alsa_ioctl_name(cmd), decode_alsa(payload, ret)),
+            IoctlFamily::TrustyTipc => (trusty_tipc_ioctl_name(cmd), IoctlFields::None),
+            IoctlFamily::V4l2 => (v4l2_ioctl_name(cmd), IoctlFields::None),
             _ => (None, IoctlFields::None),
         },
     };
@@ -322,6 +344,36 @@ fn decode_lwis_cmd_pkt(payload: &[u8]) -> IoctlFields {
     IoctlFields::LwisCmdPkt {
         cmd_id,
         cmd_id_name: lwis_cmd_id_name(cmd_id),
+    }
+}
+
+fn trusty_tipc_ioctl_name(cmd: u32) -> Option<&'static str> {
+    if neutron_common::ioctl_type(cmd) != IOCTL_TYPE_TRUSTY_TIPC {
+        return None;
+    }
+    match ((cmd >> 30) & 0x3, cmd & 0xff) {
+        (1, 0x80) => Some("TIPC_IOC_CONNECT"),
+        (1, 0x81) => Some("TIPC_IOC_SEND_MSG"),
+        _ => None,
+    }
+}
+
+fn v4l2_ioctl_name(cmd: u32) -> Option<&'static str> {
+    if neutron_common::ioctl_type(cmd) != IOCTL_TYPE_V4L2 {
+        return None;
+    }
+    match ((cmd >> 30) & 0x3, cmd & 0xff) {
+        (2, 0) => Some("VIDIOC_QUERYCAP"),
+        (3, 2) => Some("VIDIOC_ENUM_FMT"),
+        (3, 4) => Some("VIDIOC_G_FMT"),
+        (3, 5) => Some("VIDIOC_S_FMT"),
+        (3, 8) => Some("VIDIOC_REQBUFS"),
+        (3, 9) => Some("VIDIOC_QUERYBUF"),
+        (3, 15) => Some("VIDIOC_QBUF"),
+        (3, 17) => Some("VIDIOC_DQBUF"),
+        (1, 18) => Some("VIDIOC_STREAMON"),
+        (1, 19) => Some("VIDIOC_STREAMOFF"),
+        _ => None,
     }
 }
 

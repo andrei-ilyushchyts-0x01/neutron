@@ -192,6 +192,7 @@ pub struct CausalMetadata {
     pub depth: u8,
     pub relation: CausalRelation,
     pub root_package: Option<String>,
+    pub root_uid: Option<u32>,
 }
 
 pub fn enrich_json(line: &str, metadata: &CausalMetadata) -> Result<String> {
@@ -220,6 +221,9 @@ pub fn enrich_json(line: &str, metadata: &CausalMetadata) -> Result<String> {
     );
     if let Some(package) = &metadata.root_package {
         object.insert("root_package".into(), Value::String(package.clone()));
+    }
+    if let Some(uid) = metadata.root_uid {
+        object.insert("root_uid".into(), Value::from(uid));
     }
     serde_json::to_string(&value).context("serializing causal event JSON")
 }
@@ -522,5 +526,23 @@ mod tests {
         assert_eq!(bytes[16], 4);
         assert_eq!(bytes[17], TraceReason::Binder as u8);
         assert_eq!(&bytes[18..20], &5u16.to_ne_bytes());
+    }
+
+    #[test]
+    fn causal_json_includes_uid_root_metadata() {
+        let metadata = CausalMetadata {
+            scenario_id: "camera".into(),
+            trace_id: 1,
+            span_id: 2,
+            parent_span_id: 3,
+            depth: 0,
+            relation: CausalRelation::Exact,
+            root_package: None,
+            root_uid: Some(10123),
+        };
+        let line = enrich_json(r#"{"type":"syscall"}"#, &metadata).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["root_uid"], 10123);
+        assert!(value.get("root_package").is_none());
     }
 }

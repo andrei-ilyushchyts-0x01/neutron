@@ -247,10 +247,8 @@ fn parse_status_uid(status: &str) -> Option<u32> {
     })
 }
 
-/// Find every live process belonging to the package UID whose cmdline is the
-/// package or one of its colon-suffixed Android child process names.
-pub fn find_package_processes(package: &str, uid: u32) -> Result<Vec<u32>> {
-    let package = validate_package_name(package)?;
+/// Find every live process whose real UID matches `uid`.
+pub fn find_uid_processes(uid: u32) -> Result<Vec<u32>> {
     let mut pids = Vec::new();
     for entry in fs::read_dir("/proc").context("reading /proc")? {
         let entry = match entry {
@@ -268,10 +266,21 @@ pub fn find_package_processes(package: &str, uid: u32) -> Result<Vec<u32>> {
             Ok(status) => status,
             Err(_) => continue,
         };
-        if parse_status_uid(&status) != Some(uid) {
-            continue;
+        if parse_status_uid(&status) == Some(uid) {
+            pids.push(pid);
         }
-        let cmdline = match fs::read(entry.path().join("cmdline")) {
+    }
+    pids.sort_unstable();
+    Ok(pids)
+}
+
+/// Find every live process belonging to the package UID whose cmdline is the
+/// package or one of its colon-suffixed Android child process names.
+pub fn find_package_processes(package: &str, uid: u32) -> Result<Vec<u32>> {
+    let package = validate_package_name(package)?;
+    let mut pids = Vec::new();
+    for pid in find_uid_processes(uid)? {
+        let cmdline = match fs::read(format!("/proc/{pid}/cmdline")) {
             Ok(cmdline) => cmdline,
             Err(_) => continue,
         };
@@ -382,5 +391,23 @@ Registered ContentProviders:
             b"com.example.application\0",
             "com.example.app"
         ));
+    }
+
+    #[test]
+    fn status_uid_parser_uses_the_real_uid_column() {
+        assert_eq!(
+            parse_status_uid("Uid:\t10123\t20123\t30123\t40123\n"),
+            Some(10123)
+        );
+        assert_eq!(parse_status_uid("Name:\tapp\nGid:\t10123\n"), None);
+    }
+
+    #[test]
+    fn uid_process_discovery_includes_self() {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let uid = parse_status_uid(&status).unwrap();
+        assert!(find_uid_processes(uid)
+            .unwrap()
+            .contains(&std::process::id()));
     }
 }

@@ -202,6 +202,9 @@ pub struct CaptureMetadata {
     pub match_uids: Vec<String>,
     pub match_pids: Vec<String>,
     pub root_package: Option<String>,
+    pub root_uid: Option<u32>,
+    pub boot_id: Option<String>,
+    pub fingerprint: Option<String>,
     pub max_depth: u8,
     pub max_processes: u32,
 }
@@ -316,10 +319,12 @@ pub fn format_capture_health_json_with_metadata(
     write_string_array(&mut s, "match_packages", &meta.match_packages);
     write_string_array(&mut s, "match_uids", &meta.match_uids);
     write_string_array(&mut s, "match_pids", &meta.match_pids);
-    if let Some(package) = &meta.root_package {
-        let escaped = package.replace('\\', "\\\\").replace('"', "\\\"");
-        let _ = write!(s, r#","root_package":"{escaped}""#);
+    write_optional_string(&mut s, "root_package", meta.root_package.as_deref());
+    if let Some(uid) = meta.root_uid {
+        let _ = write!(s, r#","root_uid":{uid}"#);
     }
+    write_optional_string(&mut s, "boot_id", meta.boot_id.as_deref());
+    write_optional_string(&mut s, "fingerprint", meta.fingerprint.as_deref());
     let _ = write!(
         s,
         r#","max_depth":{},"max_processes":{}"#,
@@ -327,6 +332,14 @@ pub fn format_capture_health_json_with_metadata(
     );
     s.push('}');
     s
+}
+
+fn write_optional_string(s: &mut String, key: &str, value: Option<&str>) {
+    use std::fmt::Write as _;
+    if let Some(value) = value {
+        let encoded = serde_json::to_string(value).expect("serializing a string cannot fail");
+        let _ = write!(s, r#","{key}":{encoded}"#);
+    }
 }
 
 fn write_string_array(s: &mut String, key: &str, values: &[String]) {
@@ -478,6 +491,9 @@ mod tests {
         let line = format_capture_health_json(&h, &user, 0);
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["degraded"], false);
+        assert!(v.get("root_uid").is_none());
+        assert!(v.get("boot_id").is_none());
+        assert!(v.get("fingerprint").is_none());
     }
 
     #[test]
@@ -491,6 +507,26 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(v["output_cap_hit"], true);
+    }
+
+    #[test]
+    fn capture_health_json_includes_additive_root_and_device_metadata() {
+        let metadata = CaptureMetadata {
+            root_uid: Some(10123),
+            boot_id: Some("boot-id".into()),
+            fingerprint: Some("vendor/device:\"build\"".into()),
+            ..CaptureMetadata::default()
+        };
+        let line = format_capture_health_json_with_metadata(
+            &CaptureHealth::default(),
+            &UserspaceHealth::default(),
+            0,
+            &metadata,
+        );
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["root_uid"], 10123);
+        assert_eq!(value["boot_id"], "boot-id");
+        assert_eq!(value["fingerprint"], "vendor/device:\"build\"");
     }
 
     #[test]

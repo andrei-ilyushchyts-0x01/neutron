@@ -115,6 +115,7 @@ fn causal_json_has_stable_pair_span_and_honest_relation() {
         depth: 2,
         relation: CausalRelation::Inferred,
         root_package: Some("com.example.app".into()),
+        root_uid: None,
     };
     let line = enrich_json(r#"{"type":"syscall","phase":"exit"}"#, &meta).unwrap();
     let value: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -124,6 +125,7 @@ fn causal_json_has_stable_pair_span_and_honest_relation() {
     assert_eq!(value["parent_span_id"], "0000000000000055");
     assert_eq!(value["depth"], 2);
     assert_eq!(value["causal_relation"], "inferred");
+    assert!(value.get("root_uid").is_none());
 }
 
 #[test]

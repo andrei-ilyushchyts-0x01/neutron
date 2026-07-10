@@ -6,7 +6,7 @@ use neutron::capture_normalize::{normalize_capture, CausalRelation};
 fn syscall_enter_and_exit_merge_into_one_exit_span() {
     let input = r#"
 {"type":"syscall","ts_ns":20,"pid":200,"tid":201,"nr":29,"name":"ioctl","phase":"enter","args":[4,3227014671,0,0,0,0],"trace_id":"trace-a","scenario_id":"camera","span_id":"span-1","parent_span_id":"binder-1","causal_relation":"exact"}
-{"type":"syscall","ts_ns":30,"enter_ts_ns":20,"pid":200,"tid":201,"nr":29,"name":"ioctl","phase":"exit","args":[4,3227014671,0,0,0,0],"ret":0,"latency_us":10,"ioctl_name":"VIDIOC_QBUF","trace_id":"trace-a","scenario_id":"camera","span_id":"span-1","parent_span_id":"binder-1","causal_relation":"exact"}
+{"type":"syscall","ts_ns":30,"enter_ts_ns":20,"pid":200,"tid":201,"nr":29,"name":"ioctl","phase":"exit","args":[4,3227014671,0,0,0,0],"ret":0,"latency_us":10,"fd_path":"/dev/video0","ioctl_family":"v4l2","ioctl_name":"VIDIOC_QBUF","trace_id":"trace-a","scenario_id":"camera","span_id":"span-1","parent_span_id":"binder-1","depth":2,"causal_relation":"exact"}
 "#;
 
     let capture = normalize_capture(Cursor::new(input)).expect("normalize capture");
@@ -16,15 +16,21 @@ fn syscall_enter_and_exit_merge_into_one_exit_span() {
     assert_eq!(syscall.phase, "exit");
     assert_eq!(syscall.ret, Some(0));
     assert_eq!(syscall.latency_us, Some(10));
+    assert_eq!(syscall.ioctl_cmd, Some(3_227_014_671));
+    assert_eq!(syscall.fd_path.as_deref(), Some("/dev/video0"));
+    assert_eq!(syscall.ioctl_family.as_deref(), Some("v4l2"));
     assert_eq!(syscall.ioctl_name.as_deref(), Some("VIDIOC_QBUF"));
+    assert_eq!(syscall.scenario_id.as_deref(), Some("camera"));
+    assert_eq!(syscall.parent_span_id.as_deref(), Some("binder-1"));
+    assert_eq!(syscall.depth, Some(2));
     assert_eq!(syscall.relation, CausalRelation::Exact);
 }
 
 #[test]
 fn binder_enrichment_without_relation_does_not_overwrite_inferred_evidence() {
     let input = r#"
-{"type":"binder","ts_ns":10,"pid":100,"comm":"app","to_proc":200,"target_node":7,"code":1,"debug_id":11,"trace_id":"trace-a","scenario_id":"camera","span_id":"binder-1","parent_span_id":"root-1","causal_relation":"inferred"}
-{"type":"binder_call","ts_ns":10,"debug_id":11,"caller_pid":100,"caller_comm":"app","callee_pid":200,"target_node":7,"code":1,"service":"camera/default","method":"connect","latency_us":5,"status":"completed","trace_id":"trace-a","scenario_id":"camera","span_id":"binder-1","parent_span_id":"root-1"}
+{"type":"binder","ts_ns":10,"pid":100,"comm":"app","to_proc":200,"target_node":7,"code":1,"debug_id":11,"trace_id":"trace-a","scenario_id":"camera","span_id":"binder-1","parent_span_id":"root-1","depth":1,"causal_relation":"inferred"}
+{"type":"binder_call","ts_ns":10,"debug_id":11,"caller_pid":100,"caller_comm":"app","callee_pid":200,"target_node":7,"code":1,"service":"camera/default","method":"connect","attribution_confidence":"candidate","latency_us":5,"status":"completed","trace_id":"trace-a","scenario_id":"camera","span_id":"binder-1","parent_span_id":"root-1"}
 "#;
 
     let capture = normalize_capture(Cursor::new(input)).expect("normalize capture");
@@ -35,6 +41,10 @@ fn binder_enrichment_without_relation_does_not_overwrite_inferred_evidence() {
     assert_eq!(binder.callee_pid, 200);
     assert_eq!(binder.service.as_deref(), Some("camera/default"));
     assert_eq!(binder.method.as_deref(), Some("connect"));
+    assert_eq!(binder.attribution_confidence.as_deref(), Some("candidate"));
+    assert_eq!(binder.scenario_id.as_deref(), Some("camera"));
+    assert_eq!(binder.parent_span_id.as_deref(), Some("root-1"));
+    assert_eq!(binder.depth, Some(1));
     assert_eq!(binder.relation, CausalRelation::Inferred);
 }
 
@@ -91,7 +101,7 @@ not-json
 #[test]
 fn capture_health_retains_uid_and_device_identity_metadata() {
     let input = r#"
-{"type":"capture_health","degraded":true,"output_cap_hit":false,"root_uid":10123,"boot_id":"8b2d6c98-20a1-4e7e-944f-53f61b52d5ef","fingerprint":"google/husky/husky:16/test:user/release-keys"}
+{"type":"capture_health","degraded":true,"output_cap_hit":false,"root_package":"com.example.app","root_uid":10123,"boot_id":"8b2d6c98-20a1-4e7e-944f-53f61b52d5ef","fingerprint":"google/husky/husky:16/test:user/release-keys"}
 "#;
 
     let capture = normalize_capture(Cursor::new(input)).expect("normalize capture");
@@ -99,6 +109,7 @@ fn capture_health_retains_uid_and_device_identity_metadata() {
 
     assert!(health.degraded);
     assert!(!health.output_cap_hit);
+    assert_eq!(health.root_package.as_deref(), Some("com.example.app"));
     assert_eq!(health.root_uid, Some(10123));
     assert_eq!(
         health.boot_id.as_deref(),
@@ -108,4 +119,23 @@ fn capture_health_retains_uid_and_device_identity_metadata() {
         health.fingerprint.as_deref(),
         Some("google/husky/husky:16/test:user/release-keys")
     );
+}
+
+#[test]
+fn markers_retain_scenario_and_root_selector_metadata() {
+    let input = r#"
+{"type":"marker","ts_ns":99,"name":"surface-observe","phase":"start","scenario_id":"surface-observe","trace_id":"trace-a","root_package":"com.example.app","root_uid":10123}
+"#;
+
+    let capture = normalize_capture(Cursor::new(input)).expect("normalize capture");
+
+    assert_eq!(capture.markers.len(), 1);
+    let marker = &capture.markers[0];
+    assert_eq!(marker.ts_ns, Some(99));
+    assert_eq!(marker.name, "surface-observe");
+    assert_eq!(marker.phase.as_deref(), Some("start"));
+    assert_eq!(marker.scenario_id.as_deref(), Some("surface-observe"));
+    assert_eq!(marker.trace_id.as_deref(), Some("trace-a"));
+    assert_eq!(marker.root_package.as_deref(), Some("com.example.app"));
+    assert_eq!(marker.root_uid, Some(10123));
 }
