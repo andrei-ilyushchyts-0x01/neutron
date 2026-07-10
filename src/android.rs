@@ -1,9 +1,38 @@
 //! Android platform helpers used by the tracer CLI.
 
 use std::fs;
-use std::process::Command;
+use std::io;
+use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
+
+pub(crate) fn run_platform_command(program: &str, args: &[&str]) -> io::Result<Output> {
+    let candidates: &[&str] = match program {
+        "cmd" => &["/system/bin/cmd"],
+        "pm" => &["/system/bin/pm"],
+        "service" => &["/system/bin/service"],
+        "dumpsys" => &["/system/bin/dumpsys"],
+        "getprop" => &["/system/bin/getprop"],
+        "lshal" => &["/system/bin/lshal", "/vendor/bin/lshal"],
+        "vndservice" => &["/vendor/bin/vndservice", "/system/bin/vndservice"],
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported Android platform command: {program}"),
+            ))
+        }
+    };
+    let mut last_not_found = None;
+    for candidate in candidates {
+        match Command::new(candidate).args(args).output() {
+            Ok(output) => return Ok(output),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => last_not_found = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_not_found
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "platform command not found")))
+}
 
 fn validate_package_name(package: &str) -> Result<&str> {
     let package = package.trim();
@@ -182,9 +211,7 @@ pub fn match_package_uid_warning(package: &str, uid: u32) -> Option<String> {
 /// Intended to run on-device, where `dumpsys package providers` is available.
 pub fn resolve_provider_authority(authority: &str) -> Result<ProviderResolution> {
     let authority = normalize_provider_authority(authority)?;
-    let output = Command::new("dumpsys")
-        .args(["package", "providers"])
-        .output()
+    let output = run_platform_command("dumpsys", &["package", "providers"])
         .context("running dumpsys package providers")?;
     if !output.status.success() {
         bail!("dumpsys package providers exited with {}", output.status);
@@ -194,9 +221,7 @@ pub fn resolve_provider_authority(authority: &str) -> Result<ProviderResolution>
 }
 
 fn run_package_query(program: &str, args: &[&str], package: &str) -> Result<Option<u32>> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
+    let output = run_platform_command(program, args)
         .with_context(|| format!("running {program} {}", args.join(" ")))?;
     if !output.status.success() {
         return Ok(None);
@@ -253,7 +278,8 @@ pub fn find_uid_processes(uid: u32) -> Result<Vec<u32>> {
     for entry in fs::read_dir("/proc").context("reading /proc")? {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("reading /proc directory entry"),
         };
         let Some(pid) = entry
             .file_name()
@@ -264,9 +290,15 @@ pub fn find_uid_processes(uid: u32) -> Result<Vec<u32>> {
         };
         let status = match fs::read_to_string(entry.path().join("status")) {
             Ok(status) => status,
-            Err(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading /proc/{pid}/status for UID discovery"))
+            }
         };
-        if parse_status_uid(&status) == Some(uid) {
+        let process_uid = parse_status_uid(&status)
+            .with_context(|| format!("parsing /proc/{pid}/status for UID discovery"))?;
+        if process_uid == uid {
             pids.push(pid);
         }
     }
@@ -282,7 +314,11 @@ pub fn find_package_processes(package: &str, uid: u32) -> Result<Vec<u32>> {
     for pid in find_uid_processes(uid)? {
         let cmdline = match fs::read(format!("/proc/{pid}/cmdline")) {
             Ok(cmdline) => cmdline,
-            Err(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading /proc/{pid}/cmdline for package discovery"))
+            }
         };
         if is_package_process_cmdline(&cmdline, package) {
             pids.push(pid);

@@ -143,6 +143,9 @@ impl PlatformReader for FixtureReader {
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        if self.denied.contains(path) {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         self.canonical
             .get(path)
             .cloned()
@@ -239,6 +242,13 @@ fn fixture() -> FixtureReader {
 
     reader.dir("/sys/module", &["trusty_core"]);
     reader.dir("/sys/module/trusty_core", &[]);
+    reader.dir("/sys/class", &["misc"]);
+    reader.dir("/sys/class/misc", &["trusty-ipc-dev0"]);
+    reader.symlink(
+        "/sys/class/misc/trusty-ipc-dev0",
+        "../../devices/platform/trusty/trusty-ipc-dev0",
+        Some("/sys/devices/platform/trusty/trusty-ipc-dev0"),
+    );
     reader.symlink(
         "/sys/dev/char/10:55",
         "../../devices/platform/trusty/trusty-ipc-dev0",
@@ -337,16 +347,80 @@ fn static_scan_is_deterministic_and_maps_process_service_device_and_module() {
 }
 
 #[test]
+fn device_link_proves_driver_and_module_when_class_node_has_no_driver() {
+    let mut reader = fixture();
+    let class_driver = PathBuf::from("/sys/devices/platform/trusty/trusty-ipc-dev0/driver");
+    reader.links.remove(&class_driver);
+    reader.canonical.remove(&class_driver);
+    reader.metadata.remove(&class_driver);
+    reader.symlink(
+        "/sys/devices/platform/trusty/trusty-ipc-dev0/device",
+        "..",
+        Some("/sys/devices/platform/trusty"),
+    );
+    reader.symlink(
+        "/sys/devices/platform/trusty/driver",
+        "../../../bus/platform/drivers/trusty-ipc",
+        Some("/sys/bus/platform/drivers/trusty-ipc"),
+    );
+
+    let snapshot = scan_with_reader(&reader).expect("static scan");
+    assert_eq!(snapshot.devices[0].driver.as_deref(), Some("trusty-ipc"));
+    assert_eq!(snapshot.devices[0].module.as_deref(), Some("trusty_core"));
+}
+
+#[test]
 fn individual_permission_error_degrades_but_missing_primary_source_is_fatal() {
     let mut partial = fixture();
     partial.denied.insert(PathBuf::from("/proc/42/maps"));
+    partial.denied.insert(PathBuf::from(
+        "/sys/devices/platform/trusty/trusty-ipc-dev0/driver",
+    ));
     let snapshot = scan_with_reader(&partial).expect("partial scan remains usable");
     assert_eq!(snapshot.health.status, "degraded");
     assert!(snapshot.processes[0].libraries.is_empty());
+    assert!(snapshot
+        .health
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("sysfs driver")));
 
     let missing = FixtureReader::default();
     let error = scan_with_reader(&missing).unwrap_err();
     assert!(format!("{error:#}").contains("/proc"));
+}
+
+#[test]
+fn symlink_alias_is_kept_when_it_targets_a_noncanonical_name_for_the_same_node() {
+    let mut reader = fixture();
+    let duplicate = PathBuf::from("/dev/zz-trusty-node");
+    let alias = PathBuf::from("/dev/alias-to-zz");
+    reader
+        .dirs
+        .get_mut(Path::new("/dev"))
+        .unwrap()
+        .extend([duplicate.clone(), alias.clone()]);
+    reader.metadata.insert(
+        duplicate.clone(),
+        PlatformMetadata {
+            kind: FileKind::CharacterDevice,
+            mode: 0o660,
+            uid: 0,
+            gid: 1000,
+            major: Some(10),
+            minor: Some(55),
+        },
+    );
+    reader.symlink(
+        alias.to_str().unwrap(),
+        "zz-trusty-node",
+        duplicate.to_str(),
+    );
+
+    let snapshot = scan_with_reader(&reader).unwrap();
+    assert!(snapshot.devices[0]
+        .aliases
+        .contains(&"/dev/alias-to-zz".to_string()));
 }
 
 #[test]
@@ -361,6 +435,11 @@ fn service_join_revalidates_process_starttime_to_reject_pid_reuse() {
     );
 
     let snapshot = scan_with_reader(&reader).expect("scan survives PID reuse");
+    assert!(snapshot.processes.is_empty());
+    assert!(!snapshot
+        .relations
+        .iter()
+        .any(|relation| relation.from == "process:boot-a:42:4242"));
     let service = snapshot
         .services
         .iter()
@@ -372,6 +451,53 @@ fn service_join_revalidates_process_starttime_to_reject_pid_reuse() {
         .warnings
         .iter()
         .any(|warning| warning.contains("identity changed")));
+}
+
+#[test]
+fn identical_names_from_distinct_binder_transports_remain_distinct_services() {
+    let mut reader = fixture();
+    reader.command(
+        "service",
+        &["list"],
+        "0 collision/default: [example.ICollision]\n",
+    );
+    reader.command("dumpsys", &["--pid", "collision/default"], "42\n");
+    reader.command(
+        "vndservice",
+        &["list"],
+        "0 collision/default: [example.ICollision]\n",
+    );
+
+    let mut snapshot = scan_with_reader(&reader).unwrap();
+    let transports: BTreeSet<_> = snapshot
+        .services
+        .iter()
+        .filter(|service| service.name == "collision/default")
+        .map(|service| service.transport.as_str())
+        .collect();
+    assert_eq!(transports, BTreeSet::from(["binder", "vndbinder"]));
+    assert!(snapshot
+        .services
+        .iter()
+        .filter(|service| service.name == "collision/default")
+        .all(|service| !service.hal));
+
+    let capture = r#"
+{"type":"marker","phase":"start","name":"collision","scenario_id":"collision","trace_id":"trace-collision","root_package":"com.example.app"}
+{"type":"binder","pid":100,"to_proc":99,"debug_id":1,"service":"collision/default","trace_id":"trace-collision","span_id":"binder-1","scenario_id":"collision","depth":0,"causal_relation":"exact"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.app","boot_id":"boot-a"}
+"#;
+    import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
+    assert!(snapshot.relations.iter().any(|relation| {
+        relation.relation_type == "binder"
+            && relation.from == "process:capture:trace-collision:100"
+            && relation.to == "process:capture:trace-collision:99"
+    }));
+    assert!(!snapshot.relations.iter().any(|relation| {
+        relation.relation_type == "binder"
+            && relation.trace_id.as_deref() == Some("trace-collision")
+            && relation.to.starts_with("service:")
+    }));
 }
 
 #[test]
@@ -511,4 +637,27 @@ fn capture_can_create_services_from_exact_or_single_candidate_evidence() {
         .warnings
         .iter()
         .any(|warning| warning.contains("missing process endpoint")));
+}
+
+#[test]
+fn capture_process_uids_come_from_each_event_not_the_root_selector() {
+    let mut snapshot = scan_with_reader(&fixture()).unwrap();
+    let capture = r#"
+{"type":"marker","phase":"start","name":"uid-root","scenario_id":"uid-root","trace_id":"trace-uid","root_uid":10123}
+{"type":"binder","pid":100,"caller_uid":10123,"to_proc":200,"debug_id":1,"service":"example.IFirst/default","trace_id":"trace-uid","span_id":"binder-1","scenario_id":"uid-root","depth":0,"causal_relation":"exact"}
+{"type":"binder","pid":200,"caller_uid":1000,"to_proc":300,"debug_id":2,"service":"example.ISecond/default","trace_id":"trace-uid","span_id":"binder-2","scenario_id":"uid-root","depth":1,"causal_relation":"exact"}
+{"type":"syscall","pid":200,"uid":1000,"tid":201,"name":"ioctl","phase":"exit","args":[7,1074295424,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-uid","span_id":"ioctl-1","parent_span_id":"binder-2","scenario_id":"uid-root","depth":2,"causal_relation":"exact"}
+{"type":"capture_health","degraded":false,"root_uid":10123,"boot_id":"boot-a"}
+"#;
+
+    import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
+    let uid_by_pid: BTreeMap<_, _> = snapshot
+        .processes
+        .iter()
+        .filter(|process| process.id.starts_with("process:capture:trace-uid:"))
+        .map(|process| (process.pid, process.uid))
+        .collect();
+    assert_eq!(uid_by_pid.get(&100), Some(&10_123));
+    assert_eq!(uid_by_pid.get(&200), Some(&1000));
+    assert_eq!(uid_by_pid.get(&300), Some(&0));
 }

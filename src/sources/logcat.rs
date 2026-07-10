@@ -64,7 +64,7 @@ impl RealLogcatReader {
     /// the binary is missing (host without `logcat`) so the caller can
     /// degrade gracefully.
     pub fn spawn() -> std::io::Result<Self> {
-        let mut child = Command::new("logcat")
+        let mut child = Command::new("/system/bin/logcat")
             .args(["-v", "threadtime", "-b", "crash", "-b", "main", "*:F"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

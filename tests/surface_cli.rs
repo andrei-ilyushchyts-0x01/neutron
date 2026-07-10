@@ -146,6 +146,25 @@ fn scan_observe_requires_exactly_one_selector() {
 }
 
 #[test]
+fn scan_selectors_are_rejected_without_observe() {
+    for selector in [
+        ["--from-package", "com.example.app"],
+        ["--from-uid", "10123"],
+    ] {
+        assert!(
+            Cli::try_parse_from(["neutron", "surface", "scan"].into_iter().chain(selector))
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(
+            ["neutron", "surface", "scan", "--capture", "capture.ndjson"]
+                .into_iter()
+                .chain(selector)
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn trace_accepts_uid_root() {
     let cli = Cli::try_parse_from(["neutron", "trace", "--root-uid", "10123"])
         .expect("trace --root-uid should parse");

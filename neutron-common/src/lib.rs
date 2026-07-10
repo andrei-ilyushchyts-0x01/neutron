@@ -159,9 +159,51 @@ pub const FILTER_KEY_CAUSAL_MODE: u32 = 8;
 pub const FILTER_KEY_FOLLOW_BINDER: u32 = 9;
 /// Maximum Binder expansion depth.
 pub const FILTER_KEY_MAX_DEPTH: u32 = 10;
+/// Enable the root-process UID guard used by package/UID causal roots.
+pub const FILTER_KEY_ROOT_UID_ACTIVE: u32 = 11;
+/// Expected UID for depth-zero roots. Binder-followed processes are exempt.
+pub const FILTER_KEY_ROOT_UID: u32 = 12;
+/// Admit previously unseen matching-UID roots on their first kernel event.
+/// Enabled only for explicit `--root-uid`, never package/shared-UID roots.
+pub const FILTER_KEY_ROOT_UID_ADMIT: u32 = 13;
 /// Allocate generously so future Phase-1 extensions don't require a wire
 /// bump. Existing slots stay at their current indices.
 pub const FILTER_MAP_SLOT_COUNT: u32 = 16;
+
+pub const CAUSAL_PID_REJECT: u8 = 0;
+pub const CAUSAL_PID_MATCH: u8 = 1;
+pub const CAUSAL_PID_ADMIT_ROOT: u8 = 2;
+pub const CAUSAL_PID_FALLTHROUGH: u8 = 3;
+
+/// Decide whether a process is already in causal scope, may become an
+/// explicit UID root, or must continue through the legacy non-causal filters.
+#[inline(always)]
+pub const fn causal_pid_action(
+    causal_mode: bool,
+    context_reason: u8,
+    root_uid_admit: bool,
+    root_uid_matches: bool,
+) -> u8 {
+    if context_reason != 0 {
+        if context_reason == TraceReason::Root as u8 {
+            if !root_uid_matches {
+                CAUSAL_PID_REJECT
+            } else if root_uid_admit {
+                CAUSAL_PID_ADMIT_ROOT
+            } else {
+                CAUSAL_PID_MATCH
+            }
+        } else {
+            CAUSAL_PID_MATCH
+        }
+    } else if !causal_mode {
+        CAUSAL_PID_FALLTHROUGH
+    } else if root_uid_admit && root_uid_matches {
+        CAUSAL_PID_ADMIT_ROOT
+    } else {
+        CAUSAL_PID_REJECT
+    }
+}
 
 // ── MATCH_BITS — bitfield in FILTER_MAP[FILTER_KEY_MATCH_BITS] ───────────────
 //
@@ -718,5 +760,52 @@ mod ioctl_policy_tests {
     fn unknown_type_is_not_refreshed() {
         let cmd = ioc(IOCTL_DIR_RW, 0xab, 5, 8);
         assert!(!ioctl_post_exit_refresh(cmd));
+    }
+}
+
+#[cfg(test)]
+mod causal_pid_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_uid_admits_an_unlisted_matching_process() {
+        assert_eq!(
+            causal_pid_action(true, 0, true, true),
+            CAUSAL_PID_ADMIT_ROOT
+        );
+    }
+
+    #[test]
+    fn package_or_match_predicates_cannot_broaden_causal_scope() {
+        assert_eq!(causal_pid_action(true, 0, false, true), CAUSAL_PID_REJECT);
+    }
+
+    #[test]
+    fn uid_guard_rejects_wrong_uid_roots_but_not_binder_followers() {
+        assert_eq!(
+            causal_pid_action(true, TraceReason::Root as u8, true, false),
+            CAUSAL_PID_REJECT
+        );
+        assert_eq!(
+            causal_pid_action(true, TraceReason::Binder as u8, true, false),
+            CAUSAL_PID_MATCH
+        );
+        assert_eq!(causal_pid_action(true, 0, true, false), CAUSAL_PID_REJECT);
+    }
+
+    #[test]
+    fn explicit_uid_refreshes_a_root_admitted_before_the_active_marker() {
+        assert_eq!(
+            causal_pid_action(true, TraceReason::Root as u8, true, true),
+            CAUSAL_PID_ADMIT_ROOT
+        );
+    }
+
+    #[test]
+    fn noncausal_absent_processes_continue_to_legacy_filters() {
+        assert_eq!(
+            causal_pid_action(false, 0, false, false),
+            CAUSAL_PID_FALLTHROUGH
+        );
     }
 }

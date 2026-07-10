@@ -386,7 +386,7 @@ writes a mode-`0600` file instead of stdout.
 | `args`            | number[6]           | Raw syscall arguments. All six positions reflect the actual ABI args (no field hijacking — the enter timestamp lives in its own field). |
 | `data`            | string (optional)   | Decoded argument data (path, sockaddr, hex, …); omitted if empty |
 | `data_phase`      | string              | `"enter"` when `data[]` carries the pre-call buffer; `"exit"` when the BPF program refreshed the buffer post-call. Built-in refresh covers dma-heap/binder/dma-buf/ashmem; `--driver-pack` can enable runtime refresh for KGSL, Mali, ALSA, LWIS, and GXP families. |
-| `ioctl_family`    | string (optional)   | Family classification for `ioctl(2)` events: `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"`, `"gxp"`, or `"unknown"`. Magic collisions are disambiguated with FD-graph path/kind when available. |
+| `ioctl_family`    | string (optional)   | Family classification for `ioctl(2)` events: `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"`, `"gxp"`, `"trusty_tipc"`, `"v4l2"`, or `"unknown"`. Magic collisions are disambiguated with FD-graph path/kind when available. |
 | `ioctl_name`      | string (optional)   | Human name for the cmd when the decoder registry knows it (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"BINDER_WRITE_READ"`, `"IOCTL_KGSL_GPUMEM_ALLOC"`). |
 | `dma_heap`        | object (optional)   | Decoded `struct dma_heap_allocation_data`: `{ "len":N, "returned_fd":N, "fd_flags":N, "fd_flags_str":"O_RDWR\|O_CLOEXEC", "heap_flags":N }`. Meaningful only when `data_phase == "exit"` (the kernel writes `fd` post-call). |
 | `binder_write_read` | object (optional) | Scalar `BINDER_WRITE_READ` header: `write_size`, `write_consumed`, `read_size`, `read_consumed`. Nested Parcel buffers are not dereferenced. |
@@ -565,5 +565,6 @@ neutron --json --output trace.ndjson 2>diag.log
 ```
 
 Surface commands also default to JSON on stdout. Their `--output PATH` rejects
-a final-component symlink, then truncates the selected file and forces mode
-`0600`.
+a final-component symlink and any existing file that is not already
+mode-private, owned, regular, and single-link. The verified descriptor is
+truncated and kept at mode `0600`.

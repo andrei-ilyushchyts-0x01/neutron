@@ -31,7 +31,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 
@@ -110,14 +109,14 @@ impl BinderCatalog {
     pub fn discover(include_services: bool, include_hal: bool) -> Self {
         let mut catalog = Self::default();
         if include_services || include_hal {
-            if let Ok(output) = Command::new("service").args(["list", "-p"]).output() {
+            if let Ok(output) = crate::android::run_platform_command("service", &["list", "-p"]) {
                 if output.status.success() {
                     catalog.merge_service_list(&String::from_utf8_lossy(&output.stdout));
                 }
             }
         }
         if include_hal {
-            if let Ok(output) = Command::new("lshal").args(["-i", "-p"]).output() {
+            if let Ok(output) = crate::android::run_platform_command("lshal", &["-i", "-p"]) {
                 if output.status.success() {
                     catalog.merge_lshal(&String::from_utf8_lossy(&output.stdout));
                 }

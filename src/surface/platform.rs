@@ -5,7 +5,6 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -144,38 +143,7 @@ impl PlatformReader for RealPlatformReader {
     }
 
     fn command_output(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
-        let candidates: &[&str] = match program {
-            "service" => &["/system/bin/service"],
-            "dumpsys" => &["/system/bin/dumpsys"],
-            "getprop" => &["/system/bin/getprop"],
-            "lshal" => &["/system/bin/lshal", "/vendor/bin/lshal"],
-            "vndservice" => &["/vendor/bin/vndservice", "/system/bin/vndservice"],
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported platform command: {program}"),
-                ))
-            }
-        };
-        let mut last_not_found = None;
-        let mut output = None;
-        for candidate in candidates {
-            match Command::new(candidate).args(args).output() {
-                Ok(result) => {
-                    output = Some(result);
-                    break;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    last_not_found = Some(error)
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let output = output.ok_or_else(|| {
-            last_not_found.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "platform command not found")
-            })
-        })?;
+        let output = crate::android::run_platform_command(program, args)?;
         Ok(CommandOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

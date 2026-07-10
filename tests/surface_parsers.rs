@@ -114,6 +114,27 @@ fn malformed_vintf_manifest_is_an_error() {
 }
 
 #[test]
+fn vintf_manifest_preserves_each_declared_hidl_version() {
+    let xml = r#"
+<manifest version="1.0" type="device">
+  <hal format="hidl">
+    <name>android.hardware.example</name>
+    <version>1.0</version>
+    <version>2.0</version>
+    <interface><name>IExample</name><instance>default</instance></interface>
+  </hal>
+</manifest>
+"#;
+
+    let declarations = parse_vintf_manifest(xml).unwrap();
+    let versions: Vec<_> = declarations
+        .iter()
+        .map(|declaration| declaration.version.as_deref())
+        .collect();
+    assert_eq!(versions, [Some("1.0"), Some("2.0")]);
+}
+
+#[test]
 fn process_status_reads_real_uid_and_gid() {
     let status = r#"Name:	android.hardwar
 State:	S (sleeping)

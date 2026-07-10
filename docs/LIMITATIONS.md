@@ -156,9 +156,10 @@ backlog — see [docs/ROADMAP.md](ROADMAP.md).
 neutron captures events from the moment the BPF programs are attached.
 Activity that ran before `--pid`, `--package`, or `--root-uid` was issued
 (zygote initialization, early app `onCreate`, splash logic) is not
-retroactively visible. Package and UID roots refresh matching processes once
-per second after attach, so they cannot reconstruct earlier activity and can
-miss a process that starts and exits between refreshes.
+retroactively visible. Package roots refresh matching processes once per
+second after attach and can miss a process that starts and exits between
+refreshes. Explicit UID roots are admitted by eBPF on their first observed
+kernel event; their refresh is only for reconciliation and limit enforcement.
 
 ---
 
@@ -261,7 +262,7 @@ vulnerability, a feature, or a false positive is up to the analyst.
 | FD → device/socket attribution for ioctl | v1.1 | Userspace FD graph (landed) |
 | FD-count rules / poller / rlimit awareness | sprint-1 PR 3 | `fd_snapshot` events + `fd_count_*` predicates |
 | ioctl decoder registry | v1.1–v1.4 | Typed/verified mappings grow additively; unknown commands remain numeric |
-| `--package` / `--root-uid` process discovery | v1.3 / v1.4 | One-second refresh; no retroactive activity, and sub-second processes can be missed |
+| `--package` / `--root-uid` process discovery | v1.3 / v1.4 | Neither is retroactive. Package roots can miss sub-second processes between refreshes; explicit UID roots use first-event kernel admission. |
 | Cross-process causal tracing | v1.3 | Observed, bounded Binder following; it is not a theoretical reachability solver |
 | Android surface mapper | v1.4 | Static inventory plus imported/live causal evidence; explicit collector health |
 | `path_truncated` counter wired in BPF | v1.1 | Currently reserved in COUNTERS but not incremented |

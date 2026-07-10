@@ -46,6 +46,7 @@ pub struct BinderSpan {
 pub struct SyscallSpan {
     pub ts_ns: Option<u64>,
     pub pid: u32,
+    pub uid: Option<u32>,
     pub tid: u32,
     pub nr: i64,
     pub name: String,
@@ -194,7 +195,15 @@ pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
             capture.binders.push(binder);
         }
     }
-    capture.syscalls = syscalls.into_values().collect();
+    for syscall in syscalls.into_values() {
+        if syscall.pid == 0 {
+            capture
+                .health_warnings
+                .insert("ignored syscall span with a missing process endpoint".into());
+        } else {
+            capture.syscalls.push(syscall);
+        }
+    }
     Ok(capture)
 }
 
@@ -307,6 +316,7 @@ fn merge_syscall(syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>, object: &Map<
     let candidate = SyscallSpan {
         ts_ns: number_u64(object, "ts_ns"),
         pid,
+        uid: number_u32(object, "uid"),
         tid,
         nr,
         name: text(object, "name")
@@ -349,6 +359,7 @@ fn merge_syscall_fields(
     let previous = std::mem::take(existing);
     *existing = candidate;
     existing.ts_ns = existing.ts_ns.or(previous.ts_ns);
+    existing.uid = existing.uid.or(previous.uid);
     existing.comm = existing.comm.take().or(previous.comm);
     existing.ret = existing.ret.or(previous.ret);
     existing.latency_us = existing.latency_us.or(previous.latency_us);

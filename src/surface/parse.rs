@@ -130,7 +130,7 @@ pub fn parse_dumpsys_pid(input: &str) -> Option<u32> {
 struct HalBuilder {
     format: String,
     package: String,
-    version: Option<String>,
+    versions: Vec<String>,
     transport: Option<String>,
     fqnames: Vec<String>,
     interfaces: Vec<InterfaceBuilder>,
@@ -145,29 +145,43 @@ struct InterfaceBuilder {
 impl HalBuilder {
     fn finish(self) -> Vec<VintfDeclaration> {
         let mut declarations = Vec::new();
+        let declared_versions: Vec<Option<String>> = if self.versions.is_empty() {
+            vec![None]
+        } else {
+            self.versions.iter().cloned().map(Some).collect()
+        };
         for fqname in self.fqnames {
             if let Some((version, interface, instance)) = split_fqname(&fqname) {
-                declarations.push(VintfDeclaration {
-                    format: self.format.clone(),
-                    package: self.package.clone(),
-                    version: version.or_else(|| self.version.clone()),
-                    interface,
-                    instance,
-                    transport: self.transport.clone(),
-                });
+                let versions =
+                    version.map_or_else(|| declared_versions.clone(), |value| vec![Some(value)]);
+                for version in versions {
+                    declarations.push(VintfDeclaration {
+                        format: self.format.clone(),
+                        package: self.package.clone(),
+                        version,
+                        interface: interface.clone(),
+                        instance: instance.clone(),
+                        transport: self.transport.clone(),
+                    });
+                }
             }
         }
         for interface in self.interfaces {
             for instance in interface.instances {
-                if !self.package.is_empty() && !interface.name.is_empty() && !instance.is_empty() {
-                    declarations.push(VintfDeclaration {
-                        format: self.format.clone(),
-                        package: self.package.clone(),
-                        version: self.version.clone(),
-                        interface: interface.name.clone(),
-                        instance,
-                        transport: self.transport.clone(),
-                    });
+                for version in &declared_versions {
+                    if !self.package.is_empty()
+                        && !interface.name.is_empty()
+                        && !instance.is_empty()
+                    {
+                        declarations.push(VintfDeclaration {
+                            format: self.format.clone(),
+                            package: self.package.clone(),
+                            version: version.clone(),
+                            interface: interface.name.clone(),
+                            instance: instance.clone(),
+                            transport: self.transport.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -258,7 +272,7 @@ pub fn parse_vintf_manifest(input: &str) -> Result<Vec<VintfDeclaration>> {
                 } else if let Some(current_hal) = hal.as_mut() {
                     match tag {
                         b"name" => current_hal.package = value,
-                        b"version" => current_hal.version = Some(value),
+                        b"version" => current_hal.versions.push(value),
                         b"transport" => current_hal.transport = Some(value),
                         b"fqname" => current_hal.fqnames.push(value),
                         _ => {}

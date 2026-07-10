@@ -154,3 +154,18 @@ fn malformed_binder_endpoints_and_oversized_debug_ids_are_ignored() {
         .health_warnings
         .contains("ignored Binder span with a missing process endpoint"));
 }
+
+#[test]
+fn syscall_uid_is_retained_and_pid_zero_is_rejected() {
+    let input = r#"
+{"type":"syscall","pid":42,"uid":1000,"tid":42,"name":"ioctl","phase":"exit","trace_id":"trace-a","span_id":"valid"}
+{"type":"syscall","pid":0,"uid":10123,"tid":0,"name":"ioctl","phase":"exit","trace_id":"trace-a","span_id":"invalid"}
+"#;
+
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+    assert_eq!(capture.syscalls.len(), 1);
+    assert_eq!(capture.syscalls[0].uid, Some(1000));
+    assert!(capture
+        .health_warnings
+        .contains("ignored syscall span with a missing process endpoint"));
+}

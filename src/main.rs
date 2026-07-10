@@ -21,7 +21,7 @@ use std::time::Duration;
 use std::os::fd::AsRawFd;
 
 use anyhow::{bail, Context, Result};
-use aya::maps::{Array, HashMap as AyaHashMap, RingBuf, StackTraceMap};
+use aya::maps::{Array, HashMap as AyaHashMap, MapError, RingBuf, StackTraceMap};
 use aya::programs::{KProbe, TracePoint};
 use aya::{Ebpf, EbpfLoader, VerifierLogLevel};
 use clap::Parser;
@@ -62,10 +62,11 @@ use neutron_common::{
     ExitSource, ProcessTraceContext, TraceReason, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF,
     FILTER_KEY_CAUSAL_MODE, FILTER_KEY_FOLLOW_BINDER, FILTER_KEY_IOCTL_DIR,
     FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_MAX_DEPTH, FILTER_KEY_PID,
-    FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED, MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD,
-    MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY,
-    MATCH_BIT_RET, MATCH_BIT_UID, PROCESS_TRACE_CONTEXT_SIZE, SYSCALL_NR_BINDER_RECEIVED,
-    SYSCALL_NR_PROCESS_EXIT,
+    FILTER_KEY_RET_CLASS, FILTER_KEY_ROOT_UID, FILTER_KEY_ROOT_UID_ACTIVE,
+    FILTER_KEY_ROOT_UID_ADMIT, FILTER_KEY_STATE_EMIT_REQUIRED, MATCH_BIT_ARG_U32,
+    MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE,
+    MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID, PROCESS_TRACE_CONTEXT_SIZE,
+    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -478,6 +479,8 @@ fn populate_filter_map(
     causal_mode: bool,
     follow_binder: bool,
     max_depth: u8,
+    root_uid: Option<u32>,
+    admit_root_uid: bool,
 ) -> Result<()> {
     let map = bpf
         .map_mut("FILTER_MAP")
@@ -499,6 +502,15 @@ fn populate_filter_map(
     filter
         .set(FILTER_KEY_MAX_DEPTH, u32::from(max_depth), 0)
         .context("setting FILTER_MAP[MAX_DEPTH]")?;
+    filter
+        .set(FILTER_KEY_ROOT_UID, root_uid.unwrap_or_default(), 0)
+        .context("setting FILTER_MAP[ROOT_UID]")?;
+    filter
+        .set(FILTER_KEY_ROOT_UID_ACTIVE, u32::from(root_uid.is_some()), 0)
+        .context("setting FILTER_MAP[ROOT_UID_ACTIVE]")?;
+    filter
+        .set(FILTER_KEY_ROOT_UID_ADMIT, u32::from(admit_root_uid), 0)
+        .context("setting FILTER_MAP[ROOT_UID_ADMIT]")?;
     Ok(())
 }
 
@@ -1371,24 +1383,49 @@ fn replace_causal_roots(
         .context("TRACED_PROCESSES missing")?;
     let mut traced: AyaHashMap<_, u32, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
         AyaHashMap::try_from(map).context("TRACED_PROCESSES has unexpected layout")?;
-    let keys: Vec<u32> = traced.keys().filter_map(Result::ok).collect();
+    let keys: Vec<u32> = traced
+        .keys()
+        .collect::<Result<_, _>>()
+        .context("enumerating causal process roots")?;
     for pid in keys {
-        let _ = traced.remove(&pid);
+        match traced.remove(&pid) {
+            Ok(()) => {}
+            Err(error) if map_delete_already_absent(&error) => {}
+            Err(error) => return Err(error).with_context(|| format!("removing causal PID {pid}")),
+        }
     }
     for pid in roots.iter().copied() {
-        let context = ProcessTraceContext {
-            root_trace_id: trace_id,
-            parent_pid: 0,
-            binder_debug_id: 0,
-            depth: 0,
-            reason: TraceReason::Root,
-            scenario_generation: generation,
-        };
+        let context = root_process_context(trace_id, generation);
         traced
             .insert(pid, process_context_bytes(&context), 0)
             .with_context(|| format!("adding root PID {pid} to TRACED_PROCESSES"))?;
     }
     Ok(())
+}
+
+fn map_delete_already_absent(error: &MapError) -> bool {
+    match error {
+        MapError::KeyNotFound | MapError::ElementNotFound => true,
+        MapError::SyscallError(error) => {
+            error.call == "bpf_map_delete_elem"
+                && error.io_error.raw_os_error() == Some(libc::ENOENT)
+        }
+        _ => false,
+    }
+}
+
+fn set_root_uid_context(bpf: &mut Ebpf, trace_id: u64, generation: u16) -> Result<()> {
+    let map = bpf
+        .map_mut("ROOT_UID_CONTEXT")
+        .context("ROOT_UID_CONTEXT missing")?;
+    let mut root: Array<_, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
+        Array::try_from(map).context("ROOT_UID_CONTEXT has unexpected layout")?;
+    root.set(
+        0,
+        process_context_bytes(&root_process_context(trace_id, generation)),
+        0,
+    )
+    .context("updating ROOT_UID_CONTEXT")
 }
 
 fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
@@ -1401,9 +1438,19 @@ fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
             .context("BINDER_TRANSACTION_CONTEXT missing")?;
         let mut transactions: AyaHashMap<_, u32, [u8; 29]> = AyaHashMap::try_from(map)
             .context("BINDER_TRANSACTION_CONTEXT has unexpected layout")?;
-        let keys: Vec<u32> = transactions.keys().filter_map(Result::ok).collect();
+        let keys: Vec<u32> = transactions
+            .keys()
+            .collect::<Result<_, _>>()
+            .context("enumerating Binder transaction contexts")?;
         for key in keys {
-            let _ = transactions.remove(&key);
+            match transactions.remove(&key) {
+                Ok(()) => {}
+                Err(error) if map_delete_already_absent(&error) => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing Binder transaction context {key}"))
+                }
+            }
         }
     }
     {
@@ -1412,31 +1459,81 @@ fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
             .context("THREAD_BINDER_CONTEXT missing")?;
         let mut threads: AyaHashMap<_, u64, [u8; 7]> =
             AyaHashMap::try_from(map).context("THREAD_BINDER_CONTEXT has unexpected layout")?;
-        let keys: Vec<u64> = threads.keys().filter_map(Result::ok).collect();
+        let keys: Vec<u64> = threads
+            .keys()
+            .collect::<Result<_, _>>()
+            .context("enumerating Binder thread contexts")?;
         for key in keys {
-            let _ = threads.remove(&key);
+            match threads.remove(&key) {
+                Ok(()) => {}
+                Err(error) if map_delete_already_absent(&error) => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing Binder thread context {key}"))
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn insert_causal_root(bpf: &mut Ebpf, pid: u32, trace_id: u64, generation: u16) -> Result<()> {
+fn reconcile_causal_roots(
+    bpf: &mut Ebpf,
+    roots: &[u32],
+    trace_id: u64,
+    generation: u16,
+) -> Result<()> {
     let map = bpf
         .map_mut("TRACED_PROCESSES")
         .context("TRACED_PROCESSES missing")?;
     let mut traced: AyaHashMap<_, u32, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
         AyaHashMap::try_from(map).context("TRACED_PROCESSES has unexpected layout")?;
-    let context = ProcessTraceContext {
+    let roots: HashSet<u32> = roots.iter().copied().collect();
+    let keys: Vec<u32> = traced
+        .keys()
+        .collect::<Result<_, _>>()
+        .context("enumerating causal roots for reconciliation")?;
+    for pid in keys {
+        let remove = match traced.get(&pid, 0) {
+            Ok(context) => {
+                let context = process_context_from_bytes(context);
+                context.reason == TraceReason::Root && !roots.contains(&pid)
+            }
+            Err(MapError::KeyNotFound | MapError::ElementNotFound) => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading causal PID {pid} during reconciliation"))
+            }
+        };
+        if remove {
+            match traced.remove(&pid) {
+                Ok(()) => {}
+                Err(error) if map_delete_already_absent(&error) => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing stale causal root PID {pid}"))
+                }
+            }
+        }
+    }
+    let context = root_process_context(trace_id, generation);
+    for pid in roots {
+        traced
+            .insert(pid, process_context_bytes(&context), 0)
+            .with_context(|| format!("adding refreshed causal root PID {pid}"))?;
+    }
+    Ok(())
+}
+
+fn root_process_context(trace_id: u64, generation: u16) -> ProcessTraceContext {
+    ProcessTraceContext {
         root_trace_id: trace_id,
         parent_pid: 0,
         binder_debug_id: 0,
         depth: 0,
         reason: TraceReason::Root,
         scenario_generation: generation,
-    };
-    traced
-        .insert(pid, process_context_bytes(&context), 0)
-        .with_context(|| format!("adding new causal root PID {pid}"))
+    }
 }
 
 fn discover_dynamic_roots(args: &Args, package_uid: Option<u32>) -> Result<Option<Vec<u32>>> {
@@ -1812,7 +1909,10 @@ fn run_trace(mut args: Args) -> Result<()> {
         args.package.is_some() || args.root_uid.is_some(),
         args.follow_binder,
         args.max_depth,
+        args.root_uid.or(package_uid),
+        args.root_uid.is_some(),
     )?;
+    set_root_uid_context(&mut bpf, 0, 0)?;
     replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
     populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
     let capture_predicate = build_capture_predicate(&args)?;
@@ -2190,9 +2290,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                         if let Some(discovered) = discover_dynamic_roots(&args, package_uid)? {
                             root_pids = discovered;
                         }
-                        if root_pids.is_empty() {
+                        if root_pids.is_empty() && args.root_uid.is_none() {
                             bail!(
-                                "live scenarios require --package, --root-uid, or a non-zero --pid root with a running process"
+                                "live scenarios require --root-uid, a running --package root, or a non-zero --pid root"
                             );
                         }
                         if root_pids.len() > args.max_processes as usize {
@@ -2203,13 +2303,14 @@ fn run_trace(mut args: Args) -> Result<()> {
                             );
                         }
                         let scenario = scenarios.start(&request.name)?;
-                        clear_causal_transients(&mut bpf)?;
+                        set_root_uid_context(&mut bpf, scenario.trace_id, scenario.generation)?;
                         replace_causal_roots(
                             &mut bpf,
                             &root_pids,
                             scenario.trace_id,
                             scenario.generation,
                         )?;
+                        clear_causal_transients(&mut bpf)?;
                         binder_causal.clear();
                         recent_exit_causal.clear();
                         let ts_ns = monotonic_timestamp_ns();
@@ -2223,8 +2324,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                         Ok((scenario, ts_ns, line))
                     } else {
                         let scenario = scenarios.end(&request.name)?;
-                        clear_causal_transients(&mut bpf)?;
+                        set_root_uid_context(&mut bpf, 0, 0)?;
                         replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
+                        clear_causal_transients(&mut bpf)?;
                         recent_exit_causal.clear();
                         let ts_ns = monotonic_timestamp_ns();
                         let line = live_marker_line(
@@ -2271,20 +2373,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                             .active()
                             .map(|scenario| (scenario.trace_id, scenario.generation))
                             .unwrap_or((0, 0));
-                        let missing: Vec<u32> = discovered
-                            .iter()
-                            .copied()
-                            .filter(|pid| read_process_context(&bpf, *pid).is_none())
-                            .collect();
-                        for pid in missing {
-                            if let Err(error) =
-                                insert_causal_root(&mut bpf, pid, trace_id, generation)
-                            {
-                                eprintln!(
-                                    "neutron: warn: could not add new causal root PID {pid}: {error:#}"
-                                );
-                            }
-                        }
+                        reconcile_causal_roots(&mut bpf, &discovered, trace_id, generation)?;
                         root_pids = discovered;
                     }
                     Ok(Some(discovered)) => bail!(

@@ -28,7 +28,7 @@ the **Marker workflow** section below. For Android provider work, use
 | Flag                              | Type             | Default                                  | Description |
 |-----------------------------------|------------------|------------------------------------------|-------------|
 | `--package NAME`                  | String           | unset                                    | Root package for causal tracing; resolves UID, then matches `/proc/PID/cmdline` as `package` or `package:*`. Separate from `--match-package`. |
-| `--root-uid UID`                  | u32              | unset                                    | Root current processes of one Android UID and add matches found by a one-second refresh. A process that starts and exits between refreshes can be missed. Mutually exclusive with `--package` and an explicit `--pid`. (1.4.0) |
+| `--root-uid UID`                  | u32              | unset                                    | Root one Android UID. eBPF admits a matching process on its first observed kernel event; a one-second `/proc` refresh reconciles exits and process limits. Mutually exclusive with `--package` and an explicit `--pid`. (1.4.0) |
 | `--follow-binder`                 | flag             | off                                      | Add Binder callees to the bounded dynamic trace set before publishing the caller event. |
 | `--follow-services`               | flag             | off                                      | Enable `service list -p` candidate discovery; implies `--follow-binder`. |
 | `--follow-hal`                    | flag             | off                                      | Enable `service list -p` and `lshal -ip` HAL candidate discovery; implies `--follow-binder`. |
@@ -156,7 +156,9 @@ neutron surface reachable --from-uid 10123 --input surface.json
 PID shared by multiple stored identities. `explain` accepts a service ID/name
 or device ID/path/alias and rejects zero or ambiguous matches. Every command
 writes JSON to stdout unless `--output` is set; a final-component symlink is
-rejected, while a selected file is truncated and forced to mode `0600`.
+rejected. An existing output must already be a mode-private, owned, single-link
+regular file; the verified file descriptor is then truncated and kept at mode
+`0600`.
 
 `reachable` traverses only capture-sourced `root_process`, `binder`,
 `served_by`, and `ioctl` relations from matching trace IDs. Other relation
@@ -286,8 +288,8 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
 | `args`            | u64[6]              | Syscall arguments. All six positions reflect the actual ABI args. |
 | `data`            | String (optional)   | Decoded `data[128]`: path, sockaddr, hex; omitted if empty   |
 | `data_phase`      | String              | `"enter"` when `data[]` is the pre-call buffer; `"exit"` when the BPF program refreshed it post-call. Built-in refresh covers dma-heap/binder/dma-buf/ashmem; `--driver-pack` can enable runtime refresh for KGSL, Mali, ALSA, LWIS, and GXP families. |
-| `ioctl_family`    | String (optional)   | `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"` (1.2.0), `"gxp"` (1.2.0), or `"unknown"`. Emitted for `ioctl(2)` events. |
-| `ioctl_name`      | String (optional)   | Human cmd name (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"BINDER_WRITE_READ"`, `"LWIS_CMD_PACKET"`) when the decoder registry recognises it. |
+| `ioctl_family`    | String (optional)   | `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"` (1.2.0), `"gxp"` (1.2.0), `"trusty_tipc"` (1.4.0), `"v4l2"` (1.4.0), or `"unknown"`. Emitted for `ioctl(2)` events. |
+| `ioctl_name`      | String (optional)   | Human cmd name (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"BINDER_WRITE_READ"`, `"TIPC_IOC_CONNECT"`, `"VIDIOC_QBUF"`) when the decoder registry recognises it. |
 | `dma_heap`        | Object (optional)   | Decoded `struct dma_heap_allocation_data`. Fields: `len`, `returned_fd`, `fd_flags`, `fd_flags_str`, `heap_flags`. |
 | `binder_write_read` | Object (optional) | Scalar `BINDER_WRITE_READ` header: `write_size`, `write_consumed`, `read_size`, `read_consumed`. |
 | `kgsl` / `mali`   | Object (optional)   | First four captured scalar words as `arg0..arg3`; nested pointers are not followed. |

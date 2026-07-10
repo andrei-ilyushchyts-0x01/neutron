@@ -293,9 +293,10 @@ Mutually exclusive with
 .BR \-\-root\-uid .
 .TP
 .BI \-\-root\-uid " UID"
-Root causal tracing at current processes with the Android UID, then add
-matches found by a one-second refresh (1.4.0). A process that starts and exits
-between refreshes can be missed. Mutually exclusive with
+Root causal tracing for one Android UID (1.4.0). The eBPF gate admits a
+matching process on its first observed kernel event; a one-second
+.I /proc
+refresh reconciles exits and process limits. Mutually exclusive with
 .B \-\-package
 and an explicit
 .BR \-\-pid .

@@ -36,19 +36,21 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use neutron_common::{
-    encode_causal_relation_depth, is_state_tracking_nr, ret_matches_class, ExitSource,
-    ProcessTraceContext, SyscallEvent, TraceReason, CAUSAL_RELATION_EXACT,
-    CAUSAL_RELATION_INFERRED, COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED,
-    COUNTER_EVENTS_SUBMITTED, COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED,
-    COUNTER_IOCTL_REFRESH_MISSED, COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
-    COUNTER_THREAD_CONTEXT_UPDATE_FAILED, COUNTER_TRACED_PROCESS_LIMIT,
-    COUNTER_UNIX_MSG_CONTROL_NESTED, COUNTER_UNIX_MSG_CONTROL_TRUNCATED, FILTER_KEY_ACTIVE,
-    FILTER_KEY_ARG_U32_OFF, FILTER_KEY_CAUSAL_MODE, FILTER_KEY_FOLLOW_BINDER, FILTER_KEY_IOCTL_DIR,
+    causal_pid_action, encode_causal_relation_depth, is_state_tracking_nr, ret_matches_class,
+    ExitSource, ProcessTraceContext, SyscallEvent, TraceReason, CAUSAL_PID_ADMIT_ROOT,
+    CAUSAL_PID_FALLTHROUGH, CAUSAL_PID_MATCH, CAUSAL_RELATION_EXACT, CAUSAL_RELATION_INFERRED,
+    COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED, COUNTER_EVENTS_SUBMITTED,
+    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
+    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_THREAD_CONTEXT_UPDATE_FAILED,
+    COUNTER_TRACED_PROCESS_LIMIT, COUNTER_UNIX_MSG_CONTROL_NESTED,
+    COUNTER_UNIX_MSG_CONTROL_TRUNCATED, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF,
+    FILTER_KEY_CAUSAL_MODE, FILTER_KEY_FOLLOW_BINDER, FILTER_KEY_IOCTL_DIR,
     FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_MAX_DEPTH, FILTER_KEY_PID,
-    FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED, FILTER_MAP_SLOT_COUNT, MATCH_BIT_ARG_U32,
-    MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE,
-    MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID, SYSCALL_NR_BINDER_RECEIVED,
-    SYSCALL_NR_PROCESS_EXIT,
+    FILTER_KEY_RET_CLASS, FILTER_KEY_ROOT_UID, FILTER_KEY_ROOT_UID_ACTIVE,
+    FILTER_KEY_ROOT_UID_ADMIT, FILTER_KEY_STATE_EMIT_REQUIRED, FILTER_MAP_SLOT_COUNT,
+    MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR,
+    MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
+    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
 };
 #[cfg(feature = "stacks")]
 use neutron_common::{COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED};
@@ -104,6 +106,11 @@ static PID_WHITELIST: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
 /// `--max-processes`; Binder propagation updates it before publishing events.
 #[map]
 static TRACED_PROCESSES: HashMap<u32, ProcessTraceContext> = HashMap::with_max_entries(64, 0);
+
+/// Context assigned when explicit `--root-uid` admits a process on its first
+/// event. Userspace swaps this singleton at causal scenario boundaries.
+#[map]
+static ROOT_UID_CONTEXT: Array<ProcessTraceContext> = Array::with_max_entries(1, 0);
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -282,6 +289,32 @@ fn max_causal_depth() -> u8 {
         .min(u8::MAX as u32) as u8
 }
 
+#[inline(always)]
+fn root_uid_matches() -> bool {
+    if !matches!(FILTER_MAP.get(FILTER_KEY_ROOT_UID_ACTIVE).copied(), Some(1)) {
+        return true;
+    }
+    let Some(expected) = FILTER_MAP.get(FILTER_KEY_ROOT_UID).copied() else {
+        return false;
+    };
+    bpf_get_current_uid_gid() as u32 == expected
+}
+
+#[inline(always)]
+fn root_uid_admission_enabled() -> bool {
+    matches!(FILTER_MAP.get(FILTER_KEY_ROOT_UID_ADMIT).copied(), Some(1))
+}
+
+#[inline(always)]
+fn active_causal_context_matches(context: ProcessTraceContext) -> bool {
+    let Some(active) = ROOT_UID_CONTEXT.get(0).copied() else {
+        return false;
+    };
+    context.root_trace_id != 0
+        && context.root_trace_id == active.root_trace_id
+        && context.scenario_generation == active.scenario_generation
+}
+
 /// Returns `true` if the given userspace process ID matches the configured
 /// target. `userspace_pid` corresponds to kernel `task_struct->tgid` and is
 /// stable across all threads of the process — that is precisely the property
@@ -289,6 +322,41 @@ fn max_causal_depth() -> u8 {
 /// workers, WebView/Chromium threads all share it).
 #[inline(always)]
 fn pid_matches(userspace_pid: u32) -> bool {
+    let context = unsafe { TRACED_PROCESSES.get(&userspace_pid) }.copied();
+    let action = causal_pid_action(
+        causal_mode(),
+        context.map_or(0, |value| value.reason as u8),
+        root_uid_admission_enabled(),
+        root_uid_matches(),
+    );
+    if action == CAUSAL_PID_MATCH {
+        return context.is_some_and(|existing| {
+            (existing.reason == TraceReason::Root && existing.root_trace_id == 0)
+                || active_causal_context_matches(existing)
+        });
+    }
+    if action == CAUSAL_PID_ADMIT_ROOT {
+        let Some(root) = ROOT_UID_CONTEXT.get(0).copied() else {
+            return false;
+        };
+        if root.reason != TraceReason::Root {
+            return false;
+        }
+        if context.is_some_and(|existing| {
+            existing.root_trace_id == root.root_trace_id
+                && existing.scenario_generation == root.scenario_generation
+        }) {
+            return true;
+        }
+        if TRACED_PROCESSES.insert(&userspace_pid, &root, 0).is_err() {
+            bump_counter(COUNTER_TRACED_PROCESS_LIMIT);
+            return false;
+        }
+        return true;
+    }
+    if action != CAUSAL_PID_FALLTHROUGH {
+        return false;
+    }
     let target = match target_pid() {
         Some(t) => t,
         None => return false,
@@ -299,9 +367,6 @@ fn pid_matches(userspace_pid: u32) -> bool {
     // SAFETY: `HashMap::get` borrows into kernel map memory; we discard the
     // borrow immediately, so no aliasing concern.
     if unsafe { PID_WHITELIST.get(&userspace_pid).is_some() } {
-        return true;
-    }
-    if unsafe { TRACED_PROCESSES.get(&userspace_pid).is_some() } {
         return true;
     }
     target == 0 && !causal_mode()
@@ -325,9 +390,15 @@ fn causal_context(pid_tgid: u64, userspace_pid: u32) -> (ProcessTraceContext, u3
     let Some(process) = unsafe { TRACED_PROCESSES.get(&userspace_pid) }.copied() else {
         return (EMPTY_PROCESS_CONTEXT, 0, 0);
     };
+    if process.root_trace_id != 0 && !active_causal_context_matches(process) {
+        return (EMPTY_PROCESS_CONTEXT, 0, 0);
+    }
     if let Some(thread) = unsafe { THREAD_BINDER_CONTEXT.get(&pid_tgid) }.copied() {
         if thread.scenario_generation == process.scenario_generation {
-            return (process, thread.debug_id, CAUSAL_RELATION_EXACT);
+            let mut context = process;
+            context.depth = thread.depth;
+            context.binder_debug_id = thread.debug_id;
+            return (context, thread.debug_id, CAUSAL_RELATION_EXACT);
         }
     }
     let relation = if process.depth == 0 {
@@ -671,7 +742,7 @@ fn follow_binder_callee(
     parent_debug_id: u32,
     relation: u8,
 ) {
-    if !follow_binder_enabled() {
+    if !follow_binder_enabled() || !active_causal_context_matches(caller) {
         return;
     }
     if callee_pid <= 0 || debug_id == 0 {
@@ -705,7 +776,10 @@ fn follow_binder_callee(
         return;
     }
     let pid = callee_pid as u32;
-    if TRACED_PROCESSES.insert(&pid, &process, 0).is_err() {
+    let preserve_root = unsafe { TRACED_PROCESSES.get(&pid) }
+        .copied()
+        .is_some_and(|context| context.reason == TraceReason::Root);
+    if !preserve_root && TRACED_PROCESSES.insert(&pid, &process, 0).is_err() {
         let _ = BINDER_TRANSACTION_CONTEXT.remove(&(debug_id as u32));
         bump_counter(COUNTER_TRACED_PROCESS_LIMIT);
         bump_counter(COUNTER_BINDER_FOLLOW_FAILED);
@@ -1378,6 +1452,10 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
     } else {
         unsafe { BINDER_TRANSACTION_CONTEXT.get(&(debug_id as u32)) }.copied()
     };
+    if debug_id != 0 {
+        let _ = BINDER_TRANSACTION_CONTEXT.remove(&(debug_id as u32));
+    }
+    let transaction = transaction.filter(|context| active_causal_context_matches(context.process));
     if let Some(context) = transaction {
         if context.flags & 1 == 0 {
             let thread = BinderThreadContext {
@@ -1393,7 +1471,6 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
             // Keep process-level context only, which syscalls label inferred.
             let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
         }
-        let _ = BINDER_TRANSACTION_CONTEXT.remove(&(debug_id as u32));
     }
 
     let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();

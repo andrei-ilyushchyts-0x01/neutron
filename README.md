@@ -334,10 +334,10 @@ SELinux, VINTF, manifest permissions, or theoretical Binder access. Static
 `proc_fd` relations describe the scan instant and enrich nodes, but never make
 a node reachable.
 
-For a UID-rooted causal trace, use `trace --root-uid UID`. It starts from the
-current processes and adds matching processes found by a one-second refresh;
-a process that starts and exits between refreshes can be missed. The option
-cannot be combined with `--package` or an explicit `--pid`.
+For a UID-rooted causal trace, use `trace --root-uid UID`. The eBPF gate admits
+each matching process on its first observed kernel event, including processes
+created between `/proc` refreshes; the refresh reconciles exits and process
+limits. The option cannot be combined with `--package` or an explicit `--pid`.
 
 ## Three Boundary Report Workflows
 

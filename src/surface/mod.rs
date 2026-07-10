@@ -13,7 +13,7 @@ pub use platform::{CommandOutput, FileKind, PlatformMetadata, PlatformReader, Re
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -55,10 +55,10 @@ pub struct SurfaceScanArgs {
     #[arg(long, conflicts_with = "capture", requires = "from")]
     pub observe: Option<String>,
     /// Package root for live observation.
-    #[arg(long, group = "from")]
+    #[arg(long, group = "from", requires = "observe", conflicts_with = "capture")]
     pub from_package: Option<String>,
     /// UID root for live observation.
-    #[arg(long, group = "from")]
+    #[arg(long, group = "from", requires = "observe", conflicts_with = "capture")]
     pub from_uid: Option<u32>,
     /// Write JSON to this file (mode 0600) instead of stdout.
     #[arg(long)]
@@ -667,13 +667,14 @@ fn collect_devices(
     let mut devices = Vec::new();
     for ((kind, major, minor), mut paths) in nodes {
         paths.sort_by(|a, b| a.0.cmp(&b.0));
+        let node_paths: BTreeSet<PathBuf> = paths.iter().map(|(path, _)| path.clone()).collect();
         let (canonical, metadata) = paths.remove(0);
         let mut device_aliases: BTreeSet<String> = paths
             .into_iter()
             .map(|(path, _)| path.to_string_lossy().into_owned())
             .collect();
         for (alias, target) in &aliases {
-            if target == &canonical {
+            if node_paths.contains(target) {
                 device_aliases.insert(alias.to_string_lossy().into_owned());
             }
         }
@@ -706,6 +707,7 @@ fn collect_devices(
         enrich_sysfs(reader, &mut device, health);
         devices.push(device);
     }
+    enrich_sysfs_classes(reader, &mut devices, health);
     Ok(devices)
 }
 
@@ -724,16 +726,143 @@ fn enrich_sysfs(reader: &dyn PlatformReader, device: &mut Device, health: &mut H
             return;
         }
     };
-    device.sysfs_path = Some(sysfs.to_string_lossy().into_owned());
-    if let Ok(subsystem) = reader.canonicalize(&sysfs.join("subsystem")) {
-        let name = basename(&subsystem);
-        device.class = name.clone();
-        device.subsystem = name;
+    if !sysfs.starts_with("/sys/devices") {
+        health.warn(
+            "devices",
+            format!(
+                "sysfs anchor for {} resolves outside /sys/devices: {}",
+                device.path,
+                sysfs.display()
+            ),
+        );
+        return;
     }
-    if let Ok(driver) = reader.canonicalize(&sysfs.join("driver")) {
-        device.driver = basename(&driver);
-        if let Ok(module) = reader.canonicalize(&driver.join("module")) {
-            device.module = basename(&module);
+    device.sysfs_path = Some(sysfs.to_string_lossy().into_owned());
+    match reader.canonicalize(&sysfs.join("subsystem")) {
+        Ok(subsystem) => {
+            let name = basename(&subsystem);
+            device.class = name.clone();
+            device.subsystem = name;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => health.warn(
+            "devices",
+            format!(
+                "cannot resolve sysfs subsystem for {}: {error}",
+                device.path
+            ),
+        ),
+    }
+    let mut driver_bases = vec![sysfs.clone()];
+    let mut seen = BTreeSet::from([sysfs.clone()]);
+    match reader.canonicalize(&sysfs.join("device")) {
+        Ok(target) if target.starts_with("/sys/devices") => {
+            for ancestor in target.ancestors().take(32) {
+                if !ancestor.starts_with("/sys/devices") {
+                    break;
+                }
+                if seen.insert(ancestor.to_path_buf()) {
+                    driver_bases.push(ancestor.to_path_buf());
+                }
+            }
+        }
+        Ok(target) => health.warn(
+            "devices",
+            format!(
+                "sysfs device link for {} resolves outside /sys/devices: {}",
+                device.path,
+                target.display()
+            ),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => health.warn(
+            "devices",
+            format!(
+                "cannot resolve sysfs device link for {}: {error}",
+                device.path
+            ),
+        ),
+    }
+    for ancestor in sysfs.ancestors().skip(1).take(32) {
+        if !ancestor.starts_with("/sys/devices") {
+            break;
+        }
+        if seen.insert(ancestor.to_path_buf()) {
+            driver_bases.push(ancestor.to_path_buf());
+        }
+    }
+    for base in driver_bases {
+        match reader.canonicalize(&base.join("driver")) {
+            Ok(driver) => {
+                device.driver = basename(&driver);
+                match reader.canonicalize(&driver.join("module")) {
+                    Ok(module) => device.module = basename(&module),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => health.warn(
+                        "devices",
+                        format!("cannot resolve sysfs module for {}: {error}", device.path),
+                    ),
+                }
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => health.warn(
+                "devices",
+                format!("cannot resolve sysfs driver for {}: {error}", device.path),
+            ),
+        }
+    }
+}
+
+fn enrich_sysfs_classes(
+    reader: &dyn PlatformReader,
+    devices: &mut [Device],
+    health: &mut HealthBuilder,
+) {
+    let root = Path::new("/sys/class");
+    let mut classes = match reader.read_dir(root) {
+        Ok(classes) => classes,
+        Err(error) => {
+            health.warn("devices", format!("cannot enumerate /sys/class: {error}"));
+            return;
+        }
+    };
+    classes.sort();
+    let by_sysfs: BTreeMap<String, usize> = devices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, device)| device.sysfs_path.clone().map(|path| (path, index)))
+        .collect();
+    for class in classes {
+        let Some(class_name) = basename(&class) else {
+            continue;
+        };
+        let mut entries = match reader.read_dir(&class) {
+            Ok(entries) => entries,
+            Err(error) => {
+                health.warn(
+                    "devices",
+                    format!("cannot enumerate sysfs class {}: {error}", class.display()),
+                );
+                continue;
+            }
+        };
+        entries.sort();
+        for entry in entries {
+            match reader.canonicalize(&entry) {
+                Ok(target) => {
+                    if let Some(index) = by_sysfs.get(&target.to_string_lossy().into_owned()) {
+                        devices[*index].class = Some(class_name.clone());
+                    }
+                }
+                Err(error) => health.warn(
+                    "devices",
+                    format!(
+                        "cannot resolve sysfs class entry {}: {error}",
+                        entry.display()
+                    ),
+                ),
+            }
         }
     }
 }
@@ -795,18 +924,6 @@ fn collect_processes(
         let Some(pid) = basename(&path).and_then(|name| name.parse::<u32>().ok()) else {
             continue;
         };
-        let status = match read_text(reader, &format!("/proc/{pid}/status"))
-            .and_then(|text| parse_process_status(&text).map_err(io::Error::other))
-        {
-            Ok(status) => status,
-            Err(error) => {
-                health.warn(
-                    "processes",
-                    format!("cannot read status for PID {pid}: {error}"),
-                );
-                continue;
-            }
-        };
         let starttime = match read_text(reader, &format!("/proc/{pid}/stat"))
             .and_then(|text| parse_process_starttime(&text).map_err(io::Error::other))
         {
@@ -815,6 +932,18 @@ fn collect_processes(
                 health.warn(
                     "processes",
                     format!("cannot establish identity for PID {pid}: {error}"),
+                );
+                continue;
+            }
+        };
+        let status = match read_text(reader, &format!("/proc/{pid}/status"))
+            .and_then(|text| parse_process_status(&text).map_err(io::Error::other))
+        {
+            Ok(status) => status,
+            Err(error) => {
+                health.warn(
+                    "processes",
+                    format!("cannot read status for PID {pid}: {error}"),
                 );
                 continue;
             }
@@ -873,6 +1002,7 @@ fn collect_processes(
                 Vec::new()
             }
         };
+        let relation_checkpoint = relations.len();
         let mut file_descriptors = Vec::new();
         match reader.read_dir(Path::new(&format!("/proc/{pid}/fd"))) {
             Ok(mut fds) => {
@@ -929,6 +1059,16 @@ fn collect_processes(
             ),
         }
         file_descriptors.sort_by_key(|fd| fd.fd);
+        let final_starttime = read_text(reader, &format!("/proc/{pid}/stat"))
+            .and_then(|text| parse_process_starttime(&text).map_err(io::Error::other));
+        if !matches!(final_starttime, Ok(value) if value == starttime) {
+            relations.truncate(relation_checkpoint);
+            health.warn(
+                "processes",
+                format!("PID {pid} identity changed while collecting process evidence"),
+            );
+            continue;
+        }
         processes.push(Process {
             id: process_id,
             pid,
@@ -952,7 +1092,7 @@ fn collect_services(
     relations: &mut Vec<Relation>,
     health: &mut HealthBuilder,
 ) -> Vec<Service> {
-    let mut services = BTreeMap::<String, Service>::new();
+    let mut services = BTreeMap::<(String, String), Service>::new();
 
     match reader.command_output("service", &["list"]) {
         Ok(output) if output.success => {
@@ -1012,7 +1152,7 @@ fn collect_services(
     match reader.command_output("vndservice", &["list"]) {
         Ok(output) if output.success => {
             for item in parse_vndservice_list(&output.stdout) {
-                let mut service = inventory_service(&item.name, "vndbinder", true);
+                let mut service = inventory_service(&item.name, "vndbinder", false);
                 service.descriptor = item.descriptor;
                 service.sources.push("vndservice list".into());
                 merge_service(&mut services, service);
@@ -1030,7 +1170,7 @@ fn collect_services(
             Ok(raw) => match parse_vintf_manifest(&String::from_utf8_lossy(&raw)) {
                 Ok(declarations) => {
                     for declaration in declarations {
-                        let name = vintf_name(&declaration);
+                        let name = declaration.fqname();
                         let mut service = inventory_service(
                             &name,
                             declaration
@@ -1041,7 +1181,19 @@ fn collect_services(
                         );
                         service.declared = true;
                         service.sources.push(path.to_string_lossy().into_owned());
-                        merge_service(&mut services, service);
+                        let matching_keys: Vec<_> = services
+                            .keys()
+                            .filter(|(_, service_name)| service_name == &service.name)
+                            .cloned()
+                            .collect();
+                        if let [key] = matching_keys.as_slice() {
+                            merge_service_fields(
+                                services.get_mut(key).expect("key exists"),
+                                service,
+                            );
+                        } else {
+                            merge_service(&mut services, service);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1118,26 +1270,25 @@ fn inventory_service(name: &str, transport: &str, hal: bool) -> Service {
     }
 }
 
-fn merge_service(services: &mut BTreeMap<String, Service>, incoming: Service) {
-    match services.get_mut(&incoming.name) {
-        Some(current) => {
-            if current.pid.is_none() {
-                current.pid = incoming.pid;
-            }
-            if current.descriptor.is_none() {
-                current.descriptor = incoming.descriptor;
-            }
-            current.declared |= incoming.declared;
-            current.hal |= incoming.hal;
-            current.sources.extend(incoming.sources);
-            if current.transport == "aidl" || current.transport == "hidl" {
-                current.transport = incoming.transport;
-            }
-        }
-        None => {
-            services.insert(incoming.name.clone(), incoming);
-        }
+fn merge_service(services: &mut BTreeMap<(String, String), Service>, incoming: Service) {
+    let key = (incoming.transport.clone(), incoming.name.clone());
+    if let Some(current) = services.get_mut(&key) {
+        merge_service_fields(current, incoming);
+    } else {
+        services.insert(key, incoming);
     }
+}
+
+fn merge_service_fields(current: &mut Service, incoming: Service) {
+    if current.pid.is_none() {
+        current.pid = incoming.pid;
+    }
+    if current.descriptor.is_none() {
+        current.descriptor = incoming.descriptor;
+    }
+    current.declared |= incoming.declared;
+    current.hal |= incoming.hal;
+    current.sources.extend(incoming.sources);
 }
 
 fn vintf_paths(reader: &dyn PlatformReader, health: &mut HealthBuilder) -> Vec<PathBuf> {
@@ -1162,26 +1313,6 @@ fn vintf_paths(reader: &dyn PlatformReader, health: &mut HealthBuilder) -> Vec<P
         }
     }
     paths.into_iter().collect()
-}
-
-fn vintf_name(declaration: &parse::VintfDeclaration) -> String {
-    if declaration.format == "hidl" {
-        match declaration.version.as_deref() {
-            Some(version) => format!(
-                "{}@{}::{}/{}",
-                declaration.package, version, declaration.interface, declaration.instance
-            ),
-            None => format!(
-                "{}::{}/{}",
-                declaration.package, declaration.interface, declaration.instance
-            ),
-        }
-    } else {
-        format!(
-            "{}.{}/{}",
-            declaration.package, declaration.interface, declaration.instance
-        )
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1351,11 +1482,14 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             .or_else(|| roots.get(&trace_id).map(|root| root.scenario_id.clone()))
             .filter(|value| !value.is_empty());
         let root = roots.get(&trace_id).cloned().unwrap_or_default();
+        let caller_uid = binder
+            .caller_uid
+            .or_else(|| (binder.depth == Some(0)).then_some(root.uid).flatten());
         let (caller, caller_confidence) = capture_process(
             snapshot,
             binder.caller_pid,
             &trace_id,
-            root.uid,
+            caller_uid,
             merge_confidence,
             binder.ts_ns,
         );
@@ -1444,11 +1578,14 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             continue;
         };
         let root = roots.get(&trace_id).cloned().unwrap_or_default();
+        let process_uid = syscall
+            .uid
+            .or_else(|| (syscall.depth == Some(0)).then_some(root.uid).flatten());
         let (process_id, process_confidence) = capture_process(
             snapshot,
             syscall.pid,
             &trace_id,
-            root.uid,
+            process_uid,
             merge_confidence,
             syscall.ts_ns,
         );
@@ -1571,7 +1708,15 @@ fn capture_process(
         }
     }
     let id = format!("process:capture:{trace_id}:{pid}");
-    if !snapshot.processes.iter().any(|process| process.id == id) {
+    if let Some(process) = snapshot
+        .processes
+        .iter_mut()
+        .find(|process| process.id == id)
+    {
+        if let Some(uid) = uid {
+            process.uid = uid;
+        }
+    } else {
         snapshot.processes.push(Process {
             id: id.clone(),
             pid,
@@ -1605,17 +1750,13 @@ fn resolve_capture_service(
     candidates: &[String],
 ) -> Option<(String, &'static str)> {
     if let Some(name) = name {
-        return Some((
-            resolve_named_capture_service(snapshot, name, callee_pid, "exact"),
-            "exact",
-        ));
+        return resolve_named_capture_service(snapshot, name, callee_pid, "exact")
+            .map(|service| (service, "exact"));
     }
     if candidates.len() == 1 {
         let name = candidates.first()?.as_str();
-        return Some((
-            resolve_named_capture_service(snapshot, name, callee_pid, "candidate"),
-            "candidate",
-        ));
+        return resolve_named_capture_service(snapshot, name, callee_pid, "candidate")
+            .map(|service| (service, "candidate"));
     }
     let matches: Vec<_> = snapshot
         .services
@@ -1630,13 +1771,17 @@ fn resolve_named_capture_service(
     name: &str,
     callee_pid: u32,
     confidence: &str,
-) -> String {
-    if let Some(service) = snapshot
+) -> Option<String> {
+    let matches: Vec<_> = snapshot
         .services
         .iter()
-        .find(|service| service.name == name)
-    {
-        return service.id.clone();
+        .filter(|service| service.name == name)
+        .collect();
+    if let [service] = matches.as_slice() {
+        return Some(service.id.clone());
+    }
+    if !matches.is_empty() {
+        return None;
     }
     let id = format!("service:binder:{name}");
     snapshot.services.push(Service {
@@ -1649,7 +1794,7 @@ fn resolve_named_capture_service(
         sources: vec!["capture".into()],
         ..Service::default()
     });
-    id
+    Some(id)
 }
 
 fn weakest_confidence(values: &[&str]) -> &'static str {
@@ -1873,7 +2018,7 @@ fn finish_snapshot(snapshot: &mut SurfaceSnapshot) {
 
 fn read_snapshot(path: &str) -> Result<SurfaceSnapshot> {
     let reader = open_input(path)?;
-    let snapshot: SurfaceSnapshot = serde_json::from_reader(reader)
+    let mut snapshot: SurfaceSnapshot = serde_json::from_reader(reader)
         .with_context(|| format!("parsing surface snapshot {path}"))?;
     if snapshot.schema != SURFACE_SCHEMA {
         bail!(
@@ -1881,6 +2026,7 @@ fn read_snapshot(path: &str) -> Result<SurfaceSnapshot> {
             snapshot.schema
         );
     }
+    finish_snapshot(&mut snapshot);
     Ok(snapshot)
 }
 
@@ -1898,12 +2044,23 @@ fn write_json<T: Serialize>(path: Option<&str>, value: &T) -> Result<()> {
         Some(path) => {
             let mut file = OpenOptions::new()
                 .create(true)
-                .truncate(true)
                 .write(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(path)
                 .with_context(|| format!("opening {path} for secure output"))?;
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspecting secure output {path}"))?;
+            if !metadata.file_type().is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+            {
+                bail!("secure output must be an owned regular file with one link: {path}");
+            }
+            file.set_len(0)
+                .with_context(|| format!("truncating verified output {path}"))?;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("chmod 0600 {path}"))?;
             serde_json::to_writer_pretty(&mut file, value)
@@ -1952,29 +2109,51 @@ struct ObservationDir {
 
 impl ObservationDir {
     fn create() -> Result<Self> {
-        let base = std::env::temp_dir();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        for attempt in 0..32_u32 {
-            let path = base.join(format!(
-                "neutron-surface-{}-{nonce}-{attempt}",
-                std::process::id()
-            ));
-            let result = fs::DirBuilder::new().mode(0o700).create(&path);
-            match result {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        cleaned: false,
-                    })
+        let mut bases = vec![PathBuf::from("/data/local"), std::env::temp_dir()];
+        if !bases.iter().any(|path| path == Path::new("/tmp")) {
+            bases.push(PathBuf::from("/tmp"));
+        }
+        let mut failures = Vec::new();
+        for base in bases {
+            match secure_observation_base(&base) {
+                Ok(true) => {}
+                Ok(false) => {
+                    failures.push(format!("{} is not a trusted temp base", base.display()));
+                    continue;
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error).context("creating secure observation directory"),
+                Err(error) => {
+                    failures.push(format!("{}: {error}", base.display()));
+                    continue;
+                }
+            }
+            for attempt in 0..32_u32 {
+                let path = base.join(format!(
+                    "neutron-surface-{}-{nonce}-{attempt}",
+                    std::process::id()
+                ));
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => {
+                        return Ok(Self {
+                            path,
+                            cleaned: false,
+                        })
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        failures.push(format!("{}: {error}", base.display()));
+                        break;
+                    }
+                }
             }
         }
-        bail!("could not allocate a unique observation directory")
+        bail!(
+            "could not allocate a secure observation directory: {}",
+            failures.join("; ")
+        )
     }
 
     fn file(&self, name: &str) -> PathBuf {
@@ -1987,6 +2166,19 @@ impl ObservationDir {
         self.cleaned = true;
         Ok(())
     }
+}
+
+fn secure_observation_base(path: &Path) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    let mode = metadata.mode();
+    let sticky = mode & libc::S_ISVTX != 0;
+    let writable_by_others = mode & 0o022 != 0;
+    let owner = metadata.uid();
+    let euid = unsafe { libc::geteuid() };
+    Ok((owner == euid && (!writable_by_others || sticky)) || (owner == 0 && sticky))
 }
 
 impl Drop for ObservationDir {
@@ -2015,8 +2207,9 @@ fn observe_in(
     create_private_file(&capture_path)?;
     create_private_file(&health_path)?;
 
-    let executable = std::env::current_exe().context("resolving current neutron executable")?;
-    let mut command = ProcessCommand::new(executable);
+    // `/proc/self/exe` retains the running inode even if a shell-writable
+    // deployment pathname is replaced between parent startup and child exec.
+    let mut command = ProcessCommand::new("/proc/self/exe");
     command.arg("trace");
     match selector {
         RootSelector::Package(package) => {
@@ -2072,19 +2265,7 @@ fn observe_in(
         }
         let health = fs::read_to_string(&health_path)
             .context("reading final child capture_health sidecar")?;
-        let valid_health = health.lines().any(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .as_deref()
-                == Some("capture_health")
-        });
-        if !valid_health {
+        if !ends_with_capture_health(health.as_bytes()) {
             bail!("child trace did not produce a final capture_health record");
         }
         let bytes = fs::read(&capture_path).context("reading child causal capture")?;
@@ -2110,13 +2291,24 @@ fn observe_in(
         {
             bail!("child capture is missing one matched surface-observe start/end pair");
         }
-        if normalized.health.is_none() {
+        if normalized.health.is_none() || !ends_with_capture_health(&bytes) {
             bail!("child primary capture is missing its final capture_health record");
         }
         Ok(bytes)
     })();
     let child_cleanup = stop_child(&mut child);
     combine_cleanup(result, child_cleanup, "child trace cleanup")
+}
+
+fn ends_with_capture_health(input: &[u8]) -> bool {
+    input
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .and_then(|line| serde_json::from_slice::<Value>(line).ok())
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("capture_health")
 }
 
 fn combine_cleanup<T>(primary: Result<T>, cleanup: Result<()>, label: &str) -> Result<T> {
@@ -2245,6 +2437,18 @@ mod tests {
     }
 
     #[test]
+    fn observation_base_requires_trusted_owner_or_sticky_protection() {
+        let temp = ObservationDir::create().unwrap();
+        let base = temp.file("candidate-base");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!secure_observation_base(&base).unwrap());
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(secure_observation_base(&base).unwrap());
+        temp.cleanup().unwrap();
+    }
+
+    #[test]
     fn child_cleanup_stops_a_live_process() {
         let mut child = ProcessCommand::new("/bin/sleep").arg("60").spawn().unwrap();
         stop_child(&mut child).unwrap();
@@ -2266,5 +2470,15 @@ mod tests {
         let mut child = ProcessCommand::new("/bin/sleep").arg("60").spawn().unwrap();
         wait_observation(&mut child, Duration::from_millis(1)).unwrap();
         stop_child(&mut child).unwrap();
+    }
+
+    #[test]
+    fn capture_health_must_be_the_final_nonempty_record() {
+        assert!(ends_with_capture_health(
+            b"{\"type\":\"marker\"}\n{\"type\":\"capture_health\"}\n\n"
+        ));
+        assert!(!ends_with_capture_health(
+            b"{\"type\":\"capture_health\"}\n{\"type\":\"marker\"}\n"
+        ));
     }
 }

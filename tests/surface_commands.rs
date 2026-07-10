@@ -1,4 +1,6 @@
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -293,7 +295,7 @@ fn uid_queries_and_selector_errors_are_reported_as_json_command_errors() {
 }
 
 #[test]
-fn capture_scan_degrades_mismatched_health_and_rejects_output_symlinks() {
+fn capture_scan_degrades_mismatched_health_and_rejects_unsafe_outputs() {
     let temp = TestDir::new("surface-capture-command");
     let capture = temp.path("capture.ndjson");
     fs::write(
@@ -324,4 +326,53 @@ fn capture_scan_degrades_mismatched_health_and_rejects_output_symlinks() {
     let error = run(SurfaceCommand::Services(input_args(&output, &link))).unwrap_err();
     assert!(format!("{error:#}").contains("secure output"));
     assert_eq!(fs::read(&target).unwrap(), b"untouched");
+
+    let hardlink = temp.path("output-hardlink.json");
+    fs::hard_link(&target, &hardlink).unwrap();
+    let error = run(SurfaceCommand::Services(input_args(&output, &hardlink))).unwrap_err();
+    assert!(format!("{error:#}").contains("one link"));
+    assert_eq!(fs::read(&target).unwrap(), b"untouched");
+
+    let public = temp.path("public-output.json");
+    fs::write(&public, b"private-after-validation").unwrap();
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o644)).unwrap();
+    let error = run(SurfaceCommand::Services(input_args(&output, &public))).unwrap_err();
+    assert!(format!("{error:#}").contains("secure output"));
+    assert_eq!(fs::read(&public).unwrap(), b"private-after-validation");
+
+    let fifo = temp.path("output.fifo");
+    let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let error = run(SurfaceCommand::Services(input_args(&output, &fifo))).unwrap_err();
+    assert!(format!("{error:#}").contains("secure output"));
+}
+
+#[test]
+fn query_commands_canonicalize_schema_valid_unsorted_input() {
+    let temp = TestDir::new("surface-query-order");
+    let input = temp.path("surface.json");
+    let output = temp.path("services.json");
+    let mut snapshot = minimal_snapshot();
+    let mut earlier = snapshot.services[0].clone();
+    earlier.id = "service:binder:aaa".into();
+    earlier.name = "aaa".into();
+    snapshot.services.push(earlier);
+    snapshot.services.reverse();
+    fs::write(&input, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+    run(SurfaceCommand::Services(input_args(&input, &output))).unwrap();
+    let result = read_json(&output);
+    let ids: Vec<_> = result["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|service| service["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "service:binder:aaa",
+            "service:binder:example.IExample/default"
+        ]
+    );
 }
