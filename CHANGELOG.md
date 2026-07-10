@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-07-10
+
+- Added `neutron surface scan` and JSON query commands for deterministic
+  `neutron.surface/v1` inventories of Binder/HwBinder/VndBinder services,
+  VINTF HAL declarations, processes, device nodes, drivers, and modules.
+- Added streaming causal-capture import. Relations retain evidence,
+  `exact`/`candidate` confidence, causal attribution, and trace/scenario/span
+  IDs; unknown events and additive fields remain forward-compatible.
+- Added package- or UID-rooted `surface scan --observe DURATION`. It runs one
+  child trace, brackets `surface-observe`, validates final capture health, and
+  cleans private temporary state before returning.
+- Added causal-only `surface reachable`: static `proc_fd` state can enrich an
+  already-reached node but never establishes reachability. No theoretical
+  SELinux, VINTF, permission, or Binder-access solver is implied.
+- Added `trace --root-uid UID` for current processes and processes discovered
+  by the one-second UID refresh. Very short-lived processes can finish between
+  refreshes. Causal events/markers and additive capture health now carry
+  `root_uid`; capture health also records boot ID and build fingerprint.
+- Added verified Trusty TIPC and V4L2 ioctl labels, including
+  `TIPC_IOC_CONNECT` and `VIDIOC_QBUF`. Unknown commands remain numeric
+  `cmd=0x...` evidence.
+
 ## [1.3.0] — 2026-07-10
 
 - Added explicit `trace` mode while preserving the legacy flag-only invocation.

@@ -5,11 +5,10 @@
 .\"   sudo install -m 0644 man/man1/neutron.1 /usr/local/share/man/man1/
 .\"   sudo mandb        # rebuild the man index
 .\"
-.TH NEUTRON 1 "2026-05-06" "neutron 1.2.0" "User Commands"
+.TH NEUTRON 1 "2026-07-10" "neutron 1.4.0" "User Commands"
 .\" -----------------------------------------------------------------
 .SH NAME
-neutron \- low-intrusion eBPF syscall tracer for authorized Android
-security assessment
+neutron \- Android eBPF tracer and surface mapper for authorized security assessment
 .\" -----------------------------------------------------------------
 .SH SYNOPSIS
 .B neutron
@@ -25,6 +24,9 @@ security assessment
 .RB [ \-\-json ]
 .RB [ \-\-raw ]
 .RI [ OTHER\ OPTIONS ]
+.PP
+.B neutron trace
+.RI [ TRACE\ OPTIONS ]
 .PP
 .B neutron doctor
 .PP
@@ -49,10 +51,56 @@ security assessment
 .RI [ \-\-top\ K ]
 .RI [ \-\-show\-same ]
 .PP
+.B neutron report
+.I CAPTURE
+.RI [ REPORT\ OPTIONS ]
+.PP
+.B neutron binder-map
+.RB { template | service-list }
+.RI [ BINDER-MAP\ OPTIONS ]
+.PP
 .B neutron mark
 .I NAME
 .RI [ \-\-phase\ start | end ]
 .RI [ \-\-meta\ K=V ]
+.RI [ \-\-output\ FILE ]
+.PP
+.B neutron graph
+.I CAPTURE
+.RI [ \-\-root\-package\ PACKAGE ]
+.RI [ \-\-output\ FILE ]
+.PP
+.B neutron recipes
+.I RECIPE
+.PP
+.B neutron surface scan
+.RI [ \-\-capture\ CAPTURE ]
+.RI [ \-\-observe\ DURATION
+.RB ( \-\-from\-package
+.IR PACKAGE | \-\-from\-uid
+.IR UID )]
+.RI [ \-\-output\ FILE ]
+.PP
+.B neutron surface
+.RB { services | hals | devices }
+.BI \-\-input " SNAPSHOT"
+.RI [ \-\-output\ FILE ]
+.PP
+.B neutron surface process
+.I PID
+.BI \-\-input " SNAPSHOT"
+.RI [ \-\-output\ FILE ]
+.PP
+.B neutron surface explain
+.I SERVICE-OR-DEVICE
+.BI \-\-input " SNAPSHOT"
+.RI [ \-\-output\ FILE ]
+.PP
+.B neutron surface reachable
+.RB ( \-\-from\-package
+.IR PACKAGE | \-\-from\-uid
+.IR UID )
+.BI \-\-input " SNAPSHOT"
 .RI [ \-\-output\ FILE ]
 .\" -----------------------------------------------------------------
 .SH DESCRIPTION
@@ -96,6 +144,10 @@ mobile platform specialists who need to understand how a protected Android
 application interacts with the OS at runtime.
 .\" -----------------------------------------------------------------
 .SH SUBCOMMANDS
+.TP
+.B trace
+Run the tracer explicitly. It accepts the same options as the legacy form
+with no subcommand.
 .TP
 .B doctor
 Run preflight environment checks and exit.
@@ -156,9 +208,7 @@ for stdin); writes a sorted table to standard output.
 .TP
 .BI diff " BASELINE TEST \-\-by FIELDS " [\fB\-\-top\fR " K" "] [\fB\-\-show\-same\fR ]"
 Compare two NDJSON captures aggregated on the same key (1.2.0).
-Prints rows in
-.IR |\(De|
-descending order categorised
+Prints rows in descending absolute-delta order categorised
 .BR added " / " removed " / " changed
 (plus
 .B same
@@ -171,22 +221,47 @@ may be
 .B -
 (stdin).
 .TP
+.BI report " CAPTURE " [\fB\-\-baseline\fR " NDJSON" "] [\fB\-\-output\fR " FILE" "] [...]"
+Render a Markdown kernel-boundary report from one capture, optionally with a
+baseline diff.
+.TP
+.B binder-map
+Build exact service-map templates from a capture or candidate PID catalogs
+from
+.BR "service list -p" .
+.TP
 .BI mark " NAME " [\fB\-\-phase\fR " start" | "end" "] [\fB\-\-meta\fR " K=V" "] [\fB\-\-output\fR " FILE" "]"
-Append one
+Emit one
 .B type:"marker"
-NDJSON line (1.2.0). Operators bracket external scenarios with two
+NDJSON line. Operators bracket external scenarios with two
 .B mark
 calls; downstream
 .B neutron window \-\-anchor marker:\fINAME
-cuts a window around the bracketed range. With
+cuts a window around the bracketed range. Without
+.B \-\-output
+the command requests a validated scenario transition from the live tracer's
+control socket (1.3.0). With
 .B \-\-output FILE
 the line is appended via
 .B O_APPEND
 (atomic on Linux for \(<= PIPE_BUF), so two concurrent writers do not
-interleave; without
-.B \-\-output
-the line goes to standard output. See the
+interleave (legacy 1.2 behavior). See the
 .B MARKER WORKFLOW
+section.
+.TP
+.BI graph " CAPTURE " [\fB\-\-root\-package\fR " PACKAGE" "] [\fB\-\-output\fR " FILE" "]"
+Render a causal capture as a Mermaid flowchart.
+.TP
+.B recipes
+Print one built-in Android research workflow. Run
+.B neutron recipes \-\-help
+for available names.
+.TP
+.B surface
+Collect or query a deterministic Android service, HAL, process, device,
+driver, and module snapshot (1.4.0). All surface commands emit JSON. See
+the
+.B SURFACE MAPPER
 section.
 .PP
 When no subcommand is given,
@@ -207,6 +282,27 @@ all threads of the target are captured).
 (the default) means trace every process \(em useful but generates large
 volumes; pair with
 .BR \-\-exclude\-comm .
+.TP
+.BI \-\-package " NAME"
+Root causal tracing at all current processes whose UID and command line match
+the Android package, then add matching processes found by a one-second
+refresh. A process that starts and exits between refreshes can be missed. Separate
+from
+.BR \-\-match\-package .
+Mutually exclusive with
+.BR \-\-root\-uid .
+.TP
+.BI \-\-root\-uid " UID"
+Root causal tracing at current processes with the Android UID, then add
+matches found by a one-second refresh (1.4.0). A process that starts and exits
+between refreshes can be missed. Mutually exclusive with
+.B \-\-package
+and an explicit
+.BR \-\-pid .
+The causal event/marker metadata includes
+.BR root_uid ;
+the final capture-health record also includes boot ID and build fingerprint
+when available.
 .TP
 .B \-\-follow\-children
 On
@@ -670,6 +766,184 @@ The kernel
 .B RingBuf
 size is fixed in the BPF object.
 .\" -----------------------------------------------------------------
+.SH SURFACE MAPPER
+.B neutron surface
+builds and queries one deterministic Android topology snapshot (1.4.0).
+Surface commands always emit JSON to standard output unless
+.B \-\-output
+is supplied.
+.SS Collection
+.TP
+.BI "neutron surface scan" " [\-\-output FILE]"
+Collect static state from Binder/HwBinder/VndBinder inventories, VINTF
+manifests,
+.IR /proc ,
+.IR /dev ,
+and device-anchored sysfs paths.
+.TP
+.BI "neutron surface scan \-\-capture" " CAPTURE [\-\-output FILE]"
+Stream an existing causal NDJSON capture into the static snapshot.
+.I CAPTURE
+may be
+.B -
+for standard input. Unknown NDJSON event types and fields are ignored.
+.TP
+.BI "neutron surface scan \-\-observe" " DURATION \-\-from\-package PACKAGE [\-\-output FILE]"
+.TQ
+.BI "neutron surface scan \-\-observe" " DURATION \-\-from\-uid UID [\-\-output FILE]"
+Collect static state and run one live causal child trace. Durations accept
+.BR ms ,
+.BR s ,
+.BR m ,
+or
+.B h
+and must be non-zero.
+.PP
+.B \-\-capture
+and
+.B \-\-observe
+are mutually exclusive. Live observation requires exactly one package or UID
+root; system-wide observation is not supported.
+.PP
+Live mode directly starts the current neutron executable, waits for its
+private control socket, writes
+.B surface-observe
+start/end markers, sends SIGINT, waits for successful child shutdown and a
+final
+.B capture_health
+record, and removes its private temporary directory. Child failure, timeout,
+missing health, or incomplete cleanup fails the scan. The temporary directory
+uses mode 0700 and capture/health files use 0600.
+Static collection follows the live interval so current
+.I /proc
+starttimes can reject PID reuse.
+.SS Queries
+.TP
+.BI "neutron surface services \-\-input" " SNAPSHOT"
+Return all Binder services.
+.TP
+.BI "neutron surface hals \-\-input" " SNAPSHOT"
+Return services marked as declared or running HALs.
+.TP
+.BI "neutron surface devices \-\-input" " SNAPSHOT"
+Return character and block device nodes.
+.TP
+.BI "neutron surface process" " PID \-\-input SNAPSHOT"
+Return one stored process identity. An absent PID or a PID shared by multiple
+stored identities is an error.
+.TP
+.BI "neutron surface explain" " SELECTOR \-\-input SNAPSHOT"
+Return one service/device and its incident relations. A service ID/name or
+device ID/path/alias is accepted; zero or ambiguous matches are errors.
+.TP
+.BI "neutron surface reachable \-\-from\-package" " PACKAGE \-\-input SNAPSHOT"
+.TQ
+.BI "neutron surface reachable \-\-from\-uid" " UID \-\-input SNAPSHOT"
+Return only the subgraph actually observed in matching causal traces. Exactly
+one root selector is required.
+.PP
+.I SNAPSHOT
+may be
+.B -
+for standard input. Every query accepts optional
+.BI \-\-output " FILE"
+and wraps its result in
+.BR schema:"neutron.surface/query/v1" .
+.SS Snapshot schema and ordering
+The scan schema is one JSON document, not NDJSON:
+.nf
+{
+  "schema": "neutron.surface/v1",
+  "neutron_version": "1.4.0",
+  "collected_at": "...",
+  "device": {"fingerprint":"...", "boot_id":"..."},
+  "health": {"status":"complete", "collectors":[], "warnings":[]},
+  "services": [], "processes": [], "devices": [],
+  "modules": [], "relations": [], "captures": []
+}
+.fi
+.PP
+Top-level collections are sorted and deduplicated by stable natural ID:
+.IP \(bu
+.B service:<transport>:<name>
+.IP \(bu
+.B process:<boot_id>:<pid>:<starttime>
+.IP \(bu
+.B device:<char|block>:<major>:<minor>
+.IP \(bu
+.B module:<name>
+.IP \(bu
+.B capture:<trace_id>:<scenario_id>
+.PP
+A service can include transport, descriptor, proven PID/process, SELinux
+domain, executable, mapped libraries, current device FDs, and causally
+observed devices/ioctls. A process includes UID/GID, argv, executable,
+starttime, boot ID, SELinux domain, unique file-backed shared libraries, and
+FDs. A device includes canonical path/aliases, kind, major/minor, mode,
+UID/GID, SELinux context, and any sysfs-proven subsystem, driver, and module.
+Unknown PID/binary attribution is left absent rather than guessed.
+.PP
+Relations carry
+.BR type ,
+.BR from / to ,
+evidence, and
+.BR confidence:"exact"|"candidate" .
+Causal relations can add
+.BR causal_relation:"exact"|"inferred" ,
+.BR trace_id ,
+.BR scenario_id ,
+.BR span_id ,
+and an ioctl label. Verified labels include
+.B TIPC_IOC_CONNECT
+and
+.BR VIDIOC_QBUF ;
+unknown commands remain numeric as
+.BR cmd=0x... .
+.SS Reachability and health
+.B reachable
+traverses only capture-sourced
+.BR root_process ,
+.BR binder ,
+.BR served_by ,
+and
+.B ioctl
+relations belonging to a matching causal trace. Static
+.B proc_fd
+relations describe current state and never establish reachability; static
+fields only enrich already-reached nodes. A reachable result is therefore
+observed causal evidence, not a SELinux/VINTF/manifest permission decision or
+a theoretical Binder allow graph.
+.PP
+Each collector records scope and warnings. Individual read or service-command
+failures, and malformed process/VINTF inputs, produce
+.BR health.status:"degraded"
+without aborting. Missing primary
+.I /proc
+or
+.IR /dev ,
+child-trace failure, and output failure are fatal. A capture whose boot ID is
+missing or differs is retained, but current-PID joins are
+.B candidate
+and health contains a warning.
+An imported capture without final
+.B capture_health
+is retained as degraded evidence; live observation fails without it.
+.PP
+Device sysfs enrichment follows only
+.IR /sys/dev/{char,block}/MAJOR:MINOR
+paths anchored by discovered device nodes; it does not recursively dump
+.IR /sys/devices .
+.SS Output security and rights
+Surface output rejects a symlink in the final path component, truncates the
+selected file, and forces mode 0600. Live observation needs the same
+root/KernelSU, BPF,
+tracefs, Binder,
+.IR /proc ,
+and
+.I /dev
+access as the tracer. Snapshot JSON contains device identity, process and
+service topology, paths, and SELinux labels; redact it before sharing.
+.\" -----------------------------------------------------------------
 .SH WINDOW SUBCOMMAND
 .B neutron window
 cuts time- or event-bounded windows of NDJSON events around an
@@ -804,7 +1078,9 @@ One line per event, columns
 Findings render as multi-line blocks prefixed
 .BR [FINDING] .
 .SS NDJSON ( \fB\-\-json\fR )
-One JSON object per line. The schema covers four event kinds.
+One JSON object per line. Event classes are distinguished by their
+.B type
+field and evolve additively.
 .PP
 .B Syscall events
 carry
@@ -864,10 +1140,11 @@ The last three are populated by the engine at flush time \(em see
 .PP
 .B Marker events
 .RB ( "type:\(dqmarker\(dq" ", " 1.2.0 )
-are emitted by
-.B neutron mark
-and carry
-.BR name ", optional " phase ", and optional " meta .
+are emitted by append-only
+.B neutron mark \-\-output
+or by a live causal tracer handling a control-socket request. They carry
+.BR name ", optional " phase ", and optional " meta ;
+live markers add scenario/trace/generation IDs and optional root package/UID.
 .PP
 .B Capture-health events
 .RB ( "type:\(dqcapture_health\(dq" ", " 1.2.0 )
@@ -878,9 +1155,24 @@ mode and mirror the stderr capture-summary block. Carry
 the per-cause degradation counters, and a
 .B degraded:bool
 flag identical to the WARNING-banner predicate.
+Causal captures add optional
+.BR root_package / root_uid ;
+1.4 also adds optional
+.BR boot_id / fingerprint
+for checking later identity attribution.
 .PP
 For full schema tables see
 .IR docs/REFERENCE.md " and " docs/guides/output-formats.md .
+.SS Surface JSON (1.4.0)
+Surface snapshots and query results are separate, single JSON documents rather
+than NDJSON event streams. Scans use
+.BR neutron.surface/v1 ;
+queries use
+.BR neutron.surface/query/v1 .
+See
+.B SURFACE MAPPER
+for fields, natural ordering, confidence, reachability semantics, health, and
+secure output behavior.
 .\" -----------------------------------------------------------------
 .SH FINDING AGGREGATES
 Every finding carries an optional
@@ -1101,24 +1393,30 @@ Use the heredoc form when in doubt — it transports argv literally.
 .\" -----------------------------------------------------------------
 .SH MARKER WORKFLOW
 .B neutron mark
-appends a single
+asks a live causal tracer to emit a
 .B type:"marker"
-NDJSON line so external scenarios bracket the live trace, and
+NDJSON line so external scenarios bracket the trace, and
 .B neutron window \-\-anchor marker:\fINAME
 cuts the bracketed window without manual timestamp grep'ing.
 .PP
 .EX
 \&# tracer in background
-neutron \-\-json \-\-output trace.ndjson &
+neutron trace \-\-package com.example.app \-\-follow\-hal \
+    \-\-output trace.ndjson &
 
 \&# bracket the stimulus
-neutron mark scenario \-\-phase start \-\-output trace.ndjson
+neutron mark scenario \-\-phase start
 \&./trigger\-camera\-extension\-night
-neutron mark scenario \-\-phase end   \-\-output trace.ndjson
+neutron mark scenario \-\-phase end
 
 kill %1
+wait %1
 neutron window trace.ndjson \-\-anchor marker:scenario \-\-around 5s
 .EE
+.PP
+Pass explicit
+.BI mark\ \-\-output " FILE"
+to retain the legacy append-only marker without switching live causal state.
 .PP
 With
 .B \-\-output FILE
@@ -1363,8 +1661,26 @@ adb shell su -c "/data/local/tmp/neutron mark scenario \\
     --phase end --output /data/local/tmp/trace.ndjson"
 
 kill %1
+wait %1
 adb pull /data/local/tmp/trace.ndjson .
 neutron window trace.ndjson --anchor marker:scenario --around 5s
+.EE
+.SS Build and query a surface snapshot (1.4.0)
+.PP
+.EX
+neutron surface scan --output surface.json
+neutron surface scan --capture capture.ndjson --output observed.json
+neutron surface services --input observed.json
+neutron surface explain /dev/trusty-ipc-dev0 --input observed.json
+neutron surface reachable --from-package com.example.app \
+    --input observed.json --output reachable.json
+.EE
+.SS Observe one package live (1.4.0)
+.PP
+.EX
+neutron surface scan --observe 30s \
+    --from-package com.example.app \
+    --output surface.json
 .EE
 .\" -----------------------------------------------------------------
 .SH WIRE FORMAT
@@ -1461,6 +1777,23 @@ the serialized arguments are not decoded).
 .IP \(bu
 Runtime behaviour fully inside userspace without syscalls (intra-process
 method calls, in-process decryption of already-mapped pages).
+.IP \(bu
+.B surface reachable
+does not solve SELinux rules, manifest permissions, VINTF compatibility, or
+theoretical Binder reachability; it includes only capture-sourced
+.BR root_process ,
+.BR binder ,
+.BR served_by ,
+and
+.B ioctl
+relations from matching traces and excludes static
+.BR proc_fd .
+.IP \(bu
+The surface mapper does not recursively dump
+.IR /sys/devices ,
+look up kernel source/owners, infer missing service PIDs/binaries, or support a
+system-wide live
+.BR \-\-observe .
 .IP \(bu
 .B exit_code
 on the BPF

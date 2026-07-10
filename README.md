@@ -1,6 +1,6 @@
 # neutron
 
-Rooted Android kernel-boundary tracer for security research.
+Rooted Android kernel-boundary tracer and surface mapper for security research.
 
 `neutron` runs on a rooted Android device, attaches eBPF programs to kernel
 tracepoints, and records what an app or system service does at the
@@ -23,6 +23,8 @@ Use neutron when you need to answer questions like:
   Binder, DMA heap, KGSL/Mali, LWIS/GXP, or other driver surfaces?
 - Did a Binder call correlate with a callee crash?
 - Which package or service changed behavior between two scenarios?
+- Which Binder services, HALs, processes, device nodes, drivers, and modules are
+  present on this device, and which of them were actually reached in a scenario?
 - Did a package-scoped smoke test produce enough signal to justify deeper work?
 
 Do not treat neutron as a vulnerability scanner. It does not prove that an app
@@ -43,6 +45,8 @@ neutron can observe:
 - process exits/crashes from BPF, logcat, and tombstone sources
 - FD pressure through periodic `fd_snapshot` events
 - optional stack IDs and symbols when using `neutron-stacks.bpf.elf`
+- deterministic `neutron.surface/v1` snapshots of Android services, HALs,
+  processes, device nodes, drivers, modules, and observed causal relations
 
 neutron cannot observe:
 
@@ -94,7 +98,7 @@ cargo install bpf-linker
 Use this path when a release with Android assets has been published.
 
 ```bash
-VERSION=v1.3.0
+VERSION=v1.4.0
 REPO=andrei-ilyushchyts-0x01/neutron
 
 curl -LO "https://github.com/${REPO}/releases/download/${VERSION}/neutron-${VERSION}-android-aarch64.tar.gz"
@@ -282,6 +286,58 @@ adb shell /data/local/tmp/neutron recipes system-app-sweep
 The recipe runs one package at a time, records `monkey` status, attach status,
 line/byte counts, and a per-package health sidecar. Treat low line counts as
 "needs a targeted trigger", not as safe.
+
+## Map The Android Surface
+
+Version 1.4 adds a deterministic on-device surface snapshot. A static scan
+needs no trace capture:
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron surface scan \
+  --output /data/local/tmp/surface.json'"
+adb exec-out "su -c 'cat /data/local/tmp/surface.json'" > surface.json
+```
+
+Import an existing causal NDJSON capture, or observe one package/UID live:
+
+```bash
+neutron surface scan --capture capture.ndjson --output surface.json
+
+adb shell "su -c '/data/local/tmp/neutron surface scan \
+  --observe 30s --from-package com.example.app \
+  --output /data/local/tmp/surface.json'"
+```
+
+`--capture` and `--observe` are mutually exclusive. Live observation requires
+exactly one `--from-package` or `--from-uid`; it starts one child `neutron
+trace`, brackets the interval with the `surface-observe` scenario, sends
+SIGINT, and requires a final `capture_health` record. It needs the same root,
+BPF, Binder, `/proc`, and `/dev` access as tracing. Surface output files are
+created with mode `0600`. The static snapshot is collected after the live
+interval so `/proc` starttime evidence can reject a recycled PID.
+
+Every query emits JSON (`--output` is optional):
+
+```bash
+neutron surface services  --input surface.json
+neutron surface hals      --input surface.json
+neutron surface devices   --input surface.json
+neutron surface process 1234 --input surface.json
+neutron surface explain /dev/trusty-ipc-dev0 --input surface.json
+neutron surface reachable --from-package com.example.app --input surface.json
+neutron surface reachable --from-uid 10123 --input surface.json
+```
+
+`reachable` means observed causal reachability through capture-sourced
+`root_process`, `binder`, `served_by`, and `ioctl` relations. It does not solve
+SELinux, VINTF, manifest permissions, or theoretical Binder access. Static
+`proc_fd` relations describe the scan instant and enrich nodes, but never make
+a node reachable.
+
+For a UID-rooted causal trace, use `trace --root-uid UID`. It starts from the
+current processes and adds matching processes found by a one-second refresh;
+a process that starts and exits between refreshes can be missed. The option
+cannot be combined with `--package` or an explicit `--pid`.
 
 ## Three Boundary Report Workflows
 
@@ -559,6 +615,7 @@ after maintainers have approved the tag, notes, and assets.
 - [docs/guides/bpf-tracing.md](docs/guides/bpf-tracing.md): profiles, filtering, capture, stacks
 - [docs/guides/writing-rules.md](docs/guides/writing-rules.md): custom detectors
 - [docs/guides/output-formats.md](docs/guides/output-formats.md): text and JSON schemas
+- [docs/REFERENCE.md](docs/REFERENCE.md): complete trace and Surface CLI/schema reference
 - [docs/guides/window.md](docs/guides/window.md): `neutron window`
 - [docs/guides/binder-attribution.md](docs/guides/binder-attribution.md): Binder service maps, templates, and catalogs
 - [docs/guides/frida-integration.md](docs/guides/frida-integration.md): Frida plus BPF workflows

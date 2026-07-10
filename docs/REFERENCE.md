@@ -12,6 +12,7 @@
 | `diff`        | Compare two captures aggregated on the same key; print added/removed/Δ rows. (1.2.0)  |
 | `mark`        | Switch a live start/end scenario over the control socket, or append with explicit `--output`. (1.3.0) |
 | `graph`       | Render causal NDJSON as a Mermaid `flowchart TD`. (1.3.0) |
+| `surface`     | Collect or query a deterministic Android service/HAL/process/device snapshot. (1.4.0) |
 | `recipes`     | Print built-in workflow recipes, e.g. `neutron recipes android-content-provider`. |
 
 For `window`, see [docs/guides/window.md](guides/window.md). For
@@ -27,11 +28,12 @@ the **Marker workflow** section below. For Android provider work, use
 | Flag                              | Type             | Default                                  | Description |
 |-----------------------------------|------------------|------------------------------------------|-------------|
 | `--package NAME`                  | String           | unset                                    | Root package for causal tracing; resolves UID, then matches `/proc/PID/cmdline` as `package` or `package:*`. Separate from `--match-package`. |
+| `--root-uid UID`                  | u32              | unset                                    | Root current processes of one Android UID and add matches found by a one-second refresh. A process that starts and exits between refreshes can be missed. Mutually exclusive with `--package` and an explicit `--pid`. (1.4.0) |
 | `--follow-binder`                 | flag             | off                                      | Add Binder callees to the bounded dynamic trace set before publishing the caller event. |
 | `--follow-services`               | flag             | off                                      | Enable `service list -p` candidate discovery; implies `--follow-binder`. |
 | `--follow-hal`                    | flag             | off                                      | Enable `service list -p` and `lshal -ip` HAL candidate discovery; implies `--follow-binder`. |
 | `--max-depth N`                   | u8               | `4`                                      | Maximum causal Binder expansion depth. |
-| `--max-processes N`               | 1..=1024         | `64`                                     | Dynamic `TRACED_PROCESSES` map capacity. |
+| `--max-processes N`               | 1..=1024         | `64`                                     | Dynamic `TRACED_PROCESSES` map capacity. A package/UID root exceeding the limit fails the trace. |
 | `--control-socket PATH|off`       | String           | `/data/local/tmp/neutron.control.sock`   | Live scenario marker socket; `off` disables it. |
 | `--pid N`                         | u32              | `0`                                      | Target process ID. `0` traces all processes. |
 | `--object PATH`                   | String           | `/data/local/tmp/neutron.bpf.elf`        | Path to the compiled Aya BPF ELF object on the device. |
@@ -104,6 +106,124 @@ the **Marker workflow** section below. For Android provider work, use
 | `--binder-methods FILE`           | String           | unset                                    | Verified JSON `{service: {code: method}}` map. Unknown codes remain `code=N`. |
 
 <!-- END AUTO-GENERATED -->
+
+## Surface mapper (1.4.0)
+
+`surface scan` emits one deterministic JSON document. Static collection works
+without a capture; the other two forms add observed causal evidence:
+
+```bash
+neutron surface scan --output surface.json
+neutron surface scan --capture capture.ndjson --output surface.json
+neutron surface scan --observe 30s --from-package com.example.app \
+  --output surface.json
+neutron surface scan --observe 30s --from-uid 10123 --output surface.json
+```
+
+`--capture FILE` accepts `-` for stdin. `--capture` and `--observe` are
+mutually exclusive. Live observation requires exactly one root selector and
+does not support a system-wide root. Durations accept `ms`, `s`, `m`, or `h`
+and must be non-zero.
+
+Static service inventory uses `service list` plus exact
+`dumpsys --pid SERVICE`, `lshal -ip`, and `vndservice list`. AIDL/HIDL
+declarations come from VINTF manifests under `system`, `vendor`, `product`,
+`system_ext`, and `odm`. Process evidence comes from `/proc`; device and module
+evidence starts at `/dev`, `/proc/modules`, `/sys/module`, and the sysfs links
+anchored by each discovered major/minor pair.
+
+Live mode starts the current `neutron` executable directly as one child trace,
+waits for its control socket, opens and closes a `surface-observe` scenario,
+sends SIGINT, waits for successful shutdown and a final `capture_health`, then
+removes its private temporary directory. Static collection follows the live
+interval so current `/proc` starttimes can reject PID reuse. Child failure,
+timeout, missing health, or incomplete cleanup fails the scan.
+
+All query commands read `neutron.surface/v1` and emit
+`neutron.surface/query/v1` JSON:
+
+```bash
+neutron surface services  --input surface.json --output services.json
+neutron surface hals      --input surface.json
+neutron surface devices   --input surface.json
+neutron surface process 1234 --input surface.json --output process.json
+neutron surface explain SERVICE_OR_DEVICE --input surface.json
+neutron surface reachable --from-package com.example.app --input surface.json
+neutron surface reachable --from-uid 10123 --input surface.json
+```
+
+`--input -` reads stdin. `process` rejects a PID absent from the snapshot and a
+PID shared by multiple stored identities. `explain` accepts a service ID/name
+or device ID/path/alias and rejects zero or ambiguous matches. Every command
+writes JSON to stdout unless `--output` is set; a final-component symlink is
+rejected, while a selected file is truncated and forced to mode `0600`.
+
+`reachable` traverses only capture-sourced `root_process`, `binder`,
+`served_by`, and `ioctl` relations from matching trace IDs. Other relation
+types remain enrichment evidence even if an input document attaches a trace
+ID to them.
+
+The snapshot envelope is:
+
+```json
+{
+  "schema": "neutron.surface/v1",
+  "neutron_version": "1.4.0",
+  "collected_at": "2026-07-10T00:00:00Z",
+  "device": { "fingerprint": "...", "boot_id": "..." },
+  "health": { "status": "complete", "collectors": [], "warnings": [] },
+  "services": [],
+  "processes": [],
+  "devices": [],
+  "modules": [],
+  "relations": [],
+  "captures": []
+}
+```
+
+Top-level collections are sorted by stable entity ID and deduplicated. IDs are
+derived from collected identity rather than array position:
+
+| Entity | Natural ID |
+|--------|------------|
+| service | `service:<transport>:<name>` |
+| process | `process:<boot_id>:<pid>:<starttime>` |
+| device | `device:<char\|block>:<major>:<minor>` |
+| module | `module:<name>` |
+| capture | `capture:<trace_id>:<scenario_id>` |
+| relation | type + endpoints + trace/span identity |
+
+Services include transport, declaration/runtime sources, proven PID/process,
+SELinux domain, executable, mapped libraries, current device FDs, and observed
+devices/ioctls. Processes include UID/GID, argv, executable, starttime, boot
+ID, SELinux domain, unique file-backed shared libraries, and FDs. Devices
+include canonical path and aliases, kind, major/minor, mode, UID/GID, SELinux
+label, and any sysfs-proven subsystem/driver/module. A binary or PID is left
+unknown when the collector did not prove it.
+
+Relations carry `id`, `type`, `from`, `to`, `evidence`, and
+`confidence:"exact"|"candidate"`. Capture relations may also carry
+`causal_relation:"exact"|"inferred"`, `trace_id`, `scenario_id`, `span_id`,
+and `ioctl`. Known Trusty TIPC and V4L2 commands include
+`TIPC_IOC_CONNECT` and `VIDIOC_QBUF`; an unknown command remains numeric as
+`cmd=0x...`.
+
+`reachable` selects captures matching the requested package/UID and traverses
+only capture-sourced `root_process`, `binder`, `served_by`, and `ioctl`
+relations. Static `proc_fd` relations describe current scan state but are
+excluded from traversal; static fields only enrich nodes already reached.
+Therefore “reachable” never means a SELinux/VINTF/manifest permission or
+theoretical Binder allow decision.
+
+Capture import is streaming and ignores unknown NDJSON event types and fields.
+Capture health degradation is copied into surface health. A capture without a
+final `capture_health` record is retained as degraded evidence. A capture whose
+boot ID is absent or differs from the static snapshot is retained, but joins
+to current PIDs are `candidate` and health contains a warning. Individual read or
+service-command failures, and malformed process/VINTF inputs, degrade their
+collector; missing primary `/proc` or `/dev`, live trace failure, or output
+failure is fatal. Device sysfs enrichment is limited to paths anchored by
+discovered device nodes rather than a recursive `/sys/devices` dump.
 
 ## Text Output Format
 
@@ -318,8 +438,9 @@ require a specific source (e.g. only act on tombstone-backed evidence).
 
 ### Marker Event (`type == "marker"`, 1.2.0)
 
-Emitted by the `neutron mark` subcommand. Pure operator-supplied
-correlation; the live tracer never produces these on its own.
+Emitted by append-only `neutron mark --output` or by the live tracer after a
+validated control-socket request. `surface scan --observe` uses the latter to
+bracket its `surface-observe` scenario.
 
 ```json
 {
@@ -327,6 +448,9 @@ correlation; the live tracer never produces these on its own.
   "ts_ns": 1712345678901234,
   "name":  "scenario",
   "phase": "start",
+  "scenario_id": "scenario",
+  "trace_id": "0000000000001234",
+  "root_uid": 10123,
   "meta":  { "build": "v1", "device": "oriole" }
 }
 ```
@@ -336,6 +460,8 @@ correlation; the live tracer never produces these on its own.
 | `name`  | string           | Operator-supplied scenario or stage identifier.         |
 | `phase` | string, optional | One of `"start"` / `"end"`. Omitted for one-shot marks. |
 | `meta`  | object, optional | `--meta k=v` key/value strings. Omitted when empty.     |
+| `scenario_id` / `trace_id` | string, live only | IDs assigned by a live causal tracer. |
+| `root_package` / `root_uid` | string / u32, optional | Causal root identity. |
 
 `neutron window --anchor marker:<name>` cuts a window around every
 matching marker. See **Marker workflow** below.
@@ -371,7 +497,10 @@ finding is conclusive" on a single field instead of grepping prose.
   "kprobe_packs":            [],
   "attached_programs":       ["trace_sys_enter","trace_sys_exit"],
   "ioctl_refresh_cmds":      [],
-  "ioctl_refresh_types":     ["0x9"]
+  "ioctl_refresh_types":     ["0x9"],
+  "root_uid":                10123,
+  "boot_id":                 "8b2d6c98-20a1-4e7e-944f-53f61b52d5ef",
+  "fingerprint":             "google/husky/husky:16/..."
 }
 ```
 
@@ -387,6 +516,8 @@ finding is conclusive" on a single field instead of grepping prose.
 | `driver_packs` / `kprobe_packs` | string[] | Active BPF-oriented decoder/kprobe packs requested for the capture. |
 | `attached_programs` | string[] | BPF programs successfully attached in this session. |
 | `ioctl_refresh_cmds` / `ioctl_refresh_types` | string[] | Runtime ioctl post-exit refresh coverage, rendered as hex strings. |
+| `root_package` / `root_uid` | string / u32, optional | Causal trace root. |
+| `boot_id` / `fingerprint` | string, optional | Device identity used to evaluate later attribution. |
 
 Field set is stable; new counters extend the tail without renaming
 existing fields.
@@ -598,6 +729,7 @@ neutron mark scenario --phase start
 neutron mark scenario --phase end
 
 kill %1
+wait %1
 neutron graph trace.ndjson --root-package com.example.app \
   --format mermaid --output flow.md
 ```

@@ -1,6 +1,6 @@
 # Pixel 8 Pro — Device Profile
 
-This is the primary and only target device for neutron 1.0. Any Android
+This is the documented target profile for neutron 1.4. Any Android
 14+ device with kernel 6.1+, BTF, and root access should work, but the
 verified baseline below is what we test against.
 
@@ -94,7 +94,7 @@ bpf    on /sys/fs/bpf       type bpf    (rw,nosuid,nodev,noexec,relatime)
 | `bpf_probe_read_user_str_bytes` (helper 114) | NUL-terminated userspace strings |
 | `bpf_probe_read_user` (helper 112) | Userspace buffers |
 | `bpf_probe_read_kernel` (helper 113) | Map / kernel-side buffers |
-| `RingBuf` (kernel 5.8+) | Single MPSC output ring, lossless |
+| `RingBuf` (kernel 5.8+) | Bounded MPSC output ring; reserve failures are counted in capture health |
 
 **CO-RE:** Aya performs runtime BTF relocation automatically when the BPF
 object contains BTF debuginfo (it does — `debug = true` in the release
@@ -157,3 +157,141 @@ Local variable names in BPF have been chosen to be self-documenting:
 `pid`) goes into `SyscallEvent.tgid` for per-thread debugging. The wire
 field names (`pid`, `tgid`) are inverted relative to kernel terminology
 and are not flipped without a coordinated wire-format bump.
+
+## Surface mapper smoke test (1.4.0)
+
+The following is an operator procedure, not a claim that a particular app or
+build will expose every edge. Run it on an authorized test device and replace
+the example activities with deterministic probes that perform the named
+operation during the 30-second window.
+
+First verify that a static snapshot is usable:
+
+```bash
+NEUTRON=/data/local/tmp/neutron
+SURFACE=/data/local/tmp/static.surface.json
+
+adb shell "su -c '$NEUTRON surface scan --output $SURFACE'"
+adb exec-out "su -c 'cat $SURFACE'" > static.surface.json
+jq '{schema, neutron_version, device, health}' static.surface.json
+```
+
+`schema` must be `neutron.surface/v1`. Read `health.collectors` and
+`health.warnings` before interpreting missing nodes; isolated permission or
+parse failures make the snapshot `degraded`.
+
+### KeyMint → Trusty TIPC
+
+Run live observation in one host job and repeatedly trigger a KeyMint
+operation while that job is active. The command has no external readiness
+signal: static collection precedes the child trace, so a fixed sleep is only a
+heuristic. This example assumes the probe performs the operation from
+`.KeyMintSmokeActivity`:
+
+```bash
+KEYMINT_PACKAGE=com.example.keymintprobe
+KEYMINT_SURFACE=/data/local/tmp/keymint.surface.json
+
+adb shell "su -c '$NEUTRON surface scan --observe 30s \
+  --from-package $KEYMINT_PACKAGE --output $KEYMINT_SURFACE'" &
+SCAN_PID=$!
+while kill -0 "$SCAN_PID" 2>/dev/null; do
+  adb shell am start -W -n "$KEYMINT_PACKAGE/.KeyMintSmokeActivity"
+  sleep 3
+done
+wait "$SCAN_PID"
+adb exec-out "su -c 'cat $KEYMINT_SURFACE'" > keymint.surface.json
+```
+
+Check the expected evidence without guessing an owner from a filename:
+
+```bash
+jq -e '
+  any(.services[];
+    (.name | test("keymint"; "i")) and
+    (.pid != null) and
+    ((.selinux_domain // "") | contains("hal_keymint")) and
+    ((.executable // "") | test("keymint.*trusty|trusty.*keymint"; "i")) and
+    any(.libraries[]?; test("trusty"; "i")) and
+    any(.observed_ioctls[]?; . == "TIPC_IOC_CONNECT"))
+  and
+  any(.devices[];
+    .path == "/dev/trusty-ipc-dev0" and
+    (.driver != null) and (.module != null))
+' keymint.surface.json
+
+jq '{surface_health:.health, captures:.captures}' keymint.surface.json
+```
+
+The service PID/process link, Trusty executable/library, `hal_keymint_*`
+domain, device path, and driver/module must come from inventory/sysfs evidence.
+`TIPC_IOC_CONNECT` must come from the causal capture. If capture health is
+degraded, rerun with a smaller, deterministic probe before treating absence as
+meaningful.
+
+### Camera → V4L2 and DMA heap
+
+Repeat with an app that opens the camera and queues at least one frame from its
+smoke activity:
+
+```bash
+CAMERA_PACKAGE=com.example.cameraprobe
+CAMERA_SURFACE=/data/local/tmp/camera.surface.json
+
+adb shell "su -c '$NEUTRON surface scan --observe 30s \
+  --from-package $CAMERA_PACKAGE --output $CAMERA_SURFACE'" &
+SCAN_PID=$!
+while kill -0 "$SCAN_PID" 2>/dev/null; do
+  adb shell am start -W -n "$CAMERA_PACKAGE/.CameraSmokeActivity"
+  sleep 3
+done
+wait "$SCAN_PID"
+adb exec-out "su -c 'cat $CAMERA_SURFACE'" > camera.surface.json
+
+jq -e '
+  ([.devices[] |
+      select(.path | startswith("/dev/dma_heap/")) | .id]) as $dma
+  | ([.relations[] |
+      select(.type == "binder" and .trace_id != null)] | length) >= 2
+  and
+  any(.relations[];
+      .type == "ioctl" and .ioctl == "VIDIOC_QBUF")
+  and
+  any(.relations[];
+      .type == "ioctl" and (.to as $to | $dma | index($to) != null))
+' camera.surface.json
+```
+
+Confirm that the package query returns only the observed causal subgraph:
+
+```bash
+adb push camera.surface.json /data/local/tmp/camera.surface.json
+adb shell "su -c '$NEUTRON surface reachable \
+  --from-package $CAMERA_PACKAGE \
+  --input /data/local/tmp/camera.surface.json \
+  --output /data/local/tmp/camera.reachable.json'"
+adb exec-out "su -c 'cat /data/local/tmp/camera.reachable.json'" \
+  > camera.reachable.json
+jq -e 'all(.relations[]; .type != "proc_fd")' camera.reachable.json
+```
+
+### Child-trace cleanup guard
+
+`surface --observe` validates child exit, final capture health, and temporary
+cleanup. It does not itself count BPF programs. If a cross-built `bpftool` is
+available on the Pixel, add an external leak guard in an otherwise idle test:
+
+```bash
+BPFTOOL=/data/local/tmp/bpftool
+adb shell "su -c '$BPFTOOL -j prog show'" > /tmp/neutron-bpf-before.json
+
+# Run exactly one of the observe scenarios above.
+
+adb shell "su -c '$BPFTOOL -j prog show'" > /tmp/neutron-bpf-after.json
+test "$(jq length /tmp/neutron-bpf-before.json)" = \
+     "$(jq length /tmp/neutron-bpf-after.json)"
+```
+
+The device does not ship `bpftool` by default. A changed total can also mean
+another system component loaded/unloaded BPF during the window, so repeat on an
+idle device before diagnosing a neutron leak.

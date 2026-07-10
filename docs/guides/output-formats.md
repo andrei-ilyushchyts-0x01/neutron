@@ -216,17 +216,20 @@ heavily multiplexed workloads can raise it.
 
 ### Marker Event (`type == "marker"`, 1.2.0)
 
-Operator-supplied scenario marker emitted by `neutron mark <name>
-[--phase start|end] [--meta k=v]`. The live tracer never produces
-these on its own; they exist solely to bracket external stimuli for
-later window-cutting via `neutron window --anchor marker:<name>`.
+Scenario marker emitted by append-only `neutron mark --output`, or by a live
+tracer after a control-socket `mark` request. Live markers bracket causal
+stimuli; `surface scan --observe` uses the name `surface-observe`.
 
 ```json
 { "type":"marker", "ts_ns":1712345678901234, "name":"scenario",
-  "phase":"start", "meta":{"build":"v1","device":"oriole"} }
+  "phase":"start", "scenario_id":"scenario",
+  "trace_id":"0000000000001234", "root_uid":10123,
+  "meta":{"build":"v1","device":"oriole"} }
 ```
 
-`phase` and `meta` are both optional; omitted when not set.
+`phase` and `meta` are optional. A live causal marker also has
+`scenario_id`, `trace_id`, and `generation`, plus optional `root_package` or
+`root_uid`.
 
 ### Capture Health Event (`type == "capture_health"`, 1.2.0)
 
@@ -244,11 +247,20 @@ Same counter set as the stderr capture-summary block, plus a
   "fd_graph_miss":0, "fd_graph_backfilled":0,
   "degraded":false, "driver_packs":["kgsl"],
   "attached_programs":["trace_sys_enter","trace_sys_exit"],
-  "ioctl_refresh_types":["0x9"] }
+  "ioctl_refresh_types":["0x9"], "root_uid":10123,
+  "boot_id":"8b2d6c98-20a1-4e7e-944f-53f61b52d5ef",
+  "fingerprint":"google/husky/husky:16/..." }
 ```
 
 A downstream pipeline gating on "absence of finding is conclusive"
 should require `degraded:false`.
+
+`root_package`/`root_uid` identify an optional causal root. `boot_id` and
+`fingerprint` let later consumers judge whether current process identities can
+be joined to the capture. These 1.4 fields are additive and omitted when
+unavailable, so older NDJSON remains valid. Causal syscall, Binder, exit, and
+marker lines can additionally carry `scenario_id`, `trace_id`, `span_id`,
+`parent_span_id`, `depth`, `causal_relation`, and the root identity.
 
 ### Process Exit Event (`type == "process_exit"`)
 
@@ -288,6 +300,63 @@ collapses the typical fan-out.
 `crash_context` entries are JSON-escaped strings of the original NDJSON
 lines. Disable with `--lookback-events 0`. Disable the tombstone watcher
 with `--tombstone-dir ""` and the logcat tail with `--no-logcat`.
+
+## Surface JSON Documents (1.4.0)
+
+Surface output is one pretty-printed JSON document, not NDJSON. A scan uses
+`schema:"neutron.surface/v1"`:
+
+```json
+{
+  "schema": "neutron.surface/v1",
+  "neutron_version": "1.4.0",
+  "collected_at": "2026-07-10T00:00:00Z",
+  "device": { "fingerprint": "...", "boot_id": "..." },
+  "health": {
+    "status": "complete",
+    "collectors": [],
+    "warnings": []
+  },
+  "services": [],
+  "processes": [],
+  "devices": [],
+  "modules": [],
+  "relations": [],
+  "captures": []
+}
+```
+
+| Collection | Important fields |
+|------------|------------------|
+| `services` | `id`, `name`, `transport`, optional descriptor/PID/process/domain/executable, `libraries`, current/observed devices, observed ioctls, declaration/HAL/confidence/source fields |
+| `processes` | `id`, PID, UID/GID, argv, executable, starttime, boot ID, SELinux domain, libraries, file descriptors |
+| `devices` | `id`, canonical path, aliases, char/block kind, major/minor, mode, UID/GID, SELinux context, sysfs path, class/subsystem/driver/module |
+| `modules` | `id`, name, loaded state, optional sysfs path |
+| `relations` | `id`, `type`, `from`, `to`, evidence source/detail, confidence; optional causal relation, trace/scenario/span IDs and ioctl label |
+| `captures` | `id`, trace/scenario IDs, optional root package/UID and device identity, health |
+
+Arrays are sorted and deduplicated by stable natural IDs: services by
+`service:<transport>:<name>`, processes by
+`process:<boot_id>:<pid>:<starttime>`, devices by
+`device:<char|block>:<major>:<minor>`, modules by `module:<name>`, and
+captures/relations by their causal identity. Set-like nested fields such as
+libraries, aliases, service sources/observations, and collector warnings are
+also sorted and deduplicated; ordered fields such as process argv are not.
+
+`health.status` is `complete` or `degraded`. Per-collector scope and warnings
+make partial `/proc`, `/sys`, service-manager, and VINTF access explicit.
+`proc_fd` relations are a static point-in-time observation. A
+`surface reachable` response never traverses them; it traverses only matching
+capture-sourced `root_process`, `binder`, `served_by`, and `ioctl` relations,
+so its result means observed causal reachability rather than policy or
+theoretical access. An imported capture without final `capture_health` is
+retained with degraded health; live observation fails if the final record is
+missing.
+
+The six query families (`services`, `hals`, `devices`, `process`, `explain`,
+and `reachable`) wrap their result in `schema:"neutron.surface/query/v1"`.
+They always emit JSON. `--input -` reads a snapshot from stdin; `--output`
+writes a mode-`0600` file instead of stdout.
 
 ## Field Reference
 
@@ -494,3 +563,7 @@ Redirect stderr separately:
 ```bash
 neutron --json --output trace.ndjson 2>diag.log
 ```
+
+Surface commands also default to JSON on stdout. Their `--output PATH` rejects
+a final-component symlink, then truncates the selected file and forces mode
+`0600`.

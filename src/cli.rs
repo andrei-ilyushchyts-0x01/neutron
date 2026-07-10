@@ -131,8 +131,8 @@ pub struct Args {
     #[arg(long)]
     pub package: Option<String>,
 
-    /// Root Android UID for causal tracing. Tracks every current and newly
-    /// appearing process owned by this UID.
+    /// Root Android UID for causal tracing. Tracks current processes and
+    /// matches found by a one-second refresh; shorter-lived processes can be missed.
     #[arg(long, conflicts_with_all = ["package", "pid"])]
     pub root_uid: Option<u32>,
 

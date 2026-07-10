@@ -67,10 +67,10 @@ it took" rather than as full RPC tracing.
 
 ### 3. Complete app → system service → driver causal chains
 
-When an app calls a Camera, Location, or Keystore API, the actual driver
-work happens in `system_server`, `cameraserver`, `mediaserver`, or a
-vendor HAL process — none of which share the app's PID. With a single
-`--pid <APP_PID>` invocation neutron sees:
+When an app calls a Camera, Location, or Keystore API, the actual driver work
+often happens in `system_server`, `cameraserver`, `mediaserver`, or a vendor
+HAL process. A single `--pid <APP_PID>` still cannot see those other
+processes.
 
 ```
 app → openat(/dev/binder)
@@ -79,22 +79,24 @@ app → ioctl(BINDER_WRITE_READ, ICameraService.connect)
                   │
                   ▼ (transaction reaches cameraserver via the kernel binder driver)
                   ▼
-   cameraserver → ioctl(/dev/video0, ...)        ← NOT captured today
-   vendor HAL  → mmap(/dev/dma_heap/system)     ← NOT captured today
+   cameraserver → ioctl(/dev/video0, ...)        ← outside an app-PID-only trace
+   vendor HAL  → mmap(/dev/dma_heap/system)     ← outside an app-PID-only trace
 ```
 
-Cross-process causal tracing is the v2.0 roadmap target. In the meantime,
-attach a second neutron instance to the relevant service PID manually
-(`pidof system_server` etc.) — the loader supports this.
+Package-rooted causal tracing (1.3) can follow Binder callees within bounded
+depth/process limits, and `surface scan --observe` (1.4) uses that mechanism.
+It still reports only hops that were observed while the scenario was active.
+Missing tracepoints, capture drops, depth/process limits, asynchronous work
+without a retained parent, or activity before attach can make a real chain
+incomplete. Check `capture_health` before treating an absent edge as evidence.
 
 ### 4. Driver activity by `system_server` or HAL processes on behalf of the app
 
-Same root cause as point 3. Driver-side ioctl, read, write, mmap, poll
-events that originate from a service process are not seen by an
-app-PID-only capture.
-
-Workaround: explicit multi-PID attach (manual today; `--package` +
-`--also` automation is on the v2.0 roadmap).
+Same root cause as point 3. Driver-side ioctl, read, write, mmap, and poll
+events originating from a service process are not seen by an app-PID-only
+capture. Use a causal package trace with Binder/service/HAL following, a
+service-specific PID trace, or `surface scan --observe`. None of those modes
+infers unobserved delegated work.
 
 ### 5. Runtime behavior fully inside userspace without syscalls
 
@@ -127,6 +129,10 @@ under `path_truncated` (slot reserved; instrumentation TODO).
 Long buffers (> 124 bytes) still truncate; broader cmd coverage and a
 larger `data[]` slot are tracked separately.
 
+Version 1.4 adds verified numeric-to-name mappings for Trusty TIPC and V4L2,
+including `TIPC_IOC_CONNECT` and `VIDIOC_QBUF`. An unmapped command remains
+`cmd=0x...`; neutron does not search device kernel sources or invent a name.
+
 ### 7. BPF-side exit_code / exit_signal on `process_exit`
 
 The `sched/sched_process_exit` BPF tracepoint payload carries `comm`,
@@ -148,12 +154,50 @@ backlog — see [docs/ROADMAP.md](ROADMAP.md).
 ### 8. Pre-attach activity
 
 neutron captures events from the moment the BPF programs are attached.
-Activity that ran before `--pid <PID>` was issued (zygote initialization,
-early app onCreate, splash logic) is not retroactively visible.
+Activity that ran before `--pid`, `--package`, or `--root-uid` was issued
+(zygote initialization, early app `onCreate`, splash logic) is not
+retroactively visible. Package and UID roots refresh matching processes once
+per second after attach, so they cannot reconstruct earlier activity and can
+miss a process that starts and exits between refreshes.
 
-For early-startup capture, use `--pid 0 --exclude-comm <noisy>` then
-filter by PID userspace-side, or wait for the v1.3 `--package
---attach-new` zygote-follow mode.
+---
+
+## Surface mapper limitations (1.4.0)
+
+The `neutron.surface/v1` snapshot is an evidence index, not an Android access
+policy model.
+
+- `surface reachable` means that a matching causal capture actually observed
+  a chain. It does not solve SELinux allow rules, Android manifest permissions,
+  VINTF compatibility, or theoretical Binder reachability.
+- Static `proc_fd` relations are point-in-time state and are deliberately
+  excluded from reachability traversal. Static service/process/device fields
+  only enrich a node reached through a causal trace.
+- Reachability accepts only capture-sourced `root_process`, `binder`,
+  `served_by`, and `ioctl` edges. A trace ID on any other relation type does
+  not make that edge causal.
+- Live `--observe` requires exactly one `--from-package` or `--from-uid`.
+  System-wide live observation is not supported, and `--capture` cannot be
+  combined with `--observe`.
+- A capture without the same boot ID as the static snapshot is retained, but
+  current-PID joins are only `candidate` and surface health is degraded. PID
+  identity in a static snapshot includes boot ID and `/proc/<pid>/stat`
+  starttime; this does not make legacy captures PID-reuse-proof.
+- An imported capture without a final `capture_health` record is retained as
+  degraded evidence. Live observation requires that record and fails without
+  it.
+- Device collection starts from discovered `/dev` character/block nodes and
+  follows their `/sys/dev/{char,block}/MAJOR:MINOR` bindings. It does not dump
+  all of `/sys/devices`, search kernel source, or infer a source-code owner.
+  “Driver/module” means a sysfs-proven binding.
+- Service PID, executable, and library attribution are left absent when
+  `service list`/exact `dumpsys --pid`, `lshal -ip`, or process evidence did
+  not prove them. A similar filename is not treated as proof.
+- Individual unreadable `/proc`, `/sys`, service, or VINTF inputs degrade
+  collector health. Missing primary `/proc` or `/dev`, child-trace failure, or
+  output failure is fatal.
+- Version 1.4 has no SQLite or NDJSON surface store, full sysfs dump,
+  kernel-source lookup, or Surface Mermaid renderer.
 
 ---
 
@@ -194,7 +238,8 @@ use Frida / Ghidra / radare2 to inspect or modify deeper.
 
 ### General Android device support
 
-neutron explicitly targets Pixel 8 Pro / Android 14 GKI / kernel 6.1.x.
+neutron explicitly targets the documented Pixel 8 Pro / Android 16 baseline
+on an Android 14 GKI 6.1.x kernel.
 Other devices may work — the `neutron doctor` subcommand will tell you
 whether the kernel exposes everything required — but only the documented
 profile is verified end-to-end.
@@ -215,9 +260,10 @@ vulnerability, a feature, or a false positive is up to the analyst.
 | Binder Parcel decoding | future | Full AIDL payload decoding remains out of scope for 1.2.0 |
 | FD → device/socket attribution for ioctl | v1.1 | Userspace FD graph (landed) |
 | FD-count rules / poller / rlimit awareness | sprint-1 PR 3 | `fd_snapshot` events + `fd_count_*` predicates |
-| ioctl decoder registry | sprint-1 PR 2 | DMA_HEAP_IOCTL_ALLOC decoded; family classification for binder / dma-buf / ashmem |
-| `--package` attach + zygote-follow | v1.3 | Resolves PID via UID; auto-attaches new app processes |
-| Cross-process causal tracing | v2.0 | Trace `system_server` etc.; stitch binder transactions to service-side syscalls |
+| ioctl decoder registry | v1.1–v1.4 | Typed/verified mappings grow additively; unknown commands remain numeric |
+| `--package` / `--root-uid` process discovery | v1.3 / v1.4 | One-second refresh; no retroactive activity, and sub-second processes can be missed |
+| Cross-process causal tracing | v1.3 | Observed, bounded Binder following; it is not a theoretical reachability solver |
+| Android surface mapper | v1.4 | Static inventory plus imported/live causal evidence; explicit collector health |
 | `path_truncated` counter wired in BPF | v1.1 | Currently reserved in COUNTERS but not incremented |
 
 See [docs/ROADMAP.md](ROADMAP.md) for the full multi-version plan.
