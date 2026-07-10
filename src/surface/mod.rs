@@ -1381,23 +1381,25 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             ));
         }
 
-        let service_id = resolve_capture_service(
+        let service = resolve_capture_service(
             snapshot,
             binder.service.as_deref(),
             binder.callee_pid,
             &binder.service_candidates,
         );
-        match service_id {
-            Some(service_id) => {
+        match service {
+            Some((service_id, service_confidence)) => {
+                let attribution_confidence = weakest_confidence(&[
+                    &caller_confidence,
+                    service_confidence,
+                    binder.attribution_confidence.as_deref().unwrap_or("exact"),
+                ]);
                 snapshot.relations.push(make_relation(
                     "binder",
                     &caller,
                     &service_id,
                     "capture",
-                    binder
-                        .attribution_confidence
-                        .as_deref()
-                        .unwrap_or(merge_confidence),
+                    attribution_confidence,
                     Some(relation_name(binder.relation).into()),
                     Some(trace_id.clone()),
                     scenario_id.clone(),
@@ -1408,7 +1410,7 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
                     &service_id,
                     &callee,
                     "capture",
-                    &callee_confidence,
+                    weakest_confidence(&[&callee_confidence, service_confidence]),
                     Some("exact".into()),
                     Some(trace_id.clone()),
                     scenario_id.clone(),
@@ -1427,7 +1429,7 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
                 &caller,
                 &callee,
                 "capture",
-                &caller_confidence,
+                weakest_confidence(&[&caller_confidence, &callee_confidence]),
                 Some(relation_name(binder.relation).into()),
                 Some(trace_id),
                 scenario_id,
@@ -1601,42 +1603,61 @@ fn resolve_capture_service(
     name: Option<&str>,
     callee_pid: u32,
     candidates: &[String],
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     if let Some(name) = name {
-        if let Some(service) = snapshot
-            .services
-            .iter()
-            .find(|service| service.name == name)
-        {
-            return Some(service.id.clone());
-        }
-        let id = format!("service:binder:{name}");
-        snapshot.services.push(Service {
-            id: id.clone(),
-            name: name.into(),
-            transport: "binder".into(),
-            pid: (callee_pid != 0).then_some(callee_pid),
-            hal: name.contains(".hardware.") || name.starts_with("vendor."),
-            confidence: "exact".into(),
-            sources: vec!["capture".into()],
-            ..Service::default()
-        });
-        return Some(id);
+        return Some((
+            resolve_named_capture_service(snapshot, name, callee_pid, "exact"),
+            "exact",
+        ));
     }
     if candidates.len() == 1 {
-        return resolve_capture_service(
-            snapshot,
-            candidates.first().map(String::as_str),
-            callee_pid,
-            &[],
-        );
+        let name = candidates.first()?.as_str();
+        return Some((
+            resolve_named_capture_service(snapshot, name, callee_pid, "candidate"),
+            "candidate",
+        ));
     }
     let matches: Vec<_> = snapshot
         .services
         .iter()
         .filter(|service| service.pid == Some(callee_pid))
         .collect();
-    (matches.len() == 1).then(|| matches[0].id.clone())
+    (matches.len() == 1).then(|| (matches[0].id.clone(), "candidate"))
+}
+
+fn resolve_named_capture_service(
+    snapshot: &mut SurfaceSnapshot,
+    name: &str,
+    callee_pid: u32,
+    confidence: &str,
+) -> String {
+    if let Some(service) = snapshot
+        .services
+        .iter()
+        .find(|service| service.name == name)
+    {
+        return service.id.clone();
+    }
+    let id = format!("service:binder:{name}");
+    snapshot.services.push(Service {
+        id: id.clone(),
+        name: name.into(),
+        transport: "binder".into(),
+        pid: (callee_pid != 0).then_some(callee_pid),
+        hal: name.contains(".hardware.") || name.starts_with("vendor."),
+        confidence: confidence.into(),
+        sources: vec!["capture".into()],
+        ..Service::default()
+    });
+    id
+}
+
+fn weakest_confidence(values: &[&str]) -> &'static str {
+    if values.iter().all(|value| *value == "exact") {
+        "exact"
+    } else {
+        "candidate"
+    }
 }
 
 fn device_path_index(devices: &[Device]) -> BTreeMap<String, String> {

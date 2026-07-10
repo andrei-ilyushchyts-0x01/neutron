@@ -480,10 +480,22 @@ fn capture_can_create_services_from_exact_or_single_candidate_evidence() {
         .services
         .iter()
         .any(|service| service.name == "vendor.example.INew/default"));
-    assert!(snapshot
+    let candidate = snapshot
         .services
         .iter()
-        .any(|service| service.name == "vendor.example.ICandidate/default"));
+        .find(|service| service.name == "vendor.example.ICandidate/default")
+        .expect("candidate service");
+    assert_eq!(candidate.confidence, "candidate");
+    assert!(snapshot.relations.iter().any(|relation| {
+        relation.to == candidate.id
+            && relation.relation_type == "binder"
+            && relation.confidence == "candidate"
+    }));
+    assert!(snapshot.relations.iter().any(|relation| {
+        relation.from == candidate.id
+            && relation.relation_type == "served_by"
+            && relation.confidence == "candidate"
+    }));
     assert!(snapshot.relations.iter().any(|relation| {
         relation.relation_type == "binder"
             && relation.from == "process:capture:trace-new:102"
