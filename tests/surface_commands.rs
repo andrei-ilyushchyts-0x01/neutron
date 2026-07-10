@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -220,4 +220,108 @@ fn static_scan_with_real_reader_writes_a_secure_round_trip_snapshot() {
         serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
     assert_eq!(round_trip, snapshot);
     assert_secure(&output);
+}
+
+#[test]
+fn uid_queries_and_selector_errors_are_reported_as_json_command_errors() {
+    let temp = TestDir::new("surface-query-edges");
+    let snapshot_path = temp.path("surface.json");
+    let mut snapshot = minimal_snapshot();
+    snapshot.relations[0].from = "uid:10123".into();
+    snapshot.captures[0].root_package = None;
+    snapshot.captures[0].root_uid = Some(10_123);
+    fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+    let reachable = temp.path("uid-reachable.json");
+    run(SurfaceCommand::Reachable(SurfaceReachableArgs {
+        from_package: None,
+        from_uid: Some(10_123),
+        io: input_args(&snapshot_path, &reachable),
+    }))
+    .unwrap();
+    assert_eq!(read_json(&reachable)["root"], "uid:10123");
+
+    let device = temp.path("device-explain.json");
+    run(SurfaceCommand::Explain(SurfaceExplainArgs {
+        selector: "/dev/example".into(),
+        io: input_args(&snapshot_path, &device),
+    }))
+    .unwrap();
+    assert_eq!(read_json(&device)["entity"]["kind"], "device");
+
+    let missing_process = run(SurfaceCommand::Process(SurfaceProcessArgs {
+        pid: 999,
+        io: input_args(&snapshot_path, &temp.path("missing.json")),
+    }))
+    .unwrap_err();
+    assert!(format!("{missing_process:#}").contains("not present"));
+
+    let no_selector = run(SurfaceCommand::Reachable(SurfaceReachableArgs {
+        from_package: None,
+        from_uid: None,
+        io: input_args(&snapshot_path, &temp.path("no-selector.json")),
+    }))
+    .unwrap_err();
+    assert!(format!("{no_selector:#}").contains("exactly one"));
+
+    let missing_entity = run(SurfaceCommand::Explain(SurfaceExplainArgs {
+        selector: "absent".into(),
+        io: input_args(&snapshot_path, &temp.path("absent.json")),
+    }))
+    .unwrap_err();
+    assert!(format!("{missing_entity:#}").contains("did not match"));
+
+    let mut ambiguous = snapshot;
+    let mut reused = ambiguous.processes[0].clone();
+    reused.id = "process:boot-test:42:101".into();
+    reused.starttime = 101;
+    ambiguous.processes.push(reused);
+    ambiguous.devices[0]
+        .aliases
+        .push("example.IExample/default".into());
+    fs::write(&snapshot_path, serde_json::to_vec(&ambiguous).unwrap()).unwrap();
+    assert!(run(SurfaceCommand::Process(SurfaceProcessArgs {
+        pid: 42,
+        io: input_args(&snapshot_path, &temp.path("ambiguous-process.json")),
+    }))
+    .is_err());
+    assert!(run(SurfaceCommand::Explain(SurfaceExplainArgs {
+        selector: "example.IExample/default".into(),
+        io: input_args(&snapshot_path, &temp.path("ambiguous-entity.json")),
+    }))
+    .is_err());
+}
+
+#[test]
+fn capture_scan_degrades_mismatched_health_and_rejects_output_symlinks() {
+    let temp = TestDir::new("surface-capture-command");
+    let capture = temp.path("capture.ndjson");
+    fs::write(
+        &capture,
+        concat!(
+            "{\"type\":\"marker\",\"phase\":\"start\",\"name\":\"imported\",\"scenario_id\":\"imported\",\"trace_id\":\"trace-uid\",\"root_uid\":10123}\n",
+            "{\"type\":\"capture_health\",\"degraded\":true,\"root_uid\":10123,\"boot_id\":\"different-boot\",\"fingerprint\":\"different/fingerprint\"}\n"
+        ),
+    )
+    .unwrap();
+    let output = temp.path("surface.json");
+    run(SurfaceCommand::Scan(SurfaceScanArgs {
+        capture: Some(capture.to_string_lossy().into_owned()),
+        observe: None,
+        from_package: None,
+        from_uid: None,
+        output: Some(output.to_string_lossy().into_owned()),
+    }))
+    .unwrap();
+    let snapshot: SurfaceSnapshot = serde_json::from_value(read_json(&output)).unwrap();
+    assert_eq!(snapshot.captures[0].health, "degraded");
+    assert_eq!(snapshot.health.status, "degraded");
+
+    let target = temp.path("target.json");
+    let link = temp.path("output-link.json");
+    fs::write(&target, b"untouched").unwrap();
+    symlink(&target, &link).unwrap();
+    let error = run(SurfaceCommand::Services(input_args(&output, &link))).unwrap_err();
+    assert!(format!("{error:#}").contains("secure output"));
+    assert_eq!(fs::read(&target).unwrap(), b"untouched");
 }

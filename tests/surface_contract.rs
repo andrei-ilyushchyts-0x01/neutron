@@ -461,3 +461,42 @@ fn legacy_capture_keeps_edges_as_candidate_and_warns_about_pid_identity() {
         .iter()
         .any(|warning| warning.contains("no final capture_health")));
 }
+
+#[test]
+fn capture_can_create_services_from_exact_or_single_candidate_evidence() {
+    let mut snapshot = scan_with_reader(&fixture()).expect("static scan");
+    let capture = r#"
+{"type":"marker","phase":"start","name":"new-services","scenario_id":"new-services","trace_id":"trace-new","root_package":"com.example.new"}
+{"type":"binder","pid":100,"to_proc":200,"debug_id":1,"service":"vendor.example.INew/default","trace_id":"trace-new","span_id":"binder-1","scenario_id":"new-services","causal_relation":"exact"}
+{"type":"binder","pid":101,"to_proc":201,"debug_id":2,"service_candidates":["vendor.example.ICandidate/default"],"trace_id":"trace-new","span_id":"binder-2","scenario_id":"new-services","causal_relation":"inferred"}
+{"type":"binder","pid":102,"to_proc":202,"debug_id":3,"trace_id":"trace-new","span_id":"binder-3","scenario_id":"new-services","causal_relation":"exact"}
+{"type":"binder","pid":103,"debug_id":4,"trace_id":"trace-new","span_id":"malformed"}
+{"type":"capture_health","degraded":true,"root_package":"com.example.new","boot_id":"boot-a","fingerprint":"different/fingerprint","binder_depth_limit":1}
+"#;
+
+    import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
+
+    assert!(snapshot
+        .services
+        .iter()
+        .any(|service| service.name == "vendor.example.INew/default"));
+    assert!(snapshot
+        .services
+        .iter()
+        .any(|service| service.name == "vendor.example.ICandidate/default"));
+    assert!(snapshot.relations.iter().any(|relation| {
+        relation.relation_type == "binder"
+            && relation.from == "process:capture:trace-new:102"
+            && relation.to == "process:capture:trace-new:202"
+    }));
+    assert!(snapshot
+        .health
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("fingerprint differs")));
+    assert!(snapshot
+        .health
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("missing process endpoint")));
+}
