@@ -144,7 +144,38 @@ impl PlatformReader for RealPlatformReader {
     }
 
     fn command_output(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
-        let output = Command::new(program).args(args).output()?;
+        let candidates: &[&str] = match program {
+            "service" => &["/system/bin/service"],
+            "dumpsys" => &["/system/bin/dumpsys"],
+            "getprop" => &["/system/bin/getprop"],
+            "lshal" => &["/system/bin/lshal", "/vendor/bin/lshal"],
+            "vndservice" => &["/vendor/bin/vndservice", "/system/bin/vndservice"],
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported platform command: {program}"),
+                ))
+            }
+        };
+        let mut last_not_found = None;
+        let mut output = None;
+        for candidate in candidates {
+            match Command::new(candidate).args(args).output() {
+                Ok(result) => {
+                    output = Some(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    last_not_found = Some(error)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let output = output.ok_or_else(|| {
+            last_not_found.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "platform command not found")
+            })
+        })?;
         Ok(CommandOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -174,5 +205,18 @@ impl PlatformReader for RealPlatformReader {
             utc.tm_min,
             utc.tm_sec,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_reader_rejects_commands_outside_the_android_allowlist() {
+        let error = RealPlatformReader
+            .command_output("sh", &["-c", "exit 0"])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -382,14 +383,21 @@ pub fn run(command: SurfaceCommand) -> Result<()> {
 }
 
 fn run_scan(args: SurfaceScanArgs) -> Result<()> {
-    let mut snapshot = scan_with_reader(&RealPlatformReader)?;
-    if let Some(duration) = args.observe.as_deref() {
+    let observed_capture = if let Some(duration) = args.observe.as_deref() {
         let selector = match (args.from_package, args.from_uid) {
             (Some(package), None) => RootSelector::Package(package),
             (None, Some(uid)) => RootSelector::Uid(uid),
             _ => bail!("--observe requires exactly one --from-package or --from-uid"),
         };
-        let capture = observe(parse_duration(duration)?, &selector)?;
+        Some(observe(parse_duration(duration)?, &selector)?)
+    } else {
+        None
+    };
+
+    // Live evidence must precede the static snapshot. This lets the later
+    // /proc starttime read reject a PID that was recycled during observation.
+    let mut snapshot = scan_with_reader(&RealPlatformReader)?;
+    if let Some(capture) = observed_capture {
         import_capture(&mut snapshot, Cursor::new(capture))?;
     } else if let Some(path) = args.capture.as_deref() {
         let reader = open_input(path)?;
@@ -1054,6 +1062,24 @@ fn collect_services(
         service.sources.sort();
         service.sources.dedup();
         if let Some(process) = service.pid.and_then(|pid| by_pid.get(&pid).copied()) {
+            let stat_path = PathBuf::from(format!("/proc/{}/stat", process.pid));
+            match reader
+                .read(&stat_path)
+                .ok()
+                .and_then(|raw| parse_process_starttime(&String::from_utf8_lossy(&raw)).ok())
+            {
+                Some(starttime) if starttime == process.starttime => {}
+                _ => {
+                    health.warn(
+                        "services",
+                        format!(
+                            "PID {} identity changed or could not be revalidated while joining service {}",
+                            process.pid, service.name
+                        ),
+                    );
+                    continue;
+                }
+            }
             service.process_id = Some(process.id.clone());
             service.selinux_domain =
                 (!process.selinux_domain.is_empty()).then(|| process.selinux_domain.clone());
@@ -1204,6 +1230,12 @@ struct TraceRoot {
 pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> Result<()> {
     let capture = crate::capture_normalize::normalize_capture(reader)?;
     let health = capture.health.as_ref();
+    if health.is_none() {
+        add_snapshot_warning(
+            snapshot,
+            "imported capture has no final capture_health record",
+        );
+    }
     let merge_confidence = if health
         .and_then(|health| health.boot_id.as_deref())
         .is_some_and(|boot_id| !boot_id.is_empty() && boot_id == snapshot.device.boot_id)
@@ -1282,7 +1314,9 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
         }
     }
 
-    let capture_health = if health.is_some_and(|health| health.degraded || health.output_cap_hit) {
+    let capture_health = if health.is_none()
+        || health.is_some_and(|health| health.degraded || health.output_cap_hit)
+    {
         "degraded"
     } else {
         "complete"
@@ -1664,7 +1698,11 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
                 .trace_id
                 .as_ref()
                 .is_some_and(|trace_id| trace_ids.contains(trace_id))
-                && relation.relation_type != "proc_fd"
+                && relation.evidence.source == "capture"
+                && matches!(
+                    relation.relation_type.as_str(),
+                    "root_process" | "binder" | "served_by" | "ioctl"
+                )
         })
         .cloned()
         .collect();
@@ -1845,7 +1883,7 @@ fn write_json<T: Serialize>(path: Option<&str>, value: &T) -> Result<()> {
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(path)
                 .with_context(|| format!("opening {path} for secure output"))?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            file.set_permissions(fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("chmod 0600 {path}"))?;
             serde_json::to_writer_pretty(&mut file, value)
                 .with_context(|| format!("writing JSON to {path}"))?;
@@ -1940,44 +1978,68 @@ impl Drop for ObservationDir {
 
 fn observe(duration: Duration, selector: &RootSelector) -> Result<Vec<u8>> {
     let temp = ObservationDir::create()?;
+    let result = observe_in(&temp, duration, selector);
+    let cleanup = temp.cleanup();
+    combine_cleanup(result, cleanup, "observation file cleanup")
+}
+
+fn observe_in(
+    temp: &ObservationDir,
+    duration: Duration,
+    selector: &RootSelector,
+) -> Result<Vec<u8>> {
     let capture_path = temp.file("capture.ndjson");
     let health_path = temp.file("health.ndjson");
     let socket_path = temp.file("control.sock");
     create_private_file(&capture_path)?;
     create_private_file(&health_path)?;
 
-    let result = (|| -> Result<Vec<u8>> {
-        let executable = std::env::current_exe().context("resolving current neutron executable")?;
-        let mut command = ProcessCommand::new(executable);
-        command.arg("trace");
-        match selector {
-            RootSelector::Package(package) => {
-                command.args(["--package", package]);
-            }
-            RootSelector::Uid(uid) => {
-                command.args(["--root-uid", &uid.to_string()]);
-            }
+    let executable = std::env::current_exe().context("resolving current neutron executable")?;
+    let mut command = ProcessCommand::new(executable);
+    command.arg("trace");
+    match selector {
+        RootSelector::Package(package) => {
+            command.args(["--package", package]);
         }
-        command
-            .args(["--follow-services", "--follow-hal", "--json", "--raw"])
-            .arg("--output")
-            .arg(&capture_path)
-            .arg("--health-output")
-            .arg(&health_path)
-            .arg("--control-socket")
-            .arg(&socket_path)
-            .args([
-                "--fdgraph-interval",
-                "off",
-                "--lookback-events",
-                "0",
-                "--no-logcat",
-            ])
-            .stdout(Stdio::null());
-        let mut child = command.spawn().context("starting child neutron trace")?;
+        RootSelector::Uid(uid) => {
+            command.args(["--root-uid", &uid.to_string()]);
+        }
+    }
+    command
+        .args(["--follow-services", "--follow-hal", "--json", "--raw"])
+        .arg("--output")
+        .arg(&capture_path)
+        .arg("--health-output")
+        .arg(&health_path)
+        .arg("--control-socket")
+        .arg(&socket_path)
+        .args([
+            "--fdgraph-interval",
+            "off",
+            "--lookback-events",
+            "0",
+            "--no-logcat",
+        ])
+        .stdout(Stdio::null());
+    // SAFETY: the closure only calls async-signal-safe libc functions. The
+    // death signal prevents an orphan root tracer if the surface parent is
+    // interrupted or killed before normal child cleanup runs.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                libc::_exit(128 + libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().context("starting child neutron trace")?;
+    let result = (|| -> Result<Vec<u8>> {
         wait_for_socket(&mut child, &socket_path, Duration::from_secs(10))?;
         send_observation_mark(&socket_path, "start")?;
-        std::thread::sleep(duration);
+        wait_observation(&mut child, duration)?;
         send_observation_mark(&socket_path, "end")?;
         // SAFETY: child.id() is a live process ID owned by this parent.
         if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) } != 0 {
@@ -2004,17 +2066,65 @@ fn observe(duration: Duration, selector: &RootSelector) -> Result<Vec<u8>> {
         if !valid_health {
             bail!("child trace did not produce a final capture_health record");
         }
-        fs::read(&capture_path).context("reading child causal capture")
+        let bytes = fs::read(&capture_path).context("reading child causal capture")?;
+        let normalized = crate::capture_normalize::normalize_capture(Cursor::new(&bytes))?;
+        let starts: Vec<_> = normalized
+            .markers
+            .iter()
+            .filter(|marker| {
+                marker.name == "surface-observe" && marker.phase.as_deref() == Some("start")
+            })
+            .collect();
+        let ends: Vec<_> = normalized
+            .markers
+            .iter()
+            .filter(|marker| {
+                marker.name == "surface-observe" && marker.phase.as_deref() == Some("end")
+            })
+            .collect();
+        if starts.len() != 1
+            || ends.len() != 1
+            || starts[0].trace_id.is_none()
+            || starts[0].trace_id != ends[0].trace_id
+        {
+            bail!("child capture is missing one matched surface-observe start/end pair");
+        }
+        if normalized.health.is_none() {
+            bail!("child primary capture is missing its final capture_health record");
+        }
+        Ok(bytes)
     })();
-    let cleanup = temp.cleanup();
-    match (result, cleanup) {
-        (Ok(capture), Ok(())) => Ok(capture),
+    let child_cleanup = stop_child(&mut child);
+    combine_cleanup(result, child_cleanup, "child trace cleanup")
+}
+
+fn combine_cleanup<T>(primary: Result<T>, cleanup: Result<()>, label: &str) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("observation cleanup also failed: {cleanup:#}")))
+            Err(error.context(format!("{label} also failed: {cleanup:#}")))
         }
     }
+}
+
+fn stop_child(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .context("checking child trace cleanup")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    // SAFETY: child.id() is a live process ID owned by this parent.
+    if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("stopping child trace after observation failure");
+        }
+    }
+    wait_for_child(child, Duration::from_secs(10)).map(|_| ())
 }
 
 fn create_private_file(path: &Path) -> Result<()> {
@@ -2056,6 +2166,25 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<std::process::
     bail!("timed out waiting for child trace shutdown")
 }
 
+fn wait_observation(child: &mut Child, duration: Duration) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(duration)
+        .context("observation duration is too large")?;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("polling child trace during observation")?
+        {
+            bail!("child neutron trace exited during observation: {status}");
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    }
+}
+
 fn send_observation_mark(path: &Path, phase: &str) -> Result<()> {
     crate::causal::send_mark_request(
         path,
@@ -2066,4 +2195,55 @@ fn send_observation_mark(path: &Path, phase: &str) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_duration_is_validated_and_unit_aware() {
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("30").is_err());
+    }
+
+    #[test]
+    fn observation_directory_cleanup_removes_private_artifacts() {
+        let temp = ObservationDir::create().unwrap();
+        let path = temp.path.clone();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        create_private_file(&temp.file("capture.ndjson")).unwrap();
+        temp.cleanup().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn child_cleanup_stops_a_live_process() {
+        let mut child = ProcessCommand::new("/bin/sleep").arg("60").spawn().unwrap();
+        stop_child(&mut child).unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn observation_wait_reports_early_child_exit() {
+        let mut child = ProcessCommand::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        let error = wait_observation(&mut child, Duration::from_secs(1)).unwrap_err();
+        assert!(format!("{error:#}").contains("exited during observation"));
+    }
+
+    #[test]
+    fn observation_wait_finishes_while_child_remains_live() {
+        let mut child = ProcessCommand::new("/bin/sleep").arg("60").spawn().unwrap();
+        wait_observation(&mut child, Duration::from_millis(1)).unwrap();
+        stop_child(&mut child).unwrap();
+    }
 }

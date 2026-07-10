@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ struct FixtureReader {
     labels: BTreeMap<PathBuf, String>,
     commands: BTreeMap<String, CommandOutput>,
     denied: BTreeSet<PathBuf>,
+    sequenced_files: BTreeMap<PathBuf, Vec<Vec<u8>>>,
+    read_counts: RefCell<BTreeMap<PathBuf, usize>>,
     reverse_dirs: bool,
 }
 
@@ -57,6 +60,16 @@ impl FixtureReader {
         self.files.insert(path, contents.as_ref().to_vec());
     }
 
+    fn sequenced_file(&mut self, path: &str, contents: &[&str]) {
+        self.sequenced_files.insert(
+            PathBuf::from(path),
+            contents
+                .iter()
+                .map(|contents| contents.as_bytes().to_vec())
+                .collect(),
+        );
+    }
+
     fn symlink(&mut self, path: &str, target: &str, canonical: Option<&str>) {
         let path = PathBuf::from(path);
         self.metadata.insert(
@@ -89,6 +102,17 @@ impl PlatformReader for FixtureReader {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         if self.denied.contains(path) {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        if let Some(sequence) = self.sequenced_files.get(path) {
+            let mut counts = self.read_counts.borrow_mut();
+            let count = counts.entry(path.to_path_buf()).or_default();
+            let value = sequence
+                .get(*count)
+                .or_else(|| sequence.last())
+                .cloned()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            *count += 1;
+            return Ok(value);
         }
         self.files
             .get(path)
@@ -326,6 +350,31 @@ fn individual_permission_error_degrades_but_missing_primary_source_is_fatal() {
 }
 
 #[test]
+fn service_join_revalidates_process_starttime_to_reject_pid_reuse() {
+    let mut reader = fixture();
+    reader.sequenced_file(
+        "/proc/42/stat",
+        &[
+            "42 (keymint) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 19\n",
+            "42 (reused) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 9999 19\n",
+        ],
+    );
+
+    let snapshot = scan_with_reader(&reader).expect("scan survives PID reuse");
+    let service = snapshot
+        .services
+        .iter()
+        .find(|service| service.name.contains("keymint"))
+        .expect("keymint service");
+    assert!(service.process_id.is_none());
+    assert!(snapshot
+        .health
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("identity changed")));
+}
+
+#[test]
 fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges() {
     let mut snapshot = scan_with_reader(&fixture()).expect("static scan");
     let capture = r#"
@@ -364,6 +413,28 @@ fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges
         .relations
         .iter()
         .all(|relation| relation.relation_type != "proc_fd"));
+
+    let root_relation = snapshot
+        .relations
+        .iter()
+        .find(|relation| relation.relation_type == "root_process")
+        .expect("root relation")
+        .clone();
+    let mut injected = root_relation;
+    injected.id = "relation:injected-static".into();
+    injected.relation_type = "driven_by".into();
+    injected.to = "module:injected-static".into();
+    injected.evidence.source = "sysfs".into();
+    snapshot.relations.push(injected);
+    let reached = reachable(
+        &snapshot,
+        &RootSelector::Package("com.example.app".to_string()),
+    )
+    .expect("strict causal reachability");
+    assert!(!reached
+        .nodes
+        .iter()
+        .any(|id| id == "module:injected-static"));
 }
 
 #[test]
@@ -383,4 +454,10 @@ fn legacy_capture_keeps_edges_as_candidate_and_warns_about_pid_identity() {
         relation.trace_id.as_deref() == Some("0000000000000001")
             && relation.confidence == "candidate"
     }));
+    assert_eq!(snapshot.captures[0].health, "degraded");
+    assert!(snapshot
+        .health
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("no final capture_health")));
 }

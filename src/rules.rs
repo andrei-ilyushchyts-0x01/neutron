@@ -77,8 +77,12 @@ pub fn format_finding_text(f: &neutron_rules::Finding) -> String {
 
 /// Emit findings drained from the engine. Format depends on `use_json`.
 /// Equivalent to [`emit_findings_with`] with `fd_snapshot=false`.
-pub fn emit_findings(findings: &[neutron_rules::Finding], out: &mut dyn IoWrite, use_json: bool) {
-    emit_findings_with(findings, out, use_json, false);
+pub fn emit_findings(
+    findings: &[neutron_rules::Finding],
+    out: &mut dyn IoWrite,
+    use_json: bool,
+) -> std::io::Result<()> {
+    emit_findings_with(findings, out, use_json, false)
 }
 
 /// Same as [`emit_findings`], but optionally splices a Phase 4a
@@ -90,30 +94,27 @@ pub fn emit_findings_with(
     out: &mut dyn IoWrite,
     use_json: bool,
     fd_snapshot: bool,
-) {
+) -> std::io::Result<()> {
     for f in findings {
         if use_json {
-            match serde_json::to_value(f) {
-                Ok(mut v) => {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.insert("type".into(), Value::String("finding".into()));
-                        if fd_snapshot {
-                            if let Some(map) = build_fdinfo_map(f) {
-                                obj.insert(
-                                    "fdinfo_at_event".into(),
-                                    serde_json::to_value(map).unwrap_or(Value::Null),
-                                );
-                            }
-                        }
+            let mut v = serde_json::to_value(f).map_err(std::io::Error::other)?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("type".into(), Value::String("finding".into()));
+                if fd_snapshot {
+                    if let Some(map) = build_fdinfo_map(f) {
+                        obj.insert(
+                            "fdinfo_at_event".into(),
+                            serde_json::to_value(map).unwrap_or(Value::Null),
+                        );
                     }
-                    let _ = writeln!(out, "{}", v);
                 }
-                Err(_) => continue,
             }
+            writeln!(out, "{}", v)?;
         } else {
-            let _ = writeln!(out, "{}", format_finding_text(f));
+            writeln!(out, "{}", format_finding_text(f))?;
         }
     }
+    Ok(())
 }
 
 /// Walk a finding's evidence and pull a synchronous fdinfo snapshot for
@@ -261,7 +262,7 @@ mod tests {
                 raw: Some(json!({"pid": pid, "args": [fd, 0, 0]})),
             }]);
             let mut buf = Vec::new();
-            emit_findings_with(&[f], &mut buf, true, true);
+            emit_findings_with(&[f], &mut buf, true, true).unwrap();
             let s = String::from_utf8(buf).unwrap();
             assert!(
                 s.contains("fdinfo_at_event"),
@@ -281,7 +282,7 @@ mod tests {
             raw: Some(json!({"pid": 1, "args": [3, 0, 0]})),
         }]);
         let mut buf = Vec::new();
-        emit_findings_with(&[f], &mut buf, true, false);
+        emit_findings_with(&[f], &mut buf, true, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(
             !s.contains("fdinfo_at_event"),

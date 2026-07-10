@@ -1161,6 +1161,14 @@ fn stop_if_output_cap_hit(cap_hit: &AtomicBool, reported: &mut bool, running: &A
     true
 }
 
+fn write_or_output_cap(result: io::Result<()>, cap_hit: &AtomicBool) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(_) if cap_hit.load(Ordering::Relaxed) => Ok(()),
+        Err(error) => Err(error).context("writing capture output"),
+    }
+}
+
 fn open_output(
     path: Option<&String>,
     max_bytes: Option<u64>,
@@ -1571,7 +1579,7 @@ fn emit_process_exit(
     json_mode: bool,
     event_id_counter: &mut u64,
     causal: Option<&CausalMetadata>,
-) {
+) -> io::Result<()> {
     let ctx = lookback.map(|lb| lb.take(ev.pid)).unwrap_or_default();
     *event_id_counter = event_id_counter.wrapping_add(1);
     let mut line = format_process_exit_json(ev, &ctx, Some(*event_id_counter));
@@ -1602,8 +1610,9 @@ fn emit_process_exit(
                 ev.source.as_str(),
             )
         };
-        let _ = writeln!(out, "{printed}");
+        writeln!(out, "{printed}")?;
     }
+    Ok(())
 }
 
 // ── Binder-causality emit helper (sprint-2 PR 2) ─────────────────────────────
@@ -1626,7 +1635,7 @@ fn emit_binder_call(
     catalog: &BinderCatalog,
     methods: &BinderMethodMap,
     causal: Option<&CausalMetadata>,
-) {
+) -> io::Result<()> {
     *event_id_counter = event_id_counter.wrapping_add(1);
     let attribution = catalog.resolve(
         services,
@@ -1664,7 +1673,7 @@ fn emit_binder_call(
                     .unwrap_or_default(),
             )
         };
-        let _ = writeln!(out, "{printed}");
+        writeln!(out, "{printed}")?;
     }
     if let Some(lb) = lookback {
         // Record the pair against the *caller* PID so a later caller-side
@@ -1672,6 +1681,7 @@ fn emit_binder_call(
         // crashes already trigger the on_callee_crash drain.
         lb.record(pair.caller_pid, &line);
     }
+    Ok(())
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -2229,7 +2239,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                 })();
                 let response = match result {
                     Ok((scenario, ts_ns, line)) => {
-                        let _ = writeln!(out, "{line}");
+                        write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
                         events_emitted = events_emitted.saturating_add(1);
                         pending.respond_ok(ts_ns, scenario.generation, scenario.trace_id)
                     }
@@ -2277,15 +2287,12 @@ fn run_trace(mut args: Args) -> Result<()> {
                         }
                         root_pids = discovered;
                     }
-                    Ok(Some(discovered)) => eprintln!(
-                        "neutron: warn: causal root now has {} processes, above --max-processes {}",
+                    Ok(Some(discovered)) => bail!(
+                        "causal root now has {} processes, above --max-processes {}",
                         discovered.len(),
                         args.max_processes
                     ),
-                    Err(error) if args.verbose => {
-                        eprintln!("neutron: warn: causal root PID refresh failed: {error:#}");
-                    }
-                    Err(_) => {}
+                    Err(error) => return Err(error).context("refreshing causal root process set"),
                 }
             }
         }
@@ -2353,32 +2360,38 @@ fn run_trace(mut args: Args) -> Result<()> {
                         if let Some(t) = binder_tracker.as_mut() {
                             for pair in t.on_callee_crash(pe.pid) {
                                 let pair_causal = binder_causal.remove(&pair.debug_id);
-                                emit_binder_call(
-                                    &pair,
-                                    lookback.as_mut(),
-                                    &mut engine,
-                                    &mut *out,
-                                    suppress_raw,
-                                    args.json,
-                                    &mut event_id_counter,
-                                    &binder_services,
-                                    &binder_catalog,
-                                    &binder_methods,
-                                    pair_causal.as_ref(),
-                                );
+                                write_or_output_cap(
+                                    emit_binder_call(
+                                        &pair,
+                                        lookback.as_mut(),
+                                        &mut engine,
+                                        &mut *out,
+                                        suppress_raw,
+                                        args.json,
+                                        &mut event_id_counter,
+                                        &binder_services,
+                                        &binder_catalog,
+                                        &binder_methods,
+                                        pair_causal.as_ref(),
+                                    ),
+                                    &output_cap_hit,
+                                )?;
                             }
                         }
                     }
-                    emit_process_exit(
-                        &pe,
-                        lookback.as_mut(),
-                        &mut engine,
-                        &mut *out,
-                        suppress_raw,
-                        args.json,
-                        &mut event_id_counter,
-                        causal_event.as_ref(),
-                    );
+                    write_or_output_cap(
+                        emit_process_exit(
+                            &pe,
+                            lookback.as_mut(),
+                            &mut engine,
+                            &mut *out,
+                            suppress_raw,
+                            args.json,
+                            &mut event_id_counter,
+                            causal_event.as_ref(),
+                        ),
+                        &output_cap_hit,
+                    )?;
                     continue;
                 }
 
@@ -2426,19 +2439,22 @@ fn run_trace(mut args: Args) -> Result<()> {
                         let ts = { ev.timestamp_ns };
                         if let Some(pair) = t.record_received(debug_id, ts) {
                             let pair_causal = binder_causal.remove(&pair.debug_id);
-                            emit_binder_call(
-                                &pair,
-                                lookback.as_mut(),
-                                &mut engine,
-                                &mut *out,
-                                suppress_raw,
-                                args.json,
-                                &mut event_id_counter,
-                                &binder_services,
-                                &binder_catalog,
-                                &binder_methods,
-                                pair_causal.as_ref(),
-                            );
+                            write_or_output_cap(
+                                emit_binder_call(
+                                    &pair,
+                                    lookback.as_mut(),
+                                    &mut engine,
+                                    &mut *out,
+                                    suppress_raw,
+                                    args.json,
+                                    &mut event_id_counter,
+                                    &binder_services,
+                                    &binder_catalog,
+                                    &binder_methods,
+                                    pair_causal.as_ref(),
+                                ),
+                                &output_cap_hit,
+                            )?;
                         }
                     }
                 }
@@ -2607,14 +2623,14 @@ fn run_trace(mut args: Args) -> Result<()> {
                             // capture is unavoidable when the ring buffers
                             // JSON).
                             if args.json || line != &json_line {
-                                let _ = writeln!(out, "{line}");
+                                write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
                             } else {
                                 let text = format_event_text_with_stack(
                                     &ev,
                                     args.resolve_paths,
                                     stack_str.as_deref(),
                                 );
-                                let _ = writeln!(out, "{text}");
+                                write_or_output_cap(writeln!(out, "{text}"), &output_cap_hit)?;
                             }
                         }
                     }
@@ -2633,12 +2649,15 @@ fn run_trace(mut args: Args) -> Result<()> {
                     if let Some(eng) = engine.as_mut() {
                         let findings = eng.drain_ready();
                         if !findings.is_empty() {
-                            emit_findings_with(
-                                &findings,
-                                &mut *out,
-                                args.json,
-                                args.fd_snapshot_on_finding,
-                            );
+                            write_or_output_cap(
+                                emit_findings_with(
+                                    &findings,
+                                    &mut *out,
+                                    args.json,
+                                    args.fd_snapshot_on_finding,
+                                ),
+                                &output_cap_hit,
+                            )?;
                         }
                     }
                 }
@@ -2713,7 +2732,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     }
                 }
                 if !suppress_raw {
-                    let _ = writeln!(out, "{line}");
+                    write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
                 }
                 if let Some(lb) = lookback.as_mut() {
                     lb.record(sample.pid, &line);
@@ -2757,32 +2776,38 @@ fn run_trace(mut args: Args) -> Result<()> {
                     if let Some(t) = binder_tracker.as_mut() {
                         for pair in t.on_callee_crash(pe.pid) {
                             let pair_causal = binder_causal.remove(&pair.debug_id);
-                            emit_binder_call(
-                                &pair,
-                                lookback.as_mut(),
-                                &mut engine,
-                                &mut *out,
-                                suppress_raw,
-                                args.json,
-                                &mut event_id_counter,
-                                &binder_services,
-                                &binder_catalog,
-                                &binder_methods,
-                                pair_causal.as_ref(),
-                            );
+                            write_or_output_cap(
+                                emit_binder_call(
+                                    &pair,
+                                    lookback.as_mut(),
+                                    &mut engine,
+                                    &mut *out,
+                                    suppress_raw,
+                                    args.json,
+                                    &mut event_id_counter,
+                                    &binder_services,
+                                    &binder_catalog,
+                                    &binder_methods,
+                                    pair_causal.as_ref(),
+                                ),
+                                &output_cap_hit,
+                            )?;
                         }
                     }
                 }
-                emit_process_exit(
-                    &pe,
-                    lookback.as_mut(),
-                    &mut engine,
-                    &mut *out,
-                    suppress_raw,
-                    args.json,
-                    &mut event_id_counter,
-                    pe_causal.as_ref(),
-                );
+                write_or_output_cap(
+                    emit_process_exit(
+                        &pe,
+                        lookback.as_mut(),
+                        &mut engine,
+                        &mut *out,
+                        suppress_raw,
+                        args.json,
+                        &mut event_id_counter,
+                        pe_causal.as_ref(),
+                    ),
+                    &output_cap_hit,
+                )?;
                 if stop_if_output_cap_hit(
                     &output_cap_hit,
                     &mut output_cap_reported,
@@ -2811,32 +2836,38 @@ fn run_trace(mut args: Args) -> Result<()> {
                     if let Some(t) = binder_tracker.as_mut() {
                         for pair in t.on_callee_crash(pe.pid) {
                             let pair_causal = binder_causal.remove(&pair.debug_id);
-                            emit_binder_call(
-                                &pair,
-                                lookback.as_mut(),
-                                &mut engine,
-                                &mut *out,
-                                suppress_raw,
-                                args.json,
-                                &mut event_id_counter,
-                                &binder_services,
-                                &binder_catalog,
-                                &binder_methods,
-                                pair_causal.as_ref(),
-                            );
+                            write_or_output_cap(
+                                emit_binder_call(
+                                    &pair,
+                                    lookback.as_mut(),
+                                    &mut engine,
+                                    &mut *out,
+                                    suppress_raw,
+                                    args.json,
+                                    &mut event_id_counter,
+                                    &binder_services,
+                                    &binder_catalog,
+                                    &binder_methods,
+                                    pair_causal.as_ref(),
+                                ),
+                                &output_cap_hit,
+                            )?;
                         }
                     }
                 }
-                emit_process_exit(
-                    &pe,
-                    lookback.as_mut(),
-                    &mut engine,
-                    &mut *out,
-                    suppress_raw,
-                    args.json,
-                    &mut event_id_counter,
-                    pe_causal.as_ref(),
-                );
+                write_or_output_cap(
+                    emit_process_exit(
+                        &pe,
+                        lookback.as_mut(),
+                        &mut engine,
+                        &mut *out,
+                        suppress_raw,
+                        args.json,
+                        &mut event_id_counter,
+                        pe_causal.as_ref(),
+                    ),
+                    &output_cap_hit,
+                )?;
                 if stop_if_output_cap_hit(
                     &output_cap_hit,
                     &mut output_cap_reported,
@@ -2873,7 +2904,10 @@ fn run_trace(mut args: Args) -> Result<()> {
     if let Some(eng) = engine.take() {
         let pending = eng.flush_all();
         if !pending.is_empty() {
-            emit_findings_with(&pending, &mut *out, args.json, args.fd_snapshot_on_finding);
+            write_or_output_cap(
+                emit_findings_with(&pending, &mut *out, args.json, args.fd_snapshot_on_finding),
+                &output_cap_hit,
+            )?;
         }
     }
 
@@ -2933,11 +2967,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                         total_events,
                         &capture_meta,
                     );
-                    if let Err(e) = write_health_sidecar(args.health_output.as_deref(), &line) {
-                        eprintln!("neutron: WARNING: {e:#}");
-                    }
+                    write_health_sidecar(args.health_output.as_deref(), &line)?;
                     if args.json {
-                        let _ = writeln!(out, "{line}");
+                        write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
                     }
                 }
             }
@@ -3120,6 +3152,30 @@ mod tests {
 
         let _ = std::fs::remove_file(&out_path);
         let _ = std::fs::remove_file(&health_path);
+    }
+
+    #[test]
+    fn capture_write_errors_are_fatal_unless_the_configured_cap_was_hit() {
+        let cap_hit = AtomicBool::new(false);
+        let error = write_or_output_cap(
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            &cap_hit,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("writing capture output"));
+
+        cap_hit.store(true, Ordering::Relaxed);
+        write_or_output_cap(
+            Err(io::Error::new(io::ErrorKind::WriteZero, "capped")),
+            &cap_hit,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn capture_health_sidecar_write_errors_are_returned() {
+        let directory = std::env::temp_dir();
+        assert!(write_health_sidecar(Some(&directory), r#"{"type":"capture_health"}"#,).is_err());
     }
 
     #[test]

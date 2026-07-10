@@ -139,3 +139,18 @@ fn markers_retain_scenario_and_root_selector_metadata() {
     assert_eq!(marker.root_package.as_deref(), Some("com.example.app"));
     assert_eq!(marker.root_uid, Some(10123));
 }
+
+#[test]
+fn malformed_binder_endpoints_and_oversized_debug_ids_are_ignored() {
+    let input = r#"
+{"type":"binder","pid":10,"debug_id":7,"trace_id":"trace-a","span_id":"missing-callee"}
+{"type":"binder","pid":10,"to_proc":20,"debug_id":18446744073709551615,"trace_id":"trace-a","span_id":"overflow"}
+"#;
+
+    let capture = normalize_capture(Cursor::new(input)).expect("normalize capture");
+
+    assert!(capture.binders.is_empty());
+    assert!(capture
+        .health_warnings
+        .contains("ignored Binder span with a missing process endpoint"));
+}

@@ -185,7 +185,15 @@ pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
         }
     }
 
-    capture.binders = binders.into_values().collect();
+    for binder in binders.into_values() {
+        if binder.caller_pid == 0 || binder.callee_pid == 0 {
+            capture
+                .health_warnings
+                .insert("ignored Binder span with a missing process endpoint".into());
+        } else {
+            capture.binders.push(binder);
+        }
+    }
     capture.syscalls = syscalls.into_values().collect();
     Ok(capture)
 }
@@ -491,7 +499,9 @@ fn number_u32(object: &Map<String, Value>, key: &str) -> Option<u32> {
 }
 
 fn number_i64(object: &Map<String, Value>, key: &str) -> Option<i64> {
-    object
-        .get(key)
-        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|n| n as i64)))
+    object.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+    })
 }
