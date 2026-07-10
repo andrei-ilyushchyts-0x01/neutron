@@ -94,7 +94,7 @@ cargo install bpf-linker
 Use this path when a release with Android assets has been published.
 
 ```bash
-VERSION=v1.2.0
+VERSION=v1.3.0
 REPO=andrei-ilyushchyts-0x01/neutron
 
 curl -LO "https://github.com/${REPO}/releases/download/${VERSION}/neutron-${VERSION}-android-aarch64.tar.gz"
@@ -340,12 +340,28 @@ adb shell /data/local/tmp/neutron diff \
 Bracket a live scenario with markers:
 
 ```bash
-adb shell "su -c '/data/local/tmp/neutron mark login --phase start --output /data/local/tmp/app.ndjson'"
+adb shell "su -c '/data/local/tmp/neutron trace \
+  --package com.example.app \
+  --follow-binder --follow-services --follow-hal \
+  --max-depth 4 --max-processes 64 \
+  --output /data/local/tmp/app.ndjson'" &
+
+adb shell "su -c '/data/local/tmp/neutron mark login --phase start'"
 # trigger the scenario
-adb shell "su -c '/data/local/tmp/neutron mark login --phase end --output /data/local/tmp/app.ndjson'"
+adb shell "su -c '/data/local/tmp/neutron mark login --phase end'"
 ```
 
-Then cut windows around `marker:login`.
+The tracer assigns the marker timestamp and causal IDs. To keep the old
+append-only behavior without changing a live scenario, pass `mark --output`.
+
+Render the causal scenario as Mermaid:
+
+```bash
+neutron graph app.ndjson \
+  --root-package com.example.app \
+  --format mermaid \
+  --output flow.md
+```
 
 Render a Markdown boundary report:
 

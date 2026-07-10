@@ -28,9 +28,10 @@
 //! return `None` from `lookup` — the formatter then omits the
 //! `service` field rather than emitting a placeholder.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, Result};
 
@@ -39,6 +40,203 @@ use anyhow::{Context, Result};
 #[derive(Clone, Debug, Default)]
 pub struct BinderServiceMap {
     by_pair: HashMap<(u32, i32), String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttributionConfidence {
+    Exact,
+    Candidate,
+}
+
+impl AttributionConfidence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Candidate => "candidate",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BinderMethodMap {
+    by_service_code: HashMap<(String, u32), String>,
+}
+
+impl BinderMethodMap {
+    pub fn load_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("reading binder method map: {}", path.display()))?;
+        Self::from_json(&content)
+            .with_context(|| format!("parsing binder method map: {}", path.display()))
+    }
+
+    pub fn from_json(content: &str) -> Result<Self> {
+        let raw: HashMap<String, HashMap<String, String>> =
+            serde_json::from_str(content).context("expected `{service: {code: method}}` object")?;
+        let mut by_service_code = HashMap::new();
+        for (service, methods) in raw {
+            for (code, method) in methods {
+                let code = code
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid Binder code '{code}' for {service}"))?;
+                by_service_code.insert((service.clone(), code), method);
+            }
+        }
+        Ok(Self { by_service_code })
+    }
+
+    pub fn lookup(&self, service: &str, code: u32) -> Option<&str> {
+        self.by_service_code
+            .get(&(service.to_string(), code))
+            .map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_service_code.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_service_code.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BinderCatalog {
+    by_pid: BTreeMap<u32, Vec<String>>,
+}
+
+impl BinderCatalog {
+    pub fn discover(include_services: bool, include_hal: bool) -> Self {
+        let mut catalog = Self::default();
+        if include_services || include_hal {
+            if let Ok(output) = Command::new("service").args(["list", "-p"]).output() {
+                if output.status.success() {
+                    catalog.merge_service_list(&String::from_utf8_lossy(&output.stdout));
+                }
+            }
+        }
+        if include_hal {
+            if let Ok(output) = Command::new("lshal").args(["-i", "-p"]).output() {
+                if output.status.success() {
+                    catalog.merge_lshal(&String::from_utf8_lossy(&output.stdout));
+                }
+            }
+        }
+        catalog
+    }
+
+    pub fn merge_service_list(&mut self, output: &str) {
+        if let Ok(parsed) = crate::report::parse_service_list(output) {
+            self.merge(parsed);
+        }
+    }
+
+    pub fn merge_lshal(&mut self, output: &str) {
+        self.merge(parse_lshal(output));
+    }
+
+    pub fn candidates(&self, pid: u32) -> &[String] {
+        self.by_pid.get(&pid).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn resolve(
+        &self,
+        exact: &BinderServiceMap,
+        methods: &BinderMethodMap,
+        pid: u32,
+        target_node: i32,
+        code: u32,
+    ) -> BinderAttribution {
+        if let Some(service) = exact.lookup(pid, target_node) {
+            return BinderAttribution {
+                service: Some(service.to_string()),
+                candidates: Vec::new(),
+                method: methods.lookup(service, code).map(str::to_string),
+                confidence: Some(AttributionConfidence::Exact),
+                code,
+            };
+        }
+        let candidates = self.candidates(pid).to_vec();
+        let service = (candidates.len() == 1).then(|| candidates[0].clone());
+        let method = service
+            .as_deref()
+            .and_then(|name| methods.lookup(name, code))
+            .map(str::to_string);
+        BinderAttribution {
+            service,
+            confidence: (!candidates.is_empty()).then_some(AttributionConfidence::Candidate),
+            candidates,
+            method,
+            code,
+        }
+    }
+
+    fn merge(&mut self, values: BTreeMap<u32, Vec<String>>) {
+        for (pid, names) in values {
+            let entry = self.by_pid.entry(pid).or_default();
+            for name in names {
+                if !entry.contains(&name) {
+                    entry.push(name);
+                }
+            }
+            entry.sort();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BinderAttribution {
+    pub service: Option<String>,
+    pub candidates: Vec<String>,
+    pub method: Option<String>,
+    pub confidence: Option<AttributionConfidence>,
+    code: u32,
+}
+
+impl BinderAttribution {
+    pub fn method_label(&self) -> String {
+        self.method
+            .clone()
+            .unwrap_or_else(|| format!("code={}", self.code))
+    }
+}
+
+/// Parse the PID-bearing compact output of `lshal -ip`. Both HIDL names
+/// (`package@ver::IType/instance`) and AIDL names (`package.IType/instance`)
+/// are retained as candidate attribution only.
+pub fn parse_lshal(output: &str) -> BTreeMap<u32, Vec<String>> {
+    let mut parsed = BTreeMap::<u32, Vec<String>>::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some((service_index, service)) = tokens.iter().enumerate().find(|(_, token)| {
+            (token.contains("::") || (token.contains('/') && token.contains('.')))
+                && !token.starts_with('/')
+        }) else {
+            continue;
+        };
+        let pid = tokens[service_index + 1..]
+            .iter()
+            .filter_map(|token| {
+                token
+                    .trim_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<u32>()
+                    .ok()
+            })
+            .find(|pid| *pid > 0);
+        let Some(pid) = pid else { continue };
+        let names = parsed.entry(pid).or_default();
+        let service = service.trim_matches(|c: char| matches!(c, ',' | '[' | ']'));
+        if !names.iter().any(|name| name == service) {
+            names.push(service.to_string());
+            names.sort();
+        }
+    }
+    parsed
 }
 
 impl BinderServiceMap {

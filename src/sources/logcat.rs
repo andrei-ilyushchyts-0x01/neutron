@@ -23,7 +23,8 @@
 //!
 //! [`MockLogcatReader`] consumes a `Vec<String>` of pre-baked lines.
 
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
+use std::os::fd::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 
 use neutron_common::ExitSource;
@@ -45,6 +46,19 @@ pub struct RealLogcatReader {
     parser: LogcatParser,
 }
 
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is an open descriptor owned by the caller. F_GETFL does
+    // not mutate memory; F_SETFL updates only this descriptor's status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl RealLogcatReader {
     /// Spawn `logcat -v threadtime -b crash -b main *:F`. Returns `Err` when
     /// the binary is missing (host without `logcat`) so the caller can
@@ -60,6 +74,7 @@ impl RealLogcatReader {
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("logcat stdout missing"))?;
+        set_nonblocking(stdout.as_raw_fd())?;
         Ok(Self {
             child: Some(child),
             reader: Some(BufReader::new(stdout)),
@@ -83,9 +98,8 @@ impl LogcatReader for RealLogcatReader {
         let Some(reader) = self.reader.as_mut() else {
             return out;
         };
-        // Drain until EOF or zero-length read; logcat is line-buffered.
-        // For the production case we rely on the OS to block briefly when
-        // no data is available. Tests use the Mock reader instead.
+        // Drain until EOF or EAGAIN; the pipe is explicitly non-blocking so
+        // an idle logcat cannot stall ringbuf or control-socket handling.
         let mut line = String::new();
         loop {
             line.clear();
@@ -279,6 +293,16 @@ impl LogcatReader for MockLogcatReader {
 mod tests {
     use super::*;
     use neutron_common::{SIGABRT, SIGSEGV};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn logcat_pipe_is_marked_nonblocking() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        set_nonblocking(stream.as_raw_fd()).unwrap();
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
 
     #[test]
     fn java_fatal_exception_two_line_block_emits_event() {

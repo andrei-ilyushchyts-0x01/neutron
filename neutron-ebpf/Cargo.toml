@@ -8,6 +8,12 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "neutron-ebpf"
+path = "src/main.rs"
+test = false
+bench = false
+
 # BPF programs require no_std and the bpfel-unknown-none target.
 # Build with: cargo xtask build-ebpf
 # (or manually: cargo +nightly build -Z build-std=core \

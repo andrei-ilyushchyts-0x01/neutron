@@ -1,5 +1,6 @@
 //! Android platform helpers used by the tracer CLI.
 
+use std::fs;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -223,6 +224,65 @@ pub fn resolve_package_uid(package: &str) -> Result<u32> {
     bail!("could not resolve Android package '{package}' to a UID via cmd package or pm")
 }
 
+/// Android app process names are either the package itself or
+/// `<package>:<isolated-name>`. Only argv[0] is relevant in `/proc/PID/cmdline`.
+pub fn is_package_process_cmdline(cmdline: &[u8], package: &str) -> bool {
+    let name = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    name == package
+        || name
+            .strip_prefix(package)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn parse_status_uid(status: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        line.strip_prefix("Uid:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
+/// Find every live process belonging to the package UID whose cmdline is the
+/// package or one of its colon-suffixed Android child process names.
+pub fn find_package_processes(package: &str, uid: u32) -> Result<Vec<u32>> {
+    let package = validate_package_name(package)?;
+    let mut pids = Vec::new();
+    for entry in fs::read_dir("/proc").context("reading /proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let status = match fs::read_to_string(entry.path().join("status")) {
+            Ok(status) => status,
+            Err(_) => continue,
+        };
+        if parse_status_uid(&status) != Some(uid) {
+            continue;
+        }
+        let cmdline = match fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(_) => continue,
+        };
+        if is_package_process_cmdline(&cmdline, package) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    Ok(pids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +366,21 @@ Registered ContentProviders:
     fn provider_authority_rejects_invalid_names() {
         let err = parse_provider_authority_lines("", "content://contacts;id").unwrap_err();
         assert!(format!("{err:#}").contains("invalid Android provider authority"));
+    }
+
+    #[test]
+    fn package_process_cmdline_accepts_main_and_colon_processes_only() {
+        assert!(is_package_process_cmdline(
+            b"com.example.app\0--flag\0",
+            "com.example.app"
+        ));
+        assert!(is_package_process_cmdline(
+            b"com.example.app:camera\0",
+            "com.example.app"
+        ));
+        assert!(!is_package_process_cmdline(
+            b"com.example.application\0",
+            "com.example.app"
+        ));
     }
 }

@@ -29,9 +29,8 @@
 /// `timestamp_ns - enter_timestamp_ns` for exit events. Binder events
 /// (`syscall_nr == -1`) leave it zero.
 ///
-/// `maps_generation` is reserved for the userspace symbolizer to stamp the
-/// `/proc/<pid>/maps` snapshot generation that an event was resolved against.
-/// The BPF programs leave it zero.
+/// `maps_generation` carries the live causal scenario generation in 1.3 and
+/// is copied from syscall enter to exit. Zero means no active scenario.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct SyscallEvent {
@@ -51,6 +50,59 @@ pub struct SyscallEvent {
     pub enter_timestamp_ns: u64,
     pub maps_generation: u16,
     pub _reserved: [u8; 6],
+}
+
+// ── Causal tracing (1.3) ───────────────────────────────────────────────────
+
+/// Why a process entered the dynamic causal trace set.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TraceReason {
+    #[default]
+    Root = 1,
+    Binder = 2,
+    Service = 3,
+    Hal = 4,
+}
+
+/// BPF-side context for a process in the dynamic causal trace set.
+///
+/// Packed layout avoids implicit padding so userspace can populate the Aya map
+/// as a `[u8; PROCESS_TRACE_CONTEXT_SIZE]` without adding a shared dependency.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessTraceContext {
+    pub root_trace_id: u64,
+    pub parent_pid: u32,
+    pub binder_debug_id: u32,
+    pub depth: u8,
+    pub reason: TraceReason,
+    pub scenario_generation: u16,
+}
+
+pub const PROCESS_TRACE_CONTEXT_SIZE: usize = core::mem::size_of::<ProcessTraceContext>();
+const _: () = assert!(PROCESS_TRACE_CONTEXT_SIZE == 20);
+
+/// `_reserved[5]` low bits. Zero means the event has no causal relation.
+pub const CAUSAL_RELATION_EXACT: u8 = 1;
+pub const CAUSAL_RELATION_INFERRED: u8 = 2;
+
+/// Keep relation in the documented low bits and use the otherwise-unused high
+/// bits for depth. This preserves the 257-byte event wire layout.
+#[inline]
+pub const fn encode_causal_relation_depth(relation: u8, depth: u8) -> u8 {
+    let depth = if depth > 63 { 63 } else { depth };
+    (relation & 0x03) | (depth << 2)
+}
+
+#[inline]
+pub const fn decode_causal_relation(value: u8) -> u8 {
+    value & 0x03
+}
+
+#[inline]
+pub const fn decode_causal_depth(value: u8) -> u8 {
+    value >> 2
 }
 
 // Compile-time layout check. v1.0 wire format is 257 bytes:
@@ -101,6 +153,12 @@ pub const FILTER_KEY_IOCTL_DIR: u32 = 6;
 /// `FdGraph` state (e.g. `--match-fd`, `--resolve-paths`,
 /// `--follow-children`).
 pub const FILTER_KEY_STATE_EMIT_REQUIRED: u32 = 7;
+/// Enable matching through `TRACED_PROCESSES` instead of broad PID 0 mode.
+pub const FILTER_KEY_CAUSAL_MODE: u32 = 8;
+/// Allow Binder sends to add their callee to `TRACED_PROCESSES`.
+pub const FILTER_KEY_FOLLOW_BINDER: u32 = 9;
+/// Maximum Binder expansion depth.
+pub const FILTER_KEY_MAX_DEPTH: u32 = 10;
 /// Allocate generously so future Phase-1 extensions don't require a wire
 /// bump. Existing slots stay at their current indices.
 pub const FILTER_MAP_SLOT_COUNT: u32 = 16;
@@ -222,11 +280,19 @@ pub const COUNTER_UNIX_MSG_CONTROL_TRUNCATED: u32 = 11;
 /// sendmsg/recvmsg carried more than one control message; neutron records
 /// only the first cmsghdr and counts the rest as nested metadata.
 pub const COUNTER_UNIX_MSG_CONTROL_NESTED: u32 = 12;
+/// Dynamic traced-process map had no room for a new callee/root.
+pub const COUNTER_TRACED_PROCESS_LIMIT: u32 = 13;
+/// Binder propagation stopped at the configured maximum depth.
+pub const COUNTER_BINDER_DEPTH_LIMIT: u32 = 14;
+/// A Binder follow update failed (map update or unusable callee PID).
+pub const COUNTER_BINDER_FOLLOW_FAILED: u32 = 15;
+/// Per-thread exact Binder context could not be recorded.
+pub const COUNTER_THREAD_CONTEXT_UPDATE_FAILED: u32 = 16;
 
 /// Number of slots in the COUNTERS map. New counters extend the tail; bumping
 /// requires updating the `Array::with_max_entries(...)` size in BPF and the
 /// label table in userspace.
-pub const COUNTER_SLOT_COUNT: u32 = 16;
+pub const COUNTER_SLOT_COUNT: u32 = 20;
 
 // ── ioctl post-exit refresh policy ───────────────────────────────────────────
 //

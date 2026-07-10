@@ -1,22 +1,19 @@
 //! `neutron mark <name> [--phase start|end] [--meta k=v]`
 //!
-//! Phase 5a. Emits a single `type:"marker"` NDJSON line that
-//! correlates external scenarios with the live trace. The standard
-//! Pixel-camera workflow looks like:
+//! A phased marker uses the live tracer's control socket by default. The
+//! tracer validates lifecycle, assigns causal IDs and a monotonic timestamp,
+//! then writes the marker into its own NDJSON stream:
 //!
 //! ```sh
-//! neutron --json --output trace.ndjson &           # tracer in background
-//! neutron mark scenario --phase start              # marker before stimulus
-//!     --output trace.ndjson
+//! neutron trace --package com.example --output trace.ndjson &
+//! neutron mark scenario --phase start
 //! ./trigger-camera-extension-night                  # stimulus
-//! neutron mark scenario --phase end                # marker after stimulus
-//!     --output trace.ndjson
+//! neutron mark scenario --phase end
 //! kill %1
 //! ```
 //!
-//! Downstream `neutron window` anchors on `marker:<name>` so an
-//! operator can cut a window around a scenario without manually
-//! grep'ing for timestamps.
+//! Explicit `--output` retains the 1.2 append-only path and does not switch a
+//! live scenario. Downstream `neutron window` still anchors on marker names.
 //!
 //! Concurrency: when `--output <file>` is given, the line is appended
 //! with `O_APPEND` semantics. On Linux a write of `<= PIPE_BUF` (4096
@@ -26,6 +23,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -53,6 +51,15 @@ pub struct MarkArgs {
     /// don't interleave on Linux.
     #[arg(long, value_name = "FILE")]
     pub output: Option<String>,
+
+    /// Live tracer control socket. Used first unless --output requests the
+    /// legacy append-only path. Use `off` to skip live control.
+    #[arg(
+        long,
+        default_value = "/data/local/tmp/neutron.control.sock",
+        value_name = "PATH|off"
+    )]
+    pub control_socket: String,
 
     /// Override the wall-clock timestamp (nanoseconds since
     /// epoch). Tests use this; operators rarely need it.
@@ -121,6 +128,32 @@ pub fn render_line(args: &MarkArgs) -> Result<String> {
 /// Entry point — invoked from `main.rs` when the user runs
 /// `neutron mark <name> ...`.
 pub fn run(args: MarkArgs) -> Result<()> {
+    if args.output.is_none()
+        && args.phase.is_some()
+        && args.control_socket != "off"
+        && Path::new(&args.control_socket).exists()
+    {
+        let phase = normalize_phase(args.phase.as_deref())?.context("marker phase required")?;
+        let mut meta = std::collections::BTreeMap::new();
+        for kv in &args.meta {
+            let (key, value) = kv
+                .split_once('=')
+                .with_context(|| format!("--meta entry '{kv}' missing '=' separator"))?;
+            if key.trim().is_empty() {
+                bail!("--meta entry '{kv}' has empty key");
+            }
+            meta.insert(key.trim().to_string(), value.to_string());
+        }
+        crate::causal::send_mark_request(
+            &args.control_socket,
+            &crate::causal::MarkRequest {
+                name: args.name.clone(),
+                phase: phase.to_string(),
+                meta,
+            },
+        )?;
+        return Ok(());
+    }
     let line = render_line(&args)?;
     match &args.output {
         Some(path) => {
@@ -150,6 +183,7 @@ mod tests {
             phase: None,
             meta: vec![],
             output: None,
+            control_socket: "off".into(),
             ts_ns: Some(1_234_567),
         }
     }

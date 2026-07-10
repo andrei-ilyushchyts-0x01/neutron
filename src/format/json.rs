@@ -425,6 +425,32 @@ pub fn format_binder_call_json_with_service(
     event_id: Option<u64>,
     service: Option<&str>,
 ) -> String {
+    format_binder_call_json_fields(pair, event_id, service, None, None, &[])
+}
+
+pub fn format_binder_call_json_with_attribution(
+    pair: &crate::sources::binder_tracker::BinderCallEvent,
+    event_id: Option<u64>,
+    attribution: &crate::binder_services::BinderAttribution,
+) -> String {
+    format_binder_call_json_fields(
+        pair,
+        event_id,
+        attribution.service.as_deref(),
+        attribution.method.as_deref(),
+        attribution.confidence.map(|confidence| confidence.as_str()),
+        &attribution.candidates,
+    )
+}
+
+fn format_binder_call_json_fields(
+    pair: &crate::sources::binder_tracker::BinderCallEvent,
+    event_id: Option<u64>,
+    service: Option<&str>,
+    method: Option<&str>,
+    confidence: Option<&str>,
+    candidates: &[String],
+) -> String {
     let escaped_comm = pair.caller_comm.replace('\\', "\\\\").replace('"', "\\\"");
     let event_id_json = match event_id {
         Some(id) => format!(r#","event_id":{}"#, id),
@@ -445,8 +471,25 @@ pub fn format_binder_call_json_with_service(
         }
         None => String::new(),
     };
+    let method_json = method
+        .map(|name| {
+            let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(r#","method":"{escaped}""#)
+        })
+        .unwrap_or_default();
+    let confidence_json = confidence
+        .map(|value| format!(r#","attribution_confidence":"{value}""#))
+        .unwrap_or_default();
+    let candidates_json = if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#","service_candidates":{}"#,
+            serde_json::to_string(candidates).expect("serializing string candidates cannot fail")
+        )
+    };
     format!(
-        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":"{}"{}{}}}"#,
+        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":"{}"{}{}{}{}{}}}"#,
         pair.sent_ts_ns,
         pair.debug_id,
         pair.caller_pid,
@@ -462,6 +505,9 @@ pub fn format_binder_call_json_with_service(
         latency_json,
         pair.status.as_str(),
         service_json,
+        method_json,
+        confidence_json,
+        candidates_json,
         event_id_json,
     )
 }
@@ -520,6 +566,26 @@ mod binder_call_json_tests {
         p.caller_comm = r#"weird"name"#.into();
         let line = format_binder_call_json(&p, None);
         assert!(line.contains(r#""caller_comm":"weird\"name""#));
+    }
+
+    #[test]
+    fn verified_attribution_emits_valid_service_method_json() {
+        let exact = crate::binder_services::BinderServiceMap::from_json(
+            r#"{"200":{"1":"camera/default"}}"#,
+        )
+        .unwrap();
+        let methods = crate::binder_services::BinderMethodMap::from_json(
+            r#"{"camera/default":{"7":"connect"}}"#,
+        )
+        .unwrap();
+        let attribution =
+            crate::binder_services::BinderCatalog::default().resolve(&exact, &methods, 200, 1, 7);
+        let line =
+            format_binder_call_json_with_attribution(&pair_completed(), Some(1), &attribution);
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["service"], "camera/default");
+        assert_eq!(value["method"], "connect");
+        assert_eq!(value["attribution_confidence"], "exact");
     }
 }
 

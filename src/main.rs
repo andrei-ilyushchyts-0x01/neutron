@@ -23,19 +23,24 @@ use std::os::fd::AsRawFd;
 use anyhow::{bail, Context, Result};
 use aya::maps::{Array, HashMap as AyaHashMap, RingBuf, StackTraceMap};
 use aya::programs::{KProbe, TracePoint};
-use aya::Ebpf;
+use aya::{Ebpf, EbpfLoader, VerifierLogLevel};
 use clap::Parser;
 
 use neutron::android;
-use neutron::binder_services::BinderServiceMap;
+use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap};
 use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
+use neutron::causal::{
+    binder_span_id, enrich_json, monotonic_timestamp_ns, process_context_bytes,
+    process_context_from_bytes, process_exit_span_id, root_process_span_id, syscall_span_id,
+    CausalMetadata, CausalRelation, CausalWire, ControlServer, ScenarioInfo, ScenarioState,
+};
 use neutron::cli::{Args, Cli, Command};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
 use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
 use neutron::fdgraph::FdGraph;
 use neutron::format::{
-    format_binder_call_json_with_service, format_event_json_full, format_event_text_with_stack,
+    format_binder_call_json_with_attribution, format_event_json_full, format_event_text_with_stack,
     format_fd_snapshot_json, format_process_exit_json, FdHint,
 };
 use neutron::health::{
@@ -54,11 +59,13 @@ use neutron::sources::ProcessExitEvent;
 use neutron::symbolize::{is_kernel_addr, KernelResolver, ProcSymbolizer};
 use neutron::SyscallEvent;
 use neutron_common::{
-    ExitSource, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF, FILTER_KEY_IOCTL_DIR,
-    FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_PID, FILTER_KEY_RET_CLASS,
-    FILTER_KEY_STATE_EMIT_REQUIRED, MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR,
-    MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
-    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
+    ExitSource, ProcessTraceContext, TraceReason, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF,
+    FILTER_KEY_CAUSAL_MODE, FILTER_KEY_FOLLOW_BINDER, FILTER_KEY_IOCTL_DIR,
+    FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_MAX_DEPTH, FILTER_KEY_PID,
+    FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED, MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD,
+    MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY,
+    MATCH_BIT_RET, MATCH_BIT_UID, PROCESS_TRACE_CONTEXT_SIZE, SYSCALL_NR_BINDER_RECEIVED,
+    SYSCALL_NR_PROCESS_EXIT,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -339,10 +346,21 @@ fn apply_driver_packs_with_defaults(
 
 // ── BPF load + attach ────────────────────────────────────────────────────────
 
-fn load_bpf(object_path: &str) -> Result<Ebpf> {
+fn load_bpf(object_path: &str, max_processes: u32, verbose: bool) -> Result<Ebpf> {
     let bytes =
         fs::read(object_path).with_context(|| format!("cannot read BPF object {object_path}"))?;
-    Ebpf::load(&bytes).with_context(|| format!("Ebpf::load failed for {object_path}"))
+    let log_level = if verbose {
+        VerifierLogLevel::DEBUG | VerifierLogLevel::STATS
+    } else {
+        VerifierLogLevel::STATS
+    };
+    EbpfLoader::new()
+        // DEBUG logs every verifier step and can itself exhaust the kernel's
+        // log buffer on large programs before the useful rejection reason.
+        .verifier_log_level(log_level)
+        .set_max_entries("TRACED_PROCESSES", max_processes)
+        .load(&bytes)
+        .with_context(|| format!("Ebpf::load failed for {object_path}"))
 }
 
 fn missing_stack_map_warning(stacks_requested: bool, stack_map_present: bool) -> Option<String> {
@@ -433,7 +451,13 @@ fn attach_kprobe_packs(
 
 // ── Filter map population ────────────────────────────────────────────────────
 
-fn populate_filter_map(bpf: &mut Ebpf, pid: u32) -> Result<()> {
+fn populate_filter_map(
+    bpf: &mut Ebpf,
+    pid: u32,
+    causal_mode: bool,
+    follow_binder: bool,
+    max_depth: u8,
+) -> Result<()> {
     let map = bpf
         .map_mut("FILTER_MAP")
         .context("FILTER_MAP missing from BPF object")?;
@@ -445,6 +469,15 @@ fn populate_filter_map(bpf: &mut Ebpf, pid: u32) -> Result<()> {
     filter
         .set(FILTER_KEY_ACTIVE, 0u32, 0)
         .context("setting FILTER_MAP[ACTIVE]")?;
+    filter
+        .set(FILTER_KEY_CAUSAL_MODE, u32::from(causal_mode), 0)
+        .context("setting FILTER_MAP[CAUSAL_MODE]")?;
+    filter
+        .set(FILTER_KEY_FOLLOW_BINDER, u32::from(follow_binder), 0)
+        .context("setting FILTER_MAP[FOLLOW_BINDER]")?;
+    filter
+        .set(FILTER_KEY_MAX_DEPTH, u32::from(max_depth), 0)
+        .context("setting FILTER_MAP[MAX_DEPTH]")?;
     Ok(())
 }
 
@@ -1296,6 +1329,191 @@ fn handle_capture_reads(
     Ok(())
 }
 
+// ── Causal process/scenario helpers (1.3) ──────────────────────────────────
+
+fn replace_causal_roots(
+    bpf: &mut Ebpf,
+    roots: &[u32],
+    trace_id: u64,
+    generation: u16,
+) -> Result<()> {
+    let map = bpf
+        .map_mut("TRACED_PROCESSES")
+        .context("TRACED_PROCESSES missing")?;
+    let mut traced: AyaHashMap<_, u32, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
+        AyaHashMap::try_from(map).context("TRACED_PROCESSES has unexpected layout")?;
+    let keys: Vec<u32> = traced.keys().filter_map(Result::ok).collect();
+    for pid in keys {
+        let _ = traced.remove(&pid);
+    }
+    for pid in roots.iter().copied() {
+        let context = ProcessTraceContext {
+            root_trace_id: trace_id,
+            parent_pid: 0,
+            binder_debug_id: 0,
+            depth: 0,
+            reason: TraceReason::Root,
+            scenario_generation: generation,
+        };
+        traced
+            .insert(pid, process_context_bytes(&context), 0)
+            .with_context(|| format!("adding root PID {pid} to TRACED_PROCESSES"))?;
+    }
+    Ok(())
+}
+
+fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
+    // These are internal packed BPF-map wire sizes:
+    // ProcessTraceContext(20) + flags(4) + parent_debug_id(4) + relation(1),
+    // and debug_id(4) + scenario_generation(2) + depth(1).
+    {
+        let map = bpf
+            .map_mut("BINDER_TRANSACTION_CONTEXT")
+            .context("BINDER_TRANSACTION_CONTEXT missing")?;
+        let mut transactions: AyaHashMap<_, u32, [u8; 29]> = AyaHashMap::try_from(map)
+            .context("BINDER_TRANSACTION_CONTEXT has unexpected layout")?;
+        let keys: Vec<u32> = transactions.keys().filter_map(Result::ok).collect();
+        for key in keys {
+            let _ = transactions.remove(&key);
+        }
+    }
+    {
+        let map = bpf
+            .map_mut("THREAD_BINDER_CONTEXT")
+            .context("THREAD_BINDER_CONTEXT missing")?;
+        let mut threads: AyaHashMap<_, u64, [u8; 7]> =
+            AyaHashMap::try_from(map).context("THREAD_BINDER_CONTEXT has unexpected layout")?;
+        let keys: Vec<u64> = threads.keys().filter_map(Result::ok).collect();
+        for key in keys {
+            let _ = threads.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+fn insert_causal_root(bpf: &mut Ebpf, pid: u32, trace_id: u64, generation: u16) -> Result<()> {
+    let map = bpf
+        .map_mut("TRACED_PROCESSES")
+        .context("TRACED_PROCESSES missing")?;
+    let mut traced: AyaHashMap<_, u32, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
+        AyaHashMap::try_from(map).context("TRACED_PROCESSES has unexpected layout")?;
+    let context = ProcessTraceContext {
+        root_trace_id: trace_id,
+        parent_pid: 0,
+        binder_debug_id: 0,
+        depth: 0,
+        reason: TraceReason::Root,
+        scenario_generation: generation,
+    };
+    traced
+        .insert(pid, process_context_bytes(&context), 0)
+        .with_context(|| format!("adding new package root PID {pid}"))
+}
+
+fn read_process_context(bpf: &Ebpf, pid: u32) -> Option<ProcessTraceContext> {
+    let map = bpf.map("TRACED_PROCESSES")?;
+    let traced: AyaHashMap<_, u32, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
+        AyaHashMap::try_from(map).ok()?;
+    traced.get(&pid, 0).ok().map(process_context_from_bytes)
+}
+
+fn causal_metadata_for_event(
+    ev: &SyscallEvent,
+    scenarios: &ScenarioState,
+    root_package: Option<&str>,
+) -> Option<CausalMetadata> {
+    let generation = { ev.maps_generation };
+    if generation == 0 {
+        return None;
+    }
+    let scenario = scenarios.find(generation)?;
+    let wire = CausalWire::from_event(ev);
+    let pid = { ev.pid };
+    let tid = { ev.tgid };
+    let nr = { ev.syscall_nr };
+    let timestamp = { ev.timestamp_ns };
+    let debug_id = { ev.ptr_hint } as u32 as i32;
+    let span_id = if nr == -1 || nr == SYSCALL_NR_BINDER_RECEIVED {
+        binder_span_id(scenario.trace_id, debug_id)
+    } else if nr == SYSCALL_NR_PROCESS_EXIT {
+        process_exit_span_id(scenario.trace_id, pid, timestamp)
+    } else {
+        let enter = { ev.enter_timestamp_ns };
+        syscall_span_id(
+            scenario.trace_id,
+            pid,
+            tid,
+            if enter == 0 { timestamp } else { enter },
+            nr,
+        )
+    };
+    let parent_span_id = if wire.parent_debug_id == 0 {
+        root_process_span_id(scenario.trace_id, pid)
+    } else {
+        binder_span_id(scenario.trace_id, wire.parent_debug_id as i32)
+    };
+    Some(CausalMetadata {
+        scenario_id: scenario.scenario_id.clone(),
+        trace_id: scenario.trace_id,
+        span_id,
+        parent_span_id,
+        depth: wire.depth,
+        relation: wire.relation,
+        root_package: root_package.map(str::to_string),
+    })
+}
+
+fn causal_metadata_for_process_exit(
+    ev: &ProcessExitEvent,
+    context: ProcessTraceContext,
+    scenario: &ScenarioInfo,
+    root_package: Option<&str>,
+) -> CausalMetadata {
+    let parent_span_id = if context.binder_debug_id == 0 {
+        root_process_span_id(scenario.trace_id, ev.pid)
+    } else {
+        binder_span_id(scenario.trace_id, context.binder_debug_id as i32)
+    };
+    CausalMetadata {
+        scenario_id: scenario.scenario_id.clone(),
+        trace_id: scenario.trace_id,
+        span_id: process_exit_span_id(scenario.trace_id, ev.pid, ev.ts_ns),
+        parent_span_id,
+        depth: context.depth,
+        relation: if context.depth == 0 {
+            CausalRelation::Exact
+        } else {
+            CausalRelation::Inferred
+        },
+        root_package: root_package.map(str::to_string),
+    }
+}
+
+fn live_marker_line(
+    request: &neutron::causal::MarkRequest,
+    scenario: &ScenarioInfo,
+    ts_ns: u64,
+    root_package: Option<&str>,
+) -> String {
+    let mut value = serde_json::json!({
+        "type": "marker",
+        "ts_ns": ts_ns,
+        "name": request.name,
+        "phase": request.phase,
+        "scenario_id": scenario.scenario_id,
+        "trace_id": neutron::causal::format_id(scenario.trace_id),
+        "generation": scenario.generation,
+        "meta": request.meta,
+    });
+    if let (Some(package), Some(object)) = (root_package, value.as_object_mut()) {
+        object.insert(
+            "root_package".into(),
+            serde_json::Value::String(package.into()),
+        );
+    }
+    serde_json::to_string(&value).expect("serializing marker JSON cannot fail")
+}
+
 // ── Crash-correlation emit helper (sprint-2 PR 1) ────────────────────────────
 
 /// Emit a single `ProcessExitEvent` through the same pipeline that handles
@@ -1310,10 +1528,16 @@ fn emit_process_exit(
     suppress_raw: bool,
     json_mode: bool,
     event_id_counter: &mut u64,
+    causal: Option<&CausalMetadata>,
 ) {
     let ctx = lookback.map(|lb| lb.take(ev.pid)).unwrap_or_default();
     *event_id_counter = event_id_counter.wrapping_add(1);
-    let line = format_process_exit_json(ev, &ctx, Some(*event_id_counter));
+    let mut line = format_process_exit_json(ev, &ctx, Some(*event_id_counter));
+    if let Some(metadata) = causal {
+        if let Ok(enriched) = enrich_json(&line, metadata) {
+            line = enriched;
+        }
+    }
     if let Some(eng) = engine.as_mut() {
         if let Some(owned) = neutron_rules::Event::parse_line(&line) {
             if let Some(view) = owned.view() {
@@ -1356,11 +1580,26 @@ fn emit_binder_call(
     suppress_raw: bool,
     json_mode: bool,
     event_id_counter: &mut u64,
-    services: Option<&BinderServiceMap>,
+    services: &BinderServiceMap,
+    catalog: &BinderCatalog,
+    methods: &BinderMethodMap,
+    causal: Option<&CausalMetadata>,
 ) {
     *event_id_counter = event_id_counter.wrapping_add(1);
-    let service = services.and_then(|m| m.lookup(pair.callee_pid, pair.target_node));
-    let line = format_binder_call_json_with_service(pair, Some(*event_id_counter), service);
+    let attribution = catalog.resolve(
+        services,
+        methods,
+        pair.callee_pid,
+        pair.target_node,
+        pair.code,
+    );
+    let mut line =
+        format_binder_call_json_with_attribution(pair, Some(*event_id_counter), &attribution);
+    if let Some(metadata) = causal {
+        if let Ok(enriched) = enrich_json(&line, metadata) {
+            line = enriched;
+        }
+    }
     if let Some(eng) = engine.as_mut() {
         if let Some(owned) = neutron_rules::Event::parse_line(&line) {
             if let Some(view) = owned.view() {
@@ -1398,6 +1637,7 @@ fn emit_binder_call(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Trace(args)) => run_trace(*args),
         Some(Command::Doctor) => {
             std::process::exit(doctor::run());
         }
@@ -1407,12 +1647,25 @@ fn main() -> Result<()> {
         Some(Command::Report(args)) => neutron::report::run_report(args),
         Some(Command::BinderMap(command)) => neutron::report::run_binder_map(command),
         Some(Command::Mark(args)) => neutron::mark::run(args),
+        Some(Command::Graph(args)) => neutron::graph::run(args),
         Some(Command::Recipes(command)) => neutron::recipes::run(command),
         None => run_trace(cli.args),
     }
 }
 
 fn run_trace(mut args: Args) -> Result<()> {
+    if args.follow_services || args.follow_hal {
+        args.follow_binder = true;
+    }
+    if args.follow_binder {
+        args.binder = true;
+    }
+    if args.package.is_some() {
+        // Causal captures are NDJSON evidence streams even when the explicit
+        // example omits the legacy output-mode flags.
+        args.json = true;
+        args.raw = true;
+    }
     let user_supplied_match = has_capture_predicate_flags(&args);
     apply_profile(&mut args)?;
     let driver_packs = apply_driver_packs_with_defaults(&mut args, !user_supplied_match)?;
@@ -1429,6 +1682,29 @@ fn run_trace(mut args: Args) -> Result<()> {
     let privilege = doctor::check_privilege(&doctor::RealEnv);
     capture_privilege_preflight(&privilege)?;
     let _capture_lock = acquire_capture_lock(&args.capture_lock)?;
+    let mut package_uid = None;
+    let mut root_pids = if let Some(package) = args.package.as_deref() {
+        let uid = android::resolve_package_uid(package)
+            .with_context(|| format!("resolving --package {package}"))?;
+        let pids = android::find_package_processes(package, uid)
+            .with_context(|| format!("finding processes for --package {package}"))?;
+        if pids.is_empty() {
+            bail!("no running process matches package {package} (uid {uid})");
+        }
+        package_uid = Some(uid);
+        pids
+    } else if args.pid != 0 {
+        vec![args.pid]
+    } else {
+        Vec::new()
+    };
+    if root_pids.len() > args.max_processes as usize {
+        bail!(
+            "package has {} root processes, exceeding --max-processes {}",
+            root_pids.len(),
+            args.max_processes
+        );
+    }
     eprintln!("  loading {}", args.object);
     eprintln!(
         "  target pid: {}",
@@ -1457,15 +1733,49 @@ fn run_trace(mut args: Args) -> Result<()> {
     let _ = fs::write("/proc/sys/kernel/perf_event_paranoid", "-1\n");
 
     // 1. Load BPF and attach tracepoints.
-    let mut bpf = load_bpf(&args.object)?;
+    let mut bpf = load_bpf(&args.object, args.max_processes, args.verbose)?;
     let has_stack_map = bpf.map("STACK_TRACES").is_some();
     if let Some(warning) = missing_stack_map_warning(args.stacks, has_stack_map) {
         eprintln!("neutron: WARNING: {warning}");
     }
 
+    // Configure PID/causal gates before any global tracepoint is attached so
+    // the short loader setup window cannot capture unrelated processes.
+    populate_filter_map(
+        &mut bpf,
+        args.pid,
+        args.package.is_some(),
+        args.follow_binder,
+        args.max_depth,
+    )?;
+    replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
+    populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
+    let capture_predicate = build_capture_predicate(&args)?;
+    if let Some(bpf_spec) = capture_predicate.bpf_spec() {
+        populate_match_maps(&mut bpf, bpf_spec)?;
+    }
+    if capture_predicate.needs_state_events_via_ast() {
+        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
+        let mut filter: Array<_, u32> =
+            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
+        filter
+            .set(FILTER_KEY_STATE_EMIT_REQUIRED, 1u32, 0)
+            .context("FILTER_MAP[STATE_EMIT_REQUIRED]=1")?;
+    }
+
     attach_tracepoint(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
     attach_tracepoint(&mut bpf, "trace_sys_exit", "raw_syscalls", "sys_exit")?;
-    let mut attached = vec!["trace_sys_enter", "trace_sys_exit"];
+    attach_tracepoint(
+        &mut bpf,
+        "trace_sched_process_exit",
+        "sched",
+        "sched_process_exit",
+    )?;
+    let mut attached = vec![
+        "trace_sys_enter",
+        "trace_sys_exit",
+        "trace_sched_process_exit",
+    ];
     if args.binder {
         attach_tracepoint(
             &mut bpf,
@@ -1494,29 +1804,8 @@ fn run_trace(mut args: Args) -> Result<()> {
     }
     attach_kprobe_packs(&mut bpf, &args.kprobe_pack, &mut attached)?;
 
-    // 2. Populate filter map.
-    populate_filter_map(&mut bpf, args.pid)?;
-    populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
-
-    // 2b. Phase 1a/1b — build the capture predicate. `--match <expr>`
-    // takes precedence over the individual `--match-*` flags; the two
-    // forms are mutually exclusive (using both at once is rejected).
-    let capture_predicate = build_capture_predicate(&args)?;
-    if let Some(bpf_spec) = capture_predicate.bpf_spec() {
-        populate_match_maps(&mut bpf, bpf_spec)?;
-    }
-    if capture_predicate.needs_state_events_via_ast() {
-        // Fallback path: the AST mentions fd_path even though the BPF
-        // lowering couldn't capture it (e.g. inside an OR). Toggle
-        // STATE_EMIT_REQUIRED so kernel-side fd-state syscalls still
-        // bypass the prefilter and userspace fdgraph stays consistent.
-        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
-        let mut filter: Array<_, u32> =
-            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
-        filter
-            .set(FILTER_KEY_STATE_EMIT_REQUIRED, 1u32, 0)
-            .context("FILTER_MAP[STATE_EMIT_REQUIRED]=1")?;
-    }
+    // 2. Phase 1a/1b — the capture predicate was pushed before attach. Print
+    // its split BPF/userspace audit now that setup succeeded.
     let audit = capture_predicate.audit_lines();
     if !audit.is_empty() {
         eprintln!("  match predicate (Phase 1):");
@@ -1559,14 +1848,26 @@ fn run_trace(mut args: Args) -> Result<()> {
 
     // 2e. Phase 4b — optional binder service descriptor map for
     // `binder_call` enrichment.
-    let binder_services: Option<BinderServiceMap> = match &args.binder_services {
+    let binder_services: BinderServiceMap = match &args.binder_services {
         Some(path) => {
             let m = BinderServiceMap::load_file(path)?;
             eprintln!("  binder service map: {} entries from {path}", m.len());
-            Some(m)
+            m
         }
-        None => None,
+        None => BinderServiceMap::default(),
     };
+    let binder_methods = match &args.binder_methods {
+        Some(path) => {
+            let methods = BinderMethodMap::load_file(path)?;
+            eprintln!("  binder method map: {} entries from {path}", methods.len());
+            methods
+        }
+        None => BinderMethodMap::default(),
+    };
+    let mut binder_catalog = BinderCatalog::discover(args.follow_services, args.follow_hal);
+    let mut discovery_seen_pids = HashSet::<u32>::new();
+    let mut discovery_refresh_pending = false;
+    let mut last_discovery_refresh = std::time::Instant::now();
     if !sampler.is_passthrough() {
         if let Some(p) = args.sample {
             eprintln!("  sample: p={p:.3} (state-tracking syscalls exempt)");
@@ -1611,6 +1912,22 @@ fn run_trace(mut args: Args) -> Result<()> {
     // 7. Ctrl-C handler.
     let running = Arc::new(AtomicBool::new(true));
     install_shutdown_signals(running.clone());
+
+    let control_server = if args.control_socket.eq_ignore_ascii_case("off") {
+        None
+    } else {
+        let server = ControlServer::bind(&args.control_socket)?;
+        eprintln!("  control socket: {} (0600)", args.control_socket);
+        Some(server)
+    };
+    let mut scenarios = ScenarioState::default();
+    let mut binder_causal = HashMap::<i32, CausalMetadata>::new();
+    // The sched tracepoint cannot expose the fatal signal. Preserve its
+    // causal span briefly so the later logcat/tombstone observation can
+    // enrich the same graph node with SIGSEGV/SIGABRT classification even
+    // though BPF has already removed the dying PID from its dynamic map.
+    let mut recent_exit_causal = HashMap::<u32, CausalMetadata>::new();
+    let mut last_root_refresh = std::time::Instant::now();
 
     eprintln!("  tracing… Ctrl-C to stop\n");
 
@@ -1803,6 +2120,111 @@ fn run_trace(mut args: Args) -> Result<()> {
     };
 
     while running.load(Ordering::Relaxed) {
+        if let Some(server) = control_server.as_ref() {
+            while let Some(pending) = server.try_recv()? {
+                let request = pending.request.clone();
+                let result: Result<(ScenarioInfo, u64, String)> = (|| {
+                    if request.phase == "start" {
+                        if let (Some(package), Some(uid)) = (args.package.as_deref(), package_uid) {
+                            root_pids = android::find_package_processes(package, uid)?;
+                        }
+                        if root_pids.is_empty() {
+                            bail!("live scenarios require --package or a non-zero --pid root");
+                        }
+                        if root_pids.len() > args.max_processes as usize {
+                            bail!(
+                                "{} root processes exceed --max-processes {}",
+                                root_pids.len(),
+                                args.max_processes
+                            );
+                        }
+                        let scenario = scenarios.start(&request.name)?;
+                        clear_causal_transients(&mut bpf)?;
+                        replace_causal_roots(
+                            &mut bpf,
+                            &root_pids,
+                            scenario.trace_id,
+                            scenario.generation,
+                        )?;
+                        binder_causal.clear();
+                        recent_exit_causal.clear();
+                        let ts_ns = monotonic_timestamp_ns();
+                        let line =
+                            live_marker_line(&request, &scenario, ts_ns, args.package.as_deref());
+                        Ok((scenario, ts_ns, line))
+                    } else {
+                        let scenario = scenarios.end(&request.name)?;
+                        clear_causal_transients(&mut bpf)?;
+                        replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
+                        recent_exit_causal.clear();
+                        let ts_ns = monotonic_timestamp_ns();
+                        let line =
+                            live_marker_line(&request, &scenario, ts_ns, args.package.as_deref());
+                        Ok((scenario, ts_ns, line))
+                    }
+                })();
+                let response = match result {
+                    Ok((scenario, ts_ns, line)) => {
+                        let _ = writeln!(out, "{line}");
+                        events_emitted = events_emitted.saturating_add(1);
+                        pending.respond_ok(ts_ns, scenario.generation, scenario.trace_id)
+                    }
+                    Err(error) => pending.respond_error(format!("{error:#}")),
+                };
+                if let Err(error) = response {
+                    eprintln!("neutron: warn: marker client disconnected: {error:#}");
+                }
+            }
+        }
+
+        // A camera burst can reveal dozens of new Binder PIDs in one ring
+        // drain. Coalesce those observations into one catalog refresh and
+        // always service marker requests first; running `service` + `lshal`
+        // once per PID can otherwise starve the control socket for minutes.
+        if discovery_refresh_pending && last_discovery_refresh.elapsed() >= Duration::from_secs(1) {
+            binder_catalog = BinderCatalog::discover(args.follow_services, args.follow_hal);
+            discovery_refresh_pending = false;
+            last_discovery_refresh = std::time::Instant::now();
+        }
+
+        if last_root_refresh.elapsed() >= Duration::from_secs(1) {
+            last_root_refresh = std::time::Instant::now();
+            if let (Some(package), Some(uid)) = (args.package.as_deref(), package_uid) {
+                match android::find_package_processes(package, uid) {
+                    Ok(discovered) if discovered.len() <= args.max_processes as usize => {
+                        let (trace_id, generation) = scenarios
+                            .active()
+                            .map(|scenario| (scenario.trace_id, scenario.generation))
+                            .unwrap_or((0, 0));
+                        let missing: Vec<u32> = discovered
+                            .iter()
+                            .copied()
+                            .filter(|pid| read_process_context(&bpf, *pid).is_none())
+                            .collect();
+                        for pid in missing {
+                            if let Err(error) =
+                                insert_causal_root(&mut bpf, pid, trace_id, generation)
+                            {
+                                eprintln!(
+                                    "neutron: warn: could not add new package PID {pid}: {error:#}"
+                                );
+                            }
+                        }
+                        root_pids = discovered;
+                    }
+                    Ok(discovered) => eprintln!(
+                        "neutron: warn: package now has {} roots, above --max-processes {}",
+                        discovered.len(),
+                        args.max_processes
+                    ),
+                    Err(error) if args.verbose => {
+                        eprintln!("neutron: warn: package PID refresh failed: {error:#}");
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
         let mut saw_any = false;
         loop {
             let bytes_owned: Vec<u8> = match ring.next() {
@@ -1830,6 +2252,8 @@ fn run_trace(mut args: Args) -> Result<()> {
                 if args.alert_rwx && should_skip_for_alert_rwx(&ev) {
                     continue;
                 }
+                let causal_event =
+                    causal_metadata_for_event(&ev, &scenarios, args.package.as_deref());
 
                 // ── Sprint-2 PR 1: BPF sched_process_exit handoff ────
                 //
@@ -1849,6 +2273,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                         source: ExitSource::from_u8((args_arr[2] & 0xff) as u8)
                             .unwrap_or(ExitSource::Tracepoint),
                     };
+                    if let Some(metadata) = causal_event.as_ref() {
+                        recent_exit_causal.insert(pe.pid, metadata.clone());
+                    }
                     // Sprint-2 PR 2: drain in-flight binder transactions
                     // for the dying PID before emitting the exit. Each
                     // drained entry becomes a `binder_call` line with
@@ -1856,6 +2283,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     if pe.classify() == neutron::sources::ExitClassification::Crash {
                         if let Some(t) = binder_tracker.as_mut() {
                             for pair in t.on_callee_crash(pe.pid) {
+                                let pair_causal = binder_causal.remove(&pair.debug_id);
                                 emit_binder_call(
                                     &pair,
                                     lookback.as_mut(),
@@ -1864,7 +2292,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                                     suppress_raw,
                                     args.json,
                                     &mut event_id_counter,
-                                    binder_services.as_ref(),
+                                    &binder_services,
+                                    &binder_catalog,
+                                    &binder_methods,
+                                    pair_causal.as_ref(),
                                 );
                             }
                         }
@@ -1877,6 +2308,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                         suppress_raw,
                         args.json,
                         &mut event_id_counter,
+                        causal_event.as_ref(),
                     );
                     continue;
                 }
@@ -1890,9 +2322,19 @@ fn run_trace(mut args: Args) -> Result<()> {
                 // detail.
                 let nr_now = { ev.syscall_nr };
                 if nr_now == -1 {
+                    let args_arr = { ev.args };
+                    let debug_id = { ev.ptr_hint } as u32 as i32;
+                    if let Some(metadata) = causal_event.clone() {
+                        binder_causal.insert(debug_id, metadata);
+                    }
+                    let callee_pid = args_arr[0] as u32;
+                    if callee_pid != 0
+                        && (args.follow_services || args.follow_hal)
+                        && discovery_seen_pids.insert(callee_pid)
+                    {
+                        discovery_refresh_pending = true;
+                    }
                     if let Some(t) = binder_tracker.as_mut() {
-                        let args_arr = { ev.args };
-                        let debug_id = { ev.ptr_hint } as u32 as i32;
                         let pid = { ev.pid };
                         let uid = { ev.uid };
                         let ts = { ev.timestamp_ns };
@@ -1914,6 +2356,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                         let debug_id = { ev.ptr_hint } as u32 as i32;
                         let ts = { ev.timestamp_ns };
                         if let Some(pair) = t.record_received(debug_id, ts) {
+                            let pair_causal = binder_causal.remove(&pair.debug_id);
                             emit_binder_call(
                                 &pair,
                                 lookback.as_mut(),
@@ -1922,7 +2365,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 suppress_raw,
                                 args.json,
                                 &mut event_id_counter,
-                                binder_services.as_ref(),
+                                &binder_services,
+                                &binder_catalog,
+                                &binder_methods,
+                                pair_causal.as_ref(),
                             );
                         }
                     }
@@ -2020,13 +2466,18 @@ fn run_trace(mut args: Args) -> Result<()> {
 
                 // Always compute the JSON form: cheap and fed to the rule engine.
                 event_id_counter = event_id_counter.wrapping_add(1);
-                let json_line = format_event_json_full(
+                let mut json_line = format_event_json_full(
                     &ev,
                     args.resolve_paths,
                     stack_str.as_deref(),
                     fd_hint.as_ref(),
                     Some(event_id_counter),
                 );
+                if let Some(metadata) = causal_event.as_ref() {
+                    if let Ok(enriched) = enrich_json(&json_line, metadata) {
+                        json_line = enriched;
+                    }
+                }
 
                 // Phase 1d — sampling decision. State-tracking syscalls
                 // (open/close/dup/socket/...) and synthetic sentinels
@@ -2220,9 +2671,22 @@ fn run_trace(mut args: Args) -> Result<()> {
             .unwrap_or(0);
         if let Some(w) = tombstone_watcher.as_mut() {
             for pe in w.poll(now_ns) {
+                let pe_causal = recent_exit_causal.get(&pe.pid).cloned().or_else(|| {
+                    read_process_context(&bpf, pe.pid).and_then(|context| {
+                        scenarios.find(context.scenario_generation).map(|scenario| {
+                            causal_metadata_for_process_exit(
+                                &pe,
+                                context,
+                                scenario,
+                                args.package.as_deref(),
+                            )
+                        })
+                    })
+                });
                 if pe.classify() == neutron::sources::ExitClassification::Crash {
                     if let Some(t) = binder_tracker.as_mut() {
                         for pair in t.on_callee_crash(pe.pid) {
+                            let pair_causal = binder_causal.remove(&pair.debug_id);
                             emit_binder_call(
                                 &pair,
                                 lookback.as_mut(),
@@ -2231,7 +2695,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 suppress_raw,
                                 args.json,
                                 &mut event_id_counter,
-                                binder_services.as_ref(),
+                                &binder_services,
+                                &binder_catalog,
+                                &binder_methods,
+                                pair_causal.as_ref(),
                             );
                         }
                     }
@@ -2244,6 +2711,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     suppress_raw,
                     args.json,
                     &mut event_id_counter,
+                    pe_causal.as_ref(),
                 );
                 if stop_if_output_cap_hit(
                     &output_cap_hit,
@@ -2256,9 +2724,22 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
         if let Some(r) = logcat_reader.as_mut() {
             for pe in r.drain(now_ns) {
+                let pe_causal = recent_exit_causal.get(&pe.pid).cloned().or_else(|| {
+                    read_process_context(&bpf, pe.pid).and_then(|context| {
+                        scenarios.find(context.scenario_generation).map(|scenario| {
+                            causal_metadata_for_process_exit(
+                                &pe,
+                                context,
+                                scenario,
+                                args.package.as_deref(),
+                            )
+                        })
+                    })
+                });
                 if pe.classify() == neutron::sources::ExitClassification::Crash {
                     if let Some(t) = binder_tracker.as_mut() {
                         for pair in t.on_callee_crash(pe.pid) {
+                            let pair_causal = binder_causal.remove(&pair.debug_id);
                             emit_binder_call(
                                 &pair,
                                 lookback.as_mut(),
@@ -2267,7 +2748,10 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 suppress_raw,
                                 args.json,
                                 &mut event_id_counter,
-                                binder_services.as_ref(),
+                                &binder_services,
+                                &binder_catalog,
+                                &binder_methods,
+                                pair_causal.as_ref(),
                             );
                         }
                     }
@@ -2280,6 +2764,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     suppress_raw,
                     args.json,
                     &mut event_id_counter,
+                    pe_causal.as_ref(),
                 );
                 if stop_if_output_cap_hit(
                     &output_cap_hit,
@@ -2364,6 +2849,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                         match_packages: args.match_package.clone(),
                         match_uids: args.match_uid.clone(),
                         match_pids,
+                        root_package: args.package.clone(),
+                        max_depth: args.max_depth,
+                        max_processes: args.max_processes,
                     };
                     let line = format_capture_health_json_with_metadata(
                         &health,
@@ -2413,6 +2901,7 @@ mod tests {
                 phase: Some("start".into()),
                 meta: vec![],
                 output: Some(path_s.clone()),
+                control_socket: "off".into(),
                 ts_ns: Some(42),
             })
             .expect("append marker while trace output is open");

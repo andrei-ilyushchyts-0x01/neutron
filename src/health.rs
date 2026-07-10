@@ -12,11 +12,13 @@
 //!   3. Add it to `COUNTER_LABELS` below.
 
 use neutron_common::{
-    COUNTER_EVENTS_SUBMITTED, COUNTER_FD_LOOKUP_MISSED, COUNTER_INFLIGHT_LOOKUP_MISSED,
-    COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED, COUNTER_PATH_READ_FAILED,
-    COUNTER_PATH_TRUNCATED, COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
-    COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED, COUNTER_SYMBOLIZATION_FAILED,
-    COUNTER_UNIX_MSG_CONTROL_NESTED, COUNTER_UNIX_MSG_CONTROL_TRUNCATED,
+    COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED, COUNTER_EVENTS_SUBMITTED,
+    COUNTER_FD_LOOKUP_MISSED, COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED,
+    COUNTER_IOCTL_REFRESH_MISSED, COUNTER_PATH_READ_FAILED, COUNTER_PATH_TRUNCATED,
+    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED,
+    COUNTER_STACK_USER_FAILED, COUNTER_SYMBOLIZATION_FAILED, COUNTER_THREAD_CONTEXT_UPDATE_FAILED,
+    COUNTER_TRACED_PROCESS_LIMIT, COUNTER_UNIX_MSG_CONTROL_NESTED,
+    COUNTER_UNIX_MSG_CONTROL_TRUNCATED,
 };
 
 /// Human-readable labels for each counter slot, in display order.
@@ -87,6 +89,26 @@ pub const COUNTER_LABELS: &[(u32, &str, CounterKind)] = &[
     (
         COUNTER_UNIX_MSG_CONTROL_NESTED,
         "unix msg control nested",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_TRACED_PROCESS_LIMIT,
+        "traced process limit",
+        CounterKind::Drop,
+    ),
+    (
+        COUNTER_BINDER_DEPTH_LIMIT,
+        "binder depth limit",
+        CounterKind::Drop,
+    ),
+    (
+        COUNTER_BINDER_FOLLOW_FAILED,
+        "binder follow failed",
+        CounterKind::Degradation,
+    ),
+    (
+        COUNTER_THREAD_CONTEXT_UPDATE_FAILED,
+        "thread context update failed",
         CounterKind::Degradation,
     ),
 ];
@@ -179,6 +201,9 @@ pub struct CaptureMetadata {
     pub match_packages: Vec<String>,
     pub match_uids: Vec<String>,
     pub match_pids: Vec<String>,
+    pub root_package: Option<String>,
+    pub max_depth: u8,
+    pub max_processes: u32,
 }
 
 /// Render the capture summary as a single block of text, suitable for stderr.
@@ -291,6 +316,15 @@ pub fn format_capture_health_json_with_metadata(
     write_string_array(&mut s, "match_packages", &meta.match_packages);
     write_string_array(&mut s, "match_uids", &meta.match_uids);
     write_string_array(&mut s, "match_pids", &meta.match_pids);
+    if let Some(package) = &meta.root_package {
+        let escaped = package.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = write!(s, r#","root_package":"{escaped}""#);
+    }
+    let _ = write!(
+        s,
+        r#","max_depth":{},"max_processes":{}"#,
+        meta.max_depth, meta.max_processes
+    );
     s.push('}');
     s
 }

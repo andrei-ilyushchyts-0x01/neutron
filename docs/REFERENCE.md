@@ -5,11 +5,13 @@
 | Command       | Purpose                                                                                |
 |---------------|----------------------------------------------------------------------------------------|
 | (default)     | Tracer mode: load BPF, attach tracepoints, emit NDJSON / findings.                     |
+| `trace`       | Explicit tracer mode; accepts the same flags as the legacy default invocation. (1.3.0) |
 | `doctor`      | Preflight environment checks (kernel, privileges, BPF subsystem). Exits non-zero on FAIL. |
 | `window`      | Cut event windows around an anchor from a captured NDJSON.                             |
 | `summarize`   | Aggregate an NDJSON capture by `--by <fields>` and print a sorted count table. (1.2.0) |
 | `diff`        | Compare two captures aggregated on the same key; print added/removed/Δ rows. (1.2.0)  |
-| `mark`        | Append one `type:"marker"` NDJSON line. Pair with `neutron window --anchor marker:<name>`. (1.2.0) |
+| `mark`        | Switch a live start/end scenario over the control socket, or append with explicit `--output`. (1.3.0) |
+| `graph`       | Render causal NDJSON as a Mermaid `flowchart TD`. (1.3.0) |
 | `recipes`     | Print built-in workflow recipes, e.g. `neutron recipes android-content-provider`. |
 
 For `window`, see [docs/guides/window.md](guides/window.md). For
@@ -24,6 +26,13 @@ the **Marker workflow** section below. For Android provider work, use
 
 | Flag                              | Type             | Default                                  | Description |
 |-----------------------------------|------------------|------------------------------------------|-------------|
+| `--package NAME`                  | String           | unset                                    | Root package for causal tracing; resolves UID, then matches `/proc/PID/cmdline` as `package` or `package:*`. Separate from `--match-package`. |
+| `--follow-binder`                 | flag             | off                                      | Add Binder callees to the bounded dynamic trace set before publishing the caller event. |
+| `--follow-services`               | flag             | off                                      | Enable `service list -p` candidate discovery; implies `--follow-binder`. |
+| `--follow-hal`                    | flag             | off                                      | Enable `service list -p` and `lshal -ip` HAL candidate discovery; implies `--follow-binder`. |
+| `--max-depth N`                   | u8               | `4`                                      | Maximum causal Binder expansion depth. |
+| `--max-processes N`               | 1..=1024         | `64`                                     | Dynamic `TRACED_PROCESSES` map capacity. |
+| `--control-socket PATH|off`       | String           | `/data/local/tmp/neutron.control.sock`   | Live scenario marker socket; `off` disables it. |
 | `--pid N`                         | u32              | `0`                                      | Target process ID. `0` traces all processes. |
 | `--object PATH`                   | String           | `/data/local/tmp/neutron.bpf.elf`        | Path to the compiled Aya BPF ELF object on the device. |
 | `--pages N`                       | usize            | `64`                                     | **Deprecated.** Accepted for backward compatibility; ignored. The kernel `RingBuf` size is fixed in the BPF object. |
@@ -92,6 +101,7 @@ the **Marker workflow** section below. For Android provider work, use
 |-----------------------------------|------------------|------------------------------------------|-------------|
 | `--fd-snapshot-on-finding`        | flag             | off                                      | When a finding fires with ioctl evidence, read `/proc/<pid>/fdinfo/<fd>` synchronously and embed as `fdinfo_at_event` on the JSON line. |
 | `--binder-services FILE`          | String           | unset                                    | Path to a JSON `{callee_pid: {target_node: service_name}}` map. Known pairs surface a `service` field on `binder_call` events. |
+| `--binder-methods FILE`           | String           | unset                                    | Verified JSON `{service: {code: method}}` map. Unknown codes remain `code=N`. |
 
 <!-- END AUTO-GENERATED -->
 
@@ -571,27 +581,31 @@ When `syscall_nr == -1`:
 | 4            | `reply`        | 0 = call, 1 = reply          |
 | 5            | `target_node`  | Binder node handle           |
 
-## Marker workflow (1.2.0)
+## Marker workflow (1.3.0)
 
-Use `neutron mark` to bracket external scenarios with marker events,
-then anchor `neutron window` on those markers:
+Use `neutron mark` to bracket causal scenarios. The live tracer validates the
+lifecycle, chooses the monotonic timestamp/generation/trace ID, and writes the
+marker into its own NDJSON stream:
 
 ```bash
 # In one shell: tracer.
-neutron --json --output trace.ndjson &
+neutron trace --package com.example.app --follow-hal \
+  --output trace.ndjson &
 
 # In another shell: bracket the stimulus.
-neutron mark scenario --phase start --output trace.ndjson
+neutron mark scenario --phase start
 ./trigger-camera-extension-night
-neutron mark scenario --phase end --output trace.ndjson
+neutron mark scenario --phase end
 
 kill %1
-neutron window trace.ndjson --anchor marker:scenario --around 5s
+neutron graph trace.ndjson --root-package com.example.app \
+  --format mermaid --output flow.md
 ```
 
-The marker line uses `O_APPEND`, atomic on Linux for ≤PIPE_BUF
-writes, so two concurrent writers don't interleave. See
-[docs/guides/window.md](guides/window.md) for the full anchor list.
+Pass an explicit `mark --output trace.ndjson` to retain the 1.2 append-only
+behavior without switching the live scenario. That path uses `O_APPEND`,
+atomic on Linux for ≤PIPE_BUF writes. See [docs/guides/window.md](guides/window.md)
+for the full anchor list.
 
 ## Binder service-map file (1.2.0)
 
@@ -611,9 +625,22 @@ integers):
 }
 ```
 
-Typically populated from `service list -p` dumps. Unknown
-`(callee_pid, target_node)` pairs surface no `service` field on the
-`binder_call` line — never a placeholder.
+This map is the exact `(callee_pid, target_node)` override. Without an exact
+entry, `--follow-services` / `--follow-hal` can add PID-level candidates with
+`attribution_confidence:"candidate"`; ambiguous candidates are listed without
+claiming a service.
+
+`--binder-methods <FILE>` accepts verified service/code mappings:
+
+```json
+{
+  "android.hardware.camera.provider.ICameraProvider/default": {
+    "1": "getCameraIdList"
+  }
+}
+```
+
+Without a verified entry, the numeric `code` remains the honest method label.
 
 ## LWIS command-packet IDs (1.2.0)
 

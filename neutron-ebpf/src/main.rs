@@ -4,8 +4,9 @@
 //! Target: bpfel-unknown-none (Pixel 8 Pro / Android 14 GKI / kernel 6.1.145)
 //!
 //! Modern-kernel assumptions (no kernel-4.14 workarounds):
-//! - BPF-to-BPF calls accepted by the verifier, so compiler-emitted memset /
-//!   memcpy / memmove are fine.
+//! - BPF-to-BPF calls are accepted, but fixed-size event zero/copy operations
+//!   stay explicitly expanded: generic LLVM memory loops exhaust the Pixel
+//!   Android 6.1 verifier's instruction budget.
 //! - Helpers 112/113/114 (`bpf_probe_read_kernel_*`, `bpf_probe_read_user_*`,
 //!   `bpf_probe_read_user_str_*`) are available — used in preference to the
 //!   address-space-agnostic helpers 4 / 45.
@@ -27,19 +28,23 @@ use core::ptr::{addr_of, addr_of_mut};
 use aya_ebpf::{bindings::BPF_F_USER_STACK, maps::StackTrace};
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_kernel_buf, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+        bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel_buf, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes, gen,
     },
     macros::{map, tracepoint},
-    maps::{Array, HashMap, RingBuf},
+    maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 use neutron_common::{
-    is_state_tracking_nr, ret_matches_class, ExitSource, SyscallEvent, COUNTER_EVENTS_SUBMITTED,
-    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
-    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_UNIX_MSG_CONTROL_NESTED,
-    COUNTER_UNIX_MSG_CONTROL_TRUNCATED, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF,
-    FILTER_KEY_IOCTL_DIR, FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_PID,
+    encode_causal_relation_depth, is_state_tracking_nr, ret_matches_class, ExitSource,
+    ProcessTraceContext, SyscallEvent, TraceReason, CAUSAL_RELATION_EXACT,
+    CAUSAL_RELATION_INFERRED, COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED,
+    COUNTER_EVENTS_SUBMITTED, COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED,
+    COUNTER_IOCTL_REFRESH_MISSED, COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
+    COUNTER_THREAD_CONTEXT_UPDATE_FAILED, COUNTER_TRACED_PROCESS_LIMIT,
+    COUNTER_UNIX_MSG_CONTROL_NESTED, COUNTER_UNIX_MSG_CONTROL_TRUNCATED, FILTER_KEY_ACTIVE,
+    FILTER_KEY_ARG_U32_OFF, FILTER_KEY_CAUSAL_MODE, FILTER_KEY_FOLLOW_BINDER, FILTER_KEY_IOCTL_DIR,
+    FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_MAX_DEPTH, FILTER_KEY_PID,
     FILTER_KEY_RET_CLASS, FILTER_KEY_STATE_EMIT_REQUIRED, FILTER_MAP_SLOT_COUNT, MATCH_BIT_ARG_U32,
     MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR, MATCH_BIT_IOCTL_TYPE,
     MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID, SYSCALL_NR_BINDER_RECEIVED,
@@ -66,11 +71,22 @@ use neutron_common::{COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED};
 static FILTER_MAP: Array<u32> = Array::with_max_entries(FILTER_MAP_SLOT_COUNT, 0);
 
 /// Single multi-producer ring buffer for syscall events.
-/// Size: 1 MiB — must be a power of two and at least one page. At ~241 bytes
-/// per event (plus 8-byte header per record), this fits ~4200 events of burst
+/// Size: 1 MiB — must be a power of two and at least one page. At 257 bytes
+/// per event (plus an 8-byte record header), this fits ~3950 events of burst
 /// capacity, comfortably absorbing observed 100k-events/s peaks on Pixel 8 Pro.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
+
+#[repr(C, align(8))]
+struct AlignedEvent {
+    event: SyscallEvent,
+}
+
+/// Per-CPU scratch used by the syscall-exit path, whose live locals plus a
+/// full event exceed BPF's 512-byte stack limit. Tracepoint programs run with
+/// migration disabled, so a single value per CPU is sufficient.
+#[map]
+static EVENT_SCRATCH: PerCpuArray<AlignedEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// Enter/exit correlation: `pid_tgid` → `SyscallEvent` captured on sys_enter.
 #[map]
@@ -83,6 +99,36 @@ static SYSCALL_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 /// Additional PIDs to trace (child processes after clone()).
 #[map]
 static PID_WHITELIST: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
+
+/// Dynamic causal set. Userspace overrides max_entries at load time from
+/// `--max-processes`; Binder propagation updates it before publishing events.
+#[map]
+static TRACED_PROCESSES: HashMap<u32, ProcessTraceContext> = HashMap::with_max_entries(64, 0);
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct BinderTransactionContext {
+    process: ProcessTraceContext,
+    flags: u32,
+    parent_debug_id: u32,
+    relation: u8,
+}
+
+#[map]
+static BINDER_TRANSACTION_CONTEXT: HashMap<u32, BinderTransactionContext> =
+    HashMap::with_max_entries(4096, 0);
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct BinderThreadContext {
+    debug_id: u32,
+    scenario_generation: u16,
+    depth: u8,
+}
+
+#[map]
+static THREAD_BINDER_CONTEXT: HashMap<u64, BinderThreadContext> =
+    HashMap::with_max_entries(4096, 0);
 
 /// Watched fds for selective read/write capture.
 /// Key: `(pid << 32) | fd`. Value: tag (1 = procfs/sysfs).
@@ -217,6 +263,25 @@ fn syscall_filter_active() -> bool {
     matches!(FILTER_MAP.get(FILTER_KEY_ACTIVE).copied(), Some(v) if v != 0)
 }
 
+#[inline(always)]
+fn causal_mode() -> bool {
+    matches!(FILTER_MAP.get(FILTER_KEY_CAUSAL_MODE).copied(), Some(v) if v != 0)
+}
+
+#[inline(always)]
+fn follow_binder_enabled() -> bool {
+    matches!(FILTER_MAP.get(FILTER_KEY_FOLLOW_BINDER).copied(), Some(v) if v != 0)
+}
+
+#[inline(always)]
+fn max_causal_depth() -> u8 {
+    FILTER_MAP
+        .get(FILTER_KEY_MAX_DEPTH)
+        .copied()
+        .unwrap_or(0)
+        .min(u8::MAX as u32) as u8
+}
+
 /// Returns `true` if the given userspace process ID matches the configured
 /// target. `userspace_pid` corresponds to kernel `task_struct->tgid` and is
 /// stable across all threads of the process — that is precisely the property
@@ -228,12 +293,49 @@ fn pid_matches(userspace_pid: u32) -> bool {
         Some(t) => t,
         None => return false,
     };
-    if target == 0 || target == userspace_pid {
+    if target != 0 && target == userspace_pid {
         return true;
     }
     // SAFETY: `HashMap::get` borrows into kernel map memory; we discard the
     // borrow immediately, so no aliasing concern.
-    unsafe { PID_WHITELIST.get(&userspace_pid).is_some() }
+    if unsafe { PID_WHITELIST.get(&userspace_pid).is_some() } {
+        return true;
+    }
+    if unsafe { TRACED_PROCESSES.get(&userspace_pid).is_some() } {
+        return true;
+    }
+    target == 0 && !causal_mode()
+}
+
+const EMPTY_PROCESS_CONTEXT: ProcessTraceContext = ProcessTraceContext {
+    root_trace_id: 0,
+    parent_pid: 0,
+    binder_debug_id: 0,
+    depth: 0,
+    reason: TraceReason::Root,
+    scenario_generation: 0,
+};
+
+/// The zero `root_trace_id` tuple means "no causal context". Live trace IDs
+/// are always non-zero. Returning a fully initialized tuple instead of an
+/// `Option` prevents LLVM from spilling an uninitialized enum payload that
+/// the BPF verifier cannot prove is read only after its discriminant.
+#[inline(always)]
+fn causal_context(pid_tgid: u64, userspace_pid: u32) -> (ProcessTraceContext, u32, u8) {
+    let Some(process) = unsafe { TRACED_PROCESSES.get(&userspace_pid) }.copied() else {
+        return (EMPTY_PROCESS_CONTEXT, 0, 0);
+    };
+    if let Some(thread) = unsafe { THREAD_BINDER_CONTEXT.get(&pid_tgid) }.copied() {
+        if thread.scenario_generation == process.scenario_generation {
+            return (process, thread.debug_id, CAUSAL_RELATION_EXACT);
+        }
+    }
+    let relation = if process.depth == 0 {
+        CAUSAL_RELATION_EXACT
+    } else {
+        CAUSAL_RELATION_INFERRED
+    };
+    (process, process.binder_debug_id, relation)
 }
 
 #[inline(always)]
@@ -283,10 +385,8 @@ fn uid_matches_predicate(uid: u32) -> bool {
 /// `true` when no ioctl predicate is configured.
 #[inline(always)]
 fn ioctl_matches_predicate(cmd: u32, payload_ptr: *const u8) -> bool {
-    if match_active(MATCH_BIT_IOCTL_CMD) {
-        if unsafe { MATCH_IOCTL_CMD_SET.get(&cmd) }.is_none() {
-            return false;
-        }
+    if match_active(MATCH_BIT_IOCTL_CMD) && unsafe { MATCH_IOCTL_CMD_SET.get(&cmd) }.is_none() {
+        return false;
     }
     if match_active(MATCH_BIT_IOCTL_TYPE) {
         let ty = (cmd >> 8) & 0xff;
@@ -464,6 +564,61 @@ fn should_submit_exit(nr: i32, uid: u32, saved: *const SyscallEvent, ret: i64, n
 // All field writes go through raw pointers because `SyscallEvent` is
 // `#[repr(C, packed)]` (alignment 1) — forming `&packed.field` is UB.
 
+/// Zero one wire event without asking LLVM to emit a generic `memset` loop.
+/// Android's 6.1 verifier explores such compiler-builtins until the one
+/// million instruction limit. Callers provide 8-byte-aligned stack, map, or
+/// ring memory via [`AlignedEvent`] or Aya's ring buffer.
+#[inline(always)]
+unsafe fn zero_event(ev: *mut SyscallEvent) {
+    let base = ev.cast::<u8>();
+    macro_rules! zero_u64 {
+        ($($offset:expr),+ $(,)?) => {
+            $(core::ptr::write_volatile(base.add($offset).cast::<u64>(), 0);)+
+        };
+    }
+    zero_u64!(
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160,
+        168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248,
+    );
+    core::ptr::write_volatile(base.add(256), 0);
+}
+
+/// Copy one aligned wire event without a generic `memcpy`/`memmove`
+/// subprogram. Volatile fixed-width accesses keep LLVM from folding the
+/// bounded stores back into a verifier-hostile loop.
+#[inline(always)]
+unsafe fn copy_event(dst: *mut SyscallEvent, src: *const SyscallEvent) {
+    let dst = dst.cast::<u8>();
+    let src = src.cast::<u8>();
+    macro_rules! copy_u64 {
+        ($($offset:expr),+ $(,)?) => {
+            $(
+                core::ptr::write_volatile(
+                    dst.add($offset).cast::<u64>(),
+                    core::ptr::read_volatile(src.add($offset).cast::<u64>()),
+                );
+            )+
+        };
+    }
+    copy_u64!(
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160,
+        168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248,
+    );
+    core::ptr::write_volatile(dst.add(256), core::ptr::read_volatile(src.add(256)));
+}
+
+#[inline(always)]
+unsafe fn write_current_comm(ev: *mut SyscallEvent) {
+    let _ = gen::bpf_get_current_comm(addr_of_mut!((*ev).comm).cast(), 16);
+}
+
+#[inline(always)]
+fn event_scratch() -> Option<*mut SyscallEvent> {
+    EVENT_SCRATCH
+        .get_ptr_mut(0)
+        .map(|storage| unsafe { addr_of_mut!((*storage).event) })
+}
+
 /// Single-pointer-into-`data[..]` writes. `off` must be in `0..128`.
 #[inline(always)]
 unsafe fn data_ptr(ev: *mut SyscallEvent, off: usize) -> *mut u8 {
@@ -483,6 +638,78 @@ unsafe fn data_write_u8(ev: *mut SyscallEvent, off: usize, v: u8) {
 #[inline(always)]
 unsafe fn reserved_write_u8(ev: *mut SyscallEvent, off: usize, v: u8) {
     *reserved_ptr(ev, off) = v;
+}
+
+#[inline(always)]
+unsafe fn reserved_write_u32(ev: *mut SyscallEvent, off: usize, value: u32) {
+    let bytes = value.to_le_bytes();
+    reserved_write_u8(ev, off, bytes[0]);
+    reserved_write_u8(ev, off + 1, bytes[1]);
+    reserved_write_u8(ev, off + 2, bytes[2]);
+    reserved_write_u8(ev, off + 3, bytes[3]);
+}
+
+#[inline(always)]
+unsafe fn stamp_causal(
+    ev: *mut SyscallEvent,
+    context: ProcessTraceContext,
+    parent_debug_id: u32,
+    relation: u8,
+) {
+    addr_of_mut!((*ev).maps_generation).write_unaligned(context.scenario_generation);
+    reserved_write_u32(ev, 1, parent_debug_id);
+    reserved_write_u8(ev, 5, encode_causal_relation_depth(relation, context.depth));
+}
+
+#[inline(always)]
+fn follow_binder_callee(
+    caller: ProcessTraceContext,
+    caller_pid: u32,
+    callee_pid: i32,
+    debug_id: i32,
+    flags: u32,
+    parent_debug_id: u32,
+    relation: u8,
+) {
+    if !follow_binder_enabled() {
+        return;
+    }
+    if callee_pid <= 0 || debug_id == 0 {
+        bump_counter(COUNTER_BINDER_FOLLOW_FAILED);
+        return;
+    }
+    let depth = caller.depth.saturating_add(1);
+    if depth > max_causal_depth() {
+        bump_counter(COUNTER_BINDER_DEPTH_LIMIT);
+        return;
+    }
+    let process = ProcessTraceContext {
+        root_trace_id: caller.root_trace_id,
+        parent_pid: caller_pid,
+        binder_debug_id: debug_id as u32,
+        depth,
+        reason: TraceReason::Binder,
+        scenario_generation: caller.scenario_generation,
+    };
+    let transaction = BinderTransactionContext {
+        process,
+        flags,
+        parent_debug_id,
+        relation,
+    };
+    if BINDER_TRANSACTION_CONTEXT
+        .insert(&(debug_id as u32), &transaction, 0)
+        .is_err()
+    {
+        bump_counter(COUNTER_BINDER_FOLLOW_FAILED);
+        return;
+    }
+    let pid = callee_pid as u32;
+    if TRACED_PROCESSES.insert(&pid, &process, 0).is_err() {
+        let _ = BINDER_TRANSACTION_CONTEXT.remove(&(debug_id as u32));
+        bump_counter(COUNTER_TRACED_PROCESS_LIMIT);
+        bump_counter(COUNTER_BINDER_FOLLOW_FAILED);
+    }
 }
 
 #[inline(always)]
@@ -623,8 +850,9 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
         }
         // Read msg_name (8B pointer) + msg_namelen (4B) + 4B pad in one shot
         // into a stack scratch.
-        let mut hdr_head = [0u8; 16];
-        if bpf_probe_read_user_buf(ptr as *const u8, &mut hdr_head).is_err() {
+        let mut hdr_head_buf = MaybeUninit::<[u8; 16]>::uninit();
+        let hdr_head = &mut *hdr_head_buf.as_mut_ptr();
+        if bpf_probe_read_user_buf(ptr as *const u8, hdr_head).is_err() {
             return;
         }
         let name_ptr = u64::from_le_bytes([
@@ -644,8 +872,9 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
             let _ = bpf_probe_read_user_buf(name_ptr as *const u8, dst);
         }
         // Read msg_control pointer + msg_controllen into stack scratch.
-        let mut hdr_ctl = [0u8; 16];
-        if bpf_probe_read_user_buf((ptr + 32) as *const u8, &mut hdr_ctl).is_err() {
+        let mut hdr_ctl_buf = MaybeUninit::<[u8; 16]>::uninit();
+        let hdr_ctl = &mut *hdr_ctl_buf.as_mut_ptr();
+        if bpf_probe_read_user_buf((ptr + 32) as *const u8, hdr_ctl).is_err() {
             bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
             return;
         }
@@ -671,8 +900,9 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
             bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
             return;
         }
-        let mut cmsg = [0u8; 16];
-        if bpf_probe_read_user_buf(control_ptr as *const u8, &mut cmsg).is_err() {
+        let mut cmsg_buf = MaybeUninit::<[u8; 16]>::uninit();
+        let cmsg = &mut *cmsg_buf.as_mut_ptr();
+        if bpf_probe_read_user_buf(control_ptr as *const u8, cmsg).is_err() {
             bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
             return;
         }
@@ -802,10 +1032,11 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
     // Build the event on stack first — we need to (a) insert it into INFLIGHT
     // for sys_exit correlation, and (b) submit a copy through the ring buffer.
     // The redundant 241-byte memcpy into the ring entry is trivial.
-    let mut ev_buf: MaybeUninit<SyscallEvent> = MaybeUninit::zeroed();
-    let ev: *mut SyscallEvent = ev_buf.as_mut_ptr();
+    let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();
+    let ev = unsafe { addr_of_mut!((*ev_buf.as_mut_ptr()).event) };
 
     unsafe {
+        zero_event(ev);
         let now = bpf_ktime_get_ns();
         addr_of_mut!((*ev).timestamp_ns).write_unaligned(now);
         addr_of_mut!((*ev).enter_timestamp_ns).write_unaligned(now);
@@ -815,8 +1046,8 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
         addr_of_mut!((*ev).uid).write_unaligned(bpf_get_current_uid_gid() as u32);
         addr_of_mut!((*ev).syscall_nr).write_unaligned(nr);
         addr_of_mut!((*ev).is_enter).write_unaligned(1);
-        // ret, ptr_hint, maps_generation, _reserved already zero from
-        // MaybeUninit::zeroed().
+        // ret, ptr_hint, maps_generation, and _reserved were zeroed by
+        // `zero_event` above.
 
         // Read the six syscall args from the tracepoint context and stamp
         // them into the event in one packed write.
@@ -824,11 +1055,14 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
         addr_of_mut!((*ev).args).write_unaligned(args);
 
         // comm[16] — direct write from the helper-returned array.
-        if let Ok(comm) = bpf_get_current_comm() {
-            addr_of_mut!((*ev).comm).write_unaligned(comm);
-        }
+        write_current_comm(ev);
 
         capture_syscall_data(ev, nr, &args);
+
+        let (context, parent_debug_id, relation) = causal_context(pid_tgid, userspace_pid);
+        if context.root_trace_id != 0 {
+            stamp_causal(ev, context, parent_debug_id, relation);
+        }
 
         let (kid, uid_stack) = capture_stack_ids(ctx);
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
@@ -860,8 +1094,8 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
             // SAFETY: `as_mut_ptr` returns an 8-byte-aligned pointer to
             // uninitialized memory the kernel reserved for us. `SyscallEvent`
             // is `#[repr(C, packed)]` so we use `write_unaligned`.
-            let dst: *mut SyscallEvent = entry.as_mut_ptr() as *mut SyscallEvent;
-            core::ptr::write_unaligned(dst, core::ptr::read_unaligned(ev));
+            let dst: *mut SyscallEvent = entry.as_mut_ptr();
+            copy_event(dst, ev);
             entry.submit(0);
             bump_counter(COUNTER_EVENTS_SUBMITTED);
         } else {
@@ -901,10 +1135,7 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
     // evaluator needs to read saved args (for ioctl-shape) and the saved
     // enter timestamp (for latency). The borrow is released before the
     // ringbuf reservation.
-    let saved_ptr: *const SyscallEvent = match INFLIGHT.get_ptr(&pid_tgid) {
-        Some(p) => p as *const SyscallEvent,
-        None => core::ptr::null(),
-    };
+    let saved_ptr: *const SyscallEvent = INFLIGHT.get_ptr(&pid_tgid).unwrap_or_default();
 
     if !should_submit_exit(nr, uid_now, saved_ptr, ret, now) {
         // Reclaim the INFLIGHT entry that the unconditional enter-side
@@ -915,30 +1146,21 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
         return Err(());
     }
 
-    // Reserve directly into the ring — no INFLIGHT insertion on exit, so we
-    // can skip the stack scratch and write the event into the ring entry.
-    // If the ring is full, count the drop and bail (degraded but not broken;
-    // the next event picks up where we left off).
-    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
-        bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
-        return Err(());
-    };
-
-    // SAFETY: `as_mut_ptr` returns kernel-reserved memory sized for a full
-    // `SyscallEvent`. We zero it ourselves so unset fields stay defined.
-    let ev: *mut SyscallEvent = entry.as_mut_ptr() as *mut SyscallEvent;
+    // This path has enough other live locals that a full event would exceed
+    // BPF's 512-byte stack. Use per-CPU map scratch, then copy into the ring.
+    // In particular, do not memset a reserved ring entry directly: recent
+    // LLVM BPF backends lower that to a BPF-to-BPF call carrying a ringbuf
+    // reference, which Android 6.1 rejects.
+    let ev = event_scratch().ok_or(())?;
     unsafe {
-        core::ptr::write_bytes(ev as *mut u8, 0, size_of::<SyscallEvent>());
-
+        zero_event(ev);
         addr_of_mut!((*ev).timestamp_ns).write_unaligned(now);
         addr_of_mut!((*ev).pid).write_unaligned(userspace_pid);
         addr_of_mut!((*ev).tgid).write_unaligned(userspace_tid);
         addr_of_mut!((*ev).uid).write_unaligned(bpf_get_current_uid_gid() as u32);
         addr_of_mut!((*ev).is_enter).write_unaligned(0);
         addr_of_mut!((*ev).ret).write_unaligned(ret);
-        if let Ok(comm) = bpf_get_current_comm() {
-            addr_of_mut!((*ev).comm).write_unaligned(comm);
-        }
+        write_current_comm(ev);
 
         // Try to recover args + data + stack ids from the inflight entry.
         if let Some(saved) = INFLIGHT.get_ptr(&pid_tgid) {
@@ -947,6 +1169,8 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
             let saved_kstack = addr_of!((*saved).kernel_stackid).read_unaligned();
             let saved_ustack = addr_of!((*saved).user_stackid).read_unaligned();
             let saved_ptr_hint = addr_of!((*saved).ptr_hint).read_unaligned();
+            let saved_generation = addr_of!((*saved).maps_generation).read_unaligned();
+            let saved_reserved = addr_of!((*saved)._reserved).read_unaligned();
             // Preserve all six syscall args verbatim — the previous wire
             // format hijacked args[5] for the enter timestamp, which clobbered
             // the legitimate 6th arg of mmap (offset), clone3, etc. The enter
@@ -959,6 +1183,8 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
             addr_of_mut!((*ev).kernel_stackid).write_unaligned(saved_kstack);
             addr_of_mut!((*ev).user_stackid).write_unaligned(saved_ustack);
             addr_of_mut!((*ev).ptr_hint).write_unaligned(saved_ptr_hint);
+            addr_of_mut!((*ev).maps_generation).write_unaligned(saved_generation);
+            addr_of_mut!((*ev)._reserved).write_unaligned(saved_reserved);
 
             // Copy the 128-byte data buffer from inflight map memory via the
             // kernel-space helper for a guaranteed bounded copy with EFAULT
@@ -1001,12 +1227,22 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
             addr_of_mut!((*ev).syscall_nr).write_unaligned(nr);
             addr_of_mut!((*ev).kernel_stackid).write_unaligned(-1);
             addr_of_mut!((*ev).user_stackid).write_unaligned(-1);
-            // args / data / ptr_hint / enter_timestamp_ns already zero from
-            // write_bytes above. Latency will resolve to None userspace-side.
+            let (context, parent_debug_id, relation) = causal_context(pid_tgid, userspace_pid);
+            if context.root_trace_id != 0 {
+                stamp_causal(ev, context, parent_debug_id, relation);
+            }
+            // args / data / ptr_hint / enter_timestamp_ns are already zero.
+            // Latency will resolve to None userspace-side.
         }
 
-        entry.submit(0);
-        bump_counter(COUNTER_EVENTS_SUBMITTED);
+        if let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) {
+            let dst: *mut SyscallEvent = entry.as_mut_ptr();
+            copy_event(dst, ev);
+            entry.submit(0);
+            bump_counter(COUNTER_EVENTS_SUBMITTED);
+        } else {
+            bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
+        }
     }
     Ok(())
 }
@@ -1040,26 +1276,41 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
     let target_node = unsafe { ctx.read_at::<i32>(BT_TARGET_NODE) }.unwrap_or(0);
     let now = unsafe { bpf_ktime_get_ns() };
 
-    // Binder events have no INFLIGHT correlation, so write directly into the
-    // ring entry. If the ring is full, count the drop and bail.
-    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
-        bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
-        return Err(());
-    };
+    let (context, parent_debug_id, relation) = causal_context(pid_tgid, userspace_pid);
+    let has_causal = context.root_trace_id != 0;
+    let mut event_context = context;
+    if reply == 0 {
+        event_context.depth = event_context.depth.saturating_add(1);
+        if has_causal {
+            // This update intentionally precedes EVENTS.reserve/submit: the
+            // callee can run immediately on another CPU after Binder wakes it.
+            follow_binder_callee(
+                context,
+                userspace_pid,
+                to_proc,
+                debug_id,
+                flags,
+                parent_debug_id,
+                relation,
+            );
+        }
+    } else {
+        // A synchronous reply is the reliable end boundary for the receiving
+        // Binder thread's exact context.
+        let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
+    }
 
-    let ev: *mut SyscallEvent = entry.as_mut_ptr() as *mut SyscallEvent;
+    let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();
+    let ev = unsafe { addr_of_mut!((*ev_buf.as_mut_ptr()).event) };
     unsafe {
-        core::ptr::write_bytes(ev as *mut u8, 0, size_of::<SyscallEvent>());
-
+        zero_event(ev);
         addr_of_mut!((*ev).timestamp_ns).write_unaligned(now);
         addr_of_mut!((*ev).pid).write_unaligned(userspace_pid);
         addr_of_mut!((*ev).tgid).write_unaligned(userspace_tid);
         addr_of_mut!((*ev).uid).write_unaligned(bpf_get_current_uid_gid() as u32);
         addr_of_mut!((*ev).syscall_nr).write_unaligned(-1); // sentinel
         addr_of_mut!((*ev).is_enter).write_unaligned(1);
-        if let Ok(comm) = bpf_get_current_comm() {
-            addr_of_mut!((*ev).comm).write_unaligned(comm);
-        }
+        write_current_comm(ev);
 
         let args: [u64; 6] = [
             to_proc as u32 as u64,
@@ -1076,12 +1327,22 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
         // userspace casts back to i32.
         addr_of_mut!((*ev).ptr_hint).write_unaligned(debug_id as u32 as u64);
 
+        if has_causal {
+            stamp_causal(ev, event_context, parent_debug_id, relation);
+        }
+
         let (kid, uid_stack) = capture_stack_ids(ctx);
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
         addr_of_mut!((*ev).user_stackid).write_unaligned(uid_stack);
 
-        entry.submit(0);
-        bump_counter(COUNTER_EVENTS_SUBMITTED);
+        if let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) {
+            let dst: *mut SyscallEvent = entry.as_mut_ptr();
+            copy_event(dst, ev);
+            entry.submit(0);
+            bump_counter(COUNTER_EVENTS_SUBMITTED);
+        } else {
+            bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
+        }
     }
     Ok(())
 }
@@ -1112,32 +1373,67 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
 
     let debug_id = unsafe { ctx.read_at::<i32>(BTR_DEBUG_ID) }.unwrap_or(0);
     let now = unsafe { bpf_ktime_get_ns() };
-
-    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
-        bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
-        return Err(());
+    let transaction = if debug_id == 0 {
+        None
+    } else {
+        unsafe { BINDER_TRANSACTION_CONTEXT.get(&(debug_id as u32)) }.copied()
     };
+    if let Some(context) = transaction {
+        if context.flags & 1 == 0 {
+            let thread = BinderThreadContext {
+                debug_id: debug_id as u32,
+                scenario_generation: context.process.scenario_generation,
+                depth: context.process.depth,
+            };
+            if THREAD_BINDER_CONTEXT.insert(&pid_tgid, &thread, 0).is_err() {
+                bump_counter(COUNTER_THREAD_CONTEXT_UPDATE_FAILED);
+            }
+        } else {
+            // One-way calls have no reply tracepoint to delimit execution.
+            // Keep process-level context only, which syscalls label inferred.
+            let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
+        }
+        let _ = BINDER_TRANSACTION_CONTEXT.remove(&(debug_id as u32));
+    }
 
-    let ev: *mut SyscallEvent = entry.as_mut_ptr() as *mut SyscallEvent;
+    let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();
+    let ev = unsafe { addr_of_mut!((*ev_buf.as_mut_ptr()).event) };
     unsafe {
-        core::ptr::write_bytes(ev as *mut u8, 0, size_of::<SyscallEvent>());
+        zero_event(ev);
         addr_of_mut!((*ev).timestamp_ns).write_unaligned(now);
         addr_of_mut!((*ev).pid).write_unaligned(userspace_pid);
         addr_of_mut!((*ev).tgid).write_unaligned(userspace_tid);
         addr_of_mut!((*ev).uid).write_unaligned(bpf_get_current_uid_gid() as u32);
         addr_of_mut!((*ev).syscall_nr).write_unaligned(SYSCALL_NR_BINDER_RECEIVED);
         addr_of_mut!((*ev).is_enter).write_unaligned(1);
-        if let Ok(comm) = bpf_get_current_comm() {
-            addr_of_mut!((*ev).comm).write_unaligned(comm);
-        }
+        write_current_comm(ev);
         addr_of_mut!((*ev).ptr_hint).write_unaligned(debug_id as u32 as u64);
+        if let Some(context) = transaction {
+            stamp_causal(
+                ev,
+                context.process,
+                context.parent_debug_id,
+                context.relation,
+            );
+        } else {
+            let (context, parent_debug_id, relation) = causal_context(pid_tgid, userspace_pid);
+            if context.root_trace_id != 0 {
+                stamp_causal(ev, context, parent_debug_id, relation);
+            }
+        }
         // No useful args / stacks here — debug_id alone is the matching key.
         // Stack capture is skipped to keep this tracepoint cheap.
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(-1);
         addr_of_mut!((*ev).user_stackid).write_unaligned(-1);
 
-        entry.submit(0);
-        bump_counter(COUNTER_EVENTS_SUBMITTED);
+        if let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) {
+            let dst: *mut SyscallEvent = entry.as_mut_ptr();
+            copy_event(dst, ev);
+            entry.submit(0);
+            bump_counter(COUNTER_EVENTS_SUBMITTED);
+        } else {
+            bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
+        }
     }
     Ok(())
 }
@@ -1188,16 +1484,17 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
     }
 
     let now = unsafe { bpf_ktime_get_ns() };
+    let causal = causal_context(pid_tgid, userspace_pid);
+    let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
+    if userspace_tid != userspace_pid {
+        return Ok(());
+    }
+    let _ = TRACED_PROCESSES.remove(&userspace_pid);
 
-    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
-        bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
-        return Err(());
-    };
-
-    let ev: *mut SyscallEvent = entry.as_mut_ptr() as *mut SyscallEvent;
+    let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();
+    let ev = unsafe { addr_of_mut!((*ev_buf.as_mut_ptr()).event) };
     unsafe {
-        core::ptr::write_bytes(ev as *mut u8, 0, size_of::<SyscallEvent>());
-
+        zero_event(ev);
         addr_of_mut!((*ev).timestamp_ns).write_unaligned(now);
         addr_of_mut!((*ev).pid).write_unaligned(userspace_pid);
         addr_of_mut!((*ev).tgid).write_unaligned(userspace_tid);
@@ -1208,30 +1505,37 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
         // Prefer the tracepoint's comm field — it is captured at the moment
         // of exit and survives the dying-task race that bpf_get_current_comm
         // can lose. Fall back if the read fails.
-        let mut comm_buf: [u8; 16] = [0; 16];
-        if ctx
-            .read_at::<[u8; 16]>(SCHED_EXIT_COMM)
-            .map(|c| comm_buf = c)
-            .is_err()
-        {
-            if let Ok(c) = bpf_get_current_comm() {
-                comm_buf = c;
-            }
+        if let Ok(comm) = ctx.read_at::<[u8; 16]>(SCHED_EXIT_COMM) {
+            addr_of_mut!((*ev).comm).write_unaligned(comm);
+        } else {
+            write_current_comm(ev);
         }
-        addr_of_mut!((*ev).comm).write_unaligned(comm_buf);
 
         // args[0] = exit_code (TBD via task_struct BTF), args[1] = signal,
         // args[2] = ExitSource::Tracepoint discriminant. Userspace decoders
         // key off args[2] to attribute the source on the JSON line.
-        let args: [u64; 6] = [0, 0, ExitSource::Tracepoint as u64, 0, 0, 0];
-        addr_of_mut!((*ev).args).write_unaligned(args);
+        // The event is already zeroed, so only the non-zero source slot needs
+        // a write. Building a mostly-zero `[u64; 6]` makes LLVM emit memset.
+        (addr_of_mut!((*ev).args) as *mut u64)
+            .add(2)
+            .write_unaligned(ExitSource::Tracepoint as u64);
+
+        if causal.0.root_trace_id != 0 {
+            stamp_causal(ev, causal.0, causal.1, causal.2);
+        }
 
         let (kid, uid_stack) = capture_stack_ids(ctx);
         addr_of_mut!((*ev).kernel_stackid).write_unaligned(kid);
         addr_of_mut!((*ev).user_stackid).write_unaligned(uid_stack);
 
-        entry.submit(0);
-        bump_counter(COUNTER_EVENTS_SUBMITTED);
+        if let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) {
+            let dst: *mut SyscallEvent = entry.as_mut_ptr();
+            copy_event(dst, ev);
+            entry.submit(0);
+            bump_counter(COUNTER_EVENTS_SUBMITTED);
+        } else {
+            bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
+        }
     }
 
     // Silence unused-import warning when this is the only consumer.

@@ -26,6 +26,10 @@ pub struct Cli {
 /// Subcommand registry. Add new subcommands here.
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Trace syscalls and optional causal Binder/service/HAL descendants.
+    /// The same flags remain accepted without this explicit subcommand.
+    Trace(Box<Args>),
+
     /// Preflight environment checks. Verifies that the device kernel,
     /// privileges, and BPF subsystem are in a state where neutron can attach.
     /// Prints PASS/WARN/FAIL per check and exits non-zero on any FAIL.
@@ -59,6 +63,9 @@ pub enum Command {
     /// trace; downstream `neutron window --anchor marker:<name>` cuts
     /// a window around the marker. Phase 5a.
     Mark(crate::mark::MarkArgs),
+
+    /// Render a causal capture as a Mermaid flowchart.
+    Graph(crate::graph::GraphArgs),
 
     /// Print built-in workflow recipes for common Android security
     /// research tasks.
@@ -113,8 +120,49 @@ pub struct WindowArgs {
     pub summary: bool,
 }
 
-#[derive(Parser, Debug, Default)]
+#[derive(clap::Args, Debug, Default)]
 pub struct Args {
+    /// Root Android package for causal tracing. Unlike --match-package, this
+    /// identifies root processes by UID plus /proc/<pid>/cmdline.
+    #[arg(long)]
+    pub package: Option<String>,
+
+    /// Add Binder callees to the dynamic traced-process set.
+    #[arg(
+        long,
+        default_value_if("follow_services", "true", "true"),
+        default_value_if("follow_hal", "true", "true")
+    )]
+    pub follow_binder: bool,
+
+    /// Discover candidate service PIDs with `service list -p`.
+    #[arg(long)]
+    pub follow_services: bool,
+
+    /// Discover candidate AIDL/HIDL HAL PIDs with `service list -p` and `lshal -ip`.
+    #[arg(long)]
+    pub follow_hal: bool,
+
+    /// Maximum Binder expansion depth.
+    #[arg(long, default_value_t = 4)]
+    pub max_depth: u8,
+
+    /// Maximum number of processes in the dynamic causal trace set.
+    #[arg(
+        long,
+        default_value_t = 64,
+        value_parser = clap::value_parser!(u32).range(1..=1024)
+    )]
+    pub max_processes: u32,
+
+    /// Live marker control socket path. Use `off` to disable it.
+    #[arg(
+        long,
+        default_value = "/data/local/tmp/neutron.control.sock",
+        value_name = "PATH|off"
+    )]
+    pub control_socket: String,
+
     /// Target PID (0 = all processes)
     #[arg(long, default_value_t = 0)]
     pub pid: u32,
@@ -477,6 +525,10 @@ pub struct Args {
     /// pairs surface no service field — never a placeholder.
     #[arg(long, value_name = "FILE")]
     pub binder_services: Option<String>,
+
+    /// JSON map from `service + transaction code` to a verified method name.
+    #[arg(long, value_name = "FILE")]
+    pub binder_methods: Option<String>,
 }
 
 #[cfg(test)]

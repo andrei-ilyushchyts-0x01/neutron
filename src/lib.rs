@@ -3,6 +3,7 @@
 pub mod android;
 pub mod binder_services;
 pub mod capture;
+pub mod causal;
 pub mod cli;
 pub mod decode;
 pub mod diff;
@@ -10,6 +11,7 @@ pub mod doctor;
 pub mod fdgraph;
 pub mod fdinfo;
 pub mod format;
+pub mod graph;
 pub mod health;
 pub mod mark;
 pub mod matcher;

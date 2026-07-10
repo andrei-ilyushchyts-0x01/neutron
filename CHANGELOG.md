@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-07-10
+
+- Added explicit `trace` mode while preserving the legacy flag-only invocation.
+- Added package-rooted causal Binder following with bounded depth/process maps,
+  exact receiving-thread attribution, inferred process attribution, and
+  causal IDs on NDJSON events.
+- Added live `mark --phase start|end` scenarios over a 0600 Unix control
+  socket; explicit `--output` remains append-only.
+- Added `service list -p` / `lshal -ip` candidate discovery, exact Binder
+  service overrides, and optional verified method maps.
+- Added `neutron graph ... --format mermaid`, including legacy 1.2 fallback
+  rendering and capture-health warnings.
+
 ## [1.2.0] — 2026-05-06
 
 Additive release driven by the 2026-05-06 LWIS / GXP / Camera2 assessment.
