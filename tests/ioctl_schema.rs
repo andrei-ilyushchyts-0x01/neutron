@@ -31,15 +31,15 @@ fn descriptor(id: &str, name: &str, cmd: u32, path: &str) -> Descriptor {
 #[test]
 fn pointer_graph_requires_layout_length_and_direction() {
     let cmd = 0xc018_7a01;
-    let mut value = descriptor("sample.alloc", "SAMPLE_ALLOC", cmd, "/dev/sample*");
-    value.pointers.push(PointerDescriptor {
+    let value = descriptor("sample.alloc", "SAMPLE_ALLOC", cmd, "/dev/sample*");
+    let mut value_pack = pack(vec![value]);
+    value_pack.descriptors[0].pointers.push(PointerDescriptor {
         field: "ptr".into(),
         pointee_layout: "sample.item".into(),
         length_field: Some("len".into()),
         length_expression: None,
         direction: PointerDirection::InOut,
     });
-    let mut value_pack = pack(vec![value]);
     value_pack.layouts.push(neutron::ioctl_schema::Layout {
         id: "sample.item".into(),
         type_name: "struct item".into(),

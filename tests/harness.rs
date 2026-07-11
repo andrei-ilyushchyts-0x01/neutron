@@ -139,14 +139,26 @@ fn extract_writes_portable_artifact_contract() {
         assert!(output.join(name).is_file(), "missing {name}");
     }
     assert_eq!(fs::read(output.join("input.bin")).unwrap(), input);
-    let metadata: Value = serde_json::from_slice(&fs::read(output.join("metadata.json")).unwrap())
-        .unwrap();
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(output.join("metadata.json")).unwrap()).unwrap();
     assert_eq!(metadata["schema"], HARNESS_SCHEMA);
     assert_eq!(metadata["selected_event_id"], 7);
     assert_eq!(metadata["replay_status"], "ready");
     assert_eq!(metadata["steps"][0]["event_id"], 6);
     assert_eq!(metadata["steps"][1]["event_id"], 7);
     assert_eq!(metadata["required_identity"]["package"], "com.example.app");
+    let compiled = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(output.join("replay.rs"))
+        .arg("-o")
+        .arg(output.join("replay-host-check"))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "generated replay.rs did not compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
 }
 
 #[test]
@@ -170,7 +182,11 @@ fn extract_rejects_duplicate_ids_missing_blobs_hash_mismatches_and_unknown_ref_f
     .to_string();
     assert!(error.contains("duplicate event_id"), "{error}");
 
-    fs::write(&capture, format!("{}\n", capture_line(7, &digest, "complete"))).unwrap();
+    fs::write(
+        &capture,
+        format!("{}\n", capture_line(7, &digest, "complete")),
+    )
+    .unwrap();
     let error = harness::extract(ExtractArgs {
         capture: capture.clone(),
         event_id: 7,
@@ -203,6 +219,17 @@ fn extract_rejects_duplicate_ids_missing_blobs_hash_mismatches_and_unknown_ref_f
     .unwrap_err()
     .to_string();
     assert!(error.contains("unknown field"), "{error}");
+
+    let oversized = root.join("oversized.ndjson");
+    fs::write(&oversized, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap();
+    let error = harness::extract(ExtractArgs {
+        capture: oversized,
+        event_id: 7,
+        output: root.join("oversized"),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("exceeds"), "{error}");
 }
 
 #[test]
@@ -222,8 +249,8 @@ fn truncated_capture_extracts_as_blocked_not_partially_replayable() {
         output: output.clone(),
     })
     .unwrap();
-    let metadata: Value = serde_json::from_slice(&fs::read(output.join("metadata.json")).unwrap())
-        .unwrap();
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(output.join("metadata.json")).unwrap()).unwrap();
     assert_eq!(metadata["replay_status"], "blocked");
     assert!(metadata["blocked_reasons"][0]
         .as_str()

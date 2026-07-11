@@ -13,6 +13,7 @@ pub mod fdgraph;
 pub mod fdinfo;
 pub mod format;
 pub mod graph;
+pub mod harness;
 pub mod health;
 pub mod ioctl_schema;
 pub mod mark;

@@ -613,6 +613,7 @@ after maintainers have approved the tag, notes, and assets.
 - [docs/guides/quickstart.md](docs/guides/quickstart.md): longer first-trace walkthrough
 - [docs/guides/security-assessment.md](docs/guides/security-assessment.md): assessment workflow
 - [docs/guides/bpf-tracing.md](docs/guides/bpf-tracing.md): profiles, filtering, capture, stacks
+- [docs/guides/harness.md](docs/guides/harness.md): capture, minimize, and replay regression testcases
 - [docs/guides/writing-rules.md](docs/guides/writing-rules.md): custom detectors
 - [docs/guides/output-formats.md](docs/guides/output-formats.md): text and JSON schemas
 - [docs/REFERENCE.md](docs/REFERENCE.md): complete trace and Surface CLI/schema reference

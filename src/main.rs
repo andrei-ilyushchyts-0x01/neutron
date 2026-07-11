@@ -34,7 +34,7 @@ use neutron::causal::{
     process_context_from_bytes, process_exit_span_id, root_process_span_id, syscall_span_id,
     CausalMetadata, CausalRelation, CausalWire, ControlServer, ScenarioInfo, ScenarioState,
 };
-use neutron::cli::{Args, Cli, Command, IoctlCommand};
+use neutron::cli::{Args, Cli, Command, HarnessCommand, IoctlCommand};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
 use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
@@ -148,6 +148,17 @@ fn read_boot_id() -> Option<String> {
 fn read_build_fingerprint() -> Option<String> {
     let output = std::process::Command::new("/system/bin/getprop")
         .arg("ro.build.fingerprint")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    trimmed_nonempty(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn read_device_serial() -> Option<String> {
+    let output = std::process::Command::new("/system/bin/getprop")
+        .arg("ro.serialno")
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1802,11 +1813,35 @@ fn main() -> Result<()> {
         Some(Command::Ioctl(IoctlCommand::Generate(args))) => {
             neutron::ioctl_schema::generate(&args)
         }
+        Some(Command::Harness(HarnessCommand::Extract(args))) => neutron::harness::extract(args),
+        Some(Command::Harness(HarnessCommand::Minimize(args))) => neutron::harness::minimize(args),
+        Some(Command::Harness(HarnessCommand::Replay(args))) => neutron::harness::replay(args),
         None => run_trace(cli.args),
     }
 }
 
+fn validate_harness_capture_args(args: &Args) -> Result<()> {
+    if !args.harness_capture {
+        return Ok(());
+    }
+    if args.package.is_none() && args.pid == 0 {
+        bail!("--harness-capture requires --package or a non-zero --pid");
+    }
+    if args.output.is_none() {
+        bail!("--harness-capture requires --output");
+    }
+    if args.sample.is_some_and(|sample| sample != 1.0) || args.rate_limit.is_some() {
+        bail!("--harness-capture cannot be combined with sampling or rate limiting");
+    }
+    Ok(())
+}
+
 fn run_trace(mut args: Args) -> Result<()> {
+    validate_harness_capture_args(&args)?;
+    if args.harness_capture {
+        args.json = true;
+        args.raw = true;
+    }
     if args.follow_services || args.follow_hal {
         args.follow_binder = true;
     }
@@ -1842,6 +1877,7 @@ fn run_trace(mut args: Args) -> Result<()> {
             driver_packs.refresh_cmds.len()
         );
     }
+    let harness_schema_registry = args.harness_capture.then(|| schema_registry.clone());
     neutron::ioctl_schema::install_registry(schema_registry);
     let max_output_bytes = parse_output_size_bytes(args.max_output_size.as_deref())?;
     let rotate_output_bytes = parse_rotate_output_size_bytes(args.rotate_output_size.as_deref())?;
@@ -1858,6 +1894,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     let _capture_lock = acquire_capture_lock(&args.capture_lock)?;
     let capture_boot_id = read_boot_id();
     let capture_fingerprint = read_build_fingerprint();
+    let capture_serial = args.harness_capture.then(read_device_serial).flatten();
     let package_uid = args
         .package
         .as_deref()
@@ -2094,6 +2131,21 @@ fn run_trace(mut args: Args) -> Result<()> {
     // 6. Output sink.
     let output_cap_hit = Arc::new(AtomicBool::new(false));
     let mut output_cap_reported = false;
+    let harness_capture = match (harness_schema_registry, args.output.as_deref()) {
+        (Some(registry), Some(path)) => Some(neutron::harness::CaptureWriter::new(
+            Path::new(path),
+            registry,
+            neutron::harness::CaptureIdentity {
+                serial: capture_serial,
+                fingerprint: capture_fingerprint.clone(),
+                boot_id: capture_boot_id.clone(),
+                uid: package_uid.or(args.root_uid).unwrap_or(0),
+                domain: None,
+            },
+        )?),
+        (Some(_), None) => bail!("--harness-capture requires --output"),
+        (None, _) => None,
+    };
     let mut out = open_output(
         args.output.as_ref(),
         max_output_bytes,
@@ -2679,6 +2731,13 @@ fn run_trace(mut args: Args) -> Result<()> {
                         json_line = enriched;
                     }
                 }
+                if let Some(capture) = harness_capture.as_ref() {
+                    json_line = capture.enrich_json(
+                        &ev,
+                        fd_hint.as_ref().map(|hint| hint.path.as_str()),
+                        &json_line,
+                    )?;
+                }
 
                 // Phase 1d — sampling decision. State-tracking syscalls
                 // (open/close/dup/socket/...) and synthetic sentinels
@@ -3122,6 +3181,27 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["root_uid"], 10123);
         assert!(value.get("root_package").is_none());
+    }
+
+    #[test]
+    fn harness_capture_requires_narrow_scope_file_output_and_no_sampling() {
+        let mut args = Args {
+            harness_capture: true,
+            ..Default::default()
+        };
+        assert!(validate_harness_capture_args(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("--package"));
+        args.pid = 42;
+        assert!(validate_harness_capture_args(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("--output"));
+        args.output = Some("capture.ndjson".into());
+        validate_harness_capture_args(&args).unwrap();
+        args.sample = Some(0.5);
+        assert!(validate_harness_capture_args(&args).is_err());
     }
 
     #[test]

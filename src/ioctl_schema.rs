@@ -106,6 +106,26 @@ pub struct Field {
     pub opaque: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerDirection {
+    In,
+    Out,
+    InOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PointerDescriptor {
+    pub field: String,
+    pub pointee_layout: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_expression: Option<String>,
+    pub direction: PointerDirection,
+}
+
 impl Field {
     pub fn scalar(name: &str, offset: u32, size: u32, kind: &str) -> Self {
         Self {
@@ -141,6 +161,8 @@ pub struct Descriptor {
     pub provenance: Vec<String>,
     #[serde(default)]
     pub replaces: Vec<String>,
+    #[serde(default)]
+    pub pointers: Vec<PointerDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -272,6 +294,54 @@ impl SchemaPack {
                 }
             }
         }
+        for descriptor in &self.descriptors {
+            for pointer in &descriptor.pointers {
+                let field = descriptor
+                    .fields
+                    .iter()
+                    .find(|field| field.name == pointer.field && field.kind == "pointer")
+                    .with_context(|| {
+                        format!(
+                            "pointer '{}' in '{}' does not name a pointer field",
+                            pointer.field, descriptor.id
+                        )
+                    })?;
+                if field.size != 8
+                    || !self
+                        .layouts
+                        .iter()
+                        .any(|layout| layout.id == pointer.pointee_layout)
+                    || (pointer.length_field.is_some() == pointer.length_expression.is_some())
+                {
+                    bail!(
+                        "invalid pointer descriptor '{}' in '{}'",
+                        pointer.field,
+                        descriptor.id
+                    );
+                }
+                if let Some(length_field) = &pointer.length_field {
+                    if !descriptor.fields.iter().any(|candidate| {
+                        candidate.name == *length_field
+                            && candidate.count.is_none()
+                            && matches!(candidate.size, 1 | 2 | 4 | 8)
+                    }) {
+                        bail!(
+                            "pointer '{}' in '{}' has unknown length field '{}'",
+                            pointer.field,
+                            descriptor.id,
+                            length_field
+                        );
+                    }
+                }
+                if pointer
+                    .length_expression
+                    .as_deref()
+                    .is_some_and(|expression| expression.trim().is_empty())
+                {
+                    bail!("empty pointer length expression in '{}'", descriptor.id);
+                }
+            }
+        }
         for evidence in &self.driver_evidence {
             if !matches!(evidence.confidence.as_str(), "exact" | "candidate")
                 || !self
@@ -384,14 +454,27 @@ pub struct GenericDecodedIoctl {
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
     descriptors: Vec<Descriptor>,
+    layouts: HashMap<String, Layout>,
     refresh_cmds: BTreeSet<u32>,
 }
 
 impl SchemaRegistry {
     pub fn from_packs(packs: Vec<SchemaPack>) -> Result<Self> {
         let mut descriptors: Vec<Descriptor> = Vec::new();
+        let mut layouts = HashMap::new();
         for pack in packs {
             pack.validate_model()?;
+            for layout in pack.layouts {
+                match layouts.get(&layout.id) {
+                    Some(existing) if existing != &layout => {
+                        bail!("conflicting layout '{}'", layout.id)
+                    }
+                    Some(_) => {}
+                    None => {
+                        layouts.insert(layout.id.clone(), layout);
+                    }
+                }
+            }
             for mut descriptor in pack.descriptors {
                 descriptor.fd_paths.sort();
                 descriptor.fd_paths.dedup();
@@ -427,19 +510,18 @@ impl SchemaRegistry {
         }
         Ok(Self {
             descriptors,
+            layouts,
             refresh_cmds,
         })
     }
 
-    pub fn decode(
+    pub fn descriptor(
         &self,
         cmd: u32,
-        payload: &[u8],
         fd_path: Option<&str>,
         family: Option<&str>,
-    ) -> Option<GenericDecodedIoctl> {
-        let descriptor = self
-            .descriptors
+    ) -> Option<&Descriptor> {
+        self.descriptors
             .iter()
             .enumerate()
             .filter(|(_, descriptor)| {
@@ -468,7 +550,21 @@ impl SchemaRegistry {
                     *index,
                 )
             })
-            .map(|(_, descriptor)| descriptor)?;
+            .map(|(_, descriptor)| descriptor)
+    }
+
+    pub fn layout(&self, id: &str) -> Option<&Layout> {
+        self.layouts.get(id)
+    }
+
+    pub fn decode(
+        &self,
+        cmd: u32,
+        payload: &[u8],
+        fd_path: Option<&str>,
+        family: Option<&str>,
+    ) -> Option<GenericDecodedIoctl> {
+        let descriptor = self.descriptor(cmd, fd_path, family)?;
         Some(GenericDecodedIoctl {
             name: descriptor.name.clone(),
             family: descriptor.family.clone(),
@@ -841,6 +937,16 @@ pub fn generate(args: &GenerateArgs) -> Result<()> {
         if let Some(layout) = layout {
             used_layouts.insert(layout.id.clone(), layout.clone());
         }
+        if let Some(mapping) = mapping {
+            for pointer in &mapping.pointers {
+                if let Some(layout) = layouts
+                    .values()
+                    .find(|layout| layout.id == pointer.pointee_layout)
+                {
+                    used_layouts.insert(layout.id.clone(), layout.clone());
+                }
+            }
+        }
         let size = (cmd >> 16) & 0x3fff;
         descriptors.push(Descriptor {
             id,
@@ -859,6 +965,7 @@ pub fn generate(args: &GenerateArgs) -> Result<()> {
             fields,
             provenance,
             replaces: mapping.map(|m| m.replaces.clone()).unwrap_or_default(),
+            pointers: mapping.map(|m| m.pointers.clone()).unwrap_or_default(),
         });
     }
     descriptors.sort_by(|left, right| natural_cmp(&left.id, &right.id));
@@ -1469,6 +1576,8 @@ struct ManifestEntry {
     evidence: String,
     #[serde(default)]
     replaces: Vec<String>,
+    #[serde(default)]
+    pointers: Vec<PointerDescriptor>,
 }
 
 fn exact_confidence() -> String {
@@ -1592,7 +1701,8 @@ fn emit_rust(pack: &SchemaPack) -> String {
     let mut output = String::from(
         "// @generated by neutron ioctl generate; do not edit.\n\
          pub struct Field { pub name: &'static str, pub offset: u32, pub size: u32, pub kind: &'static str, pub count: Option<u32>, pub opaque: bool }\n\
-         pub struct IoctlDescriptor { pub id: &'static str, pub name: &'static str, pub cmd: u32, pub magic: u32, pub nr: u32, pub direction: u32, pub size: u32, pub type_name: &'static str, pub family: Option<&'static str>, pub fd_paths: &'static [&'static str], pub capture_eligible: bool, pub provenance: &'static [&'static str], pub replaces: &'static [&'static str], pub fields: &'static [Field] }\n\n",
+         pub struct PointerDescriptor { pub field: &'static str, pub pointee_layout: &'static str, pub length_field: Option<&'static str>, pub length_expression: Option<&'static str>, pub direction: &'static str }\n\
+         pub struct IoctlDescriptor { pub id: &'static str, pub name: &'static str, pub cmd: u32, pub magic: u32, pub nr: u32, pub direction: u32, pub size: u32, pub type_name: &'static str, pub family: Option<&'static str>, pub fd_paths: &'static [&'static str], pub capture_eligible: bool, pub provenance: &'static [&'static str], pub replaces: &'static [&'static str], pub fields: &'static [Field], pub pointers: &'static [PointerDescriptor] }\n\n",
     );
     for (index, descriptor) in pack.descriptors.iter().enumerate() {
         output.push_str(&format!("const FIELDS_{index}: &[Field] = &[\n"));
@@ -1603,11 +1713,30 @@ fn emit_rust(pack: &SchemaPack) -> String {
             ));
         }
         output.push_str("];\n");
+        output.push_str(&format!(
+            "const POINTERS_{index}: &[PointerDescriptor] = &[\n"
+        ));
+        for pointer in &descriptor.pointers {
+            let direction = match pointer.direction {
+                PointerDirection::In => "in",
+                PointerDirection::Out => "out",
+                PointerDirection::InOut => "in_out",
+            };
+            output.push_str(&format!(
+                "    PointerDescriptor {{ field: {:?}, pointee_layout: {:?}, length_field: {:?}, length_expression: {:?}, direction: {:?} }},\n",
+                pointer.field,
+                pointer.pointee_layout,
+                pointer.length_field.as_deref(),
+                pointer.length_expression.as_deref(),
+                direction,
+            ));
+        }
+        output.push_str("];\n");
     }
     output.push_str("pub const IOCTL_DESCRIPTORS: &[IoctlDescriptor] = &[\n");
     for (index, descriptor) in pack.descriptors.iter().enumerate() {
         output.push_str(&format!(
-            "    IoctlDescriptor {{ id: {:?}, name: {:?}, cmd: {:#010x}, magic: {}, nr: {}, direction: {}, size: {}, type_name: {:?}, family: {:?}, fd_paths: &{:?}, capture_eligible: {}, provenance: &{:?}, replaces: &{:?}, fields: FIELDS_{} }},\n",
+            "    IoctlDescriptor {{ id: {:?}, name: {:?}, cmd: {:#010x}, magic: {}, nr: {}, direction: {}, size: {}, type_name: {:?}, family: {:?}, fd_paths: &{:?}, capture_eligible: {}, provenance: &{:?}, replaces: &{:?}, fields: FIELDS_{}, pointers: POINTERS_{} }},\n",
             descriptor.id,
             descriptor.name,
             descriptor.cmd,
@@ -1621,7 +1750,8 @@ fn emit_rust(pack: &SchemaPack) -> String {
             descriptor.capture_eligible,
             descriptor.provenance,
             descriptor.replaces,
-            index
+            index,
+            index,
         ));
     }
     output.push_str("];\n");

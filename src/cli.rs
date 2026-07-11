@@ -79,6 +79,20 @@ pub enum Command {
     /// Generate and inspect data-only ioctl ABI schema packs.
     #[command(subcommand)]
     Ioctl(IoctlCommand),
+
+    /// Capture, minimize, and replay authorized regression testcases.
+    #[command(subcommand)]
+    Harness(HarnessCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HarnessCommand {
+    /// Extract one captured event and its dependencies into a testcase directory.
+    Extract(crate::harness::ExtractArgs),
+    /// Minimize a testcase without synthesizing new values.
+    Minimize(crate::harness::MinimizeArgs),
+    /// Replay a testcase on one explicitly selected physical USB device.
+    Replay(crate::harness::ReplayArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -136,6 +150,11 @@ pub struct WindowArgs {
 
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {
+    /// Save replay-grade ioctl/Binder resources in an adjacent .blobs directory.
+    /// Requires --output and either --package or a non-zero --pid.
+    #[arg(long)]
+    pub harness_capture: bool,
+
     /// Root Android package for causal tracing. Unlike --match-package, this
     /// identifies root processes by UID plus /proc/<pid>/cmdline.
     #[arg(long)]
