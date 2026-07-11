@@ -1563,6 +1563,15 @@ mod tests {
     }
 
     #[test]
+    fn failed_permission_restore_remains_armed_for_drop() {
+        let mut granted = vec!["camera".to_string(), "bluetooth".to_string()];
+        let result = restore_permissions(&mut granted, |permission| permission == "camera");
+
+        assert!(result.is_err());
+        assert_eq!(granted, ["bluetooth"]);
+    }
+
+    #[test]
     fn wildcard_matching_handles_vendor_prefix_and_infix_patterns() {
         assert!(glob(
             "android.hardware.camera.provider.*",
