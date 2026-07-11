@@ -1447,6 +1447,17 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             root.uid = syscall.root_uid.or(root.uid);
         }
     }
+    for denial in &capture.denials {
+        if let Some(trace_id) = denial.trace_id.as_ref() {
+            let root = roots.entry(trace_id.clone()).or_default();
+            root.scenario_id = denial
+                .scenario_id
+                .clone()
+                .unwrap_or_else(|| root.scenario_id.clone());
+            root.package = denial.root_package.clone().or(root.package.clone());
+            root.uid = denial.root_uid.or(root.uid);
+        }
+    }
     if let Some(health) = health {
         for root in roots.values_mut() {
             root.package = root.package.clone().or(health.root_package.clone());
@@ -1672,6 +1683,71 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
                 service.observed_ioctls.push(label);
             }
         }
+    }
+
+    for denial in capture.denials {
+        let Some(trace_id) = denial.trace_id.clone() else {
+            continue;
+        };
+        let root = roots.get(&trace_id).cloned().unwrap_or_default();
+        let process_uid = denial
+            .uid
+            .or_else(|| (denial.depth == Some(0)).then_some(root.uid).flatten());
+        let (process_id, process_confidence) = capture_process(
+            snapshot,
+            denial.pid,
+            &trace_id,
+            process_uid,
+            merge_confidence,
+            denial.ts_ns,
+        );
+        let scenario_id = denial
+            .scenario_id
+            .clone()
+            .or_else(|| roots.get(&trace_id).map(|root| root.scenario_id.clone()))
+            .filter(|value| !value.is_empty());
+        if denial.depth == Some(0) {
+            if let Some(root_id) = root_id(&root) {
+                snapshot.relations.push(make_relation(
+                    "root_process",
+                    &root_id,
+                    &process_id,
+                    "capture",
+                    &process_confidence,
+                    Some(relation_name(denial.relation).into()),
+                    Some(trace_id.clone()),
+                    scenario_id.clone(),
+                    denial.span_id.clone(),
+                ));
+            }
+        }
+        let Some(device_id) = denial
+            .path
+            .as_ref()
+            .and_then(|path| device_by_path.get(path).cloned())
+        else {
+            continue;
+        };
+        let mut relation = make_relation(
+            "selinux_denial",
+            &process_id,
+            &device_id,
+            "capture",
+            &process_confidence,
+            Some(relation_name(denial.relation).into()),
+            Some(trace_id),
+            scenario_id,
+            denial.span_id,
+        );
+        relation.evidence.detail = Some(format!(
+            "{} {}:{} {{ {} }} {}",
+            denial.source_domain,
+            denial.target_type,
+            denial.tclass,
+            denial.permissions.join(" "),
+            denial.result,
+        ));
+        snapshot.relations.push(relation);
     }
 
     finish_snapshot(snapshot);
