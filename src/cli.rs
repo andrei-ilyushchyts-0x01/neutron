@@ -198,16 +198,29 @@ pub struct Args {
     pub follow_hal: bool,
 
     /// Maximum Binder expansion depth.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, visible_alias = "follow-depth", default_value_t = 4)]
     pub max_depth: u8,
 
     /// Maximum number of processes in the dynamic causal trace set.
     #[arg(
         long,
+        visible_alias = "follow-max-pids",
         default_value_t = 64,
         value_parser = clap::value_parser!(u32).range(1..=1024)
     )]
     pub max_processes: u32,
+
+    /// Remove non-root Binder followers after this time without another causal hop.
+    #[arg(long, default_value = "30s", value_name = "DURATION")]
+    pub follow_ttl: String,
+
+    /// Follow only callees in these SELinux domains. Repeat or comma-separate.
+    #[arg(long, value_delimiter = ',', num_args = 1.., value_name = "DOMAIN")]
+    pub follow_allow_domain: Vec<String>,
+
+    /// Never follow callees in these SELinux domains. Repeat or comma-separate.
+    #[arg(long, value_delimiter = ',', num_args = 1.., value_name = "DOMAIN")]
+    pub follow_deny_domain: Vec<String>,
 
     /// Live marker control socket path. Use `off` to disable it.
     #[arg(
