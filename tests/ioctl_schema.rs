@@ -1,6 +1,8 @@
 use neutron::ioctl_schema::{
-    Descriptor, Field, PackMetadata, RuntimeIdentity, SchemaPack, SchemaRegistry, Selectors,
+    install_registry, Descriptor, Field, PackMetadata, RuntimeIdentity, SchemaPack, SchemaRegistry,
+    Selectors,
 };
+use neutron::{decode::decode_ioctl_with_context, decode::render_decoded_ioctl_json};
 
 fn descriptor(id: &str, name: &str, cmd: u32, path: &str) -> Descriptor {
     Descriptor {
@@ -139,7 +141,7 @@ fn pack_hash_and_runtime_abi_are_verified() {
 
 #[test]
 fn read_descriptors_are_exported_as_refresh_commands() {
-    let cmd = 0x8010_7a02;
+    let cmd = 0x8018_7a02;
     let registry = SchemaRegistry::from_packs(vec![pack(vec![descriptor(
         "sample.read",
         "SAMPLE_READ",
@@ -148,4 +150,39 @@ fn read_descriptors_are_exported_as_refresh_commands() {
     )])])
     .unwrap();
     assert_eq!(registry.refresh_cmds().collect::<Vec<_>>(), vec![cmd]);
+}
+
+#[test]
+fn active_pack_adds_ioctl_fields_without_replacing_legacy_objects() {
+    let cmd = 0xc018_4800;
+    let mut dma = descriptor(
+        "dma.heap.alloc",
+        "DMA_HEAP_IOCTL_ALLOC",
+        cmd,
+        "/dev/dma_heap/*",
+    );
+    dma.family = Some("dma_heap".into());
+    dma.fields[1].name = "returned_fd".into();
+    install_registry(SchemaRegistry::from_packs(vec![pack(vec![dma])]).unwrap());
+    let mut payload = [0u8; 24];
+    payload[0..8].copy_from_slice(&4096u64.to_le_bytes());
+    payload[8..12].copy_from_slice(&12i32.to_le_bytes());
+
+    let decoded = decode_ioctl_with_context(
+        cmd,
+        &payload,
+        0,
+        None,
+        Some("/dev/dma_heap/system"),
+    );
+    let json: serde_json::Value = serde_json::from_str(&format!(
+        "{{{}}}",
+        render_decoded_ioctl_json(&decoded).trim_start_matches(',')
+    ))
+    .unwrap();
+    assert_eq!(json["ioctl_name"], "DMA_HEAP_IOCTL_ALLOC");
+    assert_eq!(json["dma_heap"]["returned_fd"], 12);
+    assert_eq!(json["ioctl_fields"]["expected_size"], 24);
+    assert_eq!(json["ioctl_fields"]["values"]["len"], 4096);
+    assert_eq!(json["ioctl_fields"]["values"]["returned_fd"], 12);
 }
