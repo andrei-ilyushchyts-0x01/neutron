@@ -130,3 +130,29 @@ fn native_output_rejects_hardlink_without_truncating_source() {
     assert_eq!(std::fs::read(&source).unwrap(), b"keep-me");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn native_map_bounds_recursive_symbol_inputs() {
+    let root = std::env::temp_dir().join(format!(
+        "neutron-native-symbol-bound-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let symbols = root.join("symbols");
+    std::fs::create_dir_all(&symbols).unwrap();
+    let capture = root.join("capture.ndjson");
+    std::fs::write(&capture, "").unwrap();
+    for index in 0..=256 {
+        std::fs::write(symbols.join(index.to_string()), b"not-elf").unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_neutron"))
+        .args(["native-map", capture.to_str().unwrap(), "--symbols"])
+        .arg(&symbols)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("symbol artifact count"));
+    let _ = std::fs::remove_dir_all(root);
+}
