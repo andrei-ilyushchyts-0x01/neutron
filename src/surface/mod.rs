@@ -299,11 +299,20 @@ impl RootSelector {
 pub struct ReachableResult {
     pub schema: String,
     pub root: String,
+    pub health: ReachabilityHealth,
     pub nodes: Vec<String>,
     pub relations: Vec<Relation>,
     pub services: Vec<Service>,
     pub processes: Vec<Process>,
     pub devices: Vec<Device>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReachabilityHealth {
+    pub status: String,
+    pub confidence: String,
+    pub captures: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 pub fn run(command: SurfaceCommand) -> Result<()> {
@@ -1847,6 +1856,14 @@ fn add_snapshot_warning(snapshot: &mut SurfaceSnapshot, warning: impl Into<Strin
 
 pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<ReachableResult> {
     let root_id = selector.id();
+    let matching_captures: Vec<_> = snapshot
+        .captures
+        .iter()
+        .filter(|capture| match selector {
+            RootSelector::Package(package) => capture.root_package.as_deref() == Some(package),
+            RootSelector::Uid(uid) => capture.root_uid == Some(*uid),
+        })
+        .collect();
     let trace_ids: BTreeSet<String> = snapshot
         .captures
         .iter()
@@ -1906,9 +1923,46 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
         .filter(|device| nodes.contains(&device.id))
         .cloned()
         .collect();
+    let mut warnings = Vec::new();
+    let status = if matching_captures.is_empty() {
+        warnings.push(format!("no matching capture for {root_id}"));
+        "no_evidence"
+    } else if matching_captures
+        .iter()
+        .any(|capture| capture.health != "complete")
+    {
+        warnings.push("reachable evidence is degraded or incomplete".into());
+        "degraded"
+    } else {
+        "complete"
+    };
+    let confidence = if relations.is_empty() {
+        if !matching_captures.is_empty() {
+            warnings.push("matching capture contains no supported causal reachability edges".into());
+        }
+        "none"
+    } else if relations.iter().all(|relation| {
+        relation.confidence == "exact"
+            && relation.causal_relation.as_deref() == Some("exact")
+    }) {
+        "exact"
+    } else {
+        "candidate"
+    };
+    let mut captures: Vec<_> = matching_captures
+        .iter()
+        .map(|capture| capture.id.clone())
+        .collect();
+    captures.sort();
     Ok(ReachableResult {
         schema: QUERY_SCHEMA.into(),
         root: root_id,
+        health: ReachabilityHealth {
+            status: status.into(),
+            confidence: confidence.into(),
+            captures,
+            warnings,
+        },
         nodes: nodes.into_iter().collect(),
         relations,
         services,
