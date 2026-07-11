@@ -51,6 +51,161 @@ impl CausalRelation {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct FollowCandidate<'a> {
+    pub caller_comm: Option<&'a str>,
+    pub caller_domain: Option<&'a str>,
+    pub callee_comm: Option<&'a str>,
+    pub callee_domain: Option<&'a str>,
+    pub caller_relation: CausalRelation,
+    pub caller_depth: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FollowDecision {
+    Allow,
+    Block(&'static str),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FollowPolicy {
+    allow_domains: BTreeSet<String>,
+    deny_domains: BTreeSet<String>,
+}
+
+impl FollowPolicy {
+    pub fn new<A, D>(allow_domains: A, deny_domains: D) -> Result<Self>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<str>,
+        D: IntoIterator,
+        D::Item: AsRef<str>,
+    {
+        Ok(Self {
+            allow_domains: normalize_domains(allow_domains)?,
+            deny_domains: normalize_domains(deny_domains)?,
+        })
+    }
+
+    pub fn decide(&self, candidate: FollowCandidate<'_>) -> FollowDecision {
+        let callee_domain = candidate.callee_domain.and_then(normalize_domain_lossy);
+        if callee_domain
+            .as_ref()
+            .is_some_and(|domain| self.deny_domains.contains(domain))
+        {
+            return FollowDecision::Block("denied_domain");
+        }
+        if !self.allow_domains.is_empty()
+            && callee_domain
+                .as_ref()
+                .is_none_or(|domain| !self.allow_domains.contains(domain))
+        {
+            return FollowDecision::Block("domain_not_allowed");
+        }
+        if candidate.caller_depth >= 1
+            && (is_service_manager(candidate.caller_comm, candidate.caller_domain)
+                || is_service_manager(candidate.callee_comm, candidate.callee_domain))
+        {
+            return FollowDecision::Block("servicemanager_transit");
+        }
+        if is_named_process(
+            candidate.caller_comm,
+            candidate.caller_domain,
+            "system_server",
+        ) && candidate.caller_relation != CausalRelation::Exact
+        {
+            return FollowDecision::Block("inferred_system_server_transit");
+        }
+        FollowDecision::Allow
+    }
+}
+
+fn normalize_domains<I>(domains: I) -> Result<BTreeSet<String>>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    domains
+        .into_iter()
+        .map(|domain| normalize_domain(domain.as_ref()))
+        .collect()
+}
+
+pub fn normalize_domain(domain: &str) -> Result<String> {
+    let domain = domain.trim();
+    let domain = if domain.starts_with("u:") {
+        domain
+            .split(':')
+            .nth(2)
+            .context("invalid SELinux context")?
+    } else {
+        domain
+    };
+    if domain.is_empty()
+        || domain.len() > 128
+        || !domain
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("invalid SELinux domain '{domain}'");
+    }
+    Ok(domain.to_string())
+}
+
+fn normalize_domain_lossy(domain: &str) -> Option<String> {
+    normalize_domain(domain).ok()
+}
+
+fn is_service_manager(comm: Option<&str>, domain: Option<&str>) -> bool {
+    ["servicemanager", "hwservicemanager", "vndservicemanager"]
+        .into_iter()
+        .any(|name| is_named_process(comm, domain, name))
+}
+
+fn is_named_process(comm: Option<&str>, domain: Option<&str>, name: &str) -> bool {
+    comm.is_some_and(|value| value.trim() == name)
+        || domain
+            .and_then(normalize_domain_lossy)
+            .is_some_and(|value| value == name)
+}
+
+pub fn parse_follow_ttl(raw: &str) -> Result<Duration> {
+    let raw = raw.trim();
+    let (number, multiplier) = if let Some(value) = raw.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = raw.strip_suffix('s') {
+        (value, 1_000)
+    } else if let Some(value) = raw.strip_suffix('m') {
+        (value, 60_000)
+    } else {
+        bail!("invalid follow TTL '{raw}' (expected ms, s, or m suffix)");
+    };
+    let millis = number
+        .parse::<u64>()
+        .with_context(|| format!("invalid follow TTL '{raw}'"))?
+        .checked_mul(multiplier)
+        .context("follow TTL overflow")?;
+    if millis == 0 || millis > 86_400_000 {
+        bail!("follow TTL must be within 1ms..=24h");
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+pub fn expired_followed_pids(
+    last_seen_ns: &BTreeMap<u32, u64>,
+    root_pids: &BTreeSet<u32>,
+    now_ns: u64,
+    ttl_ns: u64,
+) -> Vec<u32> {
+    last_seen_ns
+        .iter()
+        .filter_map(|(pid, seen_ns)| {
+            (!root_pids.contains(pid) && now_ns.saturating_sub(*seen_ns) >= ttl_ns)
+                .then_some(*pid)
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CausalWire {
     pub parent_debug_id: u32,
