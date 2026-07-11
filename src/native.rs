@@ -23,6 +23,7 @@ const MAX_ARTIFACTS: usize = 256;
 const MAX_ARTIFACT_BYTES: u64 = 512 * 1_024 * 1_024;
 const MAX_TOTAL_ARTIFACT_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
 const MAX_EXEMPLARS: usize = 32;
+const MAX_SYMBOL_DEPTH: usize = 32;
 
 #[derive(Args, Debug, Clone)]
 pub struct NativeMapArgs {
@@ -888,10 +889,24 @@ impl SymbolIndex {
             let mut artifacts = Vec::new();
             collect_files(artifact_dir, &mut artifacts)?;
             artifacts.sort();
+            if paths.len().saturating_add(artifacts.len()) > MAX_ARTIFACTS {
+                bail!("symbol artifact count exceeds {MAX_ARTIFACTS}");
+            }
             paths.extend(artifacts);
         }
         let mut index = Self::default();
+        let mut total_bytes = 0u64;
         for path in paths {
+            let size = match fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(_) => continue,
+            };
+            total_bytes = total_bytes
+                .checked_add(size)
+                .context("symbol artifact size overflow")?;
+            if size > MAX_ARTIFACT_BYTES || total_bytes > MAX_TOTAL_ARTIFACT_BYTES {
+                bail!("symbol artifact byte limit exceeded");
+            }
             let Ok(bytes) = fs::read(&path) else { continue };
             let Ok(elf) = Elf::parse(&bytes) else {
                 continue;
@@ -911,7 +926,17 @@ impl SymbolIndex {
 }
 
 fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    collect_files_at(root, files, 0)
+}
+
+fn collect_files_at(root: &Path, files: &mut Vec<PathBuf>, depth: usize) -> Result<()> {
+    if depth > MAX_SYMBOL_DEPTH {
+        bail!("symbol directory depth exceeds {MAX_SYMBOL_DEPTH}");
+    }
     if root.is_file() {
+        if files.len() >= MAX_ARTIFACTS {
+            bail!("symbol artifact count exceeds {MAX_ARTIFACTS}");
+        }
         files.push(root.to_path_buf());
         return Ok(());
     }
@@ -928,8 +953,11 @@ fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         }
         let path = entry.path();
         if file_type.is_dir() {
-            collect_files(&path, files)?;
+            collect_files_at(&path, files, depth + 1)?;
         } else if file_type.is_file() {
+            if files.len() >= MAX_ARTIFACTS {
+                bail!("symbol artifact count exceeds {MAX_ARTIFACTS}");
+            }
             files.push(path);
         }
     }
