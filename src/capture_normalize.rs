@@ -481,9 +481,7 @@ fn parse_selinux_denial(object: &Map<String, Value>) -> Option<SelinuxSpan> {
         source_domain: text(object, "source_domain")
             .unwrap_or_default()
             .to_string(),
-        target_type: text(object, "target_type")
-            .unwrap_or_default()
-            .to_string(),
+        target_type: text(object, "target_type").unwrap_or_default().to_string(),
         tclass: text(object, "tclass").unwrap_or_default().to_string(),
         permissions: object
             .get("permissions")

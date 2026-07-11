@@ -200,8 +200,7 @@ pub fn expired_followed_pids(
     last_seen_ns
         .iter()
         .filter_map(|(pid, seen_ns)| {
-            (!root_pids.contains(pid) && now_ns.saturating_sub(*seen_ns) >= ttl_ns)
-                .then_some(*pid)
+            (!root_pids.contains(pid) && now_ns.saturating_sub(*seen_ns) >= ttl_ns).then_some(*pid)
         })
         .collect()
 }

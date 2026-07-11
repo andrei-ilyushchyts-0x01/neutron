@@ -621,11 +621,9 @@ fn selinux_denials_are_surface_evidence_but_not_reachability_edges() {
         .expect("SELinux relation");
     assert_eq!(denial.from, "process:capture:trace-denial:100");
     assert_eq!(denial.to, snapshot.devices[0].id);
-    assert!(denial
-        .evidence
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail.contains("untrusted_app tee_device:chr_file { ioctl } denied")));
+    assert!(denial.evidence.detail.as_deref().is_some_and(
+        |detail| detail.contains("untrusted_app tee_device:chr_file { ioctl } denied")
+    ));
 
     let reached = reachable(
         &snapshot,
@@ -636,7 +634,10 @@ fn selinux_denials_are_surface_evidence_but_not_reachability_edges() {
         .nodes
         .iter()
         .any(|node| node == "process:capture:trace-denial:100"));
-    assert!(!reached.nodes.iter().any(|node| node == &snapshot.devices[0].id));
+    assert!(!reached
+        .nodes
+        .iter()
+        .any(|node| node == &snapshot.devices[0].id));
     assert!(reached
         .relations
         .iter()

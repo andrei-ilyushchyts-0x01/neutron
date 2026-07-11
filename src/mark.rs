@@ -127,10 +127,7 @@ pub fn render_line(args: &MarkArgs) -> Result<String> {
 /// Entry point — invoked from `main.rs` when the user runs
 /// `neutron mark <name> ...`.
 pub fn run(args: MarkArgs) -> Result<()> {
-    if args.output.is_none()
-        && args.phase.is_some()
-        && args.control_socket != "off"
-    {
+    if args.output.is_none() && args.phase.is_some() && args.control_socket != "off" {
         let phase = normalize_phase(args.phase.as_deref())?.context("marker phase required")?;
         let mut meta = std::collections::BTreeMap::new();
         for kv in &args.meta {
@@ -150,7 +147,12 @@ pub fn run(args: MarkArgs) -> Result<()> {
                 meta,
             },
         )
-        .with_context(|| format!("live marker control socket {} is unavailable", args.control_socket))?;
+        .with_context(|| {
+            format!(
+                "live marker control socket {} is unavailable",
+                args.control_socket
+            )
+        })?;
         return Ok(());
     }
     let line = render_line(&args)?;
@@ -224,7 +226,10 @@ mod tests {
         let mut a = args("scenario");
         a.phase = Some("start".into());
         a.control_socket = std::env::temp_dir()
-            .join(format!("neutron-missing-control-{}.sock", std::process::id()))
+            .join(format!(
+                "neutron-missing-control-{}.sock",
+                std::process::id()
+            ))
             .to_string_lossy()
             .into_owned();
 

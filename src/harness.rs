@@ -2222,19 +2222,11 @@ fn adb_execute_argv(
         "timeout".into(),
         format!("{}s", timeout.as_secs().max(1)),
     ];
-    argv.extend(expand_argv_at(
-        execute,
-        serial,
-        package,
-        remote_artifact,
-    ));
+    argv.extend(expand_argv_at(execute, serial, package, remote_artifact));
     argv
 }
 
-fn adb_stage_files(
-    directory: &Path,
-    resources: &ResourceCatalog,
-) -> Result<Vec<AdbStageAsset>> {
+fn adb_stage_files(directory: &Path, resources: &ResourceCatalog) -> Result<Vec<AdbStageAsset>> {
     let mut assets = Vec::new();
     for (name, limit) in [
         ("replay", MAX_REPLAY_BINARY_BYTES),
@@ -2242,7 +2234,11 @@ fn adb_stage_files(
         ("metadata.json", MAX_EVENT_BYTES),
         ("resources.json", MAX_EVENT_BYTES),
     ] {
-        assets.push(checked_stage_asset(directory.join(name), name.into(), limit)?);
+        assets.push(checked_stage_asset(
+            directory.join(name),
+            name.into(),
+            limit,
+        )?);
     }
     let mut digests = HashSet::new();
     for resource in &resources.resources {
@@ -2276,10 +2272,16 @@ fn checked_stage_asset(path: PathBuf, remote_path: String, limit: u64) -> Result
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("missing ADB replay asset {}", path.display()))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        bail!("ADB replay asset must be a regular file: {}", path.display());
+        bail!(
+            "ADB replay asset must be a regular file: {}",
+            path.display()
+        );
     }
     if metadata.len() > limit {
-        bail!("ADB replay asset exceeds its size limit: {}", path.display());
+        bail!(
+            "ADB replay asset exceeds its size limit: {}",
+            path.display()
+        );
     }
     Ok(AdbStageAsset {
         local_path: path,
@@ -2334,7 +2336,11 @@ fn stage_adb_artifact(directory: &Path, serial: &str, timeout: Duration) -> Resu
             run_checked_adb(
                 &adb_argv(
                     serial,
-                    ["push".into(), local, format!("{remote}/{}", asset.remote_path)],
+                    [
+                        "push".into(),
+                        local,
+                        format!("{remote}/{}", asset.remote_path),
+                    ],
                 ),
                 timeout,
                 "asset push",
@@ -2372,12 +2378,7 @@ fn cleanup_adb_artifact(serial: &str, remote: &str, timeout: Duration) -> Result
     run_checked_adb(
         &adb_argv(
             serial,
-            [
-                "shell".into(),
-                "rm".into(),
-                "-rf".into(),
-                remote.into(),
-            ],
+            ["shell".into(), "rm".into(), "-rf".into(), remote.into()],
         ),
         timeout,
         "staging cleanup",

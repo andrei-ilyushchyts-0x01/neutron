@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use neutron::cli::{Cli, Command};
 use neutron::causal::CausalRelation;
+use neutron::cli::{Cli, Command};
 use neutron::selinux::{
     explain_from_reader, parse_avc_line, process_context_relation, render_explanation_text,
     run as run_selinux, DenialDeduper, ExplainArgs, ExplainFormat, SelinuxCommand,
@@ -63,10 +63,7 @@ fn process_wide_binder_context_is_inferred_for_selinux_denials() {
     };
 
     assert_eq!(process_context_relation(root), CausalRelation::Exact);
-    assert_eq!(
-        process_context_relation(binder),
-        CausalRelation::Inferred
-    );
+    assert_eq!(process_context_relation(binder), CausalRelation::Inferred);
 }
 
 #[test]

@@ -25,11 +25,7 @@ fn candidate<'a>(
 
 #[test]
 fn domain_policy_denies_before_allowing_and_rejects_unknown_allowlist_members() {
-    let policy = FollowPolicy::new(
-        ["hal_camera_default", "vendor_bad"],
-        ["vendor_bad"],
-    )
-    .unwrap();
+    let policy = FollowPolicy::new(["hal_camera_default", "vendor_bad"], ["vendor_bad"]).unwrap();
 
     assert_eq!(
         policy.decide(candidate(
@@ -59,8 +55,7 @@ fn domain_policy_denies_before_allowing_and_rejects_unknown_allowlist_members() 
 
 #[test]
 fn special_process_transit_is_bounded() {
-    let policy = FollowPolicy::new(std::iter::empty::<&str>(), std::iter::empty::<&str>())
-        .unwrap();
+    let policy = FollowPolicy::new(std::iter::empty::<&str>(), std::iter::empty::<&str>()).unwrap();
     let mut through_manager = candidate(
         Some("servicemanager"),
         Some("hal_camera_default"),
