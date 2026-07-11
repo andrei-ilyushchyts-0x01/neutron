@@ -1,6 +1,6 @@
 use neutron::ioctl_schema::{
-    install_registry, load_selected_packs, Descriptor, Field, PackMetadata, RuntimeIdentity,
-    SchemaPack, SchemaRegistry, Selectors,
+    install_registry, load_selected_packs, Descriptor, Field, PackMetadata, PointerDescriptor,
+    PointerDirection, RuntimeIdentity, SchemaPack, SchemaRegistry, Selectors,
 };
 use neutron::{decode::decode_ioctl_with_context, decode::render_decoded_ioctl_json};
 
@@ -24,7 +24,31 @@ fn descriptor(id: &str, name: &str, cmd: u32, path: &str) -> Descriptor {
         capture_eligible: true,
         provenance: vec!["sample.h:1".into()],
         replaces: Vec::new(),
+        pointers: Vec::new(),
     }
+}
+
+#[test]
+fn pointer_graph_requires_layout_length_and_direction() {
+    let cmd = 0xc018_7a01;
+    let mut value = descriptor("sample.alloc", "SAMPLE_ALLOC", cmd, "/dev/sample*");
+    value.pointers.push(PointerDescriptor {
+        field: "ptr".into(),
+        pointee_layout: "sample.item".into(),
+        length_field: Some("len".into()),
+        length_expression: None,
+        direction: PointerDirection::InOut,
+    });
+    let mut value_pack = pack(vec![value]);
+    value_pack.layouts.push(neutron::ioctl_schema::Layout {
+        id: "sample.item".into(),
+        type_name: "struct item".into(),
+        size: 4,
+        align: 4,
+        fields: vec![Field::scalar("value", 0, 4, "u32")],
+    });
+    value_pack.seal().unwrap();
+    SchemaRegistry::from_packs(vec![value_pack]).unwrap();
 }
 
 fn pack(descriptors: Vec<Descriptor>) -> SchemaPack {
