@@ -225,6 +225,8 @@ pub struct RunnerContract {
     pub schema: String,
     #[serde(default)]
     pub transport: RunnerTransport,
+    #[serde(default)]
+    pub capabilities: Vec<RunnerCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepare: Option<Vec<String>>,
     pub execute: Vec<String>,
@@ -240,6 +242,14 @@ pub enum RunnerTransport {
     #[default]
     Host,
     Adb,
+}
+
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerCapability {
+    CausalSteps,
+    BinderTransactions,
+    TimingDelays,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1603,6 +1613,7 @@ fn write_artifact(
         let runner = RunnerContract {
             schema: HARNESS_SCHEMA.into(),
             transport: RunnerTransport::Adb,
+            capabilities: Vec::new(),
             prepare: None,
             execute: vec!["{artifact}/replay".into(), "{artifact}/input.bin".into()],
             recover: None,
