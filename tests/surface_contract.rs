@@ -643,6 +643,60 @@ fn device_boundary_outcomes_and_crashes_remain_honest() {
 }
 
 #[test]
+fn surface_models_dma_allocations_and_mmap_lifetimes_as_resources() {
+    let mut snapshot = scan_with_reader(&fixture()).expect("static scan");
+    let capture = r#"
+{"type":"marker","phase":"start","name":"resources","scenario_id":"resources","trace_id":"trace-resources","root_package":"com.example.resources"}
+{"type":"syscall","ts_ns":10,"pid":42,"tid":42,"uid":1000,"name":"ioctl","phase":"exit","ret":0,"args":[7,3222816768,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","ioctl_family":"dma_heap","ioctl_name":"DMA_HEAP_IOCTL_ALLOC","data_phase":"exit","dma_heap":{"len":16384,"returned_fd":12,"fd_flags":524290,"heap_flags":0},"trace_id":"trace-resources","span_id":"dma-1","scenario_id":"resources","depth":0,"causal_relation":"exact"}
+{"type":"syscall","ts_ns":20,"pid":42,"tid":42,"uid":1000,"name":"mmap","phase":"exit","ret":4096,"args":[0,8192,3,1,7,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-resources","span_id":"z-map","scenario_id":"resources","depth":0,"causal_relation":"exact"}
+{"type":"syscall","ts_ns":30,"pid":42,"tid":42,"uid":1000,"name":"munmap","phase":"exit","ret":0,"args":[4096,8192,0,0,0,0],"trace_id":"trace-resources","span_id":"a-unmap","scenario_id":"resources","depth":0,"causal_relation":"exact"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.resources","boot_id":"boot-a"}
+"#;
+    import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
+
+    assert_eq!(snapshot.resources.len(), 2);
+    let allocation = snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.kind == "dma_heap_allocation")
+        .expect("DMA allocation resource");
+    assert_eq!(allocation.length, Some(16_384));
+    assert_eq!(allocation.returned_fd, Some(12));
+    assert!(allocation.active);
+
+    let mapping = snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.kind == "memory_mapping")
+        .expect("mapping resource");
+    assert_eq!(mapping.address, Some(4096));
+    assert_eq!(mapping.length, Some(8192));
+    assert!(!mapping.active);
+    assert_eq!(mapping.released_span_id.as_deref(), Some("a-unmap"));
+
+    let relation_types: BTreeSet<_> = snapshot
+        .relations
+        .iter()
+        .filter(|relation| relation.trace_id.as_deref() == Some("trace-resources"))
+        .map(|relation| relation.relation_type.as_str())
+        .collect();
+    assert!(relation_types.is_superset(&BTreeSet::from([
+        "allocation",
+        "allocated_from",
+        "mapping",
+        "mapped_from",
+        "munmap",
+    ])));
+
+    let reached = reachable(
+        &snapshot,
+        &RootSelector::Package("com.example.resources".into()),
+    )
+    .expect("resource reachability");
+    assert_eq!(reached.resources.len(), 2);
+}
+
+#[test]
 fn failed_device_open_is_attempt_evidence_not_reachability() {
     let mut snapshot = scan_with_reader(&fixture()).expect("static scan");
     let capture = r#"
