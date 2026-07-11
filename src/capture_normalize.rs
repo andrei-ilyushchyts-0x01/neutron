@@ -136,6 +136,8 @@ pub struct CaptureHealth {
     pub traced_process_limit: u64,
     pub binder_depth_limit: u64,
     pub binder_follow_failed: u64,
+    pub follow_policy_filtered: u64,
+    pub follow_ttl_expired: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -533,6 +535,8 @@ fn merge_health(capture: &mut NormalizedCapture, object: &Map<String, Value>) {
         traced_process_limit: number_u64(object, "traced_process_limit").unwrap_or(0),
         binder_depth_limit: number_u64(object, "binder_depth_limit").unwrap_or(0),
         binder_follow_failed: number_u64(object, "binder_follow_failed").unwrap_or(0),
+        follow_policy_filtered: number_u64(object, "follow_policy_filtered").unwrap_or(0),
+        follow_ttl_expired: number_u64(object, "follow_ttl_expired").unwrap_or(0),
     };
     for (value, label) in [
         (health.traced_process_limit, "traced process limit"),
@@ -568,6 +572,16 @@ fn merge_health(capture: &mut NormalizedCapture, object: &Map<String, Value>) {
         capture
             .health_warnings
             .insert("output cap truncated the capture".into());
+    }
+    if health.follow_policy_filtered > 0 {
+        capture
+            .health_warnings
+            .insert("Binder branches were policy-filtered".into());
+    }
+    if health.follow_ttl_expired > 0 {
+        capture
+            .health_warnings
+            .insert("Binder followers expired by TTL".into());
     }
     capture.health = Some(health);
 }
