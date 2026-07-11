@@ -12,7 +12,8 @@
 //!   3. Add it to `COUNTER_LABELS` below.
 
 use neutron_common::{
-    COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED, COUNTER_EVENTS_SUBMITTED,
+    COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED,
+    COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT, COUNTER_EVENTS_SUBMITTED,
     COUNTER_FD_LOOKUP_MISSED, COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED,
     COUNTER_IOCTL_REFRESH_MISSED, COUNTER_PATH_READ_FAILED, COUNTER_PATH_TRUNCATED,
     COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED,
@@ -440,6 +441,15 @@ mod tests {
     fn has_degradation_false_when_only_volume_counters_set() {
         let mut h = CaptureHealth::default();
         h.slots[COUNTER_EVENTS_SUBMITTED as usize] = 12_345;
+        assert!(!h.has_degradation());
+    }
+
+    #[test]
+    fn admission_boundary_exit_is_visible_without_marking_loss() {
+        let mut h = CaptureHealth::default();
+        h.slots[COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT as usize] = 3;
+
+        assert_eq!(h.get(COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT), 3);
         assert!(!h.has_degradation());
     }
 
