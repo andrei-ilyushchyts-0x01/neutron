@@ -1369,6 +1369,25 @@ struct PermissionGuard<'a> {
     granted: Vec<String>,
 }
 
+fn restore_permissions(
+    granted: &mut Vec<String>,
+    mut revoke: impl FnMut(&str) -> bool,
+) -> Result<Vec<String>> {
+    let pending = std::mem::take(granted);
+    let mut failures = Vec::new();
+    for permission in pending.iter().rev() {
+        if !revoke(permission) {
+            failures.push(permission.clone());
+        }
+    }
+    if !failures.is_empty() {
+        failures.reverse();
+        *granted = failures;
+        bail!("failed to restore permissions: {}", granted.join(", "));
+    }
+    Ok(pending)
+}
+
 impl<'a> PermissionGuard<'a> {
     fn new(package: &'a str) -> Self {
         Self {
@@ -1395,17 +1414,10 @@ impl<'a> PermissionGuard<'a> {
     }
 
     fn restore(&mut self) -> Result<Vec<String>> {
-        let granted = std::mem::take(&mut self.granted);
-        let mut failures = Vec::new();
-        for permission in granted.iter().rev() {
-            if !command_success("/system/bin/pm", &["revoke", self.package, permission])? {
-                failures.push(permission.as_str());
-            }
-        }
-        if !failures.is_empty() {
-            bail!("failed to restore permissions: {}", failures.join(", "));
-        }
-        Ok(granted)
+        restore_permissions(&mut self.granted, |permission| {
+            command_success("/system/bin/pm", &["revoke", self.package, permission])
+                .unwrap_or(false)
+        })
     }
 }
 
