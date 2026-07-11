@@ -172,6 +172,23 @@ fn binder_received_enriches_the_callee_process_identity() {
 }
 
 #[test]
+fn selinux_denials_preserve_policy_and_causal_evidence() {
+    let input = r#"{"type":"selinux_denial","ts_ns":90,"pid":42,"tid":43,"uid":1000,"comm":"keymint","source_domain":"hal_keymint_default","target_type":"tee_device","tclass":"chr_file","permissions":["ioctl","read"],"path":"/dev/trusty-ipc-dev0","result":"denied","trace_id":"trace-a","scenario_id":"surface-observe","span_id":"denial-1","parent_span_id":"binder-1","depth":1,"root_package":"com.example.app","root_uid":10123,"causal_relation":"inferred"}"#;
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+
+    assert_eq!(capture.denials.len(), 1);
+    let denial = &capture.denials[0];
+    assert_eq!(denial.pid, 42);
+    assert_eq!(denial.tid, 43);
+    assert_eq!(denial.source_domain, "hal_keymint_default");
+    assert_eq!(denial.target_type, "tee_device");
+    assert_eq!(denial.permissions, ["ioctl", "read"]);
+    assert_eq!(denial.path.as_deref(), Some("/dev/trusty-ipc-dev0"));
+    assert_eq!(denial.relation, CausalRelation::Inferred);
+    assert!(capture.has_causal);
+}
+
+#[test]
 fn syscall_uid_is_retained_and_pid_zero_is_rejected() {
     let input = r#"
 {"type":"syscall","pid":42,"uid":1000,"tid":42,"name":"ioctl","phase":"exit","trace_id":"trace-a","span_id":"valid"}
