@@ -92,6 +92,29 @@ pub struct ExitSpan {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct SelinuxSpan {
+    pub ts_ns: Option<u64>,
+    pub pid: u32,
+    pub tid: u32,
+    pub uid: Option<u32>,
+    pub comm: Option<String>,
+    pub source_domain: String,
+    pub target_type: String,
+    pub tclass: String,
+    pub permissions: Vec<String>,
+    pub path: Option<String>,
+    pub result: String,
+    pub trace_id: Option<String>,
+    pub scenario_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+    pub depth: Option<u8>,
+    pub root_package: Option<String>,
+    pub root_uid: Option<u32>,
+    pub relation: CausalRelation,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Marker {
     pub ts_ns: Option<u64>,
     pub name: String,
@@ -120,6 +143,7 @@ pub struct NormalizedCapture {
     pub binders: Vec<BinderSpan>,
     pub syscalls: Vec<SyscallSpan>,
     pub exits: Vec<ExitSpan>,
+    pub denials: Vec<SelinuxSpan>,
     pub markers: Vec<Marker>,
     pub health: Option<CaptureHealth>,
     pub trace_packages: BTreeMap<String, String>,
@@ -182,6 +206,12 @@ pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
                 capture.has_causal |= has_causal(object);
                 if let Some(exit) = parse_exit(object) {
                     capture.exits.push(exit);
+                }
+            }
+            "selinux_denial" => {
+                capture.has_causal |= has_causal(object);
+                if let Some(denial) = parse_selinux_denial(object) {
+                    capture.denials.push(denial);
                 }
             }
             "marker" => capture.markers.push(parse_marker(object)),
@@ -424,6 +454,45 @@ fn parse_exit(object: &Map<String, Value>) -> Option<ExitSpan> {
             .or_else(|| text(object, "classification"))
             .unwrap_or("process exit")
             .to_string(),
+        trace_id: text(object, "trace_id").map(str::to_string),
+        scenario_id: text(object, "scenario_id").map(str::to_string),
+        span_id: text(object, "span_id").map(str::to_string),
+        parent_span_id: text(object, "parent_span_id").map(str::to_string),
+        depth: number_u64(object, "depth").and_then(|value| u8::try_from(value).ok()),
+        root_package: text(object, "root_package").map(str::to_string),
+        root_uid: number_u32(object, "root_uid"),
+        relation: relation(object).unwrap_or_default(),
+    })
+}
+
+fn parse_selinux_denial(object: &Map<String, Value>) -> Option<SelinuxSpan> {
+    let pid = number_u32(object, "pid")?;
+    if pid == 0 {
+        return None;
+    }
+    Some(SelinuxSpan {
+        ts_ns: number_u64(object, "ts_ns"),
+        pid,
+        tid: number_u32(object, "tid").unwrap_or(pid),
+        uid: number_u32(object, "uid"),
+        comm: text(object, "comm").map(str::to_string),
+        source_domain: text(object, "source_domain")
+            .unwrap_or_default()
+            .to_string(),
+        target_type: text(object, "target_type")
+            .unwrap_or_default()
+            .to_string(),
+        tclass: text(object, "tclass").unwrap_or_default().to_string(),
+        permissions: object
+            .get("permissions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        path: text(object, "path").map(str::to_string),
+        result: text(object, "result").unwrap_or("denied").to_string(),
         trace_id: text(object, "trace_id").map(str::to_string),
         scenario_id: text(object, "scenario_id").map(str::to_string),
         span_id: text(object, "span_id").map(str::to_string),
