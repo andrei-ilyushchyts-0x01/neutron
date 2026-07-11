@@ -300,6 +300,49 @@ fn fixture() -> FixtureReader {
     reader
 }
 
+fn fixture_without_expected_noise() -> FixtureReader {
+    let mut reader = fixture();
+    let dev = reader.dirs.get_mut(Path::new("/dev")).unwrap();
+    dev.retain(|path| {
+        !matches!(
+            path.to_string_lossy().as_ref(),
+            "/dev/cycle-a" | "/dev/cycle-b"
+        )
+    });
+    for path in ["/dev/cycle-a", "/dev/cycle-b"] {
+        let path = PathBuf::from(path);
+        reader.metadata.remove(&path);
+        reader.links.remove(&path);
+        reader.canonical.remove(&path);
+    }
+
+    reader.dir("/dev/binderfs", &["binder"]);
+    reader.dirs.get_mut(Path::new("/dev")).unwrap().extend([
+        PathBuf::from("/dev/binderfs"),
+        PathBuf::from("/dev/stdin"),
+        PathBuf::from("/dev/stdout"),
+        PathBuf::from("/dev/stderr"),
+    ]);
+    reader.metadata.insert(
+        PathBuf::from("/dev/binderfs/binder"),
+        PlatformMetadata {
+            kind: FileKind::CharacterDevice,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            major: Some(511),
+            minor: Some(0),
+        },
+    );
+    for path in ["/dev/stdin", "/dev/stdout", "/dev/stderr"] {
+        reader.symlink(path, "/proc/self/fd/0", None);
+    }
+
+    reader.dir("/proc/99", &[]);
+    reader.dirs.get_mut(Path::new("/proc")).unwrap().push(PathBuf::from("/proc/99"));
+    reader
+}
+
 #[test]
 fn static_scan_is_deterministic_and_maps_process_service_device_and_module() {
     let forward = fixture();
@@ -344,6 +387,15 @@ fn static_scan_is_deterministic_and_maps_process_service_device_and_module() {
         .warnings
         .iter()
         .any(|warning| warning.contains("cycle")));
+}
+
+#[test]
+fn normal_proc_churn_and_pseudo_devices_do_not_degrade_snapshot() {
+    let snapshot = scan_with_reader(&fixture_without_expected_noise()).expect("static scan");
+
+    assert_eq!(snapshot.health.status, "complete");
+    assert!(!snapshot.processes.iter().any(|process| process.pid == 99));
+    assert!(snapshot.health.warnings.is_empty());
 }
 
 #[test]
