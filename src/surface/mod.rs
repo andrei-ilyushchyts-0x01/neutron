@@ -706,10 +706,21 @@ fn collect_devices(
             }
             FileKind::Symlink => match reader.canonicalize(&path) {
                 Ok(target) if target != path => aliases.push((path, target)),
+                Ok(_)
+                    if matches!(
+                        path.to_str(),
+                        Some("/dev/stdin" | "/dev/stdout" | "/dev/stderr")
+                    ) => {}
                 Ok(_) => health.warn(
                     "devices",
                     format!("symlink cycle or unresolved alias {}", path.display()),
                 ),
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && matches!(
+                            path.to_str(),
+                            Some("/dev/stdin" | "/dev/stdout" | "/dev/stderr")
+                        ) => {}
                 Err(error) => health.warn(
                     "devices",
                     format!("symlink cycle or broken alias {}: {error}", path.display()),
@@ -773,6 +784,7 @@ fn enrich_sysfs(reader: &dyn PlatformReader, device: &mut Device, health: &mut H
     ));
     let sysfs = match reader.canonicalize(&anchor) {
         Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
         Err(error) => {
             health.warn(
                 "devices",
@@ -975,7 +987,7 @@ fn collect_processes(
     let mut processes = Vec::new();
     let mut entries = entries;
     entries.sort();
-    for path in entries {
+    'processes: for path in entries {
         let Some(pid) = basename(&path).and_then(|name| name.parse::<u32>().ok()) else {
             continue;
         };
@@ -983,6 +995,7 @@ fn collect_processes(
             .and_then(|text| parse_process_starttime(&text).map_err(io::Error::other))
         {
             Ok(starttime) => starttime,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 health.warn(
                     "processes",
@@ -995,6 +1008,7 @@ fn collect_processes(
             .and_then(|text| parse_process_status(&text).map_err(io::Error::other))
         {
             Ok(status) => status,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 health.warn(
                     "processes",
@@ -1010,6 +1024,7 @@ fn collect_processes(
                 .filter(|part| !part.is_empty())
                 .map(|part| String::from_utf8_lossy(part).into_owned())
                 .collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 health.warn(
                     "processes",
@@ -1020,6 +1035,7 @@ fn collect_processes(
         };
         let executable = match reader.read_link(Path::new(&format!("/proc/{pid}/exe"))) {
             Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => {
                 health.warn(
                     "processes",
@@ -1030,6 +1046,7 @@ fn collect_processes(
         };
         let selinux_domain = match read_text(reader, &format!("/proc/{pid}/attr/current")) {
             Ok(value) => value.trim().trim_end_matches('\0').to_string(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => {
                 health.warn(
                     "processes",
@@ -1049,6 +1066,7 @@ fn collect_processes(
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 health.warn(
                     "processes",
@@ -1069,6 +1087,7 @@ fn collect_processes(
                     };
                     let target = match reader.read_link(&fd_path) {
                         Ok(target) => target.to_string_lossy().into_owned(),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                         Err(error) => {
                             health.warn(
                                 "processes",
@@ -1108,6 +1127,7 @@ fn collect_processes(
                     });
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => health.warn(
                 "processes",
                 format!("cannot enumerate file descriptors for PID {pid}: {error}"),
@@ -1116,13 +1136,20 @@ fn collect_processes(
         file_descriptors.sort_by_key(|fd| fd.fd);
         let final_starttime = read_text(reader, &format!("/proc/{pid}/stat"))
             .and_then(|text| parse_process_starttime(&text).map_err(io::Error::other));
-        if !matches!(final_starttime, Ok(value) if value == starttime) {
-            relations.truncate(relation_checkpoint);
-            health.warn(
-                "processes",
-                format!("PID {pid} identity changed while collecting process evidence"),
-            );
-            continue;
+        match final_starttime {
+            Ok(value) if value == starttime => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                relations.truncate(relation_checkpoint);
+                continue 'processes;
+            }
+            _ => {
+                relations.truncate(relation_checkpoint);
+                health.warn(
+                    "processes",
+                    format!("PID {pid} identity changed while collecting process evidence"),
+                );
+                continue 'processes;
+            }
         }
         processes.push(Process {
             id: process_id,

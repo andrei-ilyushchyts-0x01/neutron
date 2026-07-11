@@ -339,7 +339,11 @@ fn fixture_without_expected_noise() -> FixtureReader {
     }
 
     reader.dir("/proc/99", &[]);
-    reader.dirs.get_mut(Path::new("/proc")).unwrap().push(PathBuf::from("/proc/99"));
+    reader
+        .dirs
+        .get_mut(Path::new("/proc"))
+        .unwrap()
+        .push(PathBuf::from("/proc/99"));
     reader
 }
 
@@ -393,7 +397,7 @@ fn static_scan_is_deterministic_and_maps_process_service_device_and_module() {
 fn normal_proc_churn_and_pseudo_devices_do_not_degrade_snapshot() {
     let snapshot = scan_with_reader(&fixture_without_expected_noise()).expect("static scan");
 
-    assert_eq!(snapshot.health.status, "complete");
+    assert_eq!(snapshot.health.status, "complete", "{:#?}", snapshot.health);
     assert!(!snapshot.processes.iter().any(|process| process.pid == 99));
     assert!(snapshot.health.warnings.is_empty());
 }
