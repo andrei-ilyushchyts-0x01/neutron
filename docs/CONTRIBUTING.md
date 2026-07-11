@@ -90,13 +90,22 @@ exact name.
 | `INFLIGHT`         | (read inside BPF only)                        |
 | `SYSCALL_FILTER`   | `bpf.map_mut("SYSCALL_FILTER")`               |
 | `PID_WHITELIST`    | `bpf.map_mut("PID_WHITELIST")`                |
+| `TRACED_PROCESSES` | `bpf.map_mut("TRACED_PROCESSES")`             |
+| `ROOT_UID_CONTEXT` | `bpf.map_mut("ROOT_UID_CONTEXT")`              |
+| `BINDER_TRANSACTION_CONTEXT` | `bpf.map_mut("BINDER_TRANSACTION_CONTEXT")` |
+| `THREAD_BINDER_CONTEXT` | `bpf.map_mut("THREAD_BINDER_CONTEXT")`   |
 | `WATCH_FDS`        | `bpf.map_mut("WATCH_FDS")`                    |
 | `STACK_TRACES`     | `bpf.map("STACK_TRACES")` (read-only)         |
+| `COUNTERS`         | `bpf.map("COUNTERS")` (read-only)             |
 
 ### `FILTER_MAP` layout
 
-`FILTER_MAP[FILTER_KEY_PID]` (0) = target PID, `FILTER_MAP[FILTER_KEY_ACTIVE]` (1)
-= syscall whitelist active flag. Constants in `neutron-common/src/lib.rs`.
+The 16 slots are defined exclusively by `FILTER_KEY_*` constants in
+`neutron-common/src/lib.rs`; do not duplicate numeric indices in either crate.
+Slots include the target PID, syscall-filter state, lowered predicate values,
+state-emission requirement, causal/follow controls, and root-UID admission.
+Any layout change must update `FILTER_MAP_SLOT_COUNT`, the eBPF array size,
+userspace population, architecture documentation, and tests together.
 
 ## Adding a New BPF Map
 

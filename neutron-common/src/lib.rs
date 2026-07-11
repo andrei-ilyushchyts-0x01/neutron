@@ -4,7 +4,7 @@
 //! and `aarch64-unknown-linux-musl` (userspace).
 #![no_std]
 
-/// Syscall event emitted by the BPF programs into the perf ring buffer.
+/// Syscall event emitted by the BPF programs into the BPF ring buffer.
 ///
 /// CRITICAL: layout must stay in sync with the map definitions in
 /// `neutron-ebpf/src/main.rs` (inflight map value_size).

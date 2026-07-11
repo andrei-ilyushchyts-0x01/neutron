@@ -5,10 +5,10 @@
 .\"   sudo install -m 0644 man/man1/neutron.1 /usr/local/share/man/man1/
 .\"   sudo mandb        # rebuild the man index
 .\"
-.TH NEUTRON 1 "2026-07-10" "neutron 1.4.0" "User Commands"
+.TH NEUTRON 1 "2026-07-11" "neutron 1.4.0" "User Commands"
 .\" -----------------------------------------------------------------
 .SH NAME
-neutron \- Android eBPF tracer and surface mapper for authorized security assessment
+neutron \- Android kernel-boundary and cross-service causal tracer for authorized security assessment
 .\" -----------------------------------------------------------------
 .SH SYNOPSIS
 .B neutron
@@ -68,6 +68,8 @@ neutron \- Android eBPF tracer and surface mapper for authorized security assess
 .B neutron graph
 .I CAPTURE
 .RI [ \-\-root\-package\ PACKAGE ]
+.RI [ \-\-format\ mermaid | json ]
+.RI [ \-\-collapse\-syscalls ]
 .RI [ \-\-output\ FILE ]
 .PP
 .B neutron recipes
@@ -111,6 +113,36 @@ neutron \- Android eBPF tracer and surface mapper for authorized security assess
 .IR UID )
 .BI \-\-input " SNAPSHOT"
 .RI [ \-\-output\ FILE ]
+.PP
+.B neutron surface diff
+.I BASELINE
+.I CURRENT
+.RI [ \-\-output\ FILE ]
+.PP
+.B neutron aidl
+.RB { index | decode }
+.RI [ AIDL\ OPTIONS ]
+.PP
+.B neutron harness
+.RB { extract | build | minimize | replay }
+.RI [ HARNESS\ OPTIONS ]
+.PP
+.B neutron research
+.BI \-\-pack " NAME|PATH"
+.RI [ RESEARCH\ OPTIONS ]
+.PP
+.B neutron native-map
+.I CAPTURE
+.RI [ NATIVE\ OPTIONS ]
+.PP
+.B neutron ghidra-export
+.I CAPTURE
+.RI [ EXPORT\ OPTIONS ]
+.PP
+.B neutron selinux explain
+.I CAPTURE
+.BI \-\-event\-id " ID"
+.RI [ SELINUX\ OPTIONS ]
 .\" -----------------------------------------------------------------
 .SH DESCRIPTION
 .B neutron
@@ -272,8 +304,11 @@ interleave (legacy 1.2 behavior). See the
 .B MARKER WORKFLOW
 section.
 .TP
-.BI graph " CAPTURE " [\fB\-\-root\-package\fR " PACKAGE" "] [\fB\-\-output\fR " FILE" "]"
-Render a causal capture as a Mermaid flowchart.
+.BI graph " CAPTURE " [\fB\-\-root\-package\fR " PACKAGE" "] [\fB\-\-format\fR " mermaid|json" "] [\fB\-\-collapse\-syscalls\fR ] [\fB\-\-output\fR " FILE" "]"
+Render a causal capture as Mermaid or a versioned
+.B neutron.causal-graph/v1
+JSON document. Syscall collapse is deterministic and never crosses a causal
+parent or trace ID.
 .TP
 .B recipes
 Print one built-in Android research workflow. Run
@@ -282,10 +317,36 @@ for available names.
 .TP
 .B surface
 Collect or query a deterministic Android service, HAL, process, device,
-driver, and module snapshot (1.4.0). All surface commands emit JSON. See
+driver, module, and observed-resource snapshot (1.4.0), or compare two
+snapshots semantically. All surface commands emit JSON. See
 the
 .B SURFACE MAPPER
 section.
+.TP
+.B aidl
+Index deterministic AIDL descriptor/transaction catalogs or run one bounded
+offline selective decoder.
+.TP
+.B harness
+Extract, statically cross-build, minimize, and replay bounded regression
+artifacts. Device execution requires an explicit physical USB target and
+authorized-use acknowledgement.
+.TP
+.B research
+Validate and run one data-only subsystem research pack with bounded typed
+stimulus and private artifact locking.
+.TP
+.B native-map
+Resolve captured raw user IPs against bounded ELF/APK/symbol inputs into
+.BR neutron.native-map/v1 .
+.TP
+.B ghidra-export
+Export neutral, versioned ELF virtual-address bookmarks for a separate Ghidra
+consumer.
+.TP
+.B selinux explain
+Explain one captured AVC and exact observed delegation evidence without
+generating allow rules.
 .PP
 When no subcommand is given,
 .B neutron
@@ -865,14 +926,23 @@ Return one stored process identity. An absent PID or a PID shared by multiple
 stored identities is an error.
 .TP
 .BI "neutron surface explain" " SELECTOR \-\-input SNAPSHOT"
-Return one service/device and its incident relations. A service ID/name or
-device ID/path/alias is accepted; zero or ambiguous matches are errors.
+Return one service/device/resource and its incident relations. A service
+ID/name, device ID/path/alias, or resource ID is accepted; zero or ambiguous
+matches are errors.
 .TP
 .BI "neutron surface reachable \-\-from\-package" " PACKAGE \-\-input SNAPSHOT"
 .TQ
 .BI "neutron surface reachable \-\-from\-uid" " UID \-\-input SNAPSHOT"
 Return only the subgraph actually observed in matching causal traces. Exactly
 one root selector is required.
+.TP
+.BI "neutron surface diff" " BASELINE CURRENT [\-\-output FILE]"
+Compare two snapshots by stable Android semantics. The visible alias is
+.BR diff-device .
+Output uses
+.B neutron.surface-diff/v1
+and reports health, service, HAL, device, module, ioctl, binary, SELinux, and
+scenario changes while normalizing ephemeral runtime identities.
 .PP
 .I SNAPSHOT
 may be
@@ -891,7 +961,7 @@ The scan schema is one JSON document, not NDJSON:
   "device": {"fingerprint":"...", "boot_id":"..."},
   "health": {"status":"complete", "collectors":[], "warnings":[]},
   "services": [], "processes": [], "devices": [],
-  "modules": [], "relations": [], "captures": []
+  "modules": [], "resources": [], "relations": [], "captures": []
 }
 .fi
 .PP
@@ -905,6 +975,8 @@ Top-level collections are sorted and deduplicated by stable natural ID:
 .IP \(bu
 .B module:<name>
 .IP \(bu
+.B resource:<captured-identity>
+.IP \(bu
 .B capture:<trace_id>:<scenario_id>
 .PP
 A service can include transport, descriptor, proven PID/process, SELinux
@@ -914,6 +986,14 @@ starttime, boot ID, SELinux domain, unique file-backed shared libraries, and
 FDs. A device includes canonical path/aliases, kind, major/minor, mode,
 UID/GID, SELinux context, and any sysfs-proven subsystem, driver, and module.
 Unknown PID/binary attribution is left absent rather than guessed.
+.PP
+Resources model successful memory mappings and complete post-exit DMA-heap
+allocations, including owner, optional device/address/length/fd and flags,
+active state, confidence, and create/release span IDs. Exact successful
+.B munmap
+or close evidence marks a matching resource inactive. Partial unmap evidence
+leaves it active and degrades health; active means only that no release was
+observed before capture end.
 .PP
 Relations carry
 .BR type ,
@@ -937,9 +1017,12 @@ traverses only capture-sourced
 .BR root_process ,
 .BR binder ,
 .BR served_by ,
-and
-.B ioctl
-relations belonging to a matching causal trace. Static
+.BR open / mmap / ioctl ,
+and resource-acquisition
+.BR mapping / mapped_from / allocation / allocated_from
+relations belonging to a matching causal trace. Lifecycle
+.BR munmap / release
+relations are evidence but are not traversed. Static
 .B proc_fd
 relations describe current state and never establish reachability; static
 fields only enrich already-reached nodes. A reachable result is therefore
@@ -1200,7 +1283,9 @@ Surface snapshots and query results are separate, single JSON documents rather
 than NDJSON event streams. Scans use
 .BR neutron.surface/v1 ;
 queries use
-.BR neutron.surface/query/v1 .
+.BR neutron.surface/query/v1 ;
+snapshot comparisons use
+.BR neutron.surface-diff/v1 .
 See
 .B SURFACE MAPPER
 for fields, natural ordering, confidence, reachability semantics, health, and
@@ -1706,6 +1791,7 @@ neutron surface services --input observed.json
 neutron surface explain /dev/trusty-ipc-dev0 --input observed.json
 neutron surface reachable --from-package com.example.app \
     --input observed.json --output reachable.json
+neutron surface diff baseline.json ota.json --output surface-diff.json
 .EE
 .SS Observe one package live (1.4.0)
 .PP
@@ -1816,10 +1902,15 @@ theoretical Binder reachability; it includes only capture-sourced
 .BR root_process ,
 .BR binder ,
 .BR served_by ,
-and
-.B ioctl
-relations from matching traces and excludes static
+successful
+.BR open / mmap / ioctl ,
+and resource-acquisition relations from matching traces. It excludes
+lifecycle edges and static
 .BR proc_fd .
+.IP \(bu
+.B surface diff
+compares observed snapshots, not firmware source trees; degraded collectors
+can create apparent additions/removals and are reported in health warnings.
 .IP \(bu
 The surface mapper does not recursively dump
 .IR /sys/devices ,

@@ -1,5 +1,5 @@
-//! neutron — Aya-based syscall tracer for authorized Android security
-//! assessment.
+//! neutron — Android kernel-boundary and cross-service causal tracer for
+//! authorized security assessment.
 //!
 //! This binary loads the BPF programs in `neutron-ebpf` via Aya, attaches them
 //! to raw_syscalls/{sys_enter,sys_exit} (and optionally binder/binder_transaction),

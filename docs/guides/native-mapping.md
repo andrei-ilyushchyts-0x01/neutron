@@ -20,6 +20,14 @@ build-ID matches, then verified pulled/APK artifacts, then captured labels and
 stacks are reported as unresolved because runtime addresses cannot be safely
 reconstructed.
 
+Symbol ingestion is bounded to 256 artifacts, directory depth 32, 512 MiB per
+artifact, and 4 GiB total. Capture-side map generations are invalidated on
+successful mapping changes and exec transitions before later stacks are
+resolved, preventing stale ASLR/load-bias joins. Failed exec restores the
+current generation. Stripped libraries without a build ID retain a
+basename/path candidate plus ELF virtual-address fallback; this is qualified
+evidence, not a fabricated symbol match.
+
 Artifacts may be pulled only from an explicitly selected, unchanged device:
 
 ```sh
@@ -44,4 +52,6 @@ neutron ghidra-export capture.ndjson \
 
 The neutral schema is `neutron.ghidra-bookmarks/v1`. Bookmarks are grouped by
 program identity and ELF virtual address, with bounded event/crash exemplars.
-The Ghidra plugin itself is intentionally separate.
+The Ghidra plugin itself is intentionally separate. Host generation and
+invalidation behavior are covered by tests; exec/mmap churn with pulled vendor
+artifacts still requires validation on an authorized target device.

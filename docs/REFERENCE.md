@@ -11,13 +11,13 @@
 | `summarize`   | Aggregate an NDJSON capture by `--by <fields>` and print a sorted count table. (1.2.0) |
 | `diff`        | Compare two captures aggregated on the same key; print added/removed/Δ rows. (1.2.0)  |
 | `mark`        | Switch a live start/end scenario over the control socket, or append with explicit `--output`. (1.3.0) |
-| `graph`       | Render causal NDJSON as a Mermaid `flowchart TD`. (1.3.0) |
-| `surface`     | Collect or query a deterministic Android service/HAL/process/device snapshot. (1.4.0) |
+| `graph`       | Render causal NDJSON as Mermaid or `neutron.causal-graph/v1` JSON. |
+| `surface`     | Collect, query, or semantically diff Android service/HAL/process/device/resource snapshots. |
 | `report`      | Render a Markdown kernel-boundary report from one capture. |
 | `recipes`     | Print built-in workflow recipes, e.g. `neutron recipes android-content-provider`. |
 | `ioctl generate` | Build a deterministic `neutron.ioctl-schema/v1` pack from kernel UAPI/vendor headers with host `clang`. |
 | `aidl index` / `aidl decode` | Build an AIDL catalog or run a selective offline decoder plugin. |
-| `harness extract` / `minimize` / `replay` | Build and run bounded regression artifacts on an explicit physical USB device. |
+| `harness extract` / `build` / `minimize` / `replay` | Build and run bounded regression artifacts on an explicit physical USB device. |
 | `selinux explain` | Explain one captured AVC and exact observed delegation evidence. |
 | `research` | Run a validated data-only subsystem research pack. |
 | `native-map` / `ghidra-export` | Resolve captured native frames and export neutral bookmark JSON. |
@@ -160,6 +160,26 @@ driver evidence, and a `sha256:` content hash. Each descriptor contains the
 full cmd word plus `_IOC` components, C type, field offset/size/type,
 FD-path/family constraints, capture eligibility, provenance and replacements.
 
+## Causal graph
+
+`graph` consumes causal or legacy NDJSON and writes either Mermaid or a stable
+JSON graph:
+
+```bash
+neutron graph capture.ndjson --root-package com.example.app \
+  --format mermaid --output flow.md
+neutron graph capture.ndjson --root-package com.example.app \
+  --collapse-syscalls --format json --output graph.json
+```
+
+The JSON envelope is `neutron.causal-graph/v1` with `nodes`, `edges`, and
+`warnings`. Nodes carry a stable `id`, `kind`, `label`, occurrence `count`,
+optional PID, and contributing trace/span IDs. Edges carry `from`, `to`, and
+`relation` (`exact` or `inferred`). `--collapse-syscalls` merges only identical
+syscalls under the same causal parent and trace; success state, ioctl/device
+identity, and causal boundaries remain distinct. Both formats use the same
+normalized graph and surface capture-loss/incomplete-branch warnings.
+
 ## Surface mapper (1.4.0)
 
 `surface scan` emits one deterministic JSON document. Static collection works
@@ -203,20 +223,24 @@ neutron surface process 1234 --input surface.json --output process.json
 neutron surface explain SERVICE_OR_DEVICE --input surface.json
 neutron surface reachable --from-package com.example.app --input surface.json
 neutron surface reachable --from-uid 10123 --input surface.json
+neutron surface diff baseline.json current.json --output surface-diff.json
 ```
 
 `--input -` reads stdin. `process` rejects a PID absent from the snapshot and a
-PID shared by multiple stored identities. `explain` accepts a service ID/name
-or device ID/path/alias and rejects zero or ambiguous matches. Every command
-writes JSON to stdout unless `--output` is set; a final-component symlink is
-rejected. An existing output must already be a mode-private, owned, single-link
+PID shared by multiple stored identities. `explain` accepts a service ID/name,
+device ID/path/alias, or resource ID and rejects zero or ambiguous matches.
+Every command writes JSON to stdout unless `--output` is set; a
+final-component symlink is rejected. An existing output must already be a
+mode-private, owned, single-link
 regular file; the verified file descriptor is then truncated and kept at mode
 `0600`.
 
 `reachable` traverses only capture-sourced `root_process`, `binder`,
-`served_by`, and successful `open`, `mmap`, or `ioctl` relations from matching
-trace IDs. Other relation types remain enrichment evidence even if an input
-document attaches a trace ID to them.
+`served_by`, successful `open`, `mmap`, or `ioctl`, and observed resource
+acquisition (`mapping`, `mapped_from`, `allocation`, `allocated_from`) relations
+from matching trace IDs. Lifecycle relations (`munmap`, `release`) and all
+other relation types remain enrichment evidence even if an input document
+attaches a trace ID to them.
 
 The snapshot envelope is:
 
@@ -231,6 +255,7 @@ The snapshot envelope is:
   "processes": [],
   "devices": [],
   "modules": [],
+  "resources": [],
   "relations": [],
   "captures": []
 }
@@ -245,6 +270,7 @@ derived from collected identity rather than array position:
 | process | `process:<boot_id>:<pid>:<starttime>` |
 | device | `device:<char\|block>:<major>:<minor>` |
 | module | `module:<name>` |
+| resource | captured kind + process + trace/span identity |
 | capture | `capture:<trace_id>:<scenario_id>` |
 | relation | type + endpoints + trace/span identity |
 
@@ -256,6 +282,15 @@ include canonical path and aliases, kind, major/minor, mode, UID/GID, SELinux
 label, and any sysfs-proven subsystem/driver/module. A binary or PID is left
 unknown when the collector did not prove it.
 
+Resources currently model successful memory mappings and complete post-exit
+DMA-heap allocations. They retain owner, optional device/address/length/fd and
+flags, active state, confidence, trace/scenario identity, and create/release
+span IDs. A matching successful `munmap` or `close` marks the resource inactive.
+Partial `munmap` is retained conservatively as active and degrades snapshot
+health because the remaining address ranges cannot be reconstructed from the
+bounded event alone. In all cases, `active` means “no release was observed in
+this capture”, not proof that the resource still exists afterward.
+
 Relations carry `id`, `type`, `from`, `to`, `evidence`, and
 `confidence:"exact"|"candidate"`. Capture relations may also carry
 `causal_relation:"exact"|"inferred"`, `trace_id`, `scenario_id`, `span_id`,
@@ -265,11 +300,12 @@ and `ioctl`. Known Trusty TIPC and V4L2 commands include
 
 `reachable` selects captures matching the requested package/UID and traverses
 only capture-sourced `root_process`, `binder`, `served_by`, and successful
-`open`, `mmap`, or `ioctl` relations. A device-bound syscall is successful only
+`open`, `mmap`, or `ioctl` relations plus resource acquisition edges. A
+device-bound syscall is successful only
 when its exit event has a non-negative `ret`; entry-only, failed, and
 outcome-unknown events are retained as non-traversable `syscall_attempt`
-relations. `process_exit` and `crash` relate a process to the capture where the
-outcome occurred, but are also non-traversable. Static `proc_fd` relations
+relations. `munmap`, `release`, `process_exit`, and `crash` relate lifecycle or
+outcome evidence but are non-traversable. Static `proc_fd` relations
 describe current scan state and static fields only enrich nodes already
 reached. Therefore “reachable” never means a SELinux/VINTF/manifest permission
 or theoretical Binder allow decision.
@@ -289,6 +325,16 @@ service-command failures, and malformed process/VINTF inputs, degrade their
 collector; missing primary `/proc` or `/dev`, live trace failure, or output
 failure is fatal. Device sysfs enrichment is limited to paths anchored by
 discovered device nodes rather than a recursive `/sys/devices` dump.
+
+`surface diff` (visible alias `surface diff-device`) reads two
+`neutron.surface/v1` snapshots and emits `neutron.surface-diff/v1`. The report
+contains baseline/current device summaries, collector-health and warning
+deltas, semantic added/removed/changed service, HAL, device, module, and
+scenario profiles, and set deltas for ioctls, binaries, and SELinux contexts.
+Ephemeral PID/process/resource IDs are normalized where they would otherwise
+turn the same scenario into noise. Different fingerprints or degraded inputs
+are explicit warnings; a diff is observational evidence, not proof that an OTA
+alone caused every change.
 
 ## Text Output Format
 

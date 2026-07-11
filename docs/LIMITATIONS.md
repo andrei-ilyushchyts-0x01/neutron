@@ -191,9 +191,15 @@ policy model.
   excluded from reachability traversal. Static service/process/device fields
   only enrich a node reached through a causal trace.
 - Reachability accepts only capture-sourced `root_process`, `binder`,
-  `served_by`, and successful `open`, `mmap`, or `ioctl` edges. Failed or
-  incomplete syscalls, exits, crashes, AVC denials, and a trace ID on any other
-  relation type do not make that edge reachable.
+  `served_by`, successful `open`, `mmap`, or `ioctl`, and resource-acquisition
+  (`mapping`, `mapped_from`, `allocation`, `allocated_from`) edges. Failed or
+  incomplete syscalls, lifecycle edges, exits, crashes, AVC denials, and a
+  trace ID on any other relation type do not make that edge reachable.
+- Mapping resources require a successful mmap exit. DMA resources require a
+  complete successful post-exit `DMA_HEAP_IOCTL_ALLOC` payload. Exact successful
+  `munmap`/`close` evidence marks the matching resource inactive; partial
+  `munmap` leaves it conservatively active and degrades health. `active` means
+  only that no release was observed before capture end.
 - Captured SELinux denials are attempt evidence and are never traversed as
   successful device reachability.
 - Live `--observe` requires exactly one `--from-package` or `--from-uid`.
@@ -216,6 +222,9 @@ policy model.
 - Individual unreadable `/proc`, `/sys`, service, or VINTF inputs degrade
   collector health. Missing primary `/proc` or `/dev`, child-trace failure, or
   output failure is fatal.
+- `surface diff` compares observed snapshots, not firmware source trees. A
+  degraded collector can produce apparent additions/removals, and different
+  fingerprints are reported as context rather than treated as causal proof.
 - Version 1.4 has no SQLite or NDJSON surface store, full sysfs dump,
   kernel-source lookup, or Surface Mermaid renderer.
 
@@ -283,7 +292,7 @@ vulnerability, a feature, or a false positive is up to the analyst.
 | ioctl decoder registry | v1.1–v1.4 | Typed/verified mappings grow additively; unknown commands remain numeric |
 | `--package` / `--root-uid` process discovery | v1.3 / v1.4 | Neither is retroactive. Package roots can miss sub-second processes between refreshes; explicit UID roots use first-event kernel admission. |
 | Cross-process causal tracing | v1.3–v1.4 | Observed Binder following with depth/PID/TTL/domain/special-process guardrails; incomplete branches are explicit |
-| Android surface mapper | v1.4 | Static inventory plus imported/live causal evidence; explicit collector health |
+| Android surface mapper | v1.4 + Unreleased | Static/imported/live causal evidence, resource lifetimes, semantic diff, and explicit collector health |
 | `path_truncated` counter wired in BPF | v1.1 | Currently reserved in COUNTERS but not incremented |
 
 See [docs/ROADMAP.md](ROADMAP.md) for the full multi-version plan.

@@ -1,8 +1,8 @@
 //! CLI definition for the neutron production (Aya) binary.
 //!
 //! The default mode (no subcommand) runs the syscall tracer. Subcommands
-//! cover diagnostic and offline workflows: today only `doctor` is available;
-//! `timeline`, `diff`, and `bench` arrive in later P0/P1 phases.
+//! cover diagnostic, indexing, causal-analysis, surface, research, and
+//! capture-to-regression workflows.
 
 use clap::{Parser, Subcommand};
 
@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "neutron",
     version,
-    about = "Low-intrusion eBPF syscall tracer for authorized Android security assessment"
+    about = "Android kernel-boundary and cross-service causal tracer for authorized security assessment"
 )]
 pub struct Cli {
     /// Optional subcommand. When omitted, neutron runs in trace mode using
@@ -64,10 +64,10 @@ pub enum Command {
     /// a window around the marker. Phase 5a.
     Mark(crate::mark::MarkArgs),
 
-    /// Render a causal capture as a Mermaid flowchart.
+    /// Render a causal capture as Mermaid or versioned JSON.
     Graph(crate::graph::GraphArgs),
 
-    /// Build and query an Android service/HAL/device surface snapshot.
+    /// Build, query, and semantically diff Android surface snapshots.
     #[command(subcommand)]
     Surface(crate::surface::SurfaceCommand),
 

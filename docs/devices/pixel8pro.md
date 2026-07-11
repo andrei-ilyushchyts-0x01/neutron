@@ -275,6 +275,28 @@ adb exec-out "su -c 'cat /data/local/tmp/camera.reachable.json'" \
 jq -e 'all(.relations[]; .type != "proc_fd")' camera.reachable.json
 ```
 
+Successful mmap and complete DMA-heap allocation exits may also produce
+`resources`. Treat `active:true` as “no matching release was observed before
+capture end”; a partial `munmap` deliberately degrades health rather than
+inventing split ranges.
+
+### Baseline versus OTA snapshot
+
+Collect the same deterministic scenario before and after an OTA, then compare
+on the host:
+
+```bash
+neutron surface diff baseline.surface.json ota.surface.json \
+  --output ota.surface-diff.json
+jq '{schema, health, services, hals, devices, ioctls, scenarios, warnings}' \
+  ota.surface-diff.json
+```
+
+The schema must be `neutron.surface-diff/v1`. Review fingerprint and collector
+warnings before attributing a delta to firmware. This is an operator procedure;
+the repository's host tests do not substitute for running both snapshots on
+the authorized device builds being compared.
+
 ### Child-trace cleanup guard
 
 `surface --observe` validates child exit, final capture health, and temporary

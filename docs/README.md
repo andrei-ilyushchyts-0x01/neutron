@@ -1,7 +1,8 @@
 # neutron Documentation
 
-Aya-based eBPF syscall tracer for authorized Android security assessment.
-Targets kernel 6.1+ / Pixel 8 Pro / Android 14 GKI.
+Aya-based Android kernel-boundary and cross-service causal tracing platform for
+authorized security assessment. The reference target is kernel 6.1+ on Pixel
+8 Pro/Android GKI; host analysis commands also operate on saved captures.
 
 ## Contents
 
@@ -9,7 +10,7 @@ Targets kernel 6.1+ / Pixel 8 Pro / Android 14 GKI.
 |----------|-------------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Aya loader flow, RingBuf consumer, symbolization layer, rule-engine pipeline |
 | [REFERENCE.md](REFERENCE.md) | CLI flags, JSON event schema, syscall table, BPF map reference |
-| [ROADMAP.md](ROADMAP.md) | What landed in 1.0.0, V1.x backlog, V2 considerations |
+| [ROADMAP.md](ROADMAP.md) | Capability status, completed roadmap slices, external gates, and non-goals |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Build setup, how to add maps / syscalls / rules |
 | [devices/pixel8pro.md](devices/pixel8pro.md) | Reference device profile + kernel-config baseline |
 
@@ -20,6 +21,8 @@ Targets kernel 6.1+ / Pixel 8 Pro / Android 14 GKI.
 | [guides/quickstart.md](guides/quickstart.md) | Build, deploy, capture your first trace in minutes |
 | [guides/harness.md](guides/harness.md) | Extract, minimize, and safely replay captured regression testcases |
 | [guides/aidl-intelligence.md](guides/aidl-intelligence.md) | Index AIDL catalogs and selectively decode complete offline testcases |
+| [guides/native-mapping.md](guides/native-mapping.md) | Resolve bounded native ELF/APK frames and export neutral Ghidra bookmarks |
+| [guides/research-packs.md](guides/research-packs.md) | Validate and run bounded data-only subsystem research scenarios |
 | [guides/android-content-provider.md](guides/android-content-provider.md) | Low-noise Android content-provider research workflow |
 | [guides/selinux.md](guides/selinux.md) | Capture AVC decisions and explain exact observed delegation |
 | [guides/bpf-tracing.md](guides/bpf-tracing.md) | Tracing concepts, profiles, filtering, stack traces |

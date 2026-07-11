@@ -2,8 +2,8 @@
 
 ## Product direction
 
-Neutron is evolving from a flat Android syscall tracer into an Android
-kernel-boundary and cross-service causal tracing platform:
+Neutron is an Android kernel-boundary and cross-service causal tracing
+platform, with the following evidence path as its product center:
 
 ```text
 app action
@@ -14,9 +14,10 @@ app action
   -> denial, allocation, state change, crash, or reboot
 ```
 
-The current workspace is version `1.4.0`. Version numbers below describe
-capability maturity, not a promise that every workspace feature has shipped in
-a public release.
+The current workspace package version is `1.4.0`; features listed as
+Unreleased in the changelog are already implemented in this workspace but are
+not claimed as a published release. Status describes capability maturity, not
+just code presence.
 
 Status meanings:
 
@@ -31,16 +32,16 @@ Status meanings:
 
 | Direction | Status | Implemented now | Remaining boundary |
 |---|---|---|---|
-| Dynamic Binder follow | **MVP** | One package/UID root, global BPF programs, bounded `TRACED_PROCESSES`, Binder caller/callee stitching, depth/process caps, PID TTL, SELinux allow/deny domains, servicemanager transit cap, exact-only system_server transit, incomplete-branch events and health counters. | Validate on the supported Pixel matrix; add per-branch rate budgets and stronger kernel-side admission before a denied callee can run. |
-| Causal graph | **MVP** | Scenario/trace/span/parent IDs, Binder/process/syscall/ioctl/crash nodes, Mermaid output, callee identity enrichment, device paths, capture-loss and incomplete-branch warnings. | Add stable JSON graph export, branch collapse policies, and explicit graph schema versioning. |
-| Android surface mapper | **MVP** | Deterministic Binder/HwBinder/VndBinder, VINTF, process, library, SELinux, device, sysfs driver/module, and observed Binder/open/mmap/ioctl/AVC/process-exit/crash evidence. `reachable` reports capture health separately from identity confidence and traverses only completed successful device syscalls. | Model munmap/mapping lifetime and explicit DMA allocation resources; improve vendor sysfs coverage; add snapshot-to-snapshot semantic diff. |
+| Dynamic Binder follow | **MVP** | One package/UID root, global BPF programs, bounded `TRACED_PROCESSES`, Binder caller/callee stitching, depth/process caps, PID TTL, SELinux allow/deny domains, servicemanager transit cap, exact-only system_server transit, global sampling/rate limits, incomplete-branch events, and health counters. | Authorized Pixel/device-matrix validation. A denied callee can execute briefly before userspace policy removal; this is reported rather than hidden. |
+| Causal graph | **Complete** | Scenario/trace/span/parent IDs; Binder/process/syscall/ioctl/crash nodes; shared Mermaid and versioned `neutron.causal-graph/v1` JSON rendering; deterministic same-parent syscall collapse; identity/device enrichment; capture-loss and incomplete-branch warnings. | Maintain compatibility fixtures as new event types are added. |
+| Android surface mapper | **MVP** | Deterministic Binder/HwBinder/VndBinder, VINTF, process, library, SELinux, device, sysfs driver/module, and causal evidence; explicit mmap/DMA resources and release lifetimes; causal-only `reachable`; semantic `surface diff` reports. | Authorized vendor-device coverage. Partial `munmap` intentionally remains conservative because bounded events cannot reconstruct split mappings. |
 | ioctl schema generation | **Complete** | Host clang pipeline for `_IO*` macros and record layouts, data-only schema packs, selector/provenance checks, trusted runtime loading, conflict handling, and generated Rust descriptors. | Publish maintained GKI/Pixel/vendor packs; cover nested unions, flexible arrays, and driver ownership with verified source evidence. |
-| Capture -> extract -> replay | **MVP** | Bounded resource capture, strict artifact validation, generated Rust ioctl replay, explicit physical-USB identity checks, shell-free ADB staging/execution, remote timeout/cleanup, recovery classification, deterministic byte minimization. Metadata minimization runs only when a custom runner declares the relevant capability. | Build/deploy automation for the generated aarch64 binary; typed adapters that actually replay causal steps, Binder transactions, and delays; more crash oracles. |
+| Capture -> extract -> replay | **MVP** | Bounded resource capture, strict artifact validation, generated Rust ioctl replay, fixed static AArch64 build with hashed manifest, explicit physical-USB identity checks, shell-free ADB staging/execution, timeout/cleanup/recovery classification, deterministic minimization, and typed crash/reboot/timeout/nonzero/signal oracles. | Authorized-device validation and separately reviewed runners for subsystem-specific Binder/timing setup. Generic raw Binder replay is not generated. |
 | Binder/AIDL intelligence | **MVP** | Exact service attribution when evidence supports it, deterministic AOSP/vendor AIDL catalog generation, method-name attribution, and a bounded offline KeyMint decoder plugin. | Broaden exact node/descriptor discovery and selective plugins. Generic version-independent Parcel decoding remains intentionally out of scope. |
-| Security knowledge packs | **Experimental** | Data-only pack validation, built-in subsystem packs, static preflight, bounded child trace, typed companion stimulus, artifact locking, and report generation are present in the workspace. | Complete authorized-device validation, stabilize the pack schema, and define contribution/signing/versioning policy before calling this a public pack ecosystem. |
-| Native code mapping | **Experimental** | Captured process maps/raw IPs, build-ID/load-bias aware offline resolution, optional identity-checked ADB artifact pulls, and neutral Ghidra bookmark JSON are present in the workspace. | Validate capture invalidation across exec/mmap churn on device, stabilize schemas, and ship the separate Ghidra importer. |
+| Security knowledge packs | **Experimental** | Versioned data-only pack validation, built-in subsystem packs, static preflight, bounded child trace, typed companion stimulus, artifact hash locking, bounded permission cleanup, and report generation. | Authorized-device validation and a contribution/signing governance decision before publishing a community pack registry. |
+| Native code mapping | **Experimental** | Captured process maps/raw IPs, exec/mapping invalidation, bounded build-ID/load-bias aware resolution, stripped-ELF path/vaddr fallback, optional identity-checked ADB pulls, and versioned native/Ghidra JSON. | Authorized exec/mmap-churn validation and the separate Ghidra consumer/plugin. |
 | SELinux-aware tracing | **MVP** | Bounded AVC ingestion from the live capture boundary, source/current domain fields, exact-vs-inferred causal attribution, secure offline explanation, and exact delegated-path evidence. Surface imports denials as non-traversable policy evidence. | Optional binary-policy indexing and rule/source attribution. Neutron must not generate allow rules or claim theoretical reachability from policy alone. |
-| OTA/device differential analysis | **Planned** | Generic capture aggregation diff and deterministic surface snapshots exist separately. | Add a schema-aware `surface diff`/`diff-device` command for services, HALs, device nodes, contexts, modules, ioctls, binaries, and scenario behavior. |
+| OTA/device differential analysis | **MVP** | `neutron.surface-diff/v1` compares services, HALs, device nodes, contexts, modules, ioctls, binaries, scenario behavior, and health while normalizing ephemeral identities. | Validate repeatable scenarios across a maintained baseline/OTA device corpus. |
 
 ## Completed P0 vertical slice
 
@@ -59,6 +60,11 @@ neutron trace \
 neutron graph capture.ndjson \
   --format mermaid \
   --output flow.md
+
+neutron graph capture.ndjson \
+  --collapse-syscalls \
+  --format json \
+  --output graph.json
 ```
 
 Guardrails are evidence, not silent filtering:
@@ -73,12 +79,13 @@ Guardrails are evidence, not silent filtering:
 - process-wide post-Binder evidence is `inferred`; only thread-specific Binder
   context may be `exact`.
 
-## Next milestones
+## Remaining release gates
 
-### P0.5 — authorized-device evidence gate
+The host-side roadmap slice is implemented. The remaining gates require
+authorized hardware, maintained source inputs, or a separately governed
+consumer; they cannot be proven by this repository's host tests.
 
-No new feature should outrun validation of the causal core. Complete this gate
-before broadening packs or decoders:
+### 1. Authorized-device evidence
 
 1. Run a sanitized camera and KeyMint scenario on each supported
    device/kernel build.
@@ -94,35 +101,25 @@ Exit criterion: one reproducible, sanitized fixture plus an operator checklist
 for each supported device line. Device execution remains an explicit manual
 step because it can crash or reboot the target.
 
-### P1 — complete the research loop
+### 2. Maintained knowledge corpus
 
-1. **Surface evidence completeness**
-   - implemented: open/openat, mmap, process-exit, and crash relations;
-     attempted/failed/unknown syscall outcomes remain distinct and
-     non-traversable;
-   - next: model munmap/mapping lifetime and explicit DMA allocation resources;
-   - next: add schema-aware snapshot diff with confidence and capture-health
-     deltas.
+Publish reproducible AOSP/vendor AIDL catalogs and tested GKI/Pixel ioctl
+schema packs only with pinned source revisions and device evidence. Add
+selective camera/media/GPU decoders or replay adapters only when captures
+contain every required resource; incomplete Parcel or pointer data must remain
+blocked.
 
-2. **AIDL and ioctl knowledge production**
-   - generate reproducible AOSP/vendor AIDL catalogs in CI;
-   - publish tested GKI and Pixel schema packs;
-   - add selective camera/media/GPU decoder plugins only where complete
-     captured resources make decoding sound.
+### 3. External consumers and governance
 
-3. **Native mapping stabilization**
-   - finish exec/mmap generation tests and stripped-vendor fallbacks;
-   - version the native-map and bookmark schemas;
-   - keep the actual Ghidra plugin in a separate `neutron-ghidra` project.
+The neutral `neutron.ghidra-bookmarks/v1` output is ready for a separate
+Ghidra importer. A public research-pack registry still needs maintainer policy,
+signing/key-rotation rules, and review ownership. Those are separate deliverables,
+not hidden in-process plugins.
 
-4. **Harness honesty and usability**
-   - add a reviewed aarch64 build/deploy command;
-   - define typed runner adapters for every metadata capability;
-   - never minimize a field that the selected runner does not consume.
+## Conditional ecosystem split
 
-### P2 — ecosystem split
-
-Split binaries only after their schemas are stable:
+Split binaries only when independent release cadence or dependency weight
+justifies it:
 
 ```text
 neutron
@@ -138,13 +135,12 @@ neutron-ghidra
   runtime import / rebasing / bookmarks / callsite annotations
 ```
 
-Before that split, extract a shared `neutron-schema` crate for event, graph,
+Before such a split, extract a shared `neutron-schema` crate for event, graph,
 surface, AIDL, ioctl, testcase, and health contracts. Today the packed kernel
-ABI belongs to `neutron-common`, while host schemas remain in their feature
-modules; external tools should not copy those structs ad hoc.
-
-P2 also includes signed/versioned research packs and scenario-based OTA
-comparison across a maintained device corpus.
+ABI belongs to `neutron-common`, while versioned host schemas remain in their
+feature modules; external tools should consume the JSON schemas rather than
+copy private Rust structs. This is an architectural trigger, not unfinished
+functionality in the current single binary.
 
 ## Deliberate non-goals
 

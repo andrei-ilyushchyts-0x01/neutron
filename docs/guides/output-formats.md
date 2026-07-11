@@ -1,7 +1,9 @@
 # Output Formats
 
-neutron supports two output formats: human-readable text (default) and
-NDJSON. Both can be written to stdout or a file (`--output PATH`).
+Trace mode supports human-readable text (default) and NDJSON. Offline graph,
+Surface, native-map, Ghidra, ioctl/AIDL, and harness workflows use the
+versioned JSON documents described below. Outputs can be written to stdout or
+a file (`--output PATH`) where the command supports it.
 
 By default, output consists of rule-engine **findings** (one block per
 triggered detector). Add `--raw` to also emit per-event lines. Add
@@ -323,6 +325,37 @@ collapses the typical fan-out.
 lines. Disable with `--lookback-events 0`. Disable the tombstone watcher
 with `--tombstone-dir ""` and the logcat tail with `--no-logcat`.
 
+## Causal Graph Documents
+
+`neutron graph CAPTURE --format json` emits one pretty-printed
+`neutron.causal-graph/v1` document:
+
+```json
+{
+  "schema": "neutron.causal-graph/v1",
+  "nodes": [
+    {
+      "id": "process:123",
+      "kind": "process",
+      "label": "com.example.app:123",
+      "count": 1,
+      "pid": 123,
+      "trace_ids": ["camera-open-42"],
+      "span_ids": []
+    }
+  ],
+  "edges": [],
+  "warnings": []
+}
+```
+
+Each edge contains `from`, `to`, and `relation` (`exact` or `inferred`).
+`--collapse-syscalls` increases a node's `count` only for identical syscalls
+under one causal parent and trace. It does not merge success/failure states,
+ioctl/device identities, distinct parents, or trace IDs. Mermaid and JSON are
+rendered from the same normalized graph and carry the same completeness
+warnings.
+
 ## Surface JSON Documents (1.4.0)
 
 Surface output is one pretty-printed JSON document, not NDJSON. A scan uses
@@ -343,6 +376,7 @@ Surface output is one pretty-printed JSON document, not NDJSON. A scan uses
   "processes": [],
   "devices": [],
   "modules": [],
+  "resources": [],
   "relations": [],
   "captures": []
 }
@@ -354,6 +388,7 @@ Surface output is one pretty-printed JSON document, not NDJSON. A scan uses
 | `processes` | `id`, PID, UID/GID, argv, executable, starttime, boot ID, SELinux domain, libraries, file descriptors |
 | `devices` | `id`, canonical path, aliases, char/block kind, major/minor, mode, UID/GID, SELinux context, sysfs path, class/subsystem/driver/module |
 | `modules` | `id`, name, loaded state, optional sysfs path |
+| `resources` | `id`, kind, owner, optional device/address/length/fd/flags, active state, confidence, trace/scenario identity, create/release span IDs |
 | `relations` | `id`, `type`, `from`, `to`, evidence source/detail, confidence; optional causal relation, trace/scenario/span IDs and ioctl label |
 | `captures` | `id`, trace/scenario IDs, optional root package/UID and device identity, health |
 
@@ -370,16 +405,28 @@ make partial `/proc`, `/sys`, service-manager, and VINTF access explicit.
 `proc_fd` relations are a static point-in-time observation. A
 `surface reachable` response never traverses them; it traverses only matching
 capture-sourced `root_process`, `binder`, `served_by`, and successful `open`,
-`mmap`, or `ioctl` relations. Failed, entry-only, or outcome-unknown device
-syscalls are `syscall_attempt` evidence and remain non-traversable, as do
-`process_exit`, `crash`, and `selinux_denial`. An imported capture without final
-`capture_health` is retained with degraded health; live observation fails if
-the final record is missing.
+`mmap`, or `ioctl` relations plus resource acquisition edges (`mapping`,
+`mapped_from`, `allocation`, `allocated_from`). Failed, entry-only, or
+outcome-unknown device syscalls are `syscall_attempt` evidence and remain
+non-traversable, as do lifecycle (`munmap`, `release`), `process_exit`, `crash`,
+and `selinux_denial` relations. A successful exact `munmap` or close of the
+returned DMA fd marks a resource inactive. Partial `munmap` leaves it active
+and degrades health because a bounded capture cannot reconstruct split ranges.
+An imported capture without final `capture_health` is retained with degraded
+health; live observation fails if the final record is missing.
 
 The six query families (`services`, `hals`, `devices`, `process`, `explain`,
 and `reachable`) wrap their result in `schema:"neutron.surface/query/v1"`.
 They always emit JSON. `--input -` reads a snapshot from stdin; `--output`
 writes a mode-`0600` file instead of stdout.
+
+`neutron surface diff BASELINE CURRENT` emits
+`schema:"neutron.surface-diff/v1"`. It includes baseline/current summaries,
+health and collector deltas, semantic change sets for services, HALs, devices,
+modules, and scenarios, plus set deltas for ioctls, binaries, and SELinux
+contexts. A change set has `added`, `removed`, `changed` (`id`, `before`,
+`after`), and an `unchanged` count. Different fingerprints and degraded input
+snapshots are reported in `warnings`.
 
 ## Field Reference
 

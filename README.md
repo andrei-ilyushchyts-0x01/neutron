@@ -1,6 +1,7 @@
 # neutron
 
-Rooted Android kernel-boundary tracer and surface mapper for security research.
+Android kernel-boundary and cross-service causal tracing platform for
+authorized security research.
 
 `neutron` runs on a rooted Android device, attaches eBPF programs to kernel
 tracepoints, and records what an app or system service does at the
@@ -327,6 +328,7 @@ neutron surface process 1234 --input surface.json
 neutron surface explain /dev/trusty-ipc-dev0 --input surface.json
 neutron surface reachable --from-package com.example.app --input surface.json
 neutron surface reachable --from-uid 10123 --input surface.json
+neutron surface diff baseline.json ota.json --output surface-diff.json
 ```
 
 ## Run A Reproducible Research Pack
@@ -350,12 +352,29 @@ Packs are data-only and compile into allowlisted trace flags plus one of seven
 typed companion actions. See [the research-pack guide](docs/guides/research-packs.md).
 
 `reachable` means observed causal reachability through capture-sourced
-`root_process`, `binder`, `served_by`, and successful `open`, `mmap`, or
-`ioctl` relations. It does not solve SELinux, VINTF, manifest permissions, or
+`root_process`, `binder`, `served_by`, successful `open`, `mmap`, or `ioctl`,
+and resource-acquisition relations (`mapping`, `mapped_from`, `allocation`,
+`allocated_from`). It does not solve SELinux, VINTF, manifest permissions, or
 theoretical Binder access. Failed or incomplete syscalls are retained as
-non-traversable `syscall_attempt` evidence; `process_exit`, `crash`, AVC, and
-static `proc_fd` relations also enrich the capture without making a device
-reachable.
+non-traversable `syscall_attempt` evidence. Lifecycle evidence (`munmap` and
+`release`), `process_exit`, `crash`, AVC, and static `proc_fd` relations also
+enrich the capture without creating reachability.
+
+## Build And Minimize A Regression Testcase
+
+After an opted-in `--harness-capture`, extract one complete event and build
+the generated replay with the pinned static Android target:
+
+```bash
+neutron harness extract capture.ndjson --event-id 42 --output testcase
+neutron harness build testcase
+```
+
+The build writes `testcase/replay` plus a hashed `build.json`. Replay and
+minimization still require an explicit physical USB serial, package, reviewed
+runner, and `--authorized-use`. Built-in minimization oracles include `crash`,
+`reboot`, `timeout`, `nonzero`, and `signal`; custom argv-only oracles remain
+supported. See [the harness guide](docs/guides/harness.md).
 
 For a UID-rooted causal trace, use `trace --root-uid UID`. The eBPF gate admits
 each matching process on its first observed kernel event, including processes
@@ -433,14 +452,24 @@ adb shell "su -c '/data/local/tmp/neutron mark login --phase end'"
 The tracer assigns the marker timestamp and causal IDs. To keep the old
 append-only behavior without changing a live scenario, pass `mark --output`.
 
-Render the causal scenario as Mermaid:
+Render the causal scenario as Mermaid, or emit the versioned JSON graph used
+by downstream tools:
 
 ```bash
 neutron graph app.ndjson \
   --root-package com.example.app \
   --format mermaid \
   --output flow.md
+
+neutron graph app.ndjson \
+  --root-package com.example.app \
+  --collapse-syscalls \
+  --format json \
+  --output graph.json
 ```
+
+JSON output uses `neutron.causal-graph/v1`. Collapsing never merges syscalls
+across causal parents or trace IDs.
 
 Render a Markdown boundary report:
 
@@ -648,7 +677,7 @@ after maintainers have approved the tag, notes, and assets.
 - [docs/case-studies/wallet-boundary.md](docs/case-studies/wallet-boundary.md): redacted wallet boundary report example
 - [docs/devices/pixel8pro.md](docs/devices/pixel8pro.md): verified device profile
 - [docs/LIMITATIONS.md](docs/LIMITATIONS.md): what neutron cannot see
-- [docs/ROADMAP.md](docs/ROADMAP.md): planned work
+- [docs/ROADMAP.md](docs/ROADMAP.md): capability status, external gates, and planned work
 - [CHANGELOG.md](CHANGELOG.md): version history
 
 ## License

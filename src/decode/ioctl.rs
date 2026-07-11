@@ -4,11 +4,11 @@
 //!
 //! - [`format_ioctl_deep`] — the original device-agnostic `_IOC` decomposition
 //!   used by the human-readable text formatter. Stable since v1.0.
-//! - [`decode_ioctl`] — sprint-1 PR 2 decoder registry that returns a typed
-//!   [`DecodedIoctl`] for known commands (today only `DMA_HEAP_IOCTL_ALLOC`
-//!   carries field-level decoding; binder / dma-buf / ashmem are classified
-//!   to [`IoctlFamily`] only). [`render_decoded_ioctl_json`] emits the
-//!   matching JSON fragment that the NDJSON formatter splices into the line.
+//! - [`decode_ioctl`] — decoder registry that returns a typed
+//!   [`DecodedIoctl`] for known commands. Built-ins cover DMA-heap and Binder
+//!   scalar layouts plus bounded driver-family views; runtime schema packs add
+//!   more data-only layouts. [`render_decoded_ioctl_json`] emits the matching
+//!   JSON fragment that the NDJSON formatter splices into the line.
 //!
 //! The whitelist of which `cmd` values trigger a `sys_exit` re-read of the
 //! user buffer is shared with the BPF programs via

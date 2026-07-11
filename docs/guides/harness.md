@@ -52,9 +52,21 @@ Extraction validates duplicate IDs, resource sizes, blob hashes, and the strict
 - argv-only `runner.json`
 - manual `setup.sh` and safety-focused `README.md`
 
-`setup.sh` is documentation; Neutron never executes it. Review and compile
-`replay.rs` for aarch64 yourself, placing the resulting binary at
-`testcase/replay`. Resolve every blocked resource before replay.
+`setup.sh` is documentation; Neutron never executes it. Resolve every blocked
+resource before replay. Then review `replay.rs` and cross-build it with the
+fixed static Android target:
+
+```sh
+neutron harness build testcase
+```
+
+The command requires the pinned `aarch64-unknown-linux-musl` Rust target. It
+rejects symlinked or oversized source/output artifacts, verifies that the
+result is an AArch64 ELF without a dynamic interpreter, caps it at 64 MiB, and
+writes `testcase/replay` mode `0700`. `build.json` uses
+`neutron.harness/v1` and records the target, compiler, source/binary SHA-256,
+and binary size.
+
 Recorded Binder handles are never reused. Binder callback objects require an
 explicit adapter; service handles require a reacquisition adapter in the runner.
 
@@ -78,8 +90,10 @@ executes argv without `sh -c`, and removes the staging directory. ADB runners do
 not accept prepare/recover hooks; old or custom `transport:"host"` runners keep
 direct host argv semantics. The default timeout is 30 seconds and the hard cap
 is 1000 runs. Every attempt overwrites `run-result.json` with a distinct
-completed, crash, reboot, transport-loss, timeout, hook-failure, identity-drift,
-or recovery-failure result.
+completed, crash, non-zero, reboot, transport-loss, timeout, hook-failure,
+identity-drift, recovery-failure, or oracle-error result. `signal` is present
+when the host can recover the terminating signal. A normal exit status such as
+`1` is `nonzero`, not `crash`.
 
 Recovery is attempted at most once: wait for the same USB serial and
 `sys.boot_completed=1`, re-check identity, then run bounded recovery hooks.
@@ -91,15 +105,31 @@ neutron harness minimize testcase \
   --serial USB_SERIAL \
   --package com.example.app \
   --runner runner.json \
-  --oracle-command ./oracle \
-  --oracle-arg expected-signature \
+  --oracle crash \
   --max-runs 64 \
   --authorized-use
 ```
 
-The oracle receives `run-result.json` as its final argument. Exit `0` means
-reproduced, `1` means not reproduced, and `2+` is an oracle error. Infrastructure
-failures are never accepted as reproduction.
+Built-in oracles are `crash`, `reboot`, `timeout`, `nonzero`, and `signal`.
+The signal oracle additionally requires `--signal SIGSEGV` (or a number in
+`1..=64`). `nonzero` accepts a normal non-zero result or a signal crash, while
+`crash` accepts only an actual signal/process disappearance classified as a
+crash. Infrastructure failures are never accepted as reproduction.
+
+An argv-only external oracle remains available:
+
+```sh
+neutron harness minimize testcase \
+  --serial USB_SERIAL \
+  --package com.example.app \
+  --runner runner.json \
+  --oracle-command ./oracle \
+  --oracle-arg expected-signature \
+  --authorized-use
+```
+
+The external oracle receives `run-result.json` as its final argument. Exit `0`
+means reproduced, `1` means not reproduced, and `2+` is an oracle error.
 
 Deterministic ddmin always processes captured mutable regions and trailing
 buffer bytes. It processes causal steps, Binder transactions, or timing delays
@@ -110,3 +140,7 @@ consume those metadata fields. Candidates only delete existing elements,
 replace captured bytes with zero, or shorten a trailing region. The source
 testcase is left intact; accepted output is written under
 `testcase/revisions/revision-N/` with a manifest and candidate log.
+
+Neutron does not generate raw Binder or timing replay adapters. A custom
+runner may advertise those capabilities only when it actually consumes the
+corresponding fields; otherwise minimization deliberately leaves them alone.

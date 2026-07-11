@@ -33,3 +33,14 @@ group/world writable, and cannot contain symlinks, nested paths, traversal,
 unknown schema fields, duplicate IDs, oversized components, or a stale
 SHA-256 content hash. Packs cannot contain executable code, shell commands, or
 arbitrary trace argv.
+
+The pack schema is `neutron.research-pack/v1`. Its content hash and private
+copy provide run reproducibility, not publisher identity or a cryptographic
+trust chain. A public/community registry therefore still requires an explicit
+signing, key-rotation, review, and ownership policy.
+
+CI validates the Rust pack engine and the Android companion probe's unit
+tests. Hardware stimulus, capture completeness, permission restoration, and
+reboot/crash recovery remain manual gates on an explicitly authorized device;
+the repository does not claim a built-in pack is validated on every vendor
+firmware merely because host CI passes.

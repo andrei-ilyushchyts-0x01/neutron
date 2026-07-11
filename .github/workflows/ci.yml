@@ -10,9 +10,8 @@ env:
   RUSTFLAGS: -D warnings
   # The repo's rust-toolchain.toml pins nightly and lists `bpfel-unknown-none`
   # as a required target. That target has no prebuilt rust-std and breaks
-  # rustup auto-install. The host CI jobs below only build host crates and
-  # don't need that target — set RUSTUP_TOOLCHAIN per-job so rustup ignores
-  # rust-toolchain.toml entirely.
+  # rustup auto-install. Each job installs only the targets it needs, so set
+  # RUSTUP_TOOLCHAIN per Rust job and let the eBPF job build core explicitly.
 
 jobs:
   fmt:

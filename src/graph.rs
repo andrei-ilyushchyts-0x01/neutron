@@ -1,4 +1,4 @@
-//! Streaming NDJSON to Mermaid causal graph renderer.
+//! Streaming NDJSON to versioned causal graph documents.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};

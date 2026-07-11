@@ -1,4 +1,4 @@
-//! Deterministic Android service/process/device surface snapshots.
+//! Deterministic Android service/process/device/resource surface snapshots.
 
 pub mod parse;
 pub mod platform;
@@ -41,7 +41,7 @@ pub enum SurfaceCommand {
     Devices(SurfaceInputArgs),
     /// Show one PID (ambiguous reused PIDs are rejected).
     Process(SurfaceProcessArgs),
-    /// Explain a service/device selector and its relations.
+    /// Explain a service/device/resource selector and its relations.
     Explain(SurfaceExplainArgs),
     /// Show only causally observed reachability from a package or UID.
     Reachable(SurfaceReachableArgs),

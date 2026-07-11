@@ -21,7 +21,7 @@ rust-version = "1.74"
 
 [package]
 name = "neutron"
-description = "Aya-based syscall tracer for authorized Android security assessment (Pixel 8 Pro / kernel 6.1+)."
+description = "Android kernel-boundary and cross-service causal tracer for authorized security assessment."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true

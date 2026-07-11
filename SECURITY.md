@@ -24,6 +24,12 @@ in your jurisdiction:
 By using this tool you agree to comply with applicable law and the terms of
 service of any third-party application you observe.
 
+Harness replay and research-pack stimuli require an explicit physical-device
+selector and `--authorized-use` because they may crash or reboot the target.
+Review generated `replay.rs`, `runner.json`, pack parameters, and the selected
+package/device identity before execution. Neutron does not authorize network
+ADB targets, automatic exploit primitives, or unbounded replay loops.
+
 ## Reporting a vulnerability in neutron itself
 
 If you discover a vulnerability in `neutron`'s own code (the loader, the BPF
@@ -48,10 +54,10 @@ will credit the reporter (with consent) in `CHANGELOG.md`.
 
 ## Supported versions
 
-| Version    | Status     | Notes                                                       |
-|------------|------------|-------------------------------------------------------------|
-| `1.0.x`    | Supported  | Current line. Aya 0.13, kernel 6.1+ aarch64, BTF + CO-RE.   |
-| `< 1.0`    | Unsupported | Pre-public development versions.                            |
+| Version | Status | Notes |
+|---------|--------|-------|
+| `1.4.x` | Supported | Current line. Aya 0.13, kernel 6.1+ aarch64, BTF + CO-RE. |
+| `< 1.4` | Unsupported | Historical releases; reproduce against the current line. |
 
 ## Out of scope
 

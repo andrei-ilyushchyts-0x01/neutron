@@ -1,6 +1,6 @@
 # Architecture
 
-neutron 1.2 is a four-crate Rust workspace that runs an Aya-loaded eBPF
+Neutron is a five-crate Rust workspace that runs an Aya-loaded eBPF
 program against a kernel 6.1+ Android device. There is no C BPF source, no
 custom ELF parser, no hand-rolled relocation engine, and no per-CPU perf
 ring buffer — Aya owns all of that.
@@ -29,6 +29,9 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 │              │   INFLIGHT              HashMap                         │
 │              │   SYSCALL_FILTER        HashMap                         │
 │              │   PID_WHITELIST         HashMap                         │
+│              │   TRACED_PROCESSES      HashMap                         │
+│              │   ROOT_UID_CONTEXT      Array                           │
+│              │   BINDER_*_CONTEXT      HashMap                         │
 │              │   WATCH_FDS             HashMap                         │
 │              │   STACK_TRACES          StackTrace                      │
 │              │   COUNTERS              Array<u64>                      │
@@ -85,13 +88,21 @@ Host-side post-processors:
   neutron summarize  --by <fields> → group counts + exemplars (1.2)
   neutron diff       baseline vs test on a shared key (1.2)
   neutron mark       append a type:"marker" NDJSON line (1.2)
+  neutron graph      causal NDJSON → Mermaid or causal-graph/v1 JSON
+  neutron surface    inventory/query/reachability/semantic snapshot diff
+  neutron report     capture → Markdown boundary report
+  neutron ioctl/aidl deterministic source indexes and schema catalogs
+  neutron harness    extract/build/minimize/replay regression artifacts
+  neutron research   validated data-only scenarios and reports
+  neutron native-map / ghidra-export offline ELF address products
+  neutron selinux    captured AVC/delegation explanation
 ```
 
 ## BPF Programs (`neutron-ebpf`)
 
 Five programs in `neutron-ebpf/src/main.rs`. All target
 `bpfel-unknown-none`, are linked with `bpf-linker`, and ship as a single ELF
-object (`neutron.bpf.elf`, ~25 KiB).
+object (`neutron.bpf.elf`).
 
 ### `trace_sys_enter` (tracepoint/raw_syscalls/sys_enter)
 
@@ -323,10 +334,9 @@ lines; LRU eviction handles overflow. Disabled with
 
 Defined once in `neutron-common/src/lib.rs`. `#[repr(C, packed)]`,
 **257 bytes total**, asserted at compile time in both `neutron-common`
-and `neutron-ebpf`. The 1.0.0 layout was 241 bytes; 1.0.0 added a
-dedicated `enter_timestamp_ns` slot (8 B) and `maps_generation` (2 B)
-plus 6 reserved padding bytes for the next single-field bump. Sprint-1
-and sprint-2 added new event semantics without bumping the struct.
+and `neutron-ebpf`. The legacy 0.1 layout was 241 bytes; the current layout
+adds a dedicated `enter_timestamp_ns` slot (8 B), `maps_generation` (2 B),
+and 6 reserved bytes. Later event semantics did not bump the struct.
 
 | Field                | Type   | Offset | Size | Notes                                                    |
 |----------------------|--------|--------|------|----------------------------------------------------------|
@@ -344,7 +354,7 @@ and sprint-2 added new event semantics without bumping the struct.
 | `user_stackid`       | i32    | 229    | 4    | key into `STACK_TRACES`, -1 if unset                     |
 | `ptr_hint`           | u64    | 233    | 8    | raw user pointer; binder `debug_id` on nr=-1 / nr=-4     |
 | `enter_timestamp_ns` | u64    | 241    | 8    | enter ts copied through INFLIGHT for latency calc        |
-| `maps_generation`    | u16    | 249    | 2    | reserved for ProcSymbolizer maps-refresh                 |
+| `maps_generation`    | u16    | 249    | 2    | active causal scenario generation; zero outside a scenario |
 | `_reserved`          | u8[6]  | 251    | 6    | padding for next single-field bump                       |
 
 ### Synthetic event semantics
@@ -380,15 +390,28 @@ evicted, `latency_us` is `null` in JSON output.
 
 ## BPF Maps
 
-| Map               | Type             | Key             | Value          | Max entries | Purpose                                            |
-|-------------------|------------------|-----------------|----------------|-------------|----------------------------------------------------|
-| `FILTER_MAP`      | `Array<u32>`     | u32 idx         | u32            | 2           | `[0]` = target PID, `[1]` = syscall filter active  |
-| `EVENTS`          | `RingBuf`        | —               | bytes          | 1 MiB       | event output ring (single multi-producer ring)     |
-| `INFLIGHT`        | `HashMap`        | u64 (pid_tgid)  | `SyscallEvent` | 4096        | enter/exit correlation                             |
-| `SYSCALL_FILTER`  | `HashMap`        | u32 (nr)        | u8             | 64          | `--profile security` whitelist                     |
-| `PID_WHITELIST`   | `HashMap`        | u32 (pid)       | u8             | 256         | `--follow-children` child PIDs                     |
-| `WATCH_FDS`       | `HashMap`        | u64 (pid<<32\|fd)| u8            | 256         | `--capture-reads` watched fds                      |
-| `STACK_TRACES`    | `StackTrace`     | u32 (stackid)   | u64[127]       | 16384       | kernel + user IP arrays for `bpf_get_stackid`      |
+| Map | Type | Key | Value | Max entries | Purpose |
+|-----|------|-----|-------|-------------|---------|
+| `FILTER_MAP` | `Array<u32>` | u32 slot | u32 | 16 | Trace, predicate, and causal mode controls defined by `FILTER_KEY_*`. |
+| `EVENTS` | `RingBuf` | — | bytes | 1 MiB | Single multi-producer event ring. |
+| `EVENT_SCRATCH` | `PerCpuArray` | u32 | aligned event | 1 | Exit-path scratch outside the 512-byte BPF stack. |
+| `INFLIGHT` | `HashMap` | u64 pid_tgid | `SyscallEvent` | 4096 | Syscall enter/exit correlation. |
+| `SYSCALL_FILTER` | `HashMap` | u32 syscall | u8 | 64 | Active syscall whitelist. |
+| `PID_WHITELIST` | `HashMap` | u32 PID | u8 | 256 | `--follow-children` PIDs. |
+| `TRACED_PROCESSES` | `HashMap` | u32 PID | `ProcessTraceContext` | 64 default, loader override | Bounded dynamic causal set (`--max-processes`). |
+| `ROOT_UID_CONTEXT` | `Array` | u32 | `ProcessTraceContext` | 1 | Current explicit UID-root context. |
+| `BINDER_TRANSACTION_CONTEXT` | `HashMap` | u32 debug ID | Binder transaction context | 4096 | Caller-to-callee causal propagation. |
+| `THREAD_BINDER_CONTEXT` | `HashMap` | u64 pid_tgid | Binder thread context | 4096 | Exact receiving-thread attribution. |
+| `WATCH_FDS` | `HashMap` | u64 pid<<32\|fd | u8 | 256 | Selective read/write capture. |
+| `STACK_TRACES` | `StackTrace` | u32 stack ID | u64[127] | 16384 | Kernel and user IP arrays; present with `stacks`. |
+| `MATCH_UID_SET` | `HashMap` | u32 UID | u8 | 64 | UID predicate values. |
+| `MATCH_IOCTL_CMD_SET` | `HashMap` | u32 cmd | u8 | 64 | Full ioctl command predicates. |
+| `MATCH_IOCTL_TYPE_SET` | `HashMap` | u32 type | u8 | 16 | `_IOC_TYPE` predicates. |
+| `MATCH_IOCTL_NR_SET` | `HashMap` | u32 number | u8 | 64 | `_IOC_NR` predicates. |
+| `MATCH_ARG_U32_VALS` | `HashMap` | u32 value | u8 | 32 | Bounded captured-argument predicates. |
+| `IOCTL_REFRESH_CMD_SET` | `HashMap` | u32 cmd | u8 | 64 | Schema-selected post-exit refresh commands. |
+| `IOCTL_REFRESH_TYPE_SET` | `HashMap` | u32 type | u8 | 32 | Schema-selected post-exit refresh families. |
+| `COUNTERS` | `Array<u64>` | u32 slot | u64 | 20 | Capture-health counters shared with userspace. |
 
 Map names are the **exact** Rust static identifiers in
 `neutron-ebpf/src/main.rs`. Aya does not lowercase them. The userspace

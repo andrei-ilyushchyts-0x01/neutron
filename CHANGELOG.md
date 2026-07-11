@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- Added versioned `neutron.causal-graph/v1` JSON export and deterministic
+  `--collapse-syscalls` grouping alongside the existing Mermaid graph.
+- Added semantic `surface diff` / `surface diff-device` reports using
+  `neutron.surface-diff/v1`, including service, HAL, device, module, ioctl,
+  binary, SELinux, scenario, and collector-health changes.
+- Added observed mmap and DMA-heap resources to `neutron.surface/v1`, with
+  explicit acquisition and release relations. Partial `munmap` evidence is
+  retained conservatively and degrades snapshot health.
+- Added `neutron harness build` for a bounded static AArch64 replay binary,
+  plus built-in crash, reboot, timeout, non-zero, and signal minimization
+  oracles. Normal non-zero exits are no longer classified as crashes.
+- Added bounded native symbol indexing, versioned native-map and Ghidra
+  bookmark schemas, exec/mapping invalidation, and stripped-ELF fallbacks.
+- Added validated data-only subsystem research packs and typed companion
+  stimuli with private artifact locking and bounded permission cleanup.
+- Expanded CI to verify the full host workspace, AArch64 musl build, release
+  eBPF object, and Android research-probe unit tests.
+
 ## [1.4.0] — 2026-07-10
 
 - Added `neutron surface scan` and JSON query commands for deterministic
