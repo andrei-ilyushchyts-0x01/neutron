@@ -2014,12 +2014,12 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
     };
     let confidence = if relations.is_empty() {
         if !matching_captures.is_empty() {
-            warnings.push("matching capture contains no supported causal reachability edges".into());
+            warnings
+                .push("matching capture contains no supported causal reachability edges".into());
         }
         "none"
     } else if relations.iter().all(|relation| {
-        relation.confidence == "exact"
-            && relation.causal_relation.as_deref() == Some("exact")
+        relation.confidence == "exact" && relation.causal_relation.as_deref() == Some("exact")
     }) {
         "exact"
     } else {

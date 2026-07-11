@@ -31,11 +31,10 @@ use neutron::android;
 use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap};
 use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
 use neutron::causal::{
-    binder_span_id, enrich_json, expired_followed_pids, monotonic_timestamp_ns,
-    parse_follow_ttl, process_context_bytes, process_context_from_bytes, process_exit_span_id,
-    root_process_span_id, selinux_denial_span_id, syscall_span_id, CausalMetadata, CausalRelation,
-    CausalWire, ControlServer, FollowCandidate, FollowDecision, FollowPolicy, ScenarioInfo,
-    ScenarioState,
+    binder_span_id, enrich_json, expired_followed_pids, monotonic_timestamp_ns, parse_follow_ttl,
+    process_context_bytes, process_context_from_bytes, process_exit_span_id, root_process_span_id,
+    selinux_denial_span_id, syscall_span_id, CausalMetadata, CausalRelation, CausalWire,
+    ControlServer, FollowCandidate, FollowDecision, FollowPolicy, ScenarioInfo, ScenarioState,
 };
 use neutron::cli::{AidlCommand, Args, Cli, Command, HarnessCommand, IoctlCommand};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
@@ -1606,9 +1605,7 @@ fn remove_followed_process(bpf: &mut Ebpf, pid: u32) -> Result<Option<ProcessTra
         match transactions.remove(&binder_debug_id) {
             Ok(()) => {}
             Err(error) if map_delete_already_absent(&error) => {}
-            Err(error) => {
-                return Err(error).context("removing blocked Binder transaction context")
-            }
+            Err(error) => return Err(error).context("removing blocked Binder transaction context"),
         }
     }
 
@@ -1626,9 +1623,7 @@ fn remove_followed_process(bpf: &mut Ebpf, pid: u32) -> Result<Option<ProcessTra
         match threads.remove(&key) {
             Ok(()) => {}
             Err(error) if map_delete_already_absent(&error) => {}
-            Err(error) => {
-                return Err(error).context("removing blocked Binder thread context")
-            }
+            Err(error) => return Err(error).context("removing blocked Binder thread context"),
         }
     }
     Ok(Some(context))
@@ -2751,12 +2746,9 @@ fn run_trace(mut args: Args) -> Result<()> {
             if args.follow_binder && scenarios.active().is_some() {
                 let roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
                 let now_ns = monotonic_timestamp_ns();
-                for pid in expired_followed_pids(
-                    &followed_last_hop_ns,
-                    &roots,
-                    now_ns,
-                    follow_ttl_ns,
-                ) {
+                for pid in
+                    expired_followed_pids(&followed_last_hop_ns, &roots, now_ns, follow_ttl_ns)
+                {
                     followed_last_hop_ns.remove(&pid);
                     policy_blocked_pids.remove(&pid);
                     let Some(context) = remove_followed_process(&mut bpf, pid)? else {
@@ -2914,10 +2906,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     {
                         discovery_refresh_pending = true;
                     }
-                    if args.follow_binder
-                        && callee_pid != 0
-                        && !root_pids.contains(&callee_pid)
-                    {
+                    if args.follow_binder && callee_pid != 0 && !root_pids.contains(&callee_pid) {
                         if let Some(metadata) = causal_event.as_ref() {
                             let caller_pid = { ev.pid };
                             let caller_comm = format_comm(&{ ev.comm });
