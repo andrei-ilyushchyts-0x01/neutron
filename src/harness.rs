@@ -2233,6 +2233,15 @@ fn adb_stage_files(
     Ok(assets)
 }
 
+fn remote_artifact_path(input_sha256: &str) -> Result<String> {
+    let digest = normalize_digest(input_sha256)?.to_ascii_lowercase();
+    Ok(format!(
+        "/data/local/tmp/neutron-harness-{}-{}",
+        std::process::id(),
+        &digest[..16]
+    ))
+}
+
 fn checked_stage_asset(path: PathBuf, remote_path: String, limit: u64) -> Result<AdbStageAsset> {
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("missing ADB replay asset {}", path.display()))?;
