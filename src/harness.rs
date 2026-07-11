@@ -3313,6 +3313,26 @@ mod tests {
     }
 
     #[test]
+    fn metadata_minimization_requires_runner_capabilities() {
+        let mut runner = RunnerContract {
+            schema: HARNESS_SCHEMA.into(),
+            transport: RunnerTransport::Host,
+            capabilities: Vec::new(),
+            prepare: None,
+            execute: vec!["/bin/true".into()],
+            recover: None,
+            timeout_seconds: 1,
+        };
+        assert!(!runner_supports(&runner, RunnerCapability::CausalSteps));
+        runner.capabilities.push(RunnerCapability::CausalSteps);
+        assert!(runner_supports(&runner, RunnerCapability::CausalSteps));
+        assert!(!runner_supports(
+            &runner,
+            RunnerCapability::BinderTransactions
+        ));
+    }
+
+    #[test]
     fn binder_object_registry_covers_standard_reconstruction_types() {
         assert_eq!(binder_object_name(0x7362_2a85), Some("binder"));
         assert_eq!(binder_object_name(0x7762_2a85), Some("weak_binder"));
