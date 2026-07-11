@@ -2,6 +2,7 @@
 
 pub mod parse;
 pub mod platform;
+mod surface_diff;
 
 pub use parse::{
     ioctl_label, parse_dumpsys_pid, parse_lshal_inventory, parse_module_names,
@@ -9,6 +10,7 @@ pub use parse::{
     parse_vintf_manifest, parse_vndservice_list,
 };
 pub use platform::{CommandOutput, FileKind, PlatformMetadata, PlatformReader, RealPlatformReader};
+pub use surface_diff::{diff_snapshots, SurfaceDiff, SurfaceDiffArgs};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -43,6 +45,9 @@ pub enum SurfaceCommand {
     Explain(SurfaceExplainArgs),
     /// Show only causally observed reachability from a package or UID.
     Reachable(SurfaceReachableArgs),
+    /// Compare two snapshots by stable Android surface semantics.
+    #[command(visible_alias = "diff-device")]
+    Diff(SurfaceDiffArgs),
 }
 
 #[derive(Args, Debug)]
@@ -388,6 +393,7 @@ pub fn run(command: SurfaceCommand) -> Result<()> {
             let result = reachable(&snapshot, &selector)?;
             write_json(args.io.output.as_deref(), &result)
         }
+        SurfaceCommand::Diff(args) => surface_diff::run(args),
     }
 }
 

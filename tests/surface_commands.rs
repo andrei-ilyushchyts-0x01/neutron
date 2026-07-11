@@ -411,10 +411,7 @@ fn surface_diff_reports_semantic_ota_changes_without_pid_or_boot_noise() {
     let diff = read_json(&output);
     assert_eq!(diff["schema"], "neutron.surface-diff/v1");
     assert_eq!(diff["baseline"]["device"]["boot_id"], "boot-test");
-    assert_eq!(
-        diff["current"]["device"]["boot_id"],
-        "boot-after-ota"
-    );
+    assert_eq!(diff["current"]["device"]["boot_id"], "boot-after-ota");
     assert_eq!(diff["health"]["before"]["status"], "complete");
     assert_eq!(diff["health"]["after"]["status"], "degraded");
     assert_eq!(diff["services"]["changed"].as_array().unwrap().len(), 1);
