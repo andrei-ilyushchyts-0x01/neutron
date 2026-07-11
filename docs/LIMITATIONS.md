@@ -191,8 +191,9 @@ policy model.
   excluded from reachability traversal. Static service/process/device fields
   only enrich a node reached through a causal trace.
 - Reachability accepts only capture-sourced `root_process`, `binder`,
-  `served_by`, and `ioctl` edges. A trace ID on any other relation type does
-  not make that edge causal.
+  `served_by`, and successful `open`, `mmap`, or `ioctl` edges. Failed or
+  incomplete syscalls, exits, crashes, AVC denials, and a trace ID on any other
+  relation type do not make that edge reachable.
 - Captured SELinux denials are attempt evidence and are never traversed as
   successful device reachability.
 - Live `--observe` requires exactly one `--from-package` or `--from-uid`.

@@ -33,7 +33,7 @@ Status meanings:
 |---|---|---|---|
 | Dynamic Binder follow | **MVP** | One package/UID root, global BPF programs, bounded `TRACED_PROCESSES`, Binder caller/callee stitching, depth/process caps, PID TTL, SELinux allow/deny domains, servicemanager transit cap, exact-only system_server transit, incomplete-branch events and health counters. | Validate on the supported Pixel matrix; add per-branch rate budgets and stronger kernel-side admission before a denied callee can run. |
 | Causal graph | **MVP** | Scenario/trace/span/parent IDs, Binder/process/syscall/ioctl/crash nodes, Mermaid output, callee identity enrichment, device paths, capture-loss and incomplete-branch warnings. | Add stable JSON graph export, branch collapse policies, and explicit graph schema versioning. |
-| Android surface mapper | **MVP** | Deterministic Binder/HwBinder/VndBinder, VINTF, process, library, SELinux, device, sysfs driver/module, and observed Binder/ioctl/AVC evidence. `reachable` reports capture health separately from identity confidence and never treats a denial as successful reachability. | Import open/mmap/DMA/crash relations; improve vendor sysfs coverage; add snapshot-to-snapshot semantic diff. |
+| Android surface mapper | **MVP** | Deterministic Binder/HwBinder/VndBinder, VINTF, process, library, SELinux, device, sysfs driver/module, and observed Binder/open/mmap/ioctl/AVC/process-exit/crash evidence. `reachable` reports capture health separately from identity confidence and traverses only completed successful device syscalls. | Model munmap/mapping lifetime and explicit DMA allocation resources; improve vendor sysfs coverage; add snapshot-to-snapshot semantic diff. |
 | ioctl schema generation | **Complete** | Host clang pipeline for `_IO*` macros and record layouts, data-only schema packs, selector/provenance checks, trusted runtime loading, conflict handling, and generated Rust descriptors. | Publish maintained GKI/Pixel/vendor packs; cover nested unions, flexible arrays, and driver ownership with verified source evidence. |
 | Capture -> extract -> replay | **MVP** | Bounded resource capture, strict artifact validation, generated Rust ioctl replay, explicit physical-USB identity checks, shell-free ADB staging/execution, remote timeout/cleanup, recovery classification, deterministic byte minimization. Metadata minimization runs only when a custom runner declares the relevant capability. | Build/deploy automation for the generated aarch64 binary; typed adapters that actually replay causal steps, Binder transactions, and delays; more crash oracles. |
 | Binder/AIDL intelligence | **MVP** | Exact service attribution when evidence supports it, deterministic AOSP/vendor AIDL catalog generation, method-name attribution, and a bounded offline KeyMint decoder plugin. | Broaden exact node/descriptor discovery and selective plugins. Generic version-independent Parcel decoding remains intentionally out of scope. |
@@ -97,10 +97,12 @@ step because it can crash or reboot the target.
 ### P1 — complete the research loop
 
 1. **Surface evidence completeness**
-   - import open/openat, mmap/munmap, DMA allocation, process exit, and crash
-     relations;
-   - keep attempted/denied/successful relations distinct;
-   - add schema-aware snapshot diff with confidence and capture-health deltas.
+   - implemented: open/openat, mmap, process-exit, and crash relations;
+     attempted/failed/unknown syscall outcomes remain distinct and
+     non-traversable;
+   - next: model munmap/mapping lifetime and explicit DMA allocation resources;
+   - next: add schema-aware snapshot diff with confidence and capture-health
+     deltas.
 
 2. **AIDL and ioctl knowledge production**
    - generate reproducible AOSP/vendor AIDL catalogs in CI;

@@ -214,9 +214,9 @@ regular file; the verified file descriptor is then truncated and kept at mode
 `0600`.
 
 `reachable` traverses only capture-sourced `root_process`, `binder`,
-`served_by`, and `ioctl` relations from matching trace IDs. Other relation
-types remain enrichment evidence even if an input document attaches a trace
-ID to them.
+`served_by`, and successful `open`, `mmap`, or `ioctl` relations from matching
+trace IDs. Other relation types remain enrichment evidence even if an input
+document attaches a trace ID to them.
 
 The snapshot envelope is:
 
@@ -264,11 +264,15 @@ and `ioctl`. Known Trusty TIPC and V4L2 commands include
 `cmd=0x...`.
 
 `reachable` selects captures matching the requested package/UID and traverses
-only capture-sourced `root_process`, `binder`, `served_by`, and `ioctl`
-relations. Static `proc_fd` relations describe current scan state but are
-excluded from traversal; static fields only enrich nodes already reached.
-Therefore “reachable” never means a SELinux/VINTF/manifest permission or
-theoretical Binder allow decision.
+only capture-sourced `root_process`, `binder`, `served_by`, and successful
+`open`, `mmap`, or `ioctl` relations. A device-bound syscall is successful only
+when its exit event has a non-negative `ret`; entry-only, failed, and
+outcome-unknown events are retained as non-traversable `syscall_attempt`
+relations. `process_exit` and `crash` relate a process to the capture where the
+outcome occurred, but are also non-traversable. Static `proc_fd` relations
+describe current scan state and static fields only enrich nodes already
+reached. Therefore “reachable” never means a SELinux/VINTF/manifest permission
+or theoretical Binder allow decision.
 
 The query includes `health.status` (`complete`, `degraded`, or `no_evidence`),
 `health.confidence` (`exact`, `candidate`, or `none`), matched capture IDs, and

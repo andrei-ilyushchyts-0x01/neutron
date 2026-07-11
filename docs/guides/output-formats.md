@@ -369,11 +369,12 @@ also sorted and deduplicated; ordered fields such as process argv are not.
 make partial `/proc`, `/sys`, service-manager, and VINTF access explicit.
 `proc_fd` relations are a static point-in-time observation. A
 `surface reachable` response never traverses them; it traverses only matching
-capture-sourced `root_process`, `binder`, `served_by`, and `ioctl` relations,
-so its result means observed causal reachability rather than policy or
-theoretical access. An imported capture without final `capture_health` is
-retained with degraded health; live observation fails if the final record is
-missing.
+capture-sourced `root_process`, `binder`, `served_by`, and successful `open`,
+`mmap`, or `ioctl` relations. Failed, entry-only, or outcome-unknown device
+syscalls are `syscall_attempt` evidence and remain non-traversable, as do
+`process_exit`, `crash`, and `selinux_denial`. An imported capture without final
+`capture_health` is retained with degraded health; live observation fails if
+the final record is missing.
 
 The six query families (`services`, `hals`, `devices`, `process`, `explain`,
 and `reachable`) wrap their result in `schema:"neutron.surface/query/v1"`.

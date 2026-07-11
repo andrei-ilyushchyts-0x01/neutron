@@ -330,10 +330,12 @@ neutron surface reachable --from-uid 10123 --input surface.json
 ```
 
 `reachable` means observed causal reachability through capture-sourced
-`root_process`, `binder`, `served_by`, and `ioctl` relations. It does not solve
-SELinux, VINTF, manifest permissions, or theoretical Binder access. Static
-`proc_fd` relations describe the scan instant and enrich nodes, but never make
-a node reachable.
+`root_process`, `binder`, `served_by`, and successful `open`, `mmap`, or
+`ioctl` relations. It does not solve SELinux, VINTF, manifest permissions, or
+theoretical Binder access. Failed or incomplete syscalls are retained as
+non-traversable `syscall_attempt` evidence; `process_exit`, `crash`, AVC, and
+static `proc_fd` relations also enrich the capture without making a device
+reachable.
 
 For a UID-rooted causal trace, use `trace --root-uid UID`. The eBPF gate admits
 each matching process on its first observed kernel event, including processes
