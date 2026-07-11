@@ -36,11 +36,11 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use neutron_common::{
-    causal_pid_action, encode_causal_relation_depth, is_state_tracking_nr, ret_matches_class,
-    ExitSource, ProcessTraceContext, SyscallEvent, TraceReason, CAUSAL_PID_ADMIT_ROOT,
-    CAUSAL_PID_FALLTHROUGH, CAUSAL_PID_MATCH, CAUSAL_RELATION_EXACT, CAUSAL_RELATION_INFERRED,
-    COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED,
-    COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT, COUNTER_EVENTS_SUBMITTED,
+    causal_admission_boundary_exit, causal_pid_action, encode_causal_relation_depth,
+    is_state_tracking_nr, ret_matches_class, ExitSource, ProcessTraceContext, SyscallEvent,
+    TraceReason, CAUSAL_PID_ADMIT_ROOT, CAUSAL_PID_FALLTHROUGH, CAUSAL_PID_MATCH,
+    CAUSAL_RELATION_EXACT, CAUSAL_RELATION_INFERRED, COUNTER_BINDER_DEPTH_LIMIT,
+    COUNTER_BINDER_FOLLOW_FAILED, COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT, COUNTER_EVENTS_SUBMITTED,
     COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
     COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_THREAD_CONTEXT_UPDATE_FAILED,
     COUNTER_TRACED_PROCESS_LIMIT, COUNTER_UNIX_MSG_CONTROL_NESTED,
@@ -144,6 +144,13 @@ struct BinderThreadContext {
 #[map]
 static THREAD_BINDER_CONTEXT: HashMap<u64, BinderThreadContext> =
     HashMap::with_max_entries(4096, 0);
+
+/// Threads in dynamically Binder-admitted processes that have executed at
+/// least one post-admission syscall enter. A sibling Binder thread can still
+/// be exiting a syscall that began before its process was admitted; the first
+/// such exit is a causal boundary, not an INFLIGHT loss.
+#[map]
+static ADMITTED_THREAD_ENTERS: HashMap<u64, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Watched fds for selective read/write capture.
 /// Key: `(pid << 32) | fd`. Value: tag (1 = procfs/sysfs).
@@ -817,6 +824,32 @@ fn consume_admission_boundary_exit(pid_tgid: u64) -> bool {
 }
 
 #[inline(always)]
+fn mark_admitted_thread_enter(pid_tgid: u64, userspace_pid: u32) {
+    let Some(context) = unsafe { TRACED_PROCESSES.get(&userspace_pid) }.copied() else {
+        return;
+    };
+    if context.reason != TraceReason::Binder || !active_causal_context_matches(context) {
+        return;
+    }
+    let _ = ADMITTED_THREAD_ENTERS.insert(&pid_tgid, &1, 0);
+}
+
+#[inline(always)]
+fn consume_sibling_admission_boundary_exit(pid_tgid: u64, userspace_pid: u32) -> bool {
+    let Some(context) = unsafe { TRACED_PROCESSES.get(&userspace_pid) }.copied() else {
+        return false;
+    };
+    if !active_causal_context_matches(context) {
+        return false;
+    }
+    let seen_enter = unsafe { ADMITTED_THREAD_ENTERS.get(&pid_tgid) }.is_some();
+    if !causal_admission_boundary_exit(context.reason, seen_enter, false) {
+        return false;
+    }
+    ADMITTED_THREAD_ENTERS.insert(&pid_tgid, &1, 0).is_ok()
+}
+
+#[inline(always)]
 unsafe fn data_write_u32(ev: *mut SyscallEvent, off: usize, v: u32) {
     let b = v.to_le_bytes();
     data_write_u8(ev, off, b[0]);
@@ -1121,6 +1154,7 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
     if !pid_matches(userspace_pid) {
         return Err(());
     }
+    mark_admitted_thread_enter(pid_tgid, userspace_pid);
 
     let nr = match unsafe { ctx.read_at::<i64>(SYS_ENTER_ID) } {
         Ok(v) => v as i32,
@@ -1240,7 +1274,10 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
     // enter timestamp (for latency). The borrow is released before the
     // ringbuf reservation.
     let saved_ptr: *const SyscallEvent = INFLIGHT.get_ptr(&pid_tgid).unwrap_or_default();
-    let admission_boundary_exit = consume_admission_boundary_exit(pid_tgid);
+    let direct_admission_boundary = consume_admission_boundary_exit(pid_tgid);
+    let admission_boundary_exit = saved_ptr.is_null()
+        && (direct_admission_boundary
+            || consume_sibling_admission_boundary_exit(pid_tgid, userspace_pid));
 
     if !should_submit_exit(nr, uid_now, saved_ptr, ret, now) {
         // Reclaim the INFLIGHT entry that the unconditional enter-side
@@ -1599,6 +1636,7 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
     let now = unsafe { bpf_ktime_get_ns() };
     let causal = causal_context(pid_tgid, userspace_pid);
     let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
+    let _ = ADMITTED_THREAD_ENTERS.remove(&pid_tgid);
     if userspace_tid != userspace_pid {
         return Ok(());
     }

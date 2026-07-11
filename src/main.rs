@@ -1455,8 +1455,8 @@ fn set_root_uid_context(bpf: &mut Ebpf, trace_id: u64, generation: u16) -> Resul
 fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
     // These are internal packed BPF-map wire sizes:
     // ProcessTraceContext(20) + flags(4) + parent_debug_id(4) + relation(1)
-    // + admission_boundary(1), and debug_id(4) + scenario_generation(2)
-    // + depth(1) + admission_boundary(1).
+    // + admission_boundary(1), debug_id(4) + scenario_generation(2)
+    // + depth(1) + admission_boundary(1), and per-thread u8 enter markers.
     {
         let map = bpf
             .map_mut("BINDER_TRANSACTION_CONTEXT")
@@ -1495,6 +1495,27 @@ fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("removing Binder thread context {key}"))
+                }
+            }
+        }
+    }
+    {
+        let map = bpf
+            .map_mut("ADMITTED_THREAD_ENTERS")
+            .context("ADMITTED_THREAD_ENTERS missing")?;
+        let mut threads: AyaHashMap<_, u64, u8> =
+            AyaHashMap::try_from(map).context("ADMITTED_THREAD_ENTERS has unexpected layout")?;
+        let keys: Vec<u64> = threads
+            .keys()
+            .collect::<Result<_, _>>()
+            .context("enumerating admitted thread enter markers")?;
+        for key in keys {
+            match threads.remove(&key) {
+                Ok(()) => {}
+                Err(error) if map_delete_already_absent(&error) => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing admitted thread enter marker {key}"))
                 }
             }
         }
@@ -1635,6 +1656,24 @@ fn remove_followed_process(bpf: &mut Ebpf, pid: u32) -> Result<Option<ProcessTra
             Ok(()) => {}
             Err(error) if map_delete_already_absent(&error) => {}
             Err(error) => return Err(error).context("removing blocked Binder thread context"),
+        }
+    }
+
+    let map = bpf
+        .map_mut("ADMITTED_THREAD_ENTERS")
+        .context("ADMITTED_THREAD_ENTERS missing")?;
+    let mut enters: AyaHashMap<_, u64, u8> =
+        AyaHashMap::try_from(map).context("ADMITTED_THREAD_ENTERS has unexpected layout")?;
+    let keys: Vec<u64> = enters
+        .keys()
+        .filter_map(|key| key.ok())
+        .filter(|pid_tgid| (*pid_tgid >> 32) as u32 == pid)
+        .collect();
+    for key in keys {
+        match enters.remove(&key) {
+            Ok(()) => {}
+            Err(error) if map_delete_already_absent(&error) => {}
+            Err(error) => return Err(error).context("removing admitted thread enter marker"),
         }
     }
     Ok(Some(context))

@@ -205,6 +205,22 @@ pub const fn causal_pid_action(
     }
 }
 
+/// Classify a missing syscall exit at a dynamic Binder-follow boundary.
+///
+/// A process can be admitted while one of its sibling Binder threads is
+/// already blocked in a syscall that started before the trace set contained
+/// the process. That thread's first observed exit has no matching enter. It
+/// is a causal-boundary observation only when no post-admission enter was
+/// seen for that thread; later misses remain capture degradation.
+#[inline(always)]
+pub const fn causal_admission_boundary_exit(
+    reason: TraceReason,
+    thread_seen_enter: bool,
+    direct_binder_boundary: bool,
+) -> bool {
+    direct_binder_boundary || (reason as u8 == TraceReason::Binder as u8 && !thread_seen_enter)
+}
+
 // ── MATCH_BITS — bitfield in FILTER_MAP[FILTER_KEY_MATCH_BITS] ───────────────
 //
 // Each bit gates one predicate evaluator BPF-side. Userspace sets the bit
