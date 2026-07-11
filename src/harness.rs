@@ -3154,6 +3154,17 @@ mod tests {
     }
 
     #[test]
+    fn remote_staging_path_is_bounded_and_content_addressed() {
+        let path = remote_artifact_path(&"ab".repeat(32)).unwrap();
+        assert!(path.starts_with("/data/local/tmp/neutron-harness-"));
+        assert!(path.ends_with("-abababababababab"));
+        assert!(path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-')));
+        assert!(remote_artifact_path("../unsafe").is_err());
+    }
+
+    #[test]
     fn binder_object_registry_covers_standard_reconstruction_types() {
         assert_eq!(binder_object_name(0x7362_2a85), Some("binder"));
         assert_eq!(binder_object_name(0x7762_2a85), Some("weak_binder"));
