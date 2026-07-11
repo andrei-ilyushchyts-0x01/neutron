@@ -178,6 +178,27 @@ on-demand inside the event-loop iteration when `--follow-children` /
 loop only borrows `bpf` immutably (via `bpf.map("STACK_TRACES")` for the
 stack-resolve step).
 
+### Runtime ioctl schemas
+
+`neutron ioctl generate` is a host-only clang subprocess pipeline. It scans
+only the requested header roots, preprocesses `_IO*` macros, asks clang for
+constant values and record layouts, normalizes/sorts the result, hashes it and
+atomically writes a data-only `neutron.ioctl-schema/v1` pack. Optional Rust
+constants come from that same normalized model.
+
+Before loading BPF, trace mode validates and merges selected packs into one
+descriptor registry. Lookup keys on the full cmd and optional FD path/family,
+so reused magic bytes do not collapse unrelated drivers. Existing specialized
+Binder, DMA-heap and LWIS decoders run as before; a matching generated
+descriptor additionally emits `ioctl_fields`. R/RW commands populate the
+existing `IOCTL_REFRESH_CMD_SET` before tracepoint attach. Conflicts and map
+capacity errors stop startup.
+
+The generic decoder reads at most the captured 124 bytes. Scalar values,
+enums, fixed arrays and pointer numeric values may be rendered; pointer targets
+are never read. Unions, bitfields, nested records, flexible arrays and fields
+crossing the capture boundary remain opaque.
+
 ### Event loop
 
 ```

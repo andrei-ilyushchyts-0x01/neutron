@@ -188,8 +188,9 @@ fn is_alsa_type(ty: u32) -> bool {
 #[derive(Debug, Clone)]
 pub struct DecodedIoctl {
     pub family: IoctlFamily,
-    pub name: Option<&'static str>,
+    pub name: Option<String>,
     pub fields: IoctlFields,
+    pub generated: Option<crate::ioctl_schema::GenericDecodedIoctl>,
 }
 
 /// Typed view of the ioctl `arg` buffer for known commands.
@@ -307,10 +308,19 @@ pub fn decode_ioctl_with_context(
             _ => (None, IoctlFields::None),
         },
     };
+    let generated = crate::ioctl_schema::decode_active(
+        cmd,
+        payload,
+        fd_path,
+        (family != IoctlFamily::Unknown).then(|| family.as_str()),
+    );
     DecodedIoctl {
         family,
-        name,
+        name: name
+            .map(str::to_string)
+            .or_else(|| generated.as_ref().map(|d| d.name.clone())),
         fields,
+        generated,
     }
 }
 
@@ -510,11 +520,13 @@ pub fn render_decoded_ioctl_json(d: &DecodedIoctl) -> String {
         out.push_str(r#","ioctl_family":""#);
         out.push_str(d.family.as_str());
         out.push('"');
+    } else if let Some(family) = d.generated.as_ref().and_then(|d| d.family.as_deref()) {
+        out.push_str(r#","ioctl_family":"#);
+        out.push_str(&serde_json::to_string(family).expect("serializing ioctl family"));
     }
-    if let Some(name) = d.name {
-        out.push_str(r#","ioctl_name":""#);
-        out.push_str(name);
-        out.push('"');
+    if let Some(name) = &d.name {
+        out.push_str(r#","ioctl_name":"#);
+        out.push_str(&serde_json::to_string(name).expect("serializing ioctl name"));
     }
     match &d.fields {
         IoctlFields::DmaHeapAlloc {
@@ -580,6 +592,12 @@ pub fn render_decoded_ioctl_json(d: &DecodedIoctl) -> String {
             out.push('}');
         }
         IoctlFields::None => {}
+    }
+    if let Some(generated) = &d.generated {
+        out.push_str(r#","ioctl_fields":"#);
+        out.push_str(
+            &serde_json::to_string(&generated.fields).expect("serializing generated ioctl fields"),
+        );
     }
     out
 }
@@ -699,7 +717,7 @@ mod tests {
         let payload = dma_heap_payload(4096, 32, 0x80002, 0);
         let decoded = decode_ioctl(0xC018_4800, &payload, 0, None);
         assert_eq!(decoded.family, IoctlFamily::DmaHeap);
-        assert_eq!(decoded.name, Some("DMA_HEAP_IOCTL_ALLOC"));
+        assert_eq!(decoded.name.as_deref(), Some("DMA_HEAP_IOCTL_ALLOC"));
         match decoded.fields {
             IoctlFields::DmaHeapAlloc {
                 len,
@@ -723,7 +741,7 @@ mod tests {
         let short = [0u8; 16];
         let decoded = decode_ioctl(0xC018_4800, &short, 0, None);
         assert_eq!(decoded.family, IoctlFamily::DmaHeap);
-        assert_eq!(decoded.name, Some("DMA_HEAP_IOCTL_ALLOC"));
+        assert_eq!(decoded.name.as_deref(), Some("DMA_HEAP_IOCTL_ALLOC"));
         assert_eq!(decoded.fields, IoctlFields::None);
     }
 
@@ -771,6 +789,7 @@ mod tests {
             family: IoctlFamily::Unknown,
             name: None,
             fields: IoctlFields::None,
+            generated: None,
         };
         assert_eq!(render_decoded_ioctl_json(&decoded), "");
     }
@@ -826,7 +845,7 @@ mod tests {
         let payload = lwis_payload(0x10100);
         let decoded = decode_ioctl(LWIS_CMD_PACKET, &payload, 0, None);
         assert_eq!(decoded.family, IoctlFamily::Lwis);
-        assert_eq!(decoded.name, Some("LWIS_CMD_PACKET"));
+        assert_eq!(decoded.name.as_deref(), Some("LWIS_CMD_PACKET"));
         match decoded.fields {
             IoctlFields::LwisCmdPkt {
                 cmd_id,
@@ -861,7 +880,7 @@ mod tests {
     fn decode_lwis_handles_truncated_payload() {
         let decoded = decode_ioctl(LWIS_CMD_PACKET, &[0u8; 2], 0, None);
         assert_eq!(decoded.family, IoctlFamily::Lwis);
-        assert_eq!(decoded.name, Some("LWIS_CMD_PACKET"));
+        assert_eq!(decoded.name.as_deref(), Some("LWIS_CMD_PACKET"));
         assert_eq!(decoded.fields, IoctlFields::None);
     }
 
@@ -943,7 +962,7 @@ mod tests {
             Some(FdKind::Binder),
         );
         assert_eq!(decoded.family, IoctlFamily::Binder);
-        assert_eq!(decoded.name, Some("BINDER_WRITE_READ"));
+        assert_eq!(decoded.name.as_deref(), Some("BINDER_WRITE_READ"));
         match decoded.fields {
             IoctlFields::BinderWriteRead {
                 write_size,
@@ -978,7 +997,7 @@ mod tests {
             Some("/dev/kgsl-3d0"),
         );
         assert_eq!(kgsl.family, IoctlFamily::Kgsl);
-        assert_eq!(kgsl.name, Some("IOCTL_KGSL_GPUMEM_ALLOC"));
+        assert_eq!(kgsl.name.as_deref(), Some("IOCTL_KGSL_GPUMEM_ALLOC"));
         assert!(matches!(kgsl.fields, IoctlFields::DriverScalars { .. }));
 
         let mali_cmd = (3u32 << 30) | (16u32 << 16) | (0x80u32 << 8);
@@ -990,7 +1009,7 @@ mod tests {
             Some("/dev/mali0"),
         );
         assert_eq!(mali.family, IoctlFamily::Mali);
-        assert_eq!(mali.name, Some("KBASE_IOCTL_VERSION_CHECK"));
+        assert_eq!(mali.name.as_deref(), Some("KBASE_IOCTL_VERSION_CHECK"));
 
         let alsa_cmd = (3u32 << 30) | (32u32 << 16) | (0x50u32 << 8) | 0x10;
         let alsa = decode_ioctl_with_context(

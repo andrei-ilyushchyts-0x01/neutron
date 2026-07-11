@@ -117,7 +117,19 @@ DMA-heap allocation request or a driver-specific buffer deeper than 124
 bytes is truncated. The truncation is recorded in the BPF `COUNTERS` map
 under `path_truncated` (slot reserved; instrumentation TODO).
 
-1.1.0 ships:
+The built-in specialized decoders still ship for stable Binder, DMA-heap and
+LWIS output. `neutron ioctl generate` can add device/kernel-specific scalar
+coverage at runtime, but it does not remove the capture ceiling:
+
+- generated decoding is limited to complete scalar, enum and fixed-array
+  fields inside the first 124 bytes;
+- pointer values are numbers only; neutron never follows them;
+- unions, bitfields, nested records and flexible arrays remain opaque;
+- driver ownership is exact only when a manifest or build association proves
+  it; header names and locations are candidate evidence;
+- packs describe ABI/data and cannot execute code or provide trace filters.
+
+The existing runtime also provides:
 - a userspace decoder registry with typed views for known commands
   (today `DMA_HEAP_IOCTL_ALLOC`; binder / dma-buf / ashmem are
   classified to `ioctl_family` only);
@@ -126,8 +138,9 @@ under `path_truncated` (slot reserved; instrumentation TODO).
   kernel-written fields like `dma_heap_allocation_data.fd`. Userspace
   marks these events with `"data_phase":"exit"`.
 
-Long buffers (> 124 bytes) still truncate; broader cmd coverage and a
-larger `data[]` slot are tracked separately.
+Long buffers (> 124 bytes) still truncate. Generated `ioctl_fields` reports
+`expected_size`, `captured_size`, and `truncated`; a larger `data[]` slot is
+tracked separately.
 
 Version 1.4 adds verified numeric-to-name mappings for Trusty TIPC and V4L2,
 including `TIPC_IOC_CONNECT` and `VIDIOC_QBUF`. An unmapped command remains

@@ -73,6 +73,15 @@ neutron \- Android eBPF tracer and surface mapper for authorized security assess
 .B neutron recipes
 .I RECIPE
 .PP
+.B neutron ioctl generate
+.B \-\-kernel\-tree
+.I DIR
+.B \-\-headers
+.I DIR
+.B \-\-output
+.I PATH
+.RI [ GENERATE\ OPTIONS ]
+.PP
 .B neutron surface scan
 .RI [ \-\-capture\ CAPTURE ]
 .RI [ \-\-observe\ DURATION
@@ -173,6 +182,20 @@ Each check reports
 .BR PASS ", " WARN ", or " FAIL ;
 the command exits non-zero if any check is
 .BR FAIL .
+.TP
+.BI "ioctl generate --kernel-tree " DIR " --headers " DIR " --output " PATH
+Run host
+.B clang
+to extract ioctl macro constants and record layouts into a deterministic,
+data-only
+.B neutron.ioctl-schema/v1
+pack. Optional flags are
+.BR \-\-compile\-commands ,
+repeatable
+.BR \-\-clang\-arg ,
+.BR \-\-manifest ,
+and
+.BR \-\-emit\-rust .
 .TP
 .BI window " CAPTURE \-\-anchor SPEC " [\fB\-\-before\fR " DUR" "] [\fB\-\-after\fR " DUR" "] [...]"
 Host-side post-processor that cuts windows of NDJSON events around an
@@ -362,6 +385,14 @@ still observes it).
 Example:
 .B \-\-exclude\-comm
 .IR "RenderThread,Jit thread pool" .
+.TP
+.BI \-\-schema\-pack " NAME|PATH"
+Load a data-only ioctl schema pack before trace attach. Repeat to merge packs
+in order. Supplying any explicit pack disables automatic selection.
+.TP
+.B \-\-no\-schema\-auto
+Disable ioctl schema auto-selection. Auto mode only reads matching packs from
+root-owned, non-group/world-writable system schema directories and files.
 .SS Capture
 .TP
 .B \-\-binder
@@ -1092,7 +1123,7 @@ carry
 For
 .BR ioctl (2)
 exits the userspace decoder may add
-.BR "type:\(dqsyscall\(dq" ", " ioctl_family ", " ioctl_name ", and a typed nested object "
+.BR "type:\(dqsyscall\(dq" ", " ioctl_family ", " ioctl_name ", " ioctl_fields ", and a typed nested object "
 .RB ( dma_heap ", etc.) plus " "data_phase:\(dqexit\(dq" .
 .PP
 .B FD snapshot events

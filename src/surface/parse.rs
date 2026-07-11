@@ -370,6 +370,5 @@ pub fn parse_module_names(input: &str) -> Vec<String> {
 pub fn ioctl_label(cmd: u32) -> String {
     crate::decode::decode_ioctl(cmd, &[], 0, None)
         .name
-        .map(str::to_string)
         .unwrap_or_else(|| format!("cmd=0x{cmd:08x}"))
 }

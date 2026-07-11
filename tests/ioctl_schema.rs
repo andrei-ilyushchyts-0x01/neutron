@@ -1,6 +1,6 @@
 use neutron::ioctl_schema::{
-    install_registry, Descriptor, Field, PackMetadata, RuntimeIdentity, SchemaPack, SchemaRegistry,
-    Selectors,
+    install_registry, load_selected_packs, Descriptor, Field, PackMetadata, RuntimeIdentity,
+    SchemaPack, SchemaRegistry, Selectors,
 };
 use neutron::{decode::decode_ioctl_with_context, decode::render_decoded_ioctl_json};
 
@@ -79,7 +79,9 @@ fn full_cmd_and_fd_path_disambiguate_magic_collisions() {
     dma.family = Some("dma_heap".into());
     let mut snd = descriptor("snd.alloc", "SND_ALLOC", cmd, "/dev/snd/*");
     snd.family = Some("alsa".into());
-    let registry = SchemaRegistry::from_packs(vec![pack(vec![dma, snd])]).unwrap();
+    let mut broad = descriptor("generic.alloc", "GENERIC_ALLOC", cmd, "/dev/*");
+    broad.family = None;
+    let registry = SchemaRegistry::from_packs(vec![pack(vec![dma, snd, broad])]).unwrap();
 
     assert_eq!(
         registry
@@ -103,13 +105,17 @@ fn conflicting_descriptor_requires_explicit_replacement() {
     let first = descriptor("sample.alloc", "SAMPLE_ALLOC", cmd, "/dev/sample*");
     let mut conflict = first.clone();
     conflict.name = "SAMPLE_ALLOC_V2".into();
-    let error = SchemaRegistry::from_packs(vec![pack(vec![first.clone()]), pack(vec![conflict.clone()])])
-        .unwrap_err()
-        .to_string();
+    let error = SchemaRegistry::from_packs(vec![
+        pack(vec![first.clone()]),
+        pack(vec![conflict.clone()]),
+    ])
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("replaces"), "{error}");
 
     conflict.replaces.push(first.id.clone());
-    let registry = SchemaRegistry::from_packs(vec![pack(vec![first]), pack(vec![conflict])]).unwrap();
+    let registry =
+        SchemaRegistry::from_packs(vec![pack(vec![first]), pack(vec![conflict])]).unwrap();
     assert_eq!(
         registry
             .decode(cmd, &[0; 24], Some("/dev/sample0"), None)
@@ -168,13 +174,7 @@ fn active_pack_adds_ioctl_fields_without_replacing_legacy_objects() {
     payload[0..8].copy_from_slice(&4096u64.to_le_bytes());
     payload[8..12].copy_from_slice(&12i32.to_le_bytes());
 
-    let decoded = decode_ioctl_with_context(
-        cmd,
-        &payload,
-        0,
-        None,
-        Some("/dev/dma_heap/system"),
-    );
+    let decoded = decode_ioctl_with_context(cmd, &payload, 0, None, Some("/dev/dma_heap/system"));
     let json: serde_json::Value = serde_json::from_str(&format!(
         "{{{}}}",
         render_decoded_ioctl_json(&decoded).trim_start_matches(',')
@@ -185,4 +185,94 @@ fn active_pack_adds_ioctl_fields_without_replacing_legacy_objects() {
     assert_eq!(json["ioctl_fields"]["expected_size"], 24);
     assert_eq!(json["ioctl_fields"]["values"]["len"], 4096);
     assert_eq!(json["ioctl_fields"]["values"]["returned_fd"], 12);
+}
+
+#[test]
+fn arrays_and_pointer_values_decode_without_dereferencing() {
+    let cmd = 0xc018_7a03;
+    let mut value = descriptor("sample.array", "SAMPLE_ARRAY", cmd, "/dev/sample*");
+    value.fields = vec![
+        Field {
+            name: "items".into(),
+            offset: 0,
+            size: 8,
+            kind: "u16".into(),
+            count: Some(4),
+            opaque: false,
+        },
+        Field::scalar("ptr", 8, 8, "pointer"),
+    ];
+    let registry = SchemaRegistry::from_packs(vec![pack(vec![value])]).unwrap();
+    let mut payload = [0u8; 24];
+    for (index, number) in [1u16, 2, 3, 4].into_iter().enumerate() {
+        payload[index * 2..index * 2 + 2].copy_from_slice(&number.to_le_bytes());
+    }
+    payload[8..16].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+    let decoded = registry
+        .decode(cmd, &payload, Some("/dev/sample0"), Some("sample"))
+        .unwrap();
+    assert_eq!(
+        decoded.fields.values["items"],
+        serde_json::json!([1, 2, 3, 4])
+    );
+    assert_eq!(decoded.fields.values["ptr"], 0x1234_5678u64);
+}
+
+#[test]
+fn refresh_map_capacity_is_fatal() {
+    let descriptors = (0..65)
+        .map(|nr| {
+            let cmd = (2 << 30) | (24 << 16) | (0x7a << 8) | nr;
+            descriptor(
+                &format!("sample.{nr}"),
+                &format!("SAMPLE_{nr}"),
+                cmd,
+                "/dev/sample*",
+            )
+        })
+        .collect();
+    let error = SchemaRegistry::from_packs(vec![pack(descriptors)])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("BPF capacity"), "{error}");
+}
+
+#[test]
+fn explicit_pack_loading_and_selectors_are_verified() {
+    let cmd = 0xc018_7a04;
+    let mut value = pack(vec![descriptor(
+        "sample.selected",
+        "SAMPLE_SELECTED",
+        cmd,
+        "/dev/sample*",
+    )]);
+    value.metadata.selectors.device = vec!["pixel*".into()];
+    value.seal().unwrap();
+    let identity = RuntimeIdentity {
+        abi: std::env::consts::ARCH.into(),
+        fingerprint: None,
+        device: Some("pixel8pro".into()),
+        kernel_release: None,
+    };
+    value.verify(&identity).unwrap();
+    let mut wrong = identity.clone();
+    wrong.device = Some("other".into());
+    assert!(value.verify(&wrong).is_err());
+
+    let path = std::env::temp_dir().join(format!("neutron-explicit-{}.json", std::process::id()));
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let loaded =
+        load_selected_packs(&[path.to_string_lossy().into_owned()], false, &identity).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        load_selected_packs(&[path.to_string_lossy().into_owned()], false, &wrong)
+            .unwrap()
+            .len(),
+        1,
+        "explicit paths override selectors"
+    );
+    assert!(load_selected_packs(&[], true, &identity)
+        .unwrap()
+        .is_empty());
+    std::fs::remove_file(path).unwrap();
 }

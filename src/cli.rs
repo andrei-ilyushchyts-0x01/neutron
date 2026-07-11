@@ -75,6 +75,16 @@ pub enum Command {
     /// research tasks.
     #[command(subcommand)]
     Recipes(crate::recipes::RecipesCommand),
+
+    /// Generate and inspect data-only ioctl ABI schema packs.
+    #[command(subcommand)]
+    Ioctl(IoctlCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IoctlCommand {
+    /// Extract ioctl constants and record layouts from kernel headers with clang.
+    Generate(crate::ioctl_schema::GenerateArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -232,6 +242,15 @@ pub struct Args {
     /// Available: binder, kgsl, mali, alsa, unix-socket, media-hal.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub driver_pack: Vec<String>,
+
+    /// Data-only ioctl schema pack name or path. Repeat to merge in order.
+    /// Supplying any explicit pack disables automatic selection.
+    #[arg(long, value_name = "NAME|PATH")]
+    pub schema_pack: Vec<String>,
+
+    /// Disable automatic selection from trusted system schema directories.
+    #[arg(long)]
+    pub no_schema_auto: bool,
 
     /// Explicit research-mode kprobe pack. Best-effort attach; missing
     /// kernel symbols or absent BPF programs warn and capture continues.

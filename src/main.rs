@@ -34,7 +34,7 @@ use neutron::causal::{
     process_context_from_bytes, process_exit_span_id, root_process_span_id, syscall_span_id,
     CausalMetadata, CausalRelation, CausalWire, ControlServer, ScenarioInfo, ScenarioState,
 };
-use neutron::cli::{Args, Cli, Command};
+use neutron::cli::{Args, Cli, Command, IoctlCommand};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
 use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
@@ -1799,6 +1799,9 @@ fn main() -> Result<()> {
         Some(Command::Graph(args)) => neutron::graph::run(args),
         Some(Command::Surface(command)) => neutron::surface::run(command),
         Some(Command::Recipes(command)) => neutron::recipes::run(command),
+        Some(Command::Ioctl(IoctlCommand::Generate(args))) => {
+            neutron::ioctl_schema::generate(&args)
+        }
         None => run_trace(cli.args),
     }
 }
@@ -1818,7 +1821,28 @@ fn run_trace(mut args: Args) -> Result<()> {
     }
     let user_supplied_match = has_capture_predicate_flags(&args);
     apply_profile(&mut args)?;
-    let driver_packs = apply_driver_packs_with_defaults(&mut args, !user_supplied_match)?;
+    let mut driver_packs = apply_driver_packs_with_defaults(&mut args, !user_supplied_match)?;
+    let schema_identity = neutron::ioctl_schema::RuntimeIdentity::current();
+    let schema_packs = neutron::ioctl_schema::load_selected_packs(
+        &args.schema_pack,
+        args.no_schema_auto,
+        &schema_identity,
+    )?;
+    let schema_names: Vec<String> = schema_packs
+        .iter()
+        .map(|pack| pack.metadata.name.clone())
+        .collect();
+    let schema_registry = neutron::ioctl_schema::SchemaRegistry::from_packs(schema_packs)?;
+    driver_packs
+        .refresh_cmds
+        .extend(schema_registry.refresh_cmds());
+    if driver_packs.refresh_cmds.len() > 64 {
+        bail!(
+            "ioctl refresh policy requires {} commands; BPF capacity is 64",
+            driver_packs.refresh_cmds.len()
+        );
+    }
+    neutron::ioctl_schema::install_registry(schema_registry);
     let max_output_bytes = parse_output_size_bytes(args.max_output_size.as_deref())?;
     let rotate_output_bytes = parse_rotate_output_size_bytes(args.rotate_output_size.as_deref())?;
     if max_output_bytes.is_some() && rotate_output_bytes.is_some() {
@@ -1881,6 +1905,9 @@ fn run_trace(mut args: Args) -> Result<()> {
     }
     if !driver_packs.names.is_empty() {
         eprintln!("  driver packs: {}", driver_packs.names.join(", "));
+    }
+    if !schema_names.is_empty() {
+        eprintln!("  ioctl schema packs: {}", schema_names.join(", "));
     }
     resolve_match_android_providers(&mut args)?;
     resolve_match_packages(&mut args)?;

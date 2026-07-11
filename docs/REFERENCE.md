@@ -14,6 +14,7 @@
 | `graph`       | Render causal NDJSON as a Mermaid `flowchart TD`. (1.3.0) |
 | `surface`     | Collect or query a deterministic Android service/HAL/process/device snapshot. (1.4.0) |
 | `recipes`     | Print built-in workflow recipes, e.g. `neutron recipes android-content-provider`. |
+| `ioctl generate` | Build a deterministic `neutron.ioctl-schema/v1` pack from kernel UAPI/vendor headers with host `clang`. |
 
 For `window`, see [docs/guides/window.md](guides/window.md). For
 `summarize` / `diff`, see the per-subcommand `--help`. For `mark`, see
@@ -45,6 +46,8 @@ the **Marker workflow** section below. For Android provider work, use
 | `--rotate-output-size SIZE`       | String           | unset                                    | Rotate file output after SIZE bytes per segment. Requires `--output`; writes `PATH`, `PATH.1`, `PATH.2`, ... Mutually exclusive with `--max-output-size`. |
 | `--json`                          | flag             | off                                      | Emit events and findings as NDJSON (one JSON object per line). |
 | `--profile security`              | String           | off                                      | Enable BPF-side syscall whitelisting: only security-relevant syscalls are captured. Also captures file paths via `bpf_probe_read_user_str_bytes` and auto-populates `--exclude-comm` with kernel-worker noise. |
+| `--schema-pack NAME\|PATH`        | repeatable       | auto                                     | Load data-only ioctl schema packs in the given order. Any explicit pack disables auto-selection. |
+| `--no-schema-auto`                | flag             | off                                      | Disable schema auto-selection from trusted system install directories. |
 | `--binder`                        | flag             | off                                      | Enable binder transaction tracing via the `binder/binder_transaction` tracepoint. Emits events with `syscall_nr = -1`. |
 | `--stacks`                        | flag             | off                                      | Collect kernel and userspace stack traces via `bpf_get_stackid`. Resolve native ELF symbols, ART JIT regions, and (when not masked) kernel symbols via `/proc/kallsyms`. |
 | `--alert-rwx`                     | flag             | off                                      | Only show `mmap`/`mprotect` events with `PROT_READ\|PROT_WRITE\|PROT_EXEC`. Adds `"rwx_alert"` field in JSON mode. |
@@ -106,6 +109,46 @@ the **Marker workflow** section below. For Android provider work, use
 | `--binder-methods FILE`           | String           | unset                                    | Verified JSON `{service: {code: method}}` map. Unknown codes remain `code=N`. |
 
 <!-- END AUTO-GENERATED -->
+
+## ioctl schema generation and loading
+
+Generation is host-side and requires `clang` in `PATH`; no libclang or native
+pack code is linked into the Android tracer:
+
+```bash
+neutron ioctl generate \
+  --kernel-tree ~/android-kernel \
+  --headers include/uapi \
+  --output generated/pixel8 \
+  --compile-commands out/compile_commands.json \
+  --clang-arg=--target=aarch64-linux-android \
+  --manifest driver-map.json \
+  --emit-rust generated.rs
+```
+
+The output is `OUTPUT/schema.json` unless `--output` ends in `.json`.
+`--headers` and `--clang-arg` are repeatable. Without a compile-database or
+explicit target, clang defaults to `aarch64-linux-gnu`. The optional manifest maps macro
+names to `{family, fd_paths, confidence, evidence, replaces}`; only manifest
+entries should claim `confidence:"exact"`. Header location alone is emitted as
+candidate evidence.
+
+At trace startup, explicit `--schema-pack` values are verified and merged in
+argument order; explicit paths override selectors but never ABI, hash, or
+structural validation. With no explicit pack, auto-selection considers matching ABI,
+fingerprint, device and kernel-release selectors in these directories:
+`$prefix/share/neutron/schemas`, `/system/etc/neutron/schemas`,
+`/vendor/etc/neutron/schemas`, and `/data/local/tmp/neutron/schemas`. Auto mode
+accepts only root-owned directories and files with no group/world write bits.
+Packs are applied from general to specific. ABI/hash/limit failures, descriptor
+conflicts without `replaces`, and BPF refresh-map overflow are fatal before
+tracepoints attach.
+
+`neutron.ioctl-schema/v1` is JSON data only. It records target ABI/selectors,
+source revision and clang invocation, descriptors, clang record layouts,
+driver evidence, and a `sha256:` content hash. Each descriptor contains the
+full cmd word plus `_IOC` components, C type, field offset/size/type,
+FD-path/family constraints, capture eligibility, provenance and replacements.
 
 ## Surface mapper (1.4.0)
 
@@ -290,6 +333,7 @@ Emitted with `--json` (and `--raw`). One object per line (NDJSON).
 | `data_phase`      | String              | `"enter"` when `data[]` is the pre-call buffer; `"exit"` when the BPF program refreshed it post-call. Built-in refresh covers dma-heap/binder/dma-buf/ashmem; `--driver-pack` can enable runtime refresh for KGSL, Mali, ALSA, LWIS, and GXP families. |
 | `ioctl_family`    | String (optional)   | `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"` (1.2.0), `"gxp"` (1.2.0), `"trusty_tipc"` (1.4.0), `"v4l2"` (1.4.0), or `"unknown"`. Emitted for `ioctl(2)` events. |
 | `ioctl_name`      | String (optional)   | Human cmd name (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"BINDER_WRITE_READ"`, `"TIPC_IOC_CONNECT"`, `"VIDIOC_QBUF"`) when the decoder registry recognises it. |
+| `ioctl_fields`    | Object (optional)   | Generated schema view: `{expected_size,captured_size,truncated,values}`. Only bounded scalars, enums, pointers-as-numbers and fixed scalar arrays wholly inside the 124-byte snapshot are included. |
 | `dma_heap`        | Object (optional)   | Decoded `struct dma_heap_allocation_data`. Fields: `len`, `returned_fd`, `fd_flags`, `fd_flags_str`, `heap_flags`. |
 | `binder_write_read` | Object (optional) | Scalar `BINDER_WRITE_READ` header: `write_size`, `write_consumed`, `read_size`, `read_consumed`. |
 | `kgsl` / `mali`   | Object (optional)   | First four captured scalar words as `arg0..arg3`; nested pointers are not followed. |

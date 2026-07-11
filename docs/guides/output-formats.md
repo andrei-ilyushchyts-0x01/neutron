@@ -96,6 +96,21 @@ A failed call carries `ok:false` plus the decoded `errno`:
 { "type":"syscall", "name":"openat", "phase":"exit", "ret":-2, "ok":false, "errno":2, ... }
 ```
 
+A matching runtime ioctl schema adds a bounded generic view while preserving
+legacy specialized objects such as `dma_heap`:
+
+```json
+"ioctl_fields": {
+  "expected_size": 24,
+  "captured_size": 24,
+  "truncated": false,
+  "values": { "len": 4096, "fd": 12 }
+}
+```
+
+Only fields wholly inside the 124-byte snapshot appear in `values`. Pointer
+values may appear as numbers, but pointed-to memory is never read.
+
 ### Binder Event
 
 ```json
@@ -388,6 +403,7 @@ writes a mode-`0600` file instead of stdout.
 | `data_phase`      | string              | `"enter"` when `data[]` carries the pre-call buffer; `"exit"` when the BPF program refreshed the buffer post-call. Built-in refresh covers dma-heap/binder/dma-buf/ashmem; `--driver-pack` can enable runtime refresh for KGSL, Mali, ALSA, LWIS, and GXP families. |
 | `ioctl_family`    | string (optional)   | Family classification for `ioctl(2)` events: `"dma_heap"`, `"binder"`, `"dma_buf"`, `"ashmem"`, `"kgsl"`, `"mali"`, `"alsa"`, `"lwis"`, `"gxp"`, `"trusty_tipc"`, `"v4l2"`, or `"unknown"`. Magic collisions are disambiguated with FD-graph path/kind when available. |
 | `ioctl_name`      | string (optional)   | Human name for the cmd when the decoder registry knows it (e.g. `"DMA_HEAP_IOCTL_ALLOC"`, `"BINDER_WRITE_READ"`, `"IOCTL_KGSL_GPUMEM_ALLOC"`). |
+| `ioctl_fields`    | object (optional)   | Runtime schema result with `expected_size`, `captured_size`, `truncated`, and scalar/enum/fixed-array `values`. |
 | `dma_heap`        | object (optional)   | Decoded `struct dma_heap_allocation_data`: `{ "len":N, "returned_fd":N, "fd_flags":N, "fd_flags_str":"O_RDWR\|O_CLOEXEC", "heap_flags":N }`. Meaningful only when `data_phase == "exit"` (the kernel writes `fd` post-call). |
 | `binder_write_read` | object (optional) | Scalar `BINDER_WRITE_READ` header: `write_size`, `write_consumed`, `read_size`, `read_consumed`. Nested Parcel buffers are not dereferenced. |
 | `kgsl` / `mali`   | object (optional)   | First four captured scalar words as `arg0..arg3` for driver harness timelines. Nested pointers are not followed. |
