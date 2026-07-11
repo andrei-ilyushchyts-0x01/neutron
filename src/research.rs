@@ -1391,6 +1391,24 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn permission_granted_from_package_dump(dump: &str, permission: &str) -> Result<bool> {
+    let prefix = format!("{permission}:");
+    let state = dump
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+        .with_context(|| format!("runtime permission {permission} missing from package dump"))?;
+    let granted = state
+        .split(',')
+        .map(str::trim)
+        .find_map(|field| field.strip_prefix("granted="))
+        .with_context(|| format!("runtime permission {permission} has no granted state"))?;
+    match granted {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        value => bail!("runtime permission {permission} has invalid granted state '{value}'"),
+    }
+}
+
 struct PermissionGuard<'a> {
     package: &'a str,
     granted: Vec<String>,
@@ -1424,13 +1442,8 @@ impl<'a> PermissionGuard<'a> {
     }
 
     fn ensure(&mut self, permission: &str) -> Result<()> {
-        let permission_status = command_output(
-            "/system/bin/cmd",
-            &["package", "check-permission", permission, self.package, "0"],
-        )?;
-        let permission_status = permission_status.trim();
-        let already_granted =
-            permission_status == "0" || permission_status.eq_ignore_ascii_case("granted");
+        let package_dump = command_output("/system/bin/dumpsys", &["package", self.package])?;
+        let already_granted = permission_granted_from_package_dump(&package_dump, permission)?;
         if !already_granted {
             if !command_success("/system/bin/pm", &["grant", self.package, permission])? {
                 bail!("failed to grant compiled permission {permission}");
@@ -1633,8 +1646,11 @@ mod tests {
             !permission_granted_from_package_dump(dump, "android.permission.BLUETOOTH_SCAN")
                 .unwrap()
         );
-        assert!(permission_granted_from_package_dump(dump, "android.permission.NEARBY_WIFI_DEVICES")
-            .is_err());
+        assert!(permission_granted_from_package_dump(
+            dump,
+            "android.permission.NEARBY_WIFI_DEVICES"
+        )
+        .is_err());
     }
 
     #[test]
