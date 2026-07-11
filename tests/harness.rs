@@ -83,6 +83,24 @@ fn cli_registers_harness_commands_and_capture_guard() {
 
     let cli = Cli::try_parse_from([
         "neutron",
+        "harness",
+        "minimize",
+        "case",
+        "--serial",
+        "USB123",
+        "--package",
+        "com.example.app",
+        "--runner",
+        "runner.json",
+        "--oracle",
+        "crash",
+    ]);
+    if let Err(error) = cli {
+        panic!("built-in crash oracle should parse: {error}");
+    }
+
+    let cli = Cli::try_parse_from([
+        "neutron",
         "--harness-capture",
         "--pid",
         "42",
