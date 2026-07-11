@@ -52,6 +52,7 @@ public final class ResearchReceiver extends BroadcastReceiver {
     static final int COMPLETE = 0;
     static final int FAILED = 1;
     static final int UNSUPPORTED = 3;
+    static final int USB_DESCRIPTOR_DEVICE = 0x01;
 
     @Override public void onReceive(Context context, Intent intent) {
         PendingResult pending = goAsync();
@@ -258,7 +259,7 @@ public final class ResearchReceiver extends BroadcastReceiver {
             if (connection == null) unsupported();
             byte[] descriptor = new byte[18];
             int read = connection.controlTransfer(UsbConstants.USB_DIR_IN | UsbConstants.USB_TYPE_STANDARD,
-                    6, UsbConstants.USB_DT_DEVICE << 8, 0, descriptor, descriptor.length, 2000);
+                    6, USB_DESCRIPTOR_DEVICE << 8, 0, descriptor, descriptor.length, 2000);
             if (read < 0) unsupported();
         } finally {
             if (connection != null) connection.close();
