@@ -150,6 +150,7 @@ fn extract_writes_portable_artifact_contract() {
     let runner: Value =
         serde_json::from_slice(&fs::read(output.join("runner.json")).unwrap()).unwrap();
     assert_eq!(runner["transport"], "adb");
+    assert_eq!(runner["capabilities"], json!([]));
     assert_eq!(runner["execute"][0], "{artifact}/replay");
     assert_eq!(runner["execute"][1], "{artifact}/input.bin");
     let compiled = std::process::Command::new("rustc")
