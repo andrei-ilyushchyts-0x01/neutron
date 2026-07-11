@@ -12,7 +12,7 @@ use neutron::causal::{
     ScenarioState,
 };
 use neutron::cli::{Cli, Command};
-use neutron::graph::{render_mermaid_from_reader, GraphOptions};
+use neutron::graph::{render_json_from_reader, render_mermaid_from_reader, GraphOptions};
 use neutron::SyscallEvent;
 
 #[test]
@@ -320,4 +320,35 @@ fn graph_keeps_callee_identity_device_path_and_generic_loss_warnings() {
     assert!(graph.contains("/dev/video0"), "{graph}");
     assert!(graph.contains("output cap"), "{graph}");
     assert!(graph.contains("ring buffer"), "{graph}");
+}
+
+#[test]
+fn json_graph_is_versioned_and_collapses_repeated_syscalls() {
+    let capture = r#"
+{"type":"binder","pid":100,"to_proc":200,"debug_id":1,"code":7,"trace_id":"trace-a","span_id":"binder-1","causal_relation":"exact"}
+{"type":"syscall","pid":200,"tid":201,"name":"ioctl","nr":29,"phase":"exit","ret":0,"fd_path":"/dev/video0","ioctl_name":"VIDIOC_QBUF","trace_id":"trace-a","span_id":"ioctl-1","parent_span_id":"binder-1","causal_relation":"exact"}
+{"type":"syscall","pid":200,"tid":201,"name":"ioctl","nr":29,"phase":"exit","ret":0,"fd_path":"/dev/video0","ioctl_name":"VIDIOC_QBUF","trace_id":"trace-a","span_id":"ioctl-2","parent_span_id":"binder-1","causal_relation":"exact"}
+"#;
+    let json = render_json_from_reader(
+        Cursor::new(capture),
+        &GraphOptions {
+            collapse_syscalls: true,
+            ..GraphOptions::default()
+        },
+    )
+    .unwrap();
+    let graph: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(graph["schema"], "neutron.causal-graph/v1");
+    let syscalls: Vec<_> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|node| node["kind"] == "syscall")
+        .collect();
+    assert_eq!(syscalls.len(), 1);
+    assert_eq!(syscalls[0]["count"], 2);
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["from"] == "b_00000001" && edge["to"] == syscalls[0]["id"]
+    }));
 }
