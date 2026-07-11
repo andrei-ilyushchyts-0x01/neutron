@@ -23,6 +23,7 @@ const MAX_CAPTURE_LINE: usize = 4 * 1024 * 1024;
 const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_EVENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PARCEL_BYTES: u64 = 64 * 1024;
+const MAX_REPLAY_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const WARNING: &str =
     "AUTHORIZED USE ONLY: replay may crash or reboot the selected physical device.";
 
@@ -283,6 +284,12 @@ struct CommandOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     timed_out: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AdbStageAsset {
+    local_path: PathBuf,
+    remote_path: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2192,6 +2199,53 @@ fn adb_execute_argv(
         remote_artifact,
     ));
     argv
+}
+
+fn adb_stage_files(
+    directory: &Path,
+    resources: &ResourceCatalog,
+) -> Result<Vec<AdbStageAsset>> {
+    let mut assets = Vec::new();
+    for (name, limit) in [
+        ("replay", MAX_REPLAY_BINARY_BYTES),
+        ("input.bin", MAX_RESOURCE_BYTES),
+        ("metadata.json", MAX_EVENT_BYTES),
+        ("resources.json", MAX_EVENT_BYTES),
+    ] {
+        assets.push(checked_stage_asset(directory.join(name), name.into(), limit)?);
+    }
+    let mut digests = HashSet::new();
+    for resource in &resources.resources {
+        let Some(digest) = resource.sha256.as_deref() else {
+            continue;
+        };
+        let digest = normalize_digest(digest)?.to_ascii_lowercase();
+        if !digests.insert(digest.clone()) {
+            continue;
+        }
+        assets.push(checked_stage_asset(
+            directory.join("blobs").join(&digest),
+            format!("blobs/{digest}"),
+            MAX_RESOURCE_BYTES,
+        )?);
+    }
+    assets.sort_by(|left, right| left.remote_path.cmp(&right.remote_path));
+    Ok(assets)
+}
+
+fn checked_stage_asset(path: PathBuf, remote_path: String, limit: u64) -> Result<AdbStageAsset> {
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("missing ADB replay asset {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!("ADB replay asset must be a regular file: {}", path.display());
+    }
+    if metadata.len() > limit {
+        bail!("ADB replay asset exceeds its size limit: {}", path.display());
+    }
+    Ok(AdbStageAsset {
+        local_path: path,
+        remote_path,
+    })
 }
 
 fn run_argv(argv: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<CommandOutput> {
