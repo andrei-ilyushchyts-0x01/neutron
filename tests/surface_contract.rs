@@ -570,6 +570,109 @@ fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges
 }
 
 #[test]
+fn device_boundary_outcomes_and_crashes_remain_honest() {
+    let mut snapshot = scan_with_reader(&fixture()).expect("static scan");
+    let capture = r#"
+{"type":"marker","phase":"start","name":"boundary","scenario_id":"boundary","trace_id":"trace-boundary","root_package":"com.example.boundary"}
+{"type":"binder","pid":100,"to_proc":42,"debug_id":7,"service":"android.hardware.security.keymint.IKeyMintDevice/default","trace_id":"trace-boundary","span_id":"binder-1","scenario_id":"boundary","depth":0,"causal_relation":"exact"}
+{"type":"syscall","pid":42,"tid":42,"uid":1000,"name":"openat","phase":"exit","ret":7,"data":"/dev/trusty-ipc-dev0","trace_id":"trace-boundary","span_id":"open-1","parent_span_id":"binder-1","scenario_id":"boundary","depth":1,"causal_relation":"exact"}
+{"type":"syscall","pid":42,"tid":42,"uid":1000,"name":"mmap","phase":"exit","ret":4096,"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-boundary","span_id":"mmap-1","parent_span_id":"binder-1","scenario_id":"boundary","depth":1,"causal_relation":"exact"}
+{"type":"syscall","pid":42,"tid":42,"uid":1000,"name":"ioctl","phase":"exit","ret":-13,"ioctl_name":"TIPC_IOC_CONNECT","fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-boundary","span_id":"ioctl-denied","parent_span_id":"binder-1","scenario_id":"boundary","depth":1,"causal_relation":"exact"}
+{"type":"process_exit","ts_ns":50,"pid":42,"uid":1000,"comm":"keymint","classification":"crash","signal_name":"SIGSEGV","trace_id":"trace-boundary","span_id":"crash-1","parent_span_id":"binder-1","scenario_id":"boundary","depth":1,"causal_relation":"exact"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.boundary","boot_id":"boot-a"}
+"#;
+    import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
+
+    let relation_types: BTreeSet<_> = snapshot
+        .relations
+        .iter()
+        .filter(|relation| relation.trace_id.as_deref() == Some("trace-boundary"))
+        .map(|relation| relation.relation_type.as_str())
+        .collect();
+    assert!(relation_types.is_superset(&BTreeSet::from([
+        "open",
+        "mmap",
+        "syscall_attempt",
+        "crash",
+    ])));
+
+    let attempt = snapshot
+        .relations
+        .iter()
+        .find(|relation| relation.span_id.as_deref() == Some("ioctl-denied"))
+        .expect("failed ioctl evidence");
+    assert_eq!(attempt.relation_type, "syscall_attempt");
+    assert_eq!(attempt.evidence.detail.as_deref(), Some("ioctl ret=-13"));
+
+    let crash = snapshot
+        .relations
+        .iter()
+        .find(|relation| relation.span_id.as_deref() == Some("crash-1"))
+        .expect("crash evidence");
+    assert_eq!(crash.to, "capture:trace-boundary:boundary");
+    assert_eq!(crash.evidence.detail.as_deref(), Some("SIGSEGV"));
+
+    let service = snapshot
+        .services
+        .iter()
+        .find(|service| service.name.contains("keymint"))
+        .expect("keymint service");
+    assert_eq!(service.observed_devices, vec![snapshot.devices[0].id.clone()]);
+    assert!(service.observed_ioctls.is_empty());
+
+    let reached = reachable(
+        &snapshot,
+        &RootSelector::Package("com.example.boundary".into()),
+    )
+    .expect("successful boundary reachability");
+    assert!(reached.nodes.contains(&snapshot.devices[0].id));
+    assert!(reached
+        .relations
+        .iter()
+        .any(|relation| relation.relation_type == "open"));
+    assert!(reached
+        .relations
+        .iter()
+        .any(|relation| relation.relation_type == "mmap"));
+    assert!(reached.relations.iter().all(|relation| {
+        relation.relation_type != "syscall_attempt" && relation.relation_type != "crash"
+    }));
+}
+
+#[test]
+fn failed_device_open_is_attempt_evidence_not_reachability() {
+    let mut snapshot = scan_with_reader(&fixture()).expect("static scan");
+    let capture = r#"
+{"type":"marker","phase":"start","name":"failed-open","scenario_id":"failed-open","trace_id":"trace-failed-open","root_package":"com.example.failed"}
+{"type":"syscall","pid":100,"tid":100,"uid":10123,"name":"openat","phase":"exit","ret":-13,"data":"/dev/trusty-ipc-dev0","trace_id":"trace-failed-open","span_id":"open-denied","scenario_id":"failed-open","depth":0,"causal_relation":"exact"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.failed","boot_id":"boot-a"}
+"#;
+    import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
+
+    let attempt = snapshot
+        .relations
+        .iter()
+        .find(|relation| {
+            relation.span_id.as_deref() == Some("open-denied")
+                && relation.to == snapshot.devices[0].id
+        })
+        .expect("failed open evidence");
+    assert_eq!(attempt.relation_type, "syscall_attempt");
+    assert_eq!(attempt.evidence.detail.as_deref(), Some("openat ret=-13"));
+
+    let reached = reachable(
+        &snapshot,
+        &RootSelector::Package("com.example.failed".into()),
+    )
+    .expect("failed boundary reachability");
+    assert!(!reached.nodes.contains(&snapshot.devices[0].id));
+    assert!(reached
+        .relations
+        .iter()
+        .all(|relation| relation.relation_type != "syscall_attempt"));
+}
+
+#[test]
 fn reachability_distinguishes_missing_and_candidate_evidence() {
     let mut snapshot = scan_with_reader(&fixture()).unwrap();
     let missing = reachable(
