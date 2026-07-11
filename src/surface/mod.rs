@@ -2611,4 +2611,9 @@ mod tests {
             b"{\"type\":\"capture_health\"}\n{\"type\":\"marker\"}\n"
         ));
     }
+
+    #[test]
+    fn observation_trace_collects_logcat_sources() {
+        assert!(!observation_trace_args().contains(&"--no-logcat"));
+    }
 }
