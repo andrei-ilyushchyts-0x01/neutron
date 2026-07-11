@@ -234,7 +234,7 @@ pub struct RunnerContract {
     pub timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerTransport {
     #[default]
@@ -2041,6 +2041,11 @@ fn load_runner(path: &Path) -> Result<RunnerContract> {
     if !(1..=3600).contains(&runner.timeout_seconds) {
         bail!("runner timeout_seconds must be in 1..=3600");
     }
+    if runner.transport == RunnerTransport::Adb
+        && (runner.prepare.is_some() || runner.recover.is_some())
+    {
+        bail!("ADB runners do not support prepare or recover hooks");
+    }
     Ok(runner)
 }
 
@@ -2257,6 +2262,103 @@ fn checked_stage_asset(path: PathBuf, remote_path: String, limit: u64) -> Result
     })
 }
 
+fn adb_argv(serial: &str, args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut argv = vec!["adb".into(), "-s".into(), serial.into()];
+    argv.extend(args);
+    argv
+}
+
+fn run_checked_adb(argv: &[String], timeout: Duration, action: &str) -> Result<()> {
+    let output = run_argv(argv, None, timeout)?;
+    if output.timed_out || !output.status.success() {
+        bail!(
+            "adb {action} failed{}: {}",
+            if output.timed_out { " (timeout)" } else { "" },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn stage_adb_artifact(directory: &Path, serial: &str, timeout: Duration) -> Result<String> {
+    let input = fs::read(directory.join("input.bin"))?;
+    let remote = remote_artifact_path(&format!("{:x}", Sha256::digest(&input)))?;
+    let resources = load_resources(directory)?;
+    let assets = adb_stage_files(directory, &resources)?;
+    let result = (|| {
+        cleanup_adb_artifact(serial, &remote, timeout)?;
+        run_checked_adb(
+            &adb_argv(
+                serial,
+                [
+                    "shell".into(),
+                    "mkdir".into(),
+                    "-p".into(),
+                    format!("{remote}/blobs"),
+                ],
+            ),
+            timeout,
+            "staging directory creation",
+        )?;
+        for asset in assets {
+            let local = asset
+                .local_path
+                .to_str()
+                .context("ADB replay asset path is not UTF-8")?
+                .to_string();
+            run_checked_adb(
+                &adb_argv(
+                    serial,
+                    ["push".into(), local, format!("{remote}/{}", asset.remote_path)],
+                ),
+                timeout,
+                "asset push",
+            )?;
+        }
+        run_checked_adb(
+            &adb_argv(
+                serial,
+                [
+                    "shell".into(),
+                    "chmod".into(),
+                    "0700".into(),
+                    format!("{remote}/replay"),
+                ],
+            ),
+            timeout,
+            "replay chmod",
+        )?;
+        Ok(remote.clone())
+    })();
+    if result.is_err() {
+        let _ = cleanup_adb_artifact(serial, &remote, timeout);
+    }
+    result
+}
+
+fn cleanup_adb_artifact(serial: &str, remote: &str, timeout: Duration) -> Result<()> {
+    if !remote.starts_with("/data/local/tmp/neutron-harness-")
+        || remote["/data/local/tmp/neutron-harness-".len()..]
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
+    {
+        bail!("refusing unsafe remote harness cleanup path");
+    }
+    run_checked_adb(
+        &adb_argv(
+            serial,
+            [
+                "shell".into(),
+                "rm".into(),
+                "-rf".into(),
+                remote.into(),
+            ],
+        ),
+        timeout,
+        "staging cleanup",
+    )
+}
+
 fn run_argv(argv: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<CommandOutput> {
     validate_argv(argv)?;
     let mut command = Command::new(&argv[0]);
@@ -2380,60 +2482,86 @@ fn replay_once_inner(
     validate_usb_device(&devices, serial)?;
     let before = query_identity(serial, package, timeout)?;
     validate_identity(expected, &before)?;
-    if let Some(prepare) = &runner.prepare {
-        let output = run_argv(
-            &expand_argv(prepare, serial, package, directory),
-            Some(directory),
-            timeout,
-        )?;
-        if output.timed_out || !output.status.success() {
-            return Ok((
-                RunStatus::HookFailure,
-                output.status.code(),
-                output.timed_out,
-                false,
-            ));
+    let remote = (runner.transport == RunnerTransport::Adb)
+        .then(|| stage_adb_artifact(directory, serial, timeout))
+        .transpose()?;
+    let result = (|| {
+        if let Some(prepare) = &runner.prepare {
+            let output = run_argv(
+                &expand_argv(prepare, serial, package, directory),
+                Some(directory),
+                timeout,
+            )?;
+            if output.timed_out || !output.status.success() {
+                return Ok((
+                    RunStatus::HookFailure,
+                    output.status.code(),
+                    output.timed_out,
+                    false,
+                ));
+            }
+        }
+        let output = match remote.as_deref() {
+            Some(remote) => run_argv(
+                &adb_execute_argv(&runner.execute, serial, package, remote, timeout),
+                None,
+                timeout.saturating_add(Duration::from_secs(5)),
+            )?,
+            None => run_argv(
+                &expand_argv(&runner.execute, serial, package, directory),
+                Some(directory),
+                timeout,
+            )?,
+        };
+        let timed_out = output.timed_out
+            || (runner.transport == RunnerTransport::Adb && output.status.code() == Some(124));
+        let mut status = if timed_out {
+            RunStatus::Timeout
+        } else if output.status.success() {
+            RunStatus::Completed
+        } else {
+            RunStatus::Crash
+        };
+        let mut recovered = false;
+        let after = query_identity(serial, package, timeout);
+        match after {
+            Ok(actual) if actual.boot_id != before.boot_id => status = RunStatus::Reboot,
+            Ok(actual) => validate_identity(expected, &actual)?,
+            Err(_) => {
+                status = if adb_inventory(timeout)
+                    .and_then(|devices| validate_usb_device(&devices, serial))
+                    .is_ok()
+                {
+                    RunStatus::Crash
+                } else {
+                    RunStatus::TransportLoss
+                };
+            }
+        }
+        if matches!(
+            status,
+            RunStatus::Crash | RunStatus::Reboot | RunStatus::TransportLoss | RunStatus::Timeout
+        ) {
+            let actual = recover_device(serial, package, runner, directory, timeout, expected)?;
+            if actual.boot_id != expected.boot_id {
+                expected.boot_id = actual.boot_id;
+            }
+            recovered = true;
+        }
+        Ok((status, output.status.code(), timed_out, recovered))
+    })();
+    let cleanup = remote
+        .as_deref()
+        .map(|remote| cleanup_adb_artifact(serial, remote, timeout))
+        .unwrap_or(Ok(()));
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("remote staging cleanup also failed: {cleanup:#}")))
         }
     }
-    let output = run_argv(
-        &expand_argv(&runner.execute, serial, package, directory),
-        Some(directory),
-        timeout,
-    )?;
-    let mut status = if output.timed_out {
-        RunStatus::Timeout
-    } else if output.status.success() {
-        RunStatus::Completed
-    } else {
-        RunStatus::Crash
-    };
-    let mut recovered = false;
-    let after = query_identity(serial, package, timeout);
-    match after {
-        Ok(actual) if actual.boot_id != before.boot_id => status = RunStatus::Reboot,
-        Ok(actual) => validate_identity(expected, &actual)?,
-        Err(_) => {
-            status = if adb_inventory(timeout)
-                .and_then(|devices| validate_usb_device(&devices, serial))
-                .is_ok()
-            {
-                RunStatus::Crash
-            } else {
-                RunStatus::TransportLoss
-            };
-        }
-    }
-    if matches!(
-        status,
-        RunStatus::Crash | RunStatus::Reboot | RunStatus::TransportLoss | RunStatus::Timeout
-    ) {
-        let actual = recover_device(serial, package, runner, directory, timeout, expected)?;
-        if actual.boot_id != expected.boot_id {
-            expected.boot_id = actual.boot_id;
-        }
-        recovered = true;
-    }
-    Ok((status, output.status.code(), output.timed_out, recovered))
 }
 
 fn recover_device(
