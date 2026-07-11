@@ -563,6 +563,24 @@ mod tests {
     }
 
     #[test]
+    fn follow_guardrails_are_reported_without_claiming_data_loss() {
+        let health = CaptureHealth::default();
+        let user = UserspaceHealth {
+            follow_policy_filtered: 3,
+            follow_ttl_expired: 2,
+            ..UserspaceHealth::default()
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&format_capture_health_json(&health, &user, 0)).unwrap();
+        assert_eq!(value["follow_policy_filtered"], 3);
+        assert_eq!(value["follow_ttl_expired"], 2);
+        assert_eq!(value["degraded"], false);
+        let summary = format_summary_with(&health, &user, 0);
+        assert!(summary.contains("policy-filtered=3"));
+        assert!(summary.contains("ttl-expired=2"));
+    }
+
+    #[test]
     fn capture_health_json_includes_additive_root_and_device_metadata() {
         let metadata = CaptureMetadata {
             root_uid: Some(10123),
