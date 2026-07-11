@@ -95,11 +95,11 @@ impl FollowPolicy {
         {
             return FollowDecision::Block("denied_domain");
         }
-        if !self.allow_domains.is_empty()
-            && callee_domain
-                .as_ref()
-                .is_none_or(|domain| !self.allow_domains.contains(domain))
-        {
+        let callee_allowed = match callee_domain.as_ref() {
+            Some(domain) => self.allow_domains.contains(domain),
+            None => false,
+        };
+        if !self.allow_domains.is_empty() && !callee_allowed {
             return FollowDecision::Block("domain_not_allowed");
         }
         if candidate.caller_depth >= 1
