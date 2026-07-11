@@ -7,7 +7,7 @@ use clap::Args;
 use serde::Serialize;
 
 use super::{
-    CaptureRecord, CollectorHealth, Device, DeviceIdentity, Module, Relation, Service,
+    CaptureRecord, CollectorHealth, Device, DeviceIdentity, Module, Relation, Resource, Service,
     SurfaceHealth, SurfaceSnapshot,
 };
 
@@ -341,6 +341,16 @@ fn scenario_profiles(snapshot: &SurfaceSnapshot) -> Vec<ScenarioProfile> {
         .iter()
         .map(|device| (device.id.clone(), device.path.clone()))
         .collect();
+    let resource_labels: BTreeMap<_, _> = snapshot
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                semantic_resource(resource, &device_paths),
+            )
+        })
+        .collect();
     let mut groups = BTreeMap::<String, (ScenarioProfile, BTreeSet<String>)>::new();
     for capture in &snapshot.captures {
         let id = scenario_id(capture);
@@ -371,7 +381,14 @@ fn scenario_profiles(snapshot: &SurfaceSnapshot) -> Vec<ScenarioProfile> {
                         .as_ref()
                         .is_some_and(|trace| trace_ids.contains(trace))
             })
-            .map(|relation| scenario_relation(relation, &service_processes, &device_paths))
+            .map(|relation| {
+                scenario_relation(
+                    relation,
+                    &service_processes,
+                    &device_paths,
+                    &resource_labels,
+                )
+            })
             .collect();
         profile.capture_health.sort();
         profile.capture_health.dedup();
@@ -392,11 +409,22 @@ fn scenario_relation(
     relation: &Relation,
     service_processes: &BTreeMap<String, String>,
     device_paths: &BTreeMap<String, String>,
+    resource_labels: &BTreeMap<String, String>,
 ) -> ScenarioRelation {
     ScenarioRelation {
         relation_type: relation.relation_type.clone(),
-        from: semantic_endpoint(&relation.from, service_processes, device_paths),
-        to: semantic_endpoint(&relation.to, service_processes, device_paths),
+        from: semantic_endpoint(
+            &relation.from,
+            service_processes,
+            device_paths,
+            resource_labels,
+        ),
+        to: semantic_endpoint(
+            &relation.to,
+            service_processes,
+            device_paths,
+            resource_labels,
+        ),
         ioctl: relation.ioctl.clone(),
         confidence: relation.confidence.clone(),
         causal_relation: relation.causal_relation.clone(),
@@ -407,6 +435,7 @@ fn semantic_endpoint(
     endpoint: &str,
     service_processes: &BTreeMap<String, String>,
     device_paths: &BTreeMap<String, String>,
+    resource_labels: &BTreeMap<String, String>,
 ) -> String {
     if let Some(service) = service_processes.get(endpoint) {
         return format!("process-for:{service}");
@@ -414,10 +443,27 @@ fn semantic_endpoint(
     if let Some(path) = device_paths.get(endpoint) {
         return format!("device:{path}");
     }
+    if let Some(resource) = resource_labels.get(endpoint) {
+        return resource.clone();
+    }
     if endpoint.starts_with("process:") {
         return "process".into();
     }
     endpoint.to_string()
+}
+
+fn semantic_resource(resource: &Resource, device_paths: &BTreeMap<String, String>) -> String {
+    let source = resource
+        .device_id
+        .as_ref()
+        .and_then(|device| device_paths.get(device))
+        .map(String::as_str)
+        .unwrap_or("unknown-device");
+    format!(
+        "resource:{}:{source}:length={}",
+        resource.kind,
+        resource.length.unwrap_or_default()
+    )
 }
 
 fn comparison_warnings(baseline: &SurfaceSnapshot, current: &SurfaceSnapshot) -> Vec<String> {

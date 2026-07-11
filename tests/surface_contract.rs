@@ -650,6 +650,7 @@ fn surface_models_dma_allocations_and_mmap_lifetimes_as_resources() {
 {"type":"syscall","ts_ns":10,"pid":42,"tid":42,"uid":1000,"name":"ioctl","phase":"exit","ret":0,"args":[7,3222816768,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","ioctl_family":"dma_heap","ioctl_name":"DMA_HEAP_IOCTL_ALLOC","data_phase":"exit","dma_heap":{"len":16384,"returned_fd":12,"fd_flags":524290,"heap_flags":0},"trace_id":"trace-resources","span_id":"dma-1","scenario_id":"resources","depth":0,"causal_relation":"exact"}
 {"type":"syscall","ts_ns":20,"pid":42,"tid":42,"uid":1000,"name":"mmap","phase":"exit","ret":4096,"args":[0,8192,3,1,7,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-resources","span_id":"z-map","scenario_id":"resources","depth":0,"causal_relation":"exact"}
 {"type":"syscall","ts_ns":30,"pid":42,"tid":42,"uid":1000,"name":"munmap","phase":"exit","ret":0,"args":[4096,8192,0,0,0,0],"trace_id":"trace-resources","span_id":"a-unmap","scenario_id":"resources","depth":0,"causal_relation":"exact"}
+{"type":"syscall","ts_ns":40,"pid":42,"tid":42,"uid":1000,"name":"close","phase":"exit","ret":0,"args":[12,0,0,0,0,0],"trace_id":"trace-resources","span_id":"close-dma","scenario_id":"resources","depth":0,"causal_relation":"exact"}
 {"type":"capture_health","degraded":false,"root_package":"com.example.resources","boot_id":"boot-a"}
 "#;
     import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
@@ -662,7 +663,8 @@ fn surface_models_dma_allocations_and_mmap_lifetimes_as_resources() {
         .expect("DMA allocation resource");
     assert_eq!(allocation.length, Some(16_384));
     assert_eq!(allocation.returned_fd, Some(12));
-    assert!(allocation.active);
+    assert!(!allocation.active);
+    assert_eq!(allocation.released_span_id.as_deref(), Some("close-dma"));
 
     let mapping = snapshot
         .resources
@@ -686,6 +688,7 @@ fn surface_models_dma_allocations_and_mmap_lifetimes_as_resources() {
         "mapping",
         "mapped_from",
         "munmap",
+        "release",
     ])));
 
     let reached = reachable(

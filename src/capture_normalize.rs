@@ -58,6 +58,9 @@ pub struct SyscallSpan {
     pub ioctl_name: Option<String>,
     pub ioctl_family: Option<String>,
     pub fd_path: Option<String>,
+    pub args: Option<[u64; 6]>,
+    pub data_phase: Option<String>,
+    pub dma_heap: Option<DmaHeapAllocation>,
     pub trace_id: Option<String>,
     pub scenario_id: Option<String>,
     pub span_id: Option<String>,
@@ -67,6 +70,14 @@ pub struct SyscallSpan {
     pub root_uid: Option<u32>,
     pub relation: CausalRelation,
     pub enter_ts_ns: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DmaHeapAllocation {
+    pub length: u64,
+    pub returned_fd: i32,
+    pub fd_flags: u32,
+    pub heap_flags: u64,
 }
 
 impl SyscallSpan {
@@ -406,6 +417,9 @@ fn merge_syscall(syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>, object: &Map<
         ioctl_name: text(object, "ioctl_name").map(str::to_string),
         ioctl_family: text(object, "ioctl_family").map(str::to_string),
         fd_path: fd_path.map(str::to_string),
+        args: syscall_args(object),
+        data_phase: text(object, "data_phase").map(str::to_string),
+        dma_heap: parse_dma_heap(object),
         trace_id: text(object, "trace_id").map(str::to_string),
         scenario_id: text(object, "scenario_id").map(str::to_string),
         span_id: text(object, "span_id").map(str::to_string),
@@ -442,6 +456,9 @@ fn merge_syscall_fields(
     existing.ioctl_name = existing.ioctl_name.take().or(previous.ioctl_name);
     existing.ioctl_family = existing.ioctl_family.take().or(previous.ioctl_family);
     existing.fd_path = existing.fd_path.take().or(previous.fd_path);
+    existing.args = existing.args.or(previous.args);
+    existing.data_phase = existing.data_phase.take().or(previous.data_phase);
+    existing.dma_heap = existing.dma_heap.take().or(previous.dma_heap);
     existing.trace_id = existing.trace_id.take().or(previous.trace_id);
     existing.scenario_id = existing.scenario_id.take().or(previous.scenario_id);
     existing.span_id = existing.span_id.take().or(previous.span_id);
@@ -624,6 +641,28 @@ fn ioctl_cmd(object: &Map<String, Value>) -> Option<u32> {
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok())
         })
+}
+
+fn syscall_args(object: &Map<String, Value>) -> Option<[u64; 6]> {
+    let values = object.get("args")?.as_array()?;
+    if values.len() != 6 {
+        return None;
+    }
+    let mut args = [0_u64; 6];
+    for (target, value) in args.iter_mut().zip(values) {
+        *target = value.as_u64()?;
+    }
+    Some(args)
+}
+
+fn parse_dma_heap(object: &Map<String, Value>) -> Option<DmaHeapAllocation> {
+    let dma_heap = object.get("dma_heap")?.as_object()?;
+    Some(DmaHeapAllocation {
+        length: number_u64(dma_heap, "len")?,
+        returned_fd: number_i64(dma_heap, "returned_fd")?.try_into().ok()?,
+        fd_flags: number_u32(dma_heap, "fd_flags")?,
+        heap_flags: number_u64(dma_heap, "heap_flags")?,
+    })
 }
 
 fn parse_u32(value: &str) -> Option<u32> {

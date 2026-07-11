@@ -116,6 +116,8 @@ pub struct SurfaceSnapshot {
     pub processes: Vec<Process>,
     pub devices: Vec<Device>,
     pub modules: Vec<Module>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<Resource>,
     pub relations: Vec<Relation>,
     pub captures: Vec<CaptureRecord>,
 }
@@ -242,6 +244,34 @@ pub struct Module {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Resource {
+    pub id: String,
+    pub kind: String,
+    pub owner: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returned_fd: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd_flags: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap_flags: Option<u64>,
+    pub active: bool,
+    pub confidence: String,
+    pub trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scenario_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_span_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_span_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Relation {
     pub id: String,
     #[serde(rename = "type")]
@@ -310,6 +340,7 @@ pub struct ReachableResult {
     pub services: Vec<Service>,
     pub processes: Vec<Process>,
     pub devices: Vec<Device>,
+    pub resources: Vec<Resource>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -580,6 +611,7 @@ pub fn scan_with_reader(reader: &dyn PlatformReader) -> Result<SurfaceSnapshot> 
         processes,
         devices,
         modules,
+        resources: Vec::new(),
         relations,
         captures: Vec::new(),
     };
@@ -1618,7 +1650,9 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
     }
 
     let device_by_path = device_path_index(&snapshot.devices);
-    for syscall in capture.syscalls {
+    let mut syscalls = capture.syscalls;
+    syscalls.sort_by_key(|syscall| (syscall.ts_ns.unwrap_or(syscall.enter_ts_ns), syscall.pid));
+    for syscall in syscalls {
         let Some(trace_id) = syscall.trace_id.clone() else {
             continue;
         };
@@ -1654,6 +1688,31 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
                 ));
             }
         }
+        let completed_successfully = syscall.is_exit() && syscall.ret.is_some_and(|ret| ret >= 0);
+        if syscall.name == "munmap" {
+            import_munmap(
+                snapshot,
+                &syscall,
+                &trace_id,
+                scenario_id,
+                &process_id,
+                &process_confidence,
+                completed_successfully,
+            );
+            continue;
+        }
+        if syscall.name == "close" {
+            import_resource_close(
+                snapshot,
+                &syscall,
+                &trace_id,
+                scenario_id,
+                &process_id,
+                &process_confidence,
+                completed_successfully,
+            );
+            continue;
+        }
         let access_type = match syscall.name.as_str() {
             "open" | "openat" | "openat2" => "open",
             "mmap" | "mmap2" => "mmap",
@@ -1668,7 +1727,6 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
         else {
             continue;
         };
-        let completed_successfully = syscall.is_exit() && syscall.ret.is_some_and(|ret| ret >= 0);
         let ioctl_label = (access_type == "ioctl").then(|| {
             syscall
                 .ioctl_name
@@ -1707,6 +1765,28 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
 
         if !completed_successfully {
             continue;
+        }
+
+        if access_type == "mmap" {
+            import_mapping_resource(
+                snapshot,
+                &syscall,
+                &trace_id,
+                scenario_id.clone(),
+                &process_id,
+                &process_confidence,
+                &device_id,
+            );
+        } else if access_type == "ioctl" {
+            import_dma_resource(
+                snapshot,
+                &syscall,
+                &trace_id,
+                scenario_id.clone(),
+                &process_id,
+                &process_confidence,
+                &device_id,
+            );
         }
 
         let service_id = syscall
@@ -1870,6 +1950,288 @@ fn relation_name(relation: crate::capture_normalize::CausalRelation) -> &'static
         crate::capture_normalize::CausalRelation::Exact => "exact",
         crate::capture_normalize::CausalRelation::Inferred => "inferred",
     }
+}
+
+fn import_mapping_resource(
+    snapshot: &mut SurfaceSnapshot,
+    syscall: &crate::capture_normalize::SyscallSpan,
+    trace_id: &str,
+    scenario_id: Option<String>,
+    process_id: &str,
+    confidence: &str,
+    device_id: &str,
+) {
+    let Some(args) = syscall.args else {
+        add_snapshot_warning(snapshot, "captured mmap has no complete argument vector");
+        return;
+    };
+    let Some(address) = syscall.ret.and_then(|value| u64::try_from(value).ok()) else {
+        return;
+    };
+    let length = args[1];
+    let id = format!("resource:mmap:{trace_id}:{}", resource_suffix(syscall));
+    snapshot.resources.push(Resource {
+        id: id.clone(),
+        kind: "memory_mapping".into(),
+        owner: process_id.into(),
+        device_id: Some(device_id.into()),
+        address: Some(address),
+        length: Some(length),
+        active: true,
+        confidence: confidence.into(),
+        trace_id: trace_id.into(),
+        scenario_id: scenario_id.clone(),
+        created_span_id: syscall.span_id.clone(),
+        ..Resource::default()
+    });
+    let mut mapping = make_relation(
+        "mapping",
+        process_id,
+        &id,
+        "capture",
+        confidence,
+        Some(relation_name(syscall.relation).into()),
+        Some(trace_id.into()),
+        scenario_id.clone(),
+        syscall.span_id.clone(),
+    );
+    mapping.evidence.detail = Some(format!("address=0x{address:x} length={length}"));
+    snapshot.relations.push(mapping);
+    let mut backing = make_relation(
+        "mapped_from",
+        &id,
+        device_id,
+        "capture",
+        confidence,
+        Some(relation_name(syscall.relation).into()),
+        Some(trace_id.into()),
+        scenario_id,
+        syscall.span_id.clone(),
+    );
+    backing.evidence.detail = Some(format!("length={length}"));
+    snapshot.relations.push(backing);
+}
+
+fn import_dma_resource(
+    snapshot: &mut SurfaceSnapshot,
+    syscall: &crate::capture_normalize::SyscallSpan,
+    trace_id: &str,
+    scenario_id: Option<String>,
+    process_id: &str,
+    confidence: &str,
+    device_id: &str,
+) {
+    let Some(allocation) = syscall.dma_heap.as_ref() else {
+        return;
+    };
+    if syscall.ioctl_family.as_deref() != Some("dma_heap")
+        || syscall.ioctl_name.as_deref() != Some("DMA_HEAP_IOCTL_ALLOC")
+        || syscall.data_phase.as_deref() != Some("exit")
+        || allocation.returned_fd < 0
+    {
+        add_snapshot_warning(
+            snapshot,
+            "DMA-heap allocation payload is not a complete successful exit snapshot",
+        );
+        return;
+    }
+    let id = format!("resource:dma_heap:{trace_id}:{}", resource_suffix(syscall));
+    snapshot.resources.push(Resource {
+        id: id.clone(),
+        kind: "dma_heap_allocation".into(),
+        owner: process_id.into(),
+        device_id: Some(device_id.into()),
+        length: Some(allocation.length),
+        returned_fd: Some(allocation.returned_fd),
+        fd_flags: Some(allocation.fd_flags),
+        heap_flags: Some(allocation.heap_flags),
+        active: true,
+        confidence: confidence.into(),
+        trace_id: trace_id.into(),
+        scenario_id: scenario_id.clone(),
+        created_span_id: syscall.span_id.clone(),
+        ..Resource::default()
+    });
+    let mut allocated = make_relation(
+        "allocation",
+        process_id,
+        &id,
+        "capture",
+        confidence,
+        Some(relation_name(syscall.relation).into()),
+        Some(trace_id.into()),
+        scenario_id.clone(),
+        syscall.span_id.clone(),
+    );
+    allocated.ioctl = Some("DMA_HEAP_IOCTL_ALLOC".into());
+    allocated.evidence.detail = Some(format!(
+        "length={} returned_fd={}",
+        allocation.length, allocation.returned_fd
+    ));
+    snapshot.relations.push(allocated);
+    let mut source = make_relation(
+        "allocated_from",
+        &id,
+        device_id,
+        "capture",
+        confidence,
+        Some(relation_name(syscall.relation).into()),
+        Some(trace_id.into()),
+        scenario_id,
+        syscall.span_id.clone(),
+    );
+    source.ioctl = Some("DMA_HEAP_IOCTL_ALLOC".into());
+    source.evidence.detail = Some(format!("length={}", allocation.length));
+    snapshot.relations.push(source);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_munmap(
+    snapshot: &mut SurfaceSnapshot,
+    syscall: &crate::capture_normalize::SyscallSpan,
+    trace_id: &str,
+    scenario_id: Option<String>,
+    process_id: &str,
+    confidence: &str,
+    completed_successfully: bool,
+) {
+    let capture_id = format!(
+        "capture:{trace_id}:{}",
+        scenario_id.as_deref().unwrap_or("unknown")
+    );
+    let Some(args) = syscall.args else {
+        add_snapshot_warning(snapshot, "captured munmap has no complete argument vector");
+        return;
+    };
+    let address = args[0];
+    let length = args[1];
+    if !completed_successfully {
+        let mut attempt = make_relation(
+            "syscall_attempt",
+            process_id,
+            &capture_id,
+            "capture",
+            confidence,
+            Some(relation_name(syscall.relation).into()),
+            Some(trace_id.into()),
+            scenario_id,
+            syscall.span_id.clone(),
+        );
+        attempt.evidence.detail = Some(match syscall.ret {
+            Some(ret) => format!("munmap address=0x{address:x} length={length} ret={ret}"),
+            None => format!("munmap address=0x{address:x} length={length} result=unknown"),
+        });
+        snapshot.relations.push(attempt);
+        return;
+    }
+    let unmap_end = address.checked_add(length);
+    let index = snapshot.resources.iter().rposition(|resource| {
+        let mapping_end = resource
+            .address
+            .zip(resource.length)
+            .and_then(|(start, length)| start.checked_add(length));
+        resource.kind == "memory_mapping"
+            && resource.owner == process_id
+            && resource.trace_id == trace_id
+            && resource.active
+            && resource.address.is_some_and(|start| start <= address)
+            && mapping_end
+                .zip(unmap_end)
+                .is_some_and(|(mapping_end, unmap_end)| unmap_end <= mapping_end)
+    });
+    let Some(index) = index else {
+        add_snapshot_warning(
+            snapshot,
+            "captured munmap has no matching observed active mapping",
+        );
+        return;
+    };
+    let (resource_id, exact) = {
+        let resource = &mut snapshot.resources[index];
+        let exact = resource.address == Some(address) && resource.length == Some(length);
+        if exact {
+            resource.active = false;
+            resource.released_span_id = syscall.span_id.clone();
+        }
+        (resource.id.clone(), exact)
+    };
+    if !exact {
+        add_snapshot_warning(
+            snapshot,
+            "partial munmap is recorded but the mapping remains conservatively active",
+        );
+    }
+    let mut relation = make_relation(
+        "munmap",
+        process_id,
+        &resource_id,
+        "capture",
+        confidence,
+        Some(relation_name(syscall.relation).into()),
+        Some(trace_id.into()),
+        scenario_id,
+        syscall.span_id.clone(),
+    );
+    relation.evidence.detail = Some(format!(
+        "address=0x{address:x} length={length} {}",
+        if exact { "released" } else { "partial" }
+    ));
+    snapshot.relations.push(relation);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_resource_close(
+    snapshot: &mut SurfaceSnapshot,
+    syscall: &crate::capture_normalize::SyscallSpan,
+    trace_id: &str,
+    scenario_id: Option<String>,
+    process_id: &str,
+    confidence: &str,
+    completed_successfully: bool,
+) {
+    if !completed_successfully {
+        return;
+    }
+    let Some(fd) = syscall.args.and_then(|args| i32::try_from(args[0]).ok()) else {
+        return;
+    };
+    let Some(index) = snapshot.resources.iter().rposition(|resource| {
+        resource.kind == "dma_heap_allocation"
+            && resource.owner == process_id
+            && resource.trace_id == trace_id
+            && resource.returned_fd == Some(fd)
+            && resource.active
+    }) else {
+        return;
+    };
+    let resource = &mut snapshot.resources[index];
+    resource.active = false;
+    resource.released_span_id = syscall.span_id.clone();
+    let resource_id = resource.id.clone();
+    let mut relation = make_relation(
+        "release",
+        process_id,
+        &resource_id,
+        "capture",
+        confidence,
+        Some(relation_name(syscall.relation).into()),
+        Some(trace_id.into()),
+        scenario_id,
+        syscall.span_id.clone(),
+    );
+    relation.evidence.detail = Some(format!("close fd={fd}"));
+    snapshot.relations.push(relation);
+}
+
+fn resource_suffix(syscall: &crate::capture_normalize::SyscallSpan) -> String {
+    syscall.span_id.clone().unwrap_or_else(|| {
+        format!(
+            "{}-{}-{}",
+            syscall.pid,
+            syscall.tid,
+            syscall.ts_ns.unwrap_or(syscall.enter_ts_ns)
+        )
+    })
 }
 
 fn root_id(root: &TraceRoot) -> Option<String> {
@@ -2071,7 +2433,16 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
                 && relation.evidence.source == "capture"
                 && matches!(
                     relation.relation_type.as_str(),
-                    "root_process" | "binder" | "served_by" | "open" | "mmap" | "ioctl"
+                    "root_process"
+                        | "binder"
+                        | "served_by"
+                        | "open"
+                        | "mmap"
+                        | "ioctl"
+                        | "mapping"
+                        | "mapped_from"
+                        | "allocation"
+                        | "allocated_from"
                 )
         })
         .cloned()
@@ -2108,6 +2479,12 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
         .devices
         .iter()
         .filter(|device| nodes.contains(&device.id))
+        .cloned()
+        .collect();
+    let resources = snapshot
+        .resources
+        .iter()
+        .filter(|resource| nodes.contains(&resource.id))
         .cloned()
         .collect();
     let mut warnings = Vec::new();
@@ -2155,6 +2532,7 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
         services,
         processes,
         devices,
+        resources,
     })
 }
 
@@ -2176,6 +2554,14 @@ fn explain(snapshot: &SurfaceSnapshot, selector: &str) -> Result<Value> {
             matches.push((
                 device.id.clone(),
                 json!({"kind": "device", "value": device}),
+            ));
+        }
+    }
+    for resource in &snapshot.resources {
+        if resource.id == selector {
+            matches.push((
+                resource.id.clone(),
+                json!({"kind": "resource", "value": resource}),
             ));
         }
     }
@@ -2230,6 +2616,8 @@ fn finish_snapshot(snapshot: &mut SurfaceSnapshot) {
     snapshot.devices.dedup_by(|a, b| a.id == b.id);
     snapshot.modules.sort_by(|a, b| a.id.cmp(&b.id));
     snapshot.modules.dedup_by(|a, b| a.id == b.id);
+    snapshot.resources.sort_by(|a, b| a.id.cmp(&b.id));
+    snapshot.resources.dedup_by(|a, b| a.id == b.id);
     snapshot.relations.sort_by(|a, b| a.id.cmp(&b.id));
     snapshot.relations.dedup_by(|a, b| a.id == b.id);
     snapshot.captures.sort_by(|a, b| a.id.cmp(&b.id));

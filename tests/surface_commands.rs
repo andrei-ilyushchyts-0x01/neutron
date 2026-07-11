@@ -87,6 +87,7 @@ fn minimal_snapshot() -> SurfaceSnapshot {
             ..Device::default()
         }],
         modules: Vec::new(),
+        resources: Vec::new(),
         relations: vec![Relation {
             id: "relation:package-service".into(),
             relation_type: "binder".into(),
