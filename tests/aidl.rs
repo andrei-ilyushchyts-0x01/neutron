@@ -2,10 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
-use neutron::aidl::{decode_plugin, AidlCatalog, ParcelView};
+use neutron::aidl::{decode_plugin, index_catalog, AidlCatalog, IndexArgs, ParcelView};
 use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap};
 use neutron::cli::{AidlCommand, Cli, Command};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 fn catalog() -> AidlCatalog {
@@ -257,6 +256,58 @@ fn catalog_json_is_deterministic_and_rejects_wrong_schema() {
         .unwrap();
     assert_eq!(first, second);
     assert!(AidlCatalog::from_json(r#"{"schema":"wrong","interfaces":[]}"#).is_err());
+}
+
+#[test]
+fn index_uses_generated_transaction_constants_and_is_deterministic() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!("neutron-aidl-index-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let tree = root.join("tree");
+    fs::create_dir_all(tree.join("test")).unwrap();
+    fs::write(
+        tree.join("test/ITest.aidl"),
+        "package test;\n@VintfStability interface ITest { oneway void ping(in int value) = 4; }\n",
+    )
+    .unwrap();
+    fs::write(tree.join("test/Data.aidl"), "package test; parcelable Data;\n").unwrap();
+
+    let compiler = root.join("fake-aidl");
+    fs::write(
+        &compiler,
+        r#"#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; shift 2; continue; fi
+  case "$1" in --out=*) out="${1#--out=}";; esac
+  shift
+done
+mkdir -p "$out/test"
+printf '%s\n' 'public interface ITest {' 'String DESCRIPTOR = "test.ITest";' 'static final int TRANSACTION_ping = (android.os.IBinder.FIRST_CALL_TRANSACTION + 4);' '}' > "$out/test/ITest.java"
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&compiler).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&compiler, permissions).unwrap();
+
+    let args = IndexArgs {
+        aosp_root: tree,
+        vendor_tree: Vec::new(),
+        output: root.join("catalog.json"),
+        aidl_bin: Some(compiler),
+        strict: true,
+    };
+    let first = index_catalog(&args).unwrap().to_pretty_json().unwrap();
+    let second = index_catalog(&args).unwrap().to_pretty_json().unwrap();
+    assert_eq!(first, second);
+    let indexed = AidlCatalog::from_json(&first).unwrap();
+    let lookup = indexed.lookup("test.ITest", 5).unwrap();
+    assert_eq!(lookup.method.method, "ping");
+    assert!(lookup.method.oneway);
+    assert_eq!(lookup.method.arguments[0].name, "value");
+    assert_eq!(indexed.interfaces.len(), 1, "parcelable-only file ignored");
 }
 
 #[test]
