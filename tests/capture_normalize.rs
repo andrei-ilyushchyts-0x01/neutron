@@ -156,6 +156,22 @@ fn malformed_binder_endpoints_and_oversized_debug_ids_are_ignored() {
 }
 
 #[test]
+fn binder_received_enriches_the_callee_process_identity() {
+    let capture = r#"
+{"type":"binder","ts_ns":10,"pid":100,"comm":"app","to_proc":200,"debug_id":11,"code":1,"trace_id":"trace-a","span_id":"binder-1","causal_relation":"exact"}
+{"type":"binder_received","ts_ns":11,"pid":200,"comm":"camera-hal","debug_id":11,"trace_id":"trace-a","span_id":"binder-1","causal_relation":"exact"}
+{"type":"binder_call","debug_id":11,"caller_pid":100,"callee_pid":200,"code":1,"trace_id":"trace-a","span_id":"binder-1","status":"completed","causal_relation":"exact"}
+"#;
+
+    let normalized = normalize_capture(Cursor::new(capture)).unwrap();
+    assert_eq!(normalized.binders.len(), 1);
+    assert_eq!(
+        normalized.binders[0].callee_comm.as_deref(),
+        Some("camera-hal")
+    );
+}
+
+#[test]
 fn syscall_uid_is_retained_and_pid_zero_is_rejected() {
     let input = r#"
 {"type":"syscall","pid":42,"uid":1000,"tid":42,"name":"ioctl","phase":"exit","trace_id":"trace-a","span_id":"valid"}

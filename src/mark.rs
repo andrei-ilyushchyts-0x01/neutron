@@ -221,6 +221,19 @@ mod tests {
     }
 
     #[test]
+    fn phased_marker_requires_a_live_control_socket() {
+        let mut a = args("scenario");
+        a.phase = Some("start".into());
+        a.control_socket = std::env::temp_dir()
+            .join(format!("neutron-missing-control-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+
+        let error = run(a).expect_err("a phased live marker must not fall back to stdout");
+        assert!(format!("{error:#}").contains("control socket"));
+    }
+
+    #[test]
     fn meta_renders_as_nested_object() {
         let mut a = args("camera");
         a.meta = vec!["build=1".into(), "device=oriole".into()];

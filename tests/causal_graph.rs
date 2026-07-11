@@ -304,3 +304,20 @@ fn process_limit_is_preserved_as_mermaid_warning() {
     assert!(graph.contains("Binder follow failure"));
     assert!(!graph.contains("Invalid or unsupported diagram"));
 }
+
+#[test]
+fn graph_keeps_callee_identity_device_path_and_generic_loss_warnings() {
+    let capture = r#"
+{"type":"binder","ts_ns":10,"pid":100,"comm":"app","to_proc":200,"debug_id":11,"code":1,"trace_id":"trace-a","span_id":"binder-1","causal_relation":"exact"}
+{"type":"binder_received","ts_ns":11,"pid":200,"comm":"camera-hal","debug_id":11,"trace_id":"trace-a","span_id":"binder-1","causal_relation":"exact"}
+{"type":"binder_call","debug_id":11,"caller_pid":100,"callee_pid":200,"code":1,"trace_id":"trace-a","span_id":"binder-1","status":"completed","causal_relation":"exact"}
+{"type":"syscall","pid":200,"tid":201,"comm":"camera-hal","name":"ioctl","nr":29,"phase":"exit","ret":0,"fd_path":"/dev/video0","ioctl_name":"VIDIOC_QBUF","trace_id":"trace-a","span_id":"ioctl-1","parent_span_id":"binder-1","causal_relation":"exact"}
+{"type":"capture_health","degraded":true,"output_cap_hit":true,"ringbuf_reserve_failed":9}
+"#;
+
+    let graph = render_mermaid_from_reader(Cursor::new(capture), &GraphOptions::default()).unwrap();
+    assert!(graph.contains("camera-hal (pid 200)"), "{graph}");
+    assert!(graph.contains("/dev/video0"), "{graph}");
+    assert!(graph.contains("output cap"), "{graph}");
+    assert!(graph.contains("ring buffer"), "{graph}");
+}
