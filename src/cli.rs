@@ -80,7 +80,7 @@ pub enum Command {
     #[command(subcommand)]
     Ioctl(IoctlCommand),
 
-    /// Capture, minimize, and replay authorized regression testcases.
+    /// Capture, build, minimize, and replay authorized regression testcases.
     #[command(subcommand)]
     Harness(HarnessCommand),
 
