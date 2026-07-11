@@ -536,7 +536,7 @@ fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges
     assert!(reached.nodes.iter().any(|id| id == &service.id));
     assert!(reached.nodes.iter().any(|id| id == &snapshot.devices[0].id));
     assert_eq!(reached.health.status, "complete");
-    assert_eq!(reached.health.confidence, "exact");
+    assert_eq!(reached.health.confidence, "candidate");
     assert_eq!(
         reached.health.captures,
         vec!["capture:0000000000001234:surface-observe"]
