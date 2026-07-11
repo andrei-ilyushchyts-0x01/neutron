@@ -26,6 +26,7 @@ const MAX_COMPONENTS: usize = 8;
 const MAX_COMPONENT_BYTES: u64 = 1024 * 1024;
 const MAX_PACK_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PARAMS: usize = 32;
+const MAX_SETTLE_MS: u64 = 30_000;
 const PROBE_PACKAGE: &str = "dev.neutron.probe";
 const STIMULUS_ACTIONS: &[&str] = &[
     "keymint",
@@ -599,6 +600,12 @@ fn validate_components(
         }
         parse_duration(&scenario.duration)?;
         parse_timeout(&scenario.stimulus.timeout)?;
+        if scenario.settle_ms > MAX_SETTLE_MS {
+            bail!(
+                "scenario '{}' settle_ms exceeds {MAX_SETTLE_MS}",
+                scenario.id
+            );
+        }
         unique_ids(
             scenario.required_params.iter().map(String::as_str),
             "parameter",
@@ -1290,6 +1297,9 @@ fn execute(
             timeout,
         )
     };
+    let capture_duration = duration
+        .checked_add(Duration::from_millis(scenario.settle_ms))
+        .context("research duration plus settle_ms is too large")?;
     let capture = surface::run_trace_session(
         &capture_path,
         &health_path,
@@ -1302,7 +1312,7 @@ fn execute(
                 StimulusResult::Complete => {}
                 StimulusResult::Unsupported(reason) => bail!("unsupported stimulus: {reason}"),
             }
-            wait_research_trace(child, duration + Duration::from_millis(scenario.settle_ms))
+            wait_research_trace(child, capture_duration)
         },
     );
     let granted_permissions = permissions.restore()?;
