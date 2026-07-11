@@ -188,6 +188,9 @@ pub struct UserspaceHealth {
     /// Important because the main NDJSON file may be missing the final
     /// `capture_health` line unless `--health-output` was also used.
     pub output_cap_hit: bool,
+    /// Binder branches intentionally bounded by userspace follow guardrails.
+    pub follow_policy_filtered: u64,
+    pub follow_ttl_expired: u64,
     /// AVC logcat source state and bounded ingestion counters.
     pub selinux_source_enabled: bool,
     pub selinux_source_available: bool,
@@ -262,6 +265,12 @@ pub fn format_summary_with(
     if user.output_cap_hit {
         out.push_str("  output cap hit: true\n");
     }
+    if user.follow_policy_filtered > 0 || user.follow_ttl_expired > 0 {
+        out.push_str(&format!(
+            "  binder follow guardrails: policy-filtered={} ttl-expired={}\n",
+            user.follow_policy_filtered, user.follow_ttl_expired
+        ));
+    }
     if user.selinux_source_enabled {
         let status = if user.selinux_source_available {
             "available"
@@ -329,13 +338,15 @@ pub fn format_capture_health_json_with_metadata(
     }
     let _ = write!(
         s,
-        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"output_cap_hit":{},"selinux_avc_source":"{}","selinux_parsed":{},"selinux_malformed":{},"selinux_deduplicated":{},"selinux_out_of_scope":{},"degraded":{}"#,
+        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"output_cap_hit":{},"follow_policy_filtered":{},"follow_ttl_expired":{},"selinux_avc_source":"{}","selinux_parsed":{},"selinux_malformed":{},"selinux_deduplicated":{},"selinux_out_of_scope":{},"degraded":{}"#,
         user.fd_graph_miss,
         user.fd_graph_backfilled,
         user.events_matched,
         user.events_sampled_out,
         user.events_emitted,
         user.output_cap_hit,
+        user.follow_policy_filtered,
+        user.follow_ttl_expired,
         if !user.selinux_source_enabled {
             "disabled"
         } else if user.selinux_source_available {
