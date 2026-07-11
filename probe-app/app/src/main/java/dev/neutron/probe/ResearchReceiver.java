@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.ImageFormat;
 import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
@@ -186,12 +187,19 @@ public final class ResearchReceiver extends BroadcastReceiver {
             }, handler);
             if (!done.await(8, TimeUnit.SECONDS)) unsupported();
             if (!captured.get()) unsupported();
+        } catch (Exception error) {
+            if (isCameraUnavailable(error)) unsupported();
+            throw error;
         } finally {
             if (session[0] != null) session[0].close();
             if (opened[0] != null) opened[0].close();
             reader.close();
             thread.quitSafely();
         }
+    }
+
+    static boolean isCameraUnavailable(Exception error) {
+        return error instanceof CameraAccessException || error instanceof SecurityException;
     }
 
     private static void codec(String mime) throws Exception {
