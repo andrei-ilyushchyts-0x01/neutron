@@ -28,33 +28,50 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  test:
-    name: test (host crates)
+  host:
+    name: host workspace
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
+          targets: aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      # Host-only crate: rule engine. The loader and BPF programs require
-      # an aarch64 cross-toolchain and a real device; we exercise them on
-      # a separate workflow when one is available.
-      - run: cargo test -p neutron-rules
-      - run: cargo clippy -p neutron-rules --no-deps -- -D warnings
+      - run: cargo check --workspace --exclude neutron-ebpf
+      - run: cargo test --workspace --exclude neutron-ebpf
+      - run: cargo clippy --workspace --exclude neutron-ebpf --all-targets -- -D warnings
+      - run: cargo build --release --target aarch64-unknown-linux-musl
 
-  rules-lint:
-    name: rules YAML lint
+  ebpf:
+    name: release eBPF object
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
-      # Loading the default ruleset through the engine validates schema and
-      # per-rule structural constraints (non-empty conditions, sane window
-      # parameters, etc.).
-      - run: cargo test -p neutron-rules --test engine default_ruleset_loads
+      - run: cargo install bpf-linker --version 0.10.3 --locked
+      - run: cargo xtask build-ebpf release
+
+  probe:
+    name: research probe unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - run: gradle --no-daemon testDebugUnitTest
+        working-directory: probe-app
