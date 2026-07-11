@@ -10,8 +10,11 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
+use neutron_common::ProcessTraceContext;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::causal::CausalRelation;
 
 const MAX_AVC_LINE_BYTES: usize = 16 * 1024;
 const MAX_CAPTURE_LINE_BYTES: usize = 1024 * 1024;
@@ -55,6 +58,15 @@ pub enum ExplainFormat {
 pub enum SelinuxCommand {
     /// Explain one observed AVC decision and exact delegated evidence.
     Explain(ExplainArgs),
+}
+
+/// A process-wide follow context cannot prove which thread caused an AVC.
+pub fn process_context_relation(context: ProcessTraceContext) -> CausalRelation {
+    if context.depth == 0 {
+        CausalRelation::Exact
+    } else {
+        CausalRelation::Inferred
+    }
 }
 
 pub fn run(command: SelinuxCommand) -> Result<()> {
