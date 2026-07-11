@@ -1655,7 +1655,6 @@ fn causal_metadata_for_selinux_denial(
 ) -> CausalMetadata {
     let binder_debug_id = context.binder_debug_id;
     let depth = context.depth;
-    let reason = context.reason;
     let parent_span_id = if binder_debug_id == 0 {
         root_process_span_id(scenario.trace_id, denial.pid)
     } else {
@@ -1667,11 +1666,7 @@ fn causal_metadata_for_selinux_denial(
         span_id: selinux_denial_span_id(scenario.trace_id, denial.pid, denial.tid, denial.ts_ns),
         parent_span_id,
         depth,
-        relation: if matches!(reason, TraceReason::Root | TraceReason::Binder) {
-            CausalRelation::Exact
-        } else {
-            CausalRelation::Inferred
-        },
+        relation: neutron::selinux::process_context_relation(context),
         root_package: root_package.map(str::to_string),
         root_uid,
     }
