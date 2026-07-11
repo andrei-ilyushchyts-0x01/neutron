@@ -57,7 +57,7 @@ cat > "$PAYLOAD/INSTALL.md" <<'EOF'
 ```bash
 adb push neutron /data/local/tmp/neutron
 adb push neutron.bpf.elf /data/local/tmp/neutron.bpf.elf
-adb shell mkdir -p /data/local/share/neutron/packs
+adb shell "su -c 'mkdir -p /data/local/share/neutron/packs && chown 0:0 /data/local/share/neutron && chmod 0755 /data/local/share/neutron && chown -R shell:shell /data/local/share/neutron/packs'"
 adb push share/neutron/packs/. /data/local/share/neutron/packs/
 adb shell "su -c 'chown -R 0:0 /data/local/share/neutron/packs && find /data/local/share/neutron/packs -type d -exec chmod 0755 {} \; && find /data/local/share/neutron/packs -type f -exec chmod 0644 {} \;'"
 adb shell chmod +x /data/local/tmp/neutron

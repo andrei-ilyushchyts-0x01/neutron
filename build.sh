@@ -21,7 +21,7 @@ echo "=== [3/3] Deploying to connected device ==="
 if adb get-state >/dev/null 2>&1; then
     adb push neutron.bpf.elf /data/local/tmp/
     adb push target/aarch64-unknown-linux-musl/release/neutron /data/local/tmp/
-    adb shell "su -c 'mkdir -p /data/local/share/neutron/packs && chown shell:shell /data/local/share/neutron /data/local/share/neutron/packs'"
+    adb shell "su -c 'mkdir -p /data/local/share/neutron/packs && chown 0:0 /data/local/share/neutron && chmod 0755 /data/local/share/neutron && chown -R shell:shell /data/local/share/neutron/packs'"
     adb push packs/. /data/local/share/neutron/packs/
     adb shell "su -c 'chown -R 0:0 /data/local/share/neutron/packs && find /data/local/share/neutron/packs -type d -exec chmod 0755 {} \; && find /data/local/share/neutron/packs -type f -exec chmod 0644 {} \;'"
     adb shell chmod +x /data/local/tmp/neutron
@@ -42,7 +42,7 @@ else
     echo "No adb device found. Push manually:"
     echo "  adb push neutron.bpf.elf /data/local/tmp/"
     echo "  adb push target/aarch64-unknown-linux-musl/release/neutron /data/local/tmp/"
-    echo "  adb shell su -c 'mkdir -p /data/local/share/neutron/packs && chown shell:shell /data/local/share/neutron /data/local/share/neutron/packs'"
+    echo "  adb shell su -c 'mkdir -p /data/local/share/neutron/packs && chown 0:0 /data/local/share/neutron && chmod 0755 /data/local/share/neutron && chown -R shell:shell /data/local/share/neutron/packs'"
     echo "  adb push packs/. /data/local/share/neutron/packs/"
     echo "  adb shell su -c 'chown -R 0:0 /data/local/share/neutron/packs'"
     echo "  adb shell chmod +x /data/local/tmp/neutron"
