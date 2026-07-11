@@ -2157,13 +2157,41 @@ fn adb_text(serial: &str, args: &[&str], timeout: Duration) -> Result<String> {
 }
 
 fn expand_argv(argv: &[String], serial: &str, package: &str, directory: &Path) -> Vec<String> {
+    expand_argv_at(argv, serial, package, &directory.display().to_string())
+}
+
+fn expand_argv_at(argv: &[String], serial: &str, package: &str, artifact: &str) -> Vec<String> {
     argv.iter()
         .map(|arg| {
             arg.replace("{serial}", serial)
                 .replace("{package}", package)
-                .replace("{artifact}", &directory.display().to_string())
+                .replace("{artifact}", artifact)
         })
         .collect()
+}
+
+fn adb_execute_argv(
+    execute: &[String],
+    serial: &str,
+    package: &str,
+    remote_artifact: &str,
+    timeout: Duration,
+) -> Vec<String> {
+    let mut argv = vec![
+        "adb".into(),
+        "-s".into(),
+        serial.into(),
+        "shell".into(),
+        "timeout".into(),
+        format!("{}s", timeout.as_secs().max(1)),
+    ];
+    argv.extend(expand_argv_at(
+        execute,
+        serial,
+        package,
+        remote_artifact,
+    ));
+    argv
 }
 
 fn run_argv(argv: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<CommandOutput> {
