@@ -1861,41 +1861,45 @@ pub fn minimize(args: MinimizeArgs) -> Result<()> {
         candidate_items: metadata.steps.len(),
     });
 
-    let original_steps = metadata.steps.clone();
     let selected = metadata.selected_event_id;
-    let removable = original_steps
-        .iter()
-        .filter(|step| !step.selected)
-        .cloned()
-        .collect::<Vec<_>>();
-    let fixed = original_steps
-        .iter()
-        .filter(|step| step.selected)
-        .cloned()
-        .collect::<Vec<_>>();
-    let minimized_steps = state.ddmin_stage(
-        "causal_steps",
-        removable,
-        |kept, candidate| {
-            let mut steps = kept.to_vec();
-            steps.extend(fixed.clone());
-            steps.sort_by_key(|step| step.event_id);
-            candidate.steps = steps;
-        },
-        &metadata,
-        &original_input,
-    )?;
-    metadata.steps = minimized_steps.into_iter().chain(fixed).collect::<Vec<_>>();
-    metadata.steps.sort_by_key(|step| step.event_id);
+    if runner_supports(&runner, RunnerCapability::CausalSteps) {
+        let original_steps = metadata.steps.clone();
+        let removable = original_steps
+            .iter()
+            .filter(|step| !step.selected)
+            .cloned()
+            .collect::<Vec<_>>();
+        let fixed = original_steps
+            .iter()
+            .filter(|step| step.selected)
+            .cloned()
+            .collect::<Vec<_>>();
+        let minimized_steps = state.ddmin_stage(
+            "causal_steps",
+            removable,
+            |kept, candidate| {
+                let mut steps = kept.to_vec();
+                steps.extend(fixed.clone());
+                steps.sort_by_key(|step| step.event_id);
+                candidate.steps = steps;
+            },
+            &metadata,
+            &original_input,
+        )?;
+        metadata.steps = minimized_steps.into_iter().chain(fixed).collect::<Vec<_>>();
+        metadata.steps.sort_by_key(|step| step.event_id);
+    }
 
-    let minimized_transactions = state.ddmin_stage(
-        "binder_transactions",
-        metadata.transactions.clone(),
-        |kept, candidate| candidate.transactions = kept.to_vec(),
-        &metadata,
-        &original_input,
-    )?;
-    metadata.transactions = minimized_transactions;
+    if runner_supports(&runner, RunnerCapability::BinderTransactions) {
+        let minimized_transactions = state.ddmin_stage(
+            "binder_transactions",
+            metadata.transactions.clone(),
+            |kept, candidate| candidate.transactions = kept.to_vec(),
+            &metadata,
+            &original_input,
+        )?;
+        metadata.transactions = minimized_transactions;
+    }
 
     let all_regions = metadata.mutable_regions.clone();
     let retained_regions = state.ddmin_input_regions(&metadata, &original_input, &all_regions)?;
@@ -1903,30 +1907,32 @@ pub fn minimize(args: MinimizeArgs) -> Result<()> {
     zero_removed_regions(&mut input, &all_regions, &retained_regions);
     input = state.minimize_trailing(&metadata, input)?;
 
-    let delays = metadata
-        .steps
-        .iter()
-        .filter(|step| step.delay_ms != 0)
-        .map(|step| step.event_id)
-        .collect::<Vec<_>>();
-    let kept_delays = state.ddmin_stage(
-        "timing_delays",
-        delays,
-        |kept, candidate| {
-            let kept = kept.iter().copied().collect::<HashSet<_>>();
-            for step in &mut candidate.steps {
-                if !kept.contains(&step.event_id) {
-                    step.delay_ms = 0;
+    if runner_supports(&runner, RunnerCapability::TimingDelays) {
+        let delays = metadata
+            .steps
+            .iter()
+            .filter(|step| step.delay_ms != 0)
+            .map(|step| step.event_id)
+            .collect::<Vec<_>>();
+        let kept_delays = state.ddmin_stage(
+            "timing_delays",
+            delays,
+            |kept, candidate| {
+                let kept = kept.iter().copied().collect::<HashSet<_>>();
+                for step in &mut candidate.steps {
+                    if !kept.contains(&step.event_id) {
+                        step.delay_ms = 0;
+                    }
                 }
+            },
+            &metadata,
+            &input,
+        )?;
+        let kept_delays = kept_delays.into_iter().collect::<HashSet<_>>();
+        for step in &mut metadata.steps {
+            if !kept_delays.contains(&step.event_id) {
+                step.delay_ms = 0;
             }
-        },
-        &metadata,
-        &input,
-    )?;
-    let kept_delays = kept_delays.into_iter().collect::<HashSet<_>>();
-    for step in &mut metadata.steps {
-        if !kept_delays.contains(&step.event_id) {
-            step.delay_ms = 0;
         }
     }
 
@@ -2057,7 +2063,15 @@ fn load_runner(path: &Path) -> Result<RunnerContract> {
     {
         bail!("ADB runners do not support prepare or recover hooks");
     }
+    let unique_capabilities: HashSet<_> = runner.capabilities.iter().copied().collect();
+    if unique_capabilities.len() != runner.capabilities.len() {
+        bail!("runner capabilities must not contain duplicates");
+    }
     Ok(runner)
+}
+
+fn runner_supports(runner: &RunnerContract, capability: RunnerCapability) -> bool {
+    runner.capabilities.contains(&capability)
 }
 
 fn resolve_runner_path(directory: &Path, runner: &Path) -> PathBuf {
