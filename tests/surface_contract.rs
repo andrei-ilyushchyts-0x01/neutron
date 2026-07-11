@@ -535,6 +535,12 @@ fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges
     .expect("causal reachability");
     assert!(reached.nodes.iter().any(|id| id == &service.id));
     assert!(reached.nodes.iter().any(|id| id == &snapshot.devices[0].id));
+    assert_eq!(reached.health.status, "complete");
+    assert_eq!(reached.health.confidence, "exact");
+    assert_eq!(
+        reached.health.captures,
+        vec!["capture:0000000000001234:surface-observe"]
+    );
     assert!(reached
         .relations
         .iter()
@@ -561,6 +567,41 @@ fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges
         .nodes
         .iter()
         .any(|id| id == "module:injected-static"));
+}
+
+#[test]
+fn reachability_distinguishes_missing_and_candidate_evidence() {
+    let mut snapshot = scan_with_reader(&fixture()).unwrap();
+    let missing = reachable(
+        &snapshot,
+        &RootSelector::Package("com.example.missing".into()),
+    )
+    .unwrap();
+    assert_eq!(missing.health.status, "no_evidence");
+    assert_eq!(missing.health.confidence, "none");
+    assert!(missing
+        .health
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("no matching capture")));
+
+    let capture = r#"
+{"type":"marker","phase":"start","name":"candidate","scenario_id":"candidate","trace_id":"trace-candidate","root_package":"com.example.candidate"}
+{"type":"syscall","pid":42,"tid":42,"name":"ioctl","phase":"exit","args":[7,3227014671,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-candidate","span_id":"ioctl-candidate","depth":0,"causal_relation":"inferred"}
+"#;
+    import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
+    let candidate = reachable(
+        &snapshot,
+        &RootSelector::Package("com.example.candidate".into()),
+    )
+    .unwrap();
+    assert_eq!(candidate.health.status, "degraded");
+    assert_eq!(candidate.health.confidence, "candidate");
+    assert!(candidate
+        .health
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("degraded")));
 }
 
 #[test]
