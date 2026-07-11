@@ -3000,6 +3000,36 @@ mod tests {
     }
 
     #[test]
+    fn adb_runner_uses_remote_argv_without_a_shell() {
+        let execute = vec![
+            "{artifact}/replay".to_string(),
+            "{artifact}/input.bin".to_string(),
+        ];
+        let remote = "/data/local/tmp/neutron-harness-123-abcdef";
+        let argv = adb_execute_argv(
+            &execute,
+            "USB123",
+            "com.example.app",
+            remote,
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            argv,
+            [
+                "adb",
+                "-s",
+                "USB123",
+                "shell",
+                "timeout",
+                "30s",
+                "/data/local/tmp/neutron-harness-123-abcdef/replay",
+                "/data/local/tmp/neutron-harness-123-abcdef/input.bin",
+            ]
+        );
+        assert!(!argv.windows(2).any(|args| args == ["sh", "-c"]));
+    }
+
+    #[test]
     fn binder_object_registry_covers_standard_reconstruction_types() {
         assert_eq!(binder_object_name(0x7362_2a85), Some("binder"));
         assert_eq!(binder_object_name(0x7762_2a85), Some("weak_binder"));
