@@ -1,11 +1,12 @@
 //! Bounded SELinux AVC ingestion and evidence-safe offline explanation.
 
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -88,13 +89,42 @@ fn run_explain(args: ExplainArgs) -> Result<()> {
         ExplainFormat::Json => serde_json::to_string_pretty(&explanation)?,
     };
     match args.output {
-        Some(path) => fs::write(&path, format!("{report}\n"))
-            .with_context(|| format!("writing {}", path.display())),
+        Some(path) => write_private_report(&path, &report),
         None => {
             println!("{report}");
             Ok(())
         }
     }
+}
+
+fn write_private_report(path: &Path, report: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {} for secure output", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting secure output {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!(
+            "secure output must be an owned regular file with one link: {}",
+            path.display()
+        );
+    }
+    file.set_len(0)
+        .with_context(|| format!("truncating verified output {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    writeln!(file, "{report}").with_context(|| format!("writing {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("flushing {}", path.display()))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
