@@ -21,6 +21,7 @@ Targets kernel 6.1+ / Pixel 8 Pro / Android 14 GKI.
 | [guides/harness.md](guides/harness.md) | Extract, minimize, and safely replay captured regression testcases |
 | [guides/aidl-intelligence.md](guides/aidl-intelligence.md) | Index AIDL catalogs and selectively decode complete offline testcases |
 | [guides/android-content-provider.md](guides/android-content-provider.md) | Low-noise Android content-provider research workflow |
+| [guides/selinux.md](guides/selinux.md) | Capture AVC decisions and explain exact observed delegation |
 | [guides/bpf-tracing.md](guides/bpf-tracing.md) | Tracing concepts, profiles, filtering, stack traces |
 | [guides/security-assessment.md](guides/security-assessment.md) | End-to-end assessment workflow |
 | [guides/output-formats.md](guides/output-formats.md) | Text and NDJSON formats with parsing examples |

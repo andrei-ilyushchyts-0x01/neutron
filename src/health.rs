@@ -188,6 +188,19 @@ pub struct UserspaceHealth {
     /// Important because the main NDJSON file may be missing the final
     /// `capture_health` line unless `--health-output` was also used.
     pub output_cap_hit: bool,
+    /// AVC logcat source state and bounded ingestion counters.
+    pub selinux_source_enabled: bool,
+    pub selinux_source_available: bool,
+    pub selinux_parsed: u64,
+    pub selinux_malformed: u64,
+    pub selinux_deduplicated: u64,
+    pub selinux_out_of_scope: u64,
+}
+
+impl UserspaceHealth {
+    fn selinux_degraded(&self) -> bool {
+        self.selinux_source_enabled && !self.selinux_source_available
+    }
 }
 
 /// Static capture configuration surfaced in the shutdown health event.
@@ -249,7 +262,21 @@ pub fn format_summary_with(
     if user.output_cap_hit {
         out.push_str("  output cap hit: true\n");
     }
-    if health.has_degradation() {
+    if user.selinux_source_enabled {
+        let status = if user.selinux_source_available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        out.push_str(&format!(
+            "  selinux AVC source: {status}; parsed={} malformed={} deduplicated={} out-of-scope={}\n",
+            user.selinux_parsed,
+            user.selinux_malformed,
+            user.selinux_deduplicated,
+            user.selinux_out_of_scope,
+        ));
+    }
+    if health.has_degradation() || user.selinux_degraded() {
         out.push_str(
             "\nWARNING: capture had drops or degraded paths. Absence of a finding\n\
              is NOT conclusive — the relevant event may have been dropped, the\n\
@@ -302,14 +329,25 @@ pub fn format_capture_health_json_with_metadata(
     }
     let _ = write!(
         s,
-        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"output_cap_hit":{},"degraded":{}"#,
+        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"output_cap_hit":{},"selinux_avc_source":"{}","selinux_parsed":{},"selinux_malformed":{},"selinux_deduplicated":{},"selinux_out_of_scope":{},"degraded":{}"#,
         user.fd_graph_miss,
         user.fd_graph_backfilled,
         user.events_matched,
         user.events_sampled_out,
         user.events_emitted,
         user.output_cap_hit,
-        health.has_degradation()
+        if !user.selinux_source_enabled {
+            "disabled"
+        } else if user.selinux_source_available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        user.selinux_parsed,
+        user.selinux_malformed,
+        user.selinux_deduplicated,
+        user.selinux_out_of_scope,
+        health.has_degradation() || user.selinux_degraded()
     );
     write_string_array(&mut s, "driver_packs", &meta.driver_packs);
     write_string_array(&mut s, "kprobe_packs", &meta.kprobe_packs);
@@ -468,6 +506,7 @@ mod tests {
             events_sampled_out: 5,
             events_emitted: 60,
             output_cap_hit: false,
+            ..UserspaceHealth::default()
         };
         let line = format_capture_health_json(&h, &user, 99_999);
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
@@ -507,6 +546,20 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(v["output_cap_hit"], true);
+    }
+
+    #[test]
+    fn unavailable_default_selinux_source_marks_health_degraded() {
+        let user = UserspaceHealth {
+            selinux_source_enabled: true,
+            selinux_source_available: false,
+            ..UserspaceHealth::default()
+        };
+        let health = CaptureHealth::default();
+        let value: serde_json::Value =
+            serde_json::from_str(&format_capture_health_json(&health, &user, 0)).unwrap();
+        assert_eq!(value["selinux_avc_source"], "unavailable");
+        assert_eq!(value["degraded"], true);
     }
 
     #[test]

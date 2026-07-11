@@ -122,11 +122,27 @@ fn permissive_explanation_does_not_claim_operation_was_blocked() {
 #[test]
 fn excludes_non_exact_or_unsuccessful_delegated_evidence_with_warnings() {
     for (needle, replacement, warning) in [
-        (r#""trace_id":"trace-a""#, r#""trace_id":"trace-b""#, "different trace"),
+        (
+            r#""trace_id":"trace-a""#,
+            r#""trace_id":"trace-b""#,
+            "different trace",
+        ),
         (r#""ret":0"#, r#""ret":-13"#, "failed syscall"),
-        (r#""causal_relation":"exact""#, r#""causal_relation":"inferred""#, "inferred"),
-        (r#""attribution_confidence":"exact""#, r#""attribution_confidence":"candidate""#, "candidate service attribution"),
-        (r#""fd_path":"/dev/trusty-ipc-dev0""#, r#""fd_path":"/dev/other""#, "different path"),
+        (
+            r#""causal_relation":"exact""#,
+            r#""causal_relation":"inferred""#,
+            "inferred",
+        ),
+        (
+            r#""attribution_confidence":"exact""#,
+            r#""attribution_confidence":"candidate""#,
+            "candidate service attribution",
+        ),
+        (
+            r#""fd_path":"/dev/trusty-ipc-dev0""#,
+            r#""fd_path":"/dev/other""#,
+            "different path",
+        ),
     ] {
         let mut capture = positive_capture();
         let index = capture.rfind(needle).expect("fixture needle");
@@ -134,7 +150,10 @@ fn excludes_non_exact_or_unsuccessful_delegated_evidence_with_warnings() {
         let explanation = explain_from_reader(Cursor::new(capture), 9182).unwrap();
         assert!(explanation.delegated_paths.is_empty(), "{warning}");
         assert!(
-            explanation.warnings.iter().any(|item| item.contains(warning)),
+            explanation
+                .warnings
+                .iter()
+                .any(|item| item.contains(warning)),
             "missing warning {warning}: {:?}",
             explanation.warnings
         );
@@ -160,13 +179,23 @@ fn service_side_denial_is_not_delegated_reachability() {
 }
 
 #[test]
+fn pathless_denial_never_claims_delegated_path() {
+    let capture = positive_capture()
+        .replace(r#","path":"/dev/trusty-ipc-dev0""#, "")
+        .replace(r#","fd_path":"/dev/trusty-ipc-dev0""#, "");
+    let explanation = explain_from_reader(Cursor::new(capture), 9182).unwrap();
+    assert!(explanation.delegated_paths.is_empty());
+    assert!(explanation
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("pathless")));
+}
+
+#[test]
 fn explain_rejects_missing_or_non_denial_event_ids() {
-    let error = explain_from_reader(
-        Cursor::new("{\"type\":\"syscall\",\"event_id\":1}\n"),
-        1,
-    )
-    .unwrap_err()
-    .to_string();
+    let error = explain_from_reader(Cursor::new("{\"type\":\"syscall\",\"event_id\":1}\n"), 1)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("not a SELinux denial"));
 
     let error = explain_from_reader(Cursor::new(positive_capture()), 9999)

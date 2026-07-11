@@ -24,6 +24,7 @@ pub mod recipes;
 pub mod report;
 pub mod rules;
 pub mod sampler;
+pub mod selinux;
 pub mod sources;
 pub mod summarize;
 pub mod surface;

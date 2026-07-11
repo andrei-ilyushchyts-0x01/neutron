@@ -32,8 +32,9 @@ use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap}
 use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
 use neutron::causal::{
     binder_span_id, enrich_json, monotonic_timestamp_ns, process_context_bytes,
-    process_context_from_bytes, process_exit_span_id, root_process_span_id, syscall_span_id,
-    CausalMetadata, CausalRelation, CausalWire, ControlServer, ScenarioInfo, ScenarioState,
+    process_context_from_bytes, process_exit_span_id, root_process_span_id, selinux_denial_span_id,
+    syscall_span_id, CausalMetadata, CausalRelation, CausalWire, ControlServer, ScenarioInfo,
+    ScenarioState,
 };
 use neutron::cli::{AidlCommand, Args, Cli, Command, HarnessCommand, IoctlCommand};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
@@ -52,6 +53,7 @@ use neutron::matcher::{self, MatchSpec, SyscallEventLens};
 use neutron::predicate;
 use neutron::rules::{build_rule_engine, emit_findings_with};
 use neutron::sampler::SamplerChain;
+use neutron::selinux::SelinuxLogcatReader;
 use neutron::sources::binder_tracker::BinderTracker;
 use neutron::sources::logcat::{LogcatReader, RealLogcatReader};
 use neutron::sources::lookback::RingBufferStore;
@@ -1644,6 +1646,108 @@ fn causal_metadata_for_process_exit(
     }
 }
 
+fn causal_metadata_for_selinux_denial(
+    denial: &neutron::selinux::SelinuxDenial,
+    context: ProcessTraceContext,
+    scenario: &ScenarioInfo,
+    root_package: Option<&str>,
+    root_uid: Option<u32>,
+) -> CausalMetadata {
+    let binder_debug_id = context.binder_debug_id;
+    let depth = context.depth;
+    let reason = context.reason;
+    let parent_span_id = if binder_debug_id == 0 {
+        root_process_span_id(scenario.trace_id, denial.pid)
+    } else {
+        binder_span_id(scenario.trace_id, binder_debug_id as i32)
+    };
+    CausalMetadata {
+        scenario_id: scenario.scenario_id.clone(),
+        trace_id: scenario.trace_id,
+        span_id: selinux_denial_span_id(scenario.trace_id, denial.pid, denial.tid, denial.ts_ns),
+        parent_span_id,
+        depth,
+        relation: if matches!(reason, TraceReason::Root | TraceReason::Binder) {
+            CausalRelation::Exact
+        } else {
+            CausalRelation::Inferred
+        },
+        root_package: root_package.map(str::to_string),
+        root_uid,
+    }
+}
+
+fn selinux_denial_in_scope(
+    denial: &neutron::selinux::SelinuxDenial,
+    args: &Args,
+    root_pids: &[u32],
+    scope_pids: &BTreeSet<u32>,
+    scope_uids: &BTreeSet<u32>,
+    causal_context: Option<ProcessTraceContext>,
+) -> bool {
+    if args
+        .exclude_comm
+        .iter()
+        .any(|excluded| denial.comm.contains(excluded))
+    {
+        return false;
+    }
+    if args.package.is_some() || args.root_uid.is_some() {
+        return causal_context.is_some() || root_pids.contains(&denial.pid);
+    }
+    if args.pid != 0 && denial.pid != args.pid {
+        return false;
+    }
+    if !scope_pids.is_empty() && !scope_pids.contains(&denial.pid) {
+        return false;
+    }
+    if !scope_uids.is_empty() && !denial.uid.is_some_and(|uid| scope_uids.contains(&uid)) {
+        return false;
+    }
+    true
+}
+
+fn emit_selinux_denial(
+    denial: &mut neutron::selinux::SelinuxDenial,
+    causal: Option<&CausalMetadata>,
+    lookback: Option<&mut RingBufferStore>,
+    out: &mut dyn IoWrite,
+    json_mode: bool,
+    event_id_counter: &mut u64,
+) -> io::Result<()> {
+    *event_id_counter = event_id_counter.wrapping_add(1);
+    denial.event_id = Some(*event_id_counter);
+    let mut line = serde_json::to_string(denial).expect("serializing SELinux denial cannot fail");
+    if let Some(metadata) = causal {
+        if let Ok(enriched) = enrich_json(&line, metadata) {
+            line = enriched;
+        }
+    }
+    if json_mode {
+        writeln!(out, "{line}")?;
+    } else {
+        writeln!(
+            out,
+            "[selinux] {} pid={} {} {}:{} {{ {} }}{}",
+            denial.result,
+            denial.pid,
+            denial.source_domain,
+            denial.target_type,
+            denial.tclass,
+            denial.permissions.join(" "),
+            denial
+                .path
+                .as_deref()
+                .map(|path| format!(" path={path}"))
+                .unwrap_or_default(),
+        )?;
+    }
+    if let Some(lookback) = lookback {
+        lookback.record(denial.pid, &line);
+    }
+    Ok(())
+}
+
 fn live_marker_line(
     request: &neutron::causal::MarkRequest,
     scenario: &ScenarioInfo,
@@ -1823,6 +1927,7 @@ fn main() -> Result<()> {
         Some(Command::Harness(HarnessCommand::Replay(args))) => neutron::harness::replay(args),
         Some(Command::Aidl(AidlCommand::Index(args))) => neutron::aidl::run_index(args),
         Some(Command::Aidl(AidlCommand::Decode(args))) => neutron::aidl::run_decode(args),
+        Some(Command::Selinux(command)) => neutron::selinux::run(command),
         None => run_trace(cli.args),
     }
 }
@@ -1987,6 +2092,10 @@ fn run_trace(mut args: Args) -> Result<()> {
     replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
     populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
     let capture_predicate = build_capture_predicate(&args)?;
+    let (selinux_scope_pids, selinux_scope_uids) = capture_predicate
+        .bpf_spec()
+        .map(|spec| (spec.pids.clone(), spec.uids.clone()))
+        .unwrap_or_default();
     if let Some(bpf_spec) = capture_predicate.bpf_spec() {
         populate_match_maps(&mut bpf, bpf_spec)?;
     }
@@ -2375,6 +2484,25 @@ fn run_trace(mut args: Args) -> Result<()> {
                 if args.verbose {
                     eprintln!("  logcat tail: spawn failed ({e}) — skipped");
                 }
+                None
+            }
+        }
+    };
+    let selinux_source_enabled = !args.no_logcat;
+    let mut selinux_reader: Option<SelinuxLogcatReader> = if args.no_logcat {
+        None
+    } else {
+        match SelinuxLogcatReader::spawn() {
+            Ok(reader) => {
+                if args.verbose {
+                    eprintln!("  SELinux AVC logcat tail: spawned");
+                }
+                Some(reader)
+            }
+            Err(error) => {
+                eprintln!(
+                    "neutron: WARNING: SELinux AVC logcat source unavailable ({error}); capture health will be degraded"
+                );
                 None
             }
         }
@@ -3077,6 +3205,55 @@ fn run_trace(mut args: Args) -> Result<()> {
             }
         }
 
+        if let Some(reader) = selinux_reader.as_mut() {
+            for mut denial in reader.drain(monotonic_timestamp_ns()) {
+                neutron::selinux::resolve_process_identity(&mut denial);
+                denial.ts_ns = monotonic_timestamp_ns();
+                let process_context = read_process_context(&bpf, denial.pid);
+                if !selinux_denial_in_scope(
+                    &denial,
+                    &args,
+                    &root_pids,
+                    &selinux_scope_pids,
+                    &selinux_scope_uids,
+                    process_context,
+                ) {
+                    reader.record_out_of_scope();
+                    continue;
+                }
+                let causal = process_context.and_then(|context| {
+                    scenarios.find(context.scenario_generation).map(|scenario| {
+                        causal_metadata_for_selinux_denial(
+                            &denial,
+                            context,
+                            scenario,
+                            args.package.as_deref(),
+                            args.root_uid.or(package_uid),
+                        )
+                    })
+                });
+                write_or_output_cap(
+                    emit_selinux_denial(
+                        &mut denial,
+                        causal.as_ref(),
+                        lookback.as_mut(),
+                        &mut *out,
+                        args.json,
+                        &mut event_id_counter,
+                    ),
+                    &output_cap_hit,
+                )?;
+                events_emitted = events_emitted.saturating_add(1);
+                if stop_if_output_cap_hit(
+                    &output_cap_hit,
+                    &mut output_cap_reported,
+                    running.as_ref(),
+                ) {
+                    break;
+                }
+            }
+        }
+
         if !saw_any {
             // Block on `poll(2)` until the ring becomes readable (or timeout).
             // SAFETY: `pollfd` is a POD; we initialise all fields before the call.
@@ -3116,6 +3293,13 @@ fn run_trace(mut args: Args) -> Result<()> {
     // full, and the BPF programs increment COUNTER_RINGBUF_RESERVE_FAILED in
     // that case. The summary surfaces this so operators can judge whether
     // absence of a finding is conclusive.
+    let selinux_stats = selinux_reader
+        .as_ref()
+        .map(SelinuxLogcatReader::stats)
+        .unwrap_or_default();
+    let selinux_source_available = selinux_reader
+        .as_mut()
+        .is_some_and(SelinuxLogcatReader::is_available);
     let user_health = UserspaceHealth {
         fd_graph_miss: fd_graph.miss_count(),
         fd_graph_backfilled: fd_graph.backfill_count(),
@@ -3123,6 +3307,12 @@ fn run_trace(mut args: Args) -> Result<()> {
         events_sampled_out,
         events_emitted,
         output_cap_hit: output_cap_hit.load(Ordering::Relaxed),
+        selinux_source_enabled,
+        selinux_source_available,
+        selinux_parsed: selinux_stats.parsed,
+        selinux_malformed: selinux_stats.malformed,
+        selinux_deduplicated: selinux_stats.deduplicated,
+        selinux_out_of_scope: selinux_stats.out_of_scope,
     };
     if let Some(map) = bpf.map("COUNTERS") {
         match Array::<_, u64>::try_from(map) {
@@ -3584,5 +3774,93 @@ mod tests {
 
         assert!(warning.contains("--stacks"));
         assert!(warning.contains("neutron-stacks.bpf.elf"));
+    }
+
+    fn test_denial() -> neutron::selinux::SelinuxDenial {
+        neutron::selinux::parse_avc_line(
+            r#"audit(1.0:2): avc: denied { ioctl } for pid=42 comm="app" path="/dev/test" scontext=u:r:app:s0 tcontext=u:object_r:test_device:s0 tclass=chr_file permissive=0"#,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn selinux_scope_applies_pid_uid_and_exclusion() {
+        let mut denial = test_denial();
+        denial.uid = Some(10123);
+        let pids = BTreeSet::from([42]);
+        let uids = BTreeSet::from([10123]);
+        assert!(selinux_denial_in_scope(
+            &denial,
+            &Args::default(),
+            &[],
+            &pids,
+            &uids,
+            None,
+        ));
+
+        let args = Args {
+            exclude_comm: vec!["app".into()],
+            ..Args::default()
+        };
+        assert!(!selinux_denial_in_scope(
+            &denial,
+            &args,
+            &[],
+            &pids,
+            &uids,
+            None,
+        ));
+    }
+
+    #[test]
+    fn selinux_denials_share_the_global_event_counter() {
+        let mut counter = 40;
+        let mut output = Vec::new();
+        for _ in 0..2 {
+            let mut denial = test_denial();
+            denial.ts_ns = 10;
+            emit_selinux_denial(&mut denial, None, None, &mut output, true, &mut counter).unwrap();
+        }
+        let ids: Vec<u64> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["event_id"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, [41, 42]);
+    }
+
+    #[test]
+    fn selinux_denial_uses_exact_binder_process_context() {
+        let mut denial = test_denial();
+        denial.ts_ns = 99;
+        let scenario = ScenarioInfo {
+            scenario_id: "test".into(),
+            trace_id: 7,
+            generation: 1,
+        };
+        let context = ProcessTraceContext {
+            root_trace_id: 7,
+            parent_pid: 10,
+            binder_debug_id: 5,
+            depth: 1,
+            reason: TraceReason::Binder,
+            scenario_generation: 1,
+        };
+        let metadata = causal_metadata_for_selinux_denial(
+            &denial,
+            context,
+            &scenario,
+            Some("com.example.app"),
+            Some(10123),
+        );
+        assert_eq!(metadata.relation, CausalRelation::Exact);
+        assert_eq!(metadata.parent_span_id, binder_span_id(7, 5));
+        assert_eq!(metadata.root_package.as_deref(), Some("com.example.app"));
+        assert_eq!(metadata.root_uid, Some(10123));
     }
 }

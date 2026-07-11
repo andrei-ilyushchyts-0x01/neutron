@@ -252,6 +252,14 @@ pub fn process_exit_span_id(trace_id: u64, pid: u32, timestamp_ns: u64) -> u64 {
     stable_id(trace_id, b"exit", &[pid as u64, timestamp_ns])
 }
 
+pub fn selinux_denial_span_id(trace_id: u64, pid: u32, tid: u32, timestamp_ns: u64) -> u64 {
+    stable_id(
+        trace_id,
+        b"selinux_denial",
+        &[pid as u64, tid as u64, timestamp_ns],
+    )
+}
+
 fn stable_id(trace_id: u64, tag: &[u8], values: &[u64]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in trace_id

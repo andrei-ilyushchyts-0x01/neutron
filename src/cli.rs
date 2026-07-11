@@ -87,6 +87,10 @@ pub enum Command {
     /// Index AIDL interfaces and selectively decode complete harness testcases.
     #[command(subcommand)]
     Aidl(AidlCommand),
+
+    /// Explain captured SELinux AVC decisions and observed delegation.
+    #[command(subcommand)]
+    Selinux(crate::selinux::SelinuxCommand),
 }
 
 #[derive(Subcommand, Debug)]

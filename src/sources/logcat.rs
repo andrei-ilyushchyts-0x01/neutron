@@ -46,7 +46,7 @@ pub struct RealLogcatReader {
     parser: LogcatParser,
 }
 
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is an open descriptor owned by the caller. F_GETFL does
     // not mutate memory; F_SETFL updates only this descriptor's status flags.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
