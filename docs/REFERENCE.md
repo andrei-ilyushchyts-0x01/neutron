@@ -43,7 +43,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--max-processes N` / `--follow-max-pids N` | 1..=1024 | `64`                                  | Dynamic `TRACED_PROCESSES` map capacity. A package/UID root exceeding the limit fails the trace. |
 | `--follow-ttl DURATION`           | duration         | `30s`                                    | Remove a non-root follower when no later causal Binder hop refreshes it. Accepts `ms`, `s`, or `m`. |
 | `--follow-allow-domain LIST`      | repeatable/comma-separated | empty                           | If non-empty, follow only callees whose current SELinux domain is listed. Unknown domains are rejected. |
-| `--follow-deny-domain LIST`       | repeatable/comma-separated | empty                           | Never follow callees in these SELinux domains. Deny takes precedence over allow. |
+| `--follow-deny-domain LIST`       | repeatable/comma-separated | empty                           | Never follow callees in these SELinux domains. Deny takes precedence over allow; matching current PIDs are seeded before tracepoints attach. |
 | `--control-socket PATH|off`       | String           | `/data/local/tmp/neutron.control.sock`   | Live scenario marker socket; `off` disables it. |
 | `--pid N`                         | u32              | `0`                                      | Target process ID. `0` traces all processes. |
 | `--object PATH`                   | String           | `/data/local/tmp/neutron.bpf.elf`        | Path to the compiled Aya BPF ELF object on the device. |
@@ -615,6 +615,7 @@ finding is conclusive" on a single field instead of grepping prose.
   "fd_graph_backfilled":     0,
   "follow_policy_filtered":  0,
   "follow_ttl_expired":      0,
+  "causal_admission_boundary_exit": 0,
   "degraded":                false,
   "driver_packs":            ["kgsl"],
   "kprobe_packs":            [],
@@ -637,6 +638,7 @@ finding is conclusive" on a single field instead of grepping prose.
 | `fd_graph_backfilled` | u64 | Misses that `--resolve-paths` recovered via `/proc/<pid>/fd/<fd>`.         |
 | `follow_policy_filtered` | u64 | Causal branches intentionally stopped by domain/special-process policy. |
 | `follow_ttl_expired` | u64 | Non-root followers removed after the configured PID TTL. |
+| `causal_admission_boundary_exit` | u64 | Informational 1.4 volume count for an exit whose entry predates dynamic causal admission, including a sibling Binder thread; it does not set `degraded`. |
 | `degraded`         | bool | `true` when any drop or degradation counter is non-zero. Mirrors the stderr WARNING banner predicate. |
 | `driver_packs` / `kprobe_packs` | string[] | Active BPF-oriented decoder/kprobe packs requested for the capture. |
 | `attached_programs` | string[] | BPF programs successfully attached in this session. |

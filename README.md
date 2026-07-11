@@ -112,8 +112,16 @@ cd "neutron-${VERSION}-android-aarch64"
 
 adb push neutron /data/local/tmp/neutron
 adb push neutron.bpf.elf /data/local/tmp/neutron.bpf.elf
+adb shell "su -c 'mkdir -p /data/local/share/neutron/packs && chown 0:0 /data/local/share/neutron && chmod 0755 /data/local/share/neutron && chown -R shell:shell /data/local/share/neutron/packs'"
+adb push share/neutron/packs/. /data/local/share/neutron/packs/
+adb shell "su -c 'chown -R 0:0 /data/local/share/neutron/packs && find /data/local/share/neutron/packs -type d -exec chmod 0755 {} \; && find /data/local/share/neutron/packs -type f -exec chmod 0644 {} \;'"
 adb shell chmod +x /data/local/tmp/neutron
 ```
+
+The Android archive includes `share/neutron/packs`. The root-owned parent stays
+protected; temporary `shell` ownership applies only to the pack subtree so
+`adb push` can create nested directories. The final command returns the
+installed packs to root ownership with read-only file modes.
 
 Run the preflight:
 
@@ -131,8 +139,8 @@ syscall failures must be fixed before tracing.
 git clone https://github.com/andrei-ilyushchyts-0x01/neutron.git
 cd neutron
 
-# Builds neutron.bpf.elf and the Android aarch64 userspace binary,
-# then pushes both to /data/local/tmp if adb is connected.
+# Builds neutron.bpf.elf and the Android aarch64 userspace binary, then pushes
+# them and stages the built-in packs if adb is connected.
 ./build.sh
 ```
 
@@ -144,6 +152,9 @@ cargo build --release --target aarch64-unknown-linux-musl --bin neutron
 
 adb push neutron.bpf.elf /data/local/tmp/neutron.bpf.elf
 adb push target/aarch64-unknown-linux-musl/release/neutron /data/local/tmp/neutron
+adb shell "su -c 'mkdir -p /data/local/share/neutron/packs && chown 0:0 /data/local/share/neutron && chmod 0755 /data/local/share/neutron && chown -R shell:shell /data/local/share/neutron/packs'"
+adb push packs/. /data/local/share/neutron/packs/
+adb shell "su -c 'chown -R 0:0 /data/local/share/neutron/packs && find /data/local/share/neutron/packs -type d -exec chmod 0755 {} \; && find /data/local/share/neutron/packs -type f -exec chmod 0644 {} \;'"
 adb shell chmod +x /data/local/tmp/neutron
 adb shell "su -c '/data/local/tmp/neutron doctor'"
 ```
@@ -333,11 +344,38 @@ neutron surface diff baseline.json ota.json --output surface-diff.json
 
 ## Run A Reproducible Research Pack
 
+Install the companion probe before running a pack. It requires JDK 17, Android
+SDK platform 35 with Build Tools 35.0.0, and Gradle 8.10.2. From the repository
+root, point Gradle at those tools, run the probe's unit test and debug build,
+then install and verify the package:
+
+```bash
+export JAVA_HOME=/path/to/jdk-17
+export ANDROID_HOME=/path/to/android-sdk
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+  "platforms;android-35" "build-tools;35.0.0"
+
+cd probe-app
+gradle --version # must report Gradle 8.10.2 and JVM 17
+gradle --no-daemon testDebugUnitTest assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell pm path dev.neutron.probe
+cd ..
+```
+
+`pm path` must print a `package:` path before continuing. Use the probe only
+through `neutron research`; its `DUMP`-protected receiver accepts exactly the
+pack's typed action and parameters, not arbitrary broadcasts or shell commands.
+
 After installing the companion APK and built-in packs, preflight a pack without
 stimulating hardware:
 
 ```bash
-adb shell "su -c '/data/local/tmp/neutron research --pack keymint'"
+adb shell "su -c '/data/local/tmp/neutron research --pack keymint \
+  --probe-package dev.neutron.probe'"
 ```
 
 This exits `2` and writes a private `authorization_required` report. Add
@@ -345,7 +383,7 @@ This exits `2` and writes a private `authorization_required` report. Add
 
 ```bash
 adb shell "su -c '/data/local/tmp/neutron research --pack camera \
-  --param camera_id=0 --authorized-use'"
+  --param camera_id=0 --probe-package dev.neutron.probe --authorized-use'"
 ```
 
 Packs are data-only and compile into allowlisted trace flags plus one of seven

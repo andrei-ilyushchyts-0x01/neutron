@@ -30,6 +30,8 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 │              │   SYSCALL_FILTER        HashMap                         │
 │              │   PID_WHITELIST         HashMap                         │
 │              │   TRACED_PROCESSES      HashMap                         │
+│              │   BINDER_FOLLOW_DENY_PIDS HashMap                       │
+│              │   ADMITTED_THREAD_ENTERS HashMap                        │
 │              │   ROOT_UID_CONTEXT      Array                           │
 │              │   BINDER_*_CONTEXT      HashMap                         │
 │              │   WATCH_FDS             HashMap                         │
@@ -399,8 +401,10 @@ evicted, `latency_us` is `null` in JSON output.
 | `SYSCALL_FILTER` | `HashMap` | u32 syscall | u8 | 64 | Active syscall whitelist. |
 | `PID_WHITELIST` | `HashMap` | u32 PID | u8 | 256 | `--follow-children` PIDs. |
 | `TRACED_PROCESSES` | `HashMap` | u32 PID | `ProcessTraceContext` | 64 default, loader override | Bounded dynamic causal set (`--max-processes`). |
+| `BINDER_FOLLOW_DENY_PIDS` | `HashMap` | u32 PID | u8 | 64 | PIDs resolved from `--follow-deny-domain` and seeded before tracepoint attachment; they cannot enter the dynamic Binder-follow set. |
+| `ADMITTED_THREAD_ENTERS` | `HashMap` | u64 pid_tgid | u8 | 4096 | Post-admission syscall-enter marker. It classifies a first exit from an already-active sibling Binder thread as a causal admission boundary rather than an `INFLIGHT` loss. |
 | `ROOT_UID_CONTEXT` | `Array` | u32 | `ProcessTraceContext` | 1 | Current explicit UID-root context. |
-| `BINDER_TRANSACTION_CONTEXT` | `HashMap` | u32 debug ID | Binder transaction context | 4096 | Caller-to-callee causal propagation. |
+| `BINDER_TRANSACTION_CONTEXT` | `HashMap` | u32 debug ID | Binder transaction context | 4096 | Caller-to-callee causal propagation, including a one-use admission-boundary marker for syscall-exit accounting. |
 | `THREAD_BINDER_CONTEXT` | `HashMap` | u64 pid_tgid | Binder thread context | 4096 | Exact receiving-thread attribution. |
 | `WATCH_FDS` | `HashMap` | u64 pid<<32\|fd | u8 | 256 | Selective read/write capture. |
 | `STACK_TRACES` | `StackTrace` | u32 stack ID | u64[127] | 16384 | Kernel and user IP arrays; present with `stacks`. |

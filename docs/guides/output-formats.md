@@ -263,6 +263,7 @@ Same counter set as the stderr capture-summary block, plus a
   "unix_msg_control_truncated":0, "unix_msg_control_nested":0,
   "fd_graph_miss":0, "fd_graph_backfilled":0,
   "follow_policy_filtered":0, "follow_ttl_expired":0,
+  "causal_admission_boundary_exit":0,
   "degraded":false, "driver_packs":["kgsl"],
   "attached_programs":["trace_sys_enter","trace_sys_exit"],
   "ioctl_refresh_types":["0x9"], "root_uid":10123,
@@ -278,6 +279,12 @@ incomplete causal branches. They do not by themselves set `degraded:true`,
 but graph and surface consumers surface them as completeness warnings. Each
 individual boundary is also emitted as `type:"follow_guardrail"` with
 `causal_branch_complete:false`.
+
+`causal_admission_boundary_exit` is a 1.4 additive volume counter. It marks
+an exit whose matching enter happened before a process was dynamically admitted
+to the causal set, including an already-active sibling Binder thread, so it
+does not set `degraded:true`. An ordinary `inflight_lookup_missed` remains a
+degradation counter.
 
 `root_package`/`root_uid` identify an optional causal root. `boot_id` and
 `fingerprint` let later consumers judge whether current process identities can

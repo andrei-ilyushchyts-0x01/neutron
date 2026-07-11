@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stimuli with private artifact locking and bounded permission cleanup.
 - Expanded CI to verify the full host workspace, AArch64 musl build, release
   eBPF object, and Android research-probe unit tests.
+- Seeded PIDs matching explicit `--follow-deny-domain` policy before Binder
+  tracepoints attach. Research runs now pre-deny `servicemanager` and
+  `system_server` to avoid coordinator-wide follower fanout.
+- Added the additive `causal_admission_boundary_exit` capture-health volume
+  counter, including admitted sibling-worker boundary accounting, so expected
+  first exits are distinguished from ordinary correlation misses.
+- Switched temporary runtime-permission inspection to `dumpsys package`, which
+  supports Android 16 builds without `cmd package check-permission`.
+- Fixed release-pack staging for root-owned Android directories by creating
+  them as root, temporarily granting `shell` write access for `adb push`, and
+  restoring root ownership afterwards.
 
 ## [1.4.0] — 2026-07-10
 

@@ -24,7 +24,22 @@ cd android_bpf
 `build.sh` runs `cargo xtask build-ebpf release` (compiles the Rust BPF
 programs to `neutron.bpf.elf`), `cargo build --release --target
 aarch64-unknown-linux-musl --bin neutron` (cross-compiles the userspace
-loader), and `adb push`es both to `/data/local/tmp/`.
+loader), pushes both to `/data/local/tmp/`, and stages built-in research packs
+under `/data/local/share/neutron/packs/`.
+
+For a manual deployment, keep the parent root-owned and temporarily hand only
+the pack subtree to `shell` so `adb push` can create nested pack directories,
+then restore root ownership and read-only modes:
+
+```bash
+adb push neutron.bpf.elf /data/local/tmp/neutron.bpf.elf
+adb push target/aarch64-unknown-linux-musl/release/neutron /data/local/tmp/neutron
+adb shell "su -c 'mkdir -p /data/local/share/neutron/packs && chown 0:0 /data/local/share/neutron && chmod 0755 /data/local/share/neutron && chown -R shell:shell /data/local/share/neutron/packs'"
+adb push packs/. /data/local/share/neutron/packs/
+adb shell "su -c 'chown -R 0:0 /data/local/share/neutron/packs && find /data/local/share/neutron/packs -type d -exec chmod 0755 {} \; && find /data/local/share/neutron/packs -type f -exec chmod 0644 {} \;'"
+adb shell chmod +x /data/local/tmp/neutron
+adb shell "su -c '/data/local/tmp/neutron doctor'"
+```
 
 Expected output (truncated):
 

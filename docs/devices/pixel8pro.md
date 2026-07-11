@@ -9,10 +9,10 @@ verified baseline below is what we test against.
 | Property | Value |
 |----------|-------|
 | Model | Pixel 8 Pro (`husky`) |
-| Build fingerprint | `google/husky/husky:16/CP1A.260405.005/15001963:user/release-keys` |
-| Build ID | `CP1A.260405.005` |
+| Build fingerprint | `google/husky/husky:16/CP1A.260505.005/15081906:user/release-keys` |
+| Build ID | `CP1A.260505.005` |
 | Android version | 16 (SDK 36) |
-| Security patch | 2026-04-05 |
+| Security patch | 2026-05-05 |
 | Root | KernelSU (`u:r:ksu:s0`) |
 | Online CPUs | 9 (`0-8`) |
 
@@ -52,7 +52,7 @@ CONFIG_TRACEPOINTS=y
 
 ### Implications for neutron
 
-- **BTF available**: `/sys/kernel/btf/vmlinux` (5.6 MB) → CO-RE enabled by default
+- **BTF available**: `/sys/kernel/btf/vmlinux` → CO-RE enabled by default
 - **JIT mandatory** (`BPF_JIT_ALWAYS_ON=y`) — interpreter is gone, all programs JIT-compile
 - **No BPF LSM** → `bpf_d_path` works on tracepoints/kprobes but the LSM hook chain is unavailable. Acceptable for a syscall tracer; document the limitation.
 - **No `CONFIG_FUNCTION_TRACER`** → `fentry`/`fexit` programs are NOT supported. Stick to tracepoints + kprobes.
@@ -84,8 +84,52 @@ bpf    on /sys/fs/bpf       type bpf    (rw,nosuid,nodev,noexec,relatime)
 - **`bpftool` is not installed** by default on the device. The BPF feature
   inventory is read off `/proc/config.gz` plus runtime probing. For
   `bpftool feature probe`, cross-build it from the AOSP/kernel tree.
-- ADB push speeds: 30 MB/s for the 20 KB BPF ELF, 492 MB/s for the 1.5 MB
-  binary — deploy round-trip is sub-second.
+
+## Authorized-device release evidence (2026-07-11)
+
+This section records one authorized rooted-device run. It is evidence for the
+exact build above, not a claim that another Pixel build or vendor device has
+the same results.
+
+- `neutron doctor` passed privilege, BTF, tracefs, bpffs, raw-syscall,
+  stack-map, and Binder checks. Its only warnings were the expected masked
+  kernel symbols and enforcing SELinux.
+- `/data/local/tmp/neutron-static-final-20260711T193448Z.surface.json`
+  completed with no collector warnings: 436 services, 830 processes, 605
+  device nodes, and 436 modules.
+- The Gradle-built `dev.neutron.probe` companion was installed before the
+  authorized research runs. All built-in packs first completed the safe
+  preflight path without `--authorized-use`.
+
+The following results are intentionally recorded exactly as observed. Artifact
+directories are retained on that device under `/data/local/tmp/neutron-runs/`;
+they are not checked into this repository.
+
+| Pack | Observed outcome | Capture interpretation | Artifact directory |
+|------|------------------|------------------------|--------------------|
+| KeyMint | `complete`; stimulus `completed` | Clean: `degraded:false`, no ordinary inflight misses, 2 causal-admission boundary exits, and 20 intentional policy filters. | `keymint-final-20260711T193035Z` |
+| GPU | `complete`; stimulus `completed` | Clean: `degraded:false`, no ordinary inflight misses, no boundary exits, and 20 intentional policy filters. | `gpu-final-20260711T193142Z` |
+| Media Codec | `complete`; stimulus `completed` | Clean after sibling-boundary accounting: `degraded:false`, no ordinary inflight misses, 8 causal-admission boundary exits, and 38 intentional policy filters. | `media-codec-sibling-fix-20260711T192745Z` |
+| Bluetooth | `complete`; stimulus `completed` | Clean after sibling-boundary accounting: `degraded:false`, no ordinary inflight misses, 1 causal-admission boundary exit, and 40 intentional policy filters. Temporary `BLUETOOTH_SCAN`/`BLUETOOTH_CONNECT` grants were restored and verified absent afterwards. | `bluetooth-sibling-fix-20260711T192859Z` |
+| Wi-Fi | `unsupported`; stimulus `unsupported` | The companion prerequisite was unavailable. Health was clean (`degraded:false`, 0 ordinary misses/boundaries); this is not a reachability claim. | `wifi-final-20260711T193251Z` |
+| USB | `unsupported`; stimulus `not_executed` | Preflight found no usable `/dev/bus/usb/*` device for the typed companion action. | `usb-final-20260711T193326Z` |
+| Camera | `unsupported`; stimulus `unsupported` | Android 16 CameraService rejects the broadcast-only probe as an idle UID. The companion classifies that prerequisite safely; health was clean (`degraded:false`, 0 ordinary misses, 8 boundaries, 41 policy filters), but this is not a camera reachability claim. | `camera-final-20260711T193359Z` |
+
+For a retained run, inspect status and capture health together:
+
+```bash
+SERIAL=USB_SERIAL
+RUN=/data/local/tmp/neutron-runs/keymint-final-20260711T193035Z
+adb -s "$SERIAL" shell "su -c 'cat $RUN/run.json; cat $RUN/stimulus.json; tail -n 1 $RUN/capture.health.ndjson'"
+```
+
+`causal_admission_boundary_exit` is a volume counter, not a degradation
+counter: it marks an exit whose matching enter predated dynamic causal
+admission, including an already-active sibling Binder thread. Ordinary
+`inflight_lookup_missed` values still make a capture degraded.
+`follow_policy_filtered` is expected for research runs because they pre-deny
+`servicemanager` and `system_server` before tracepoint attachment to avoid
+system-wide coordinator fanout.
 
 ## Helper inventory (kernel 6.1+)
 

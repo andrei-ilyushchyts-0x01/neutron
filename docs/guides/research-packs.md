@@ -22,11 +22,58 @@ registry and are revoked only when the current run granted them. Radios are
 never enabled. USB selection is automatic only when the companion sees one
 non-hub device; otherwise pass `--param usb_device_id=...`.
 
+## Companion and authorized run
+
+Install the minimal `dev.neutron.probe` companion before running a built-in
+stimulus. Its build, unit-test, installation, and verification procedure is in
+[probe-app/README.md](../../probe-app/README.md). The only companion selector
+is `--probe-package`; there is no generic companion action or arbitrary
+broadcast interface.
+
+On hardware you are authorized to assess, a minimal KeyMint run is:
+
+```bash
+SERIAL=USB_SERIAL
+NEUTRON=/data/local/tmp/neutron
+RUN=/data/local/tmp/neutron-runs/keymint-$(date -u +%Y%m%dT%H%M%SZ)
+
+adb -s "$SERIAL" shell "su -c '$NEUTRON research --pack keymint \
+  --authorized-use --probe-package dev.neutron.probe --output $RUN'"
+adb -s "$SERIAL" shell "su -c 'cat $RUN/run.json; cat $RUN/stimulus.json; \
+  tail -n 1 $RUN/capture.health.ndjson'"
+```
+
+Without `--authorized-use`, that same command must end at the safe
+`authorization_required` preflight. `--authorized-use` is an explicit
+authorized-use acknowledgement, not a permission to enable radios, select an
+ambiguous USB device, or run arbitrary code from a pack.
+
+Before a temporary permission grant, the runner checks the package's runtime
+state with `dumpsys package <package>`; it uses `pm grant` only for a compiled
+action permission that was not already granted. Cleanup revokes only grants
+made by that run. Android builds that do not provide `cmd package
+check-permission` are therefore supported.
+
+Research child traces pre-deny `servicemanager` and `system_server` as Binder
+followers before tracepoints attach. This prevents a package action from
+turning into process-wide coordinator tracing. The root Binder edge remains
+observable, and `follow_policy_filtered` records the deliberately incomplete
+branch.
+
 The new output directory is mode `0700`; files are `0600`. `pack.lock.json`
 and the private `pack/` copy pin the exact bytes used by the child trace. The
 remaining artifacts are `run.json`, `preflight.surface.json`, `capture.ndjson`,
 `capture.health.ndjson`, `surface.json`, sanitized `stimulus.json`, and
 `report.md`.
+
+Read `run.json`, `stimulus.json`, and the final `capture.health.ndjson` line
+together. `complete` with `degraded:false` is a clean capture. `unsupported`
+is a safe prerequisite result; it is not proof of unreachability. `degraded`
+and `failed` runs are diagnostic evidence, not release validation.
+`causal_admission_boundary_exit` is an informational volume counter for an
+exit that began before dynamic causal admission, including an already-active
+sibling Binder thread; unlike an ordinary `inflight_lookup_missed`, it does
+not set `degraded:true`.
 
 Local packs must be owned by root or the current effective user, must not be
 group/world writable, and cannot contain symlinks, nested paths, traversal,
@@ -44,3 +91,7 @@ tests. Hardware stimulus, capture completeness, permission restoration, and
 reboot/crash recovery remain manual gates on an explicitly authorized device;
 the repository does not claim a built-in pack is validated on every vendor
 firmware merely because host CI passes.
+
+The dated Pixel 8 Pro results, including clean KeyMint/GPU/Media Codec/
+Bluetooth evidence and the Wi-Fi, USB, and Camera caveats, are recorded in
+[the device profile](../devices/pixel8pro.md#authorized-device-release-evidence-2026-07-11).
