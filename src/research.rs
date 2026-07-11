@@ -1183,6 +1183,12 @@ fn permissions_for(action: &str) -> &'static [&'static str] {
     }
 }
 
+fn add_research_follow_guardrails(args: &mut Vec<String>) {
+    for domain in ["servicemanager", "system_server"] {
+        args.extend(["--follow-deny-domain".into(), domain.into()]);
+    }
+}
+
 // Filled below by the trace/stimulus implementation; it deliberately accepts
 // only the typed Scenario model above, never argv from a pack.
 #[derive(Default)]
@@ -1247,6 +1253,7 @@ fn execute(
     if scenario.follow_hal {
         trace_args.push("--follow-hal".into());
     }
+    add_research_follow_guardrails(&mut trace_args);
     for driver_pack in &scenario.trace.driver_packs {
         trace_args.extend(["--driver-pack".into(), driver_pack.clone()]);
     }
