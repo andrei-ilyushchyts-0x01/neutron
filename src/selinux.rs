@@ -483,24 +483,30 @@ pub struct SelinuxLogcatReader {
     stats: SelinuxSourceStats,
 }
 
+fn selinux_logcat_args() -> &'static [&'static str] {
+    &[
+        "-v",
+        "threadtime",
+        "-T",
+        "0",
+        "-b",
+        "kernel",
+        "-b",
+        "system",
+        "-b",
+        "main",
+        "auditd:V",
+        "kernel:V",
+        "avc:V",
+        "SELinux:V",
+        "*:S",
+    ]
+}
+
 impl SelinuxLogcatReader {
     pub fn spawn() -> io::Result<Self> {
         let mut child = Command::new("/system/bin/logcat")
-            .args([
-                "-v",
-                "threadtime",
-                "-b",
-                "kernel",
-                "-b",
-                "system",
-                "-b",
-                "main",
-                "auditd:V",
-                "kernel:V",
-                "avc:V",
-                "SELinux:V",
-                "*:S",
-            ])
+            .args(selinux_logcat_args())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
