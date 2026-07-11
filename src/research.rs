@@ -1602,6 +1602,22 @@ mod tests {
     }
 
     #[test]
+    fn research_trace_blocks_global_binder_coordinators() {
+        let mut args = Vec::new();
+        add_research_follow_guardrails(&mut args);
+
+        assert_eq!(
+            args,
+            [
+                "--follow-deny-domain",
+                "servicemanager",
+                "--follow-deny-domain",
+                "system_server",
+            ]
+        );
+    }
+
+    #[test]
     fn failed_permission_restore_remains_armed_for_drop() {
         let mut granted = vec!["camera".to_string(), "bluetooth".to_string()];
         let result = restore_permissions(&mut granted, |permission| permission == "camera");
