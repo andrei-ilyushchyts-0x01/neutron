@@ -4049,6 +4049,20 @@ mod tests {
     }
 
     #[test]
+    fn pre_admission_follow_denies_normalize_requested_domains() {
+        let args = Args {
+            follow_binder: true,
+            follow_deny_domain: vec!["u:r:system_server:s0".into(), "servicemanager".into()],
+            ..Args::default()
+        };
+
+        assert_eq!(
+            pre_admission_follow_deny_domains(&args).unwrap(),
+            BTreeSet::from(["servicemanager".to_string(), "system_server".to_string()])
+        );
+    }
+
+    #[test]
     fn android_provider_match_counts_as_capture_predicate_flag() {
         let args = Args {
             match_android_provider: vec!["com.android.contacts".into()],
