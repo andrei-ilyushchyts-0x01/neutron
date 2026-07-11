@@ -9,7 +9,7 @@
 //! Targets: kernel 6.1+ (Pixel 8 Pro). The legacy raw-`bpf()`-syscall loader
 //! that targeted kernel 4.14 lives in git history before this commit.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -31,9 +31,10 @@ use neutron::android;
 use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap};
 use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
 use neutron::causal::{
-    binder_span_id, enrich_json, monotonic_timestamp_ns, process_context_bytes,
-    process_context_from_bytes, process_exit_span_id, root_process_span_id, selinux_denial_span_id,
-    syscall_span_id, CausalMetadata, CausalRelation, CausalWire, ControlServer, ScenarioInfo,
+    binder_span_id, enrich_json, expired_followed_pids, monotonic_timestamp_ns,
+    parse_follow_ttl, process_context_bytes, process_context_from_bytes, process_exit_span_id,
+    root_process_span_id, selinux_denial_span_id, syscall_span_id, CausalMetadata, CausalRelation,
+    CausalWire, ControlServer, FollowCandidate, FollowDecision, FollowPolicy, ScenarioInfo,
     ScenarioState,
 };
 use neutron::cli::{AidlCommand, Args, Cli, Command, HarnessCommand, IoctlCommand};
@@ -1570,6 +1571,133 @@ fn read_process_context(bpf: &Ebpf, pid: u32) -> Option<ProcessTraceContext> {
     traced.get(&pid, 0).ok().map(process_context_from_bytes)
 }
 
+fn remove_followed_process(bpf: &mut Ebpf, pid: u32) -> Result<Option<ProcessTraceContext>> {
+    let context = {
+        let map = bpf
+            .map_mut("TRACED_PROCESSES")
+            .context("TRACED_PROCESSES missing")?;
+        let mut traced: AyaHashMap<_, u32, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
+            AyaHashMap::try_from(map).context("TRACED_PROCESSES has unexpected layout")?;
+        let context = match traced.get(&pid, 0) {
+            Ok(bytes) => process_context_from_bytes(bytes),
+            Err(MapError::KeyNotFound | MapError::ElementNotFound) => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("reading followed PID {pid}")),
+        };
+        if context.reason == TraceReason::Root {
+            return Ok(None);
+        }
+        match traced.remove(&pid) {
+            Ok(()) => {}
+            Err(error) if map_delete_already_absent(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing followed PID {pid}"))
+            }
+        }
+        context
+    };
+
+    let binder_debug_id = { context.binder_debug_id };
+    if binder_debug_id != 0 {
+        let map = bpf
+            .map_mut("BINDER_TRANSACTION_CONTEXT")
+            .context("BINDER_TRANSACTION_CONTEXT missing")?;
+        let mut transactions: AyaHashMap<_, u32, [u8; 29]> = AyaHashMap::try_from(map)
+            .context("BINDER_TRANSACTION_CONTEXT has unexpected layout")?;
+        match transactions.remove(&binder_debug_id) {
+            Ok(()) => {}
+            Err(error) if map_delete_already_absent(&error) => {}
+            Err(error) => {
+                return Err(error).context("removing blocked Binder transaction context")
+            }
+        }
+    }
+
+    let map = bpf
+        .map_mut("THREAD_BINDER_CONTEXT")
+        .context("THREAD_BINDER_CONTEXT missing")?;
+    let mut threads: AyaHashMap<_, u64, [u8; 7]> =
+        AyaHashMap::try_from(map).context("THREAD_BINDER_CONTEXT has unexpected layout")?;
+    let keys: Vec<u64> = threads
+        .keys()
+        .filter_map(|key| key.ok())
+        .filter(|pid_tgid| (*pid_tgid >> 32) as u32 == pid)
+        .collect();
+    for key in keys {
+        match threads.remove(&key) {
+            Ok(()) => {}
+            Err(error) if map_delete_already_absent(&error) => {}
+            Err(error) => {
+                return Err(error).context("removing blocked Binder thread context")
+            }
+        }
+    }
+    Ok(Some(context))
+}
+
+fn follow_process_identity(pid: u32) -> (Option<String>, Option<String>) {
+    fn bounded(path: String, limit: usize) -> Option<String> {
+        let bytes = fs::read(path).ok()?;
+        if bytes.len() > limit {
+            return None;
+        }
+        let value = String::from_utf8(bytes).ok()?;
+        let value = value.trim_end_matches(['\n', '\0']).trim();
+        (!value.is_empty()).then(|| value.to_string())
+    }
+
+    let comm = bounded(format!("/proc/{pid}/comm"), 256);
+    let domain = bounded(format!("/proc/{pid}/attr/current"), 512)
+        .and_then(|context| neutron::causal::normalize_domain(&context).ok());
+    (comm, domain)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_follow_guardrail(
+    out: &mut dyn IoWrite,
+    json: bool,
+    event_id_counter: &mut u64,
+    status: &str,
+    reason: &str,
+    caller_pid: u32,
+    callee_pid: u32,
+    debug_id: u32,
+    depth: u8,
+    metadata: Option<&CausalMetadata>,
+    process_context: Option<ProcessTraceContext>,
+    scenarios: &ScenarioState,
+) -> io::Result<()> {
+    if !json {
+        return writeln!(
+            out,
+            "[follow] {status} pid={callee_pid} parent={caller_pid} depth={depth} reason={reason}"
+        );
+    }
+    *event_id_counter = event_id_counter.wrapping_add(1);
+    let mut value = serde_json::json!({
+        "type": "follow_guardrail",
+        "event_id": *event_id_counter,
+        "status": status,
+        "reason": reason,
+        "caller_pid": caller_pid,
+        "callee_pid": callee_pid,
+        "binder_debug_id": debug_id,
+        "depth": depth,
+        "causal_branch_complete": false,
+    });
+    if let Some(context) = process_context {
+        let trace_id = { context.root_trace_id };
+        value["trace_id"] = serde_json::Value::String(format!("{trace_id:016x}"));
+        if let Some(scenario) = scenarios.find(context.scenario_generation) {
+            value["scenario_id"] = serde_json::Value::String(scenario.scenario_id.clone());
+        }
+    }
+    let mut line = serde_json::to_string(&value).map_err(io::Error::other)?;
+    if let Some(metadata) = metadata {
+        line = enrich_json(&line, metadata).map_err(io::Error::other)?;
+    }
+    writeln!(out, "{line}")
+}
+
 fn causal_metadata_for_event(
     ev: &SyscallEvent,
     scenarios: &ScenarioState,
@@ -1961,6 +2089,12 @@ fn run_trace(mut args: Args) -> Result<()> {
         args.json = true;
         args.raw = true;
     }
+    let follow_ttl = parse_follow_ttl(&args.follow_ttl)?;
+    let follow_ttl_ns = u64::try_from(follow_ttl.as_nanos()).context("follow TTL is too large")?;
+    let follow_policy = FollowPolicy::new(
+        args.follow_allow_domain.iter(),
+        args.follow_deny_domain.iter(),
+    )?;
     let user_supplied_match = has_capture_predicate_flags(&args);
     apply_profile(&mut args)?;
     let mut driver_packs = apply_driver_packs_with_defaults(&mut args, !user_supplied_match)?;
@@ -2295,6 +2429,10 @@ fn run_trace(mut args: Args) -> Result<()> {
     // enrich the same graph node with SIGSEGV/SIGABRT classification even
     // though BPF has already removed the dying PID from its dynamic map.
     let mut recent_exit_causal = HashMap::<u32, CausalMetadata>::new();
+    let mut followed_last_hop_ns = BTreeMap::<u32, u64>::new();
+    let mut policy_blocked_pids = HashSet::<u32>::new();
+    let mut follow_policy_filtered = 0_u64;
+    let mut follow_ttl_expired = 0_u64;
     let mut last_root_refresh = std::time::Instant::now();
 
     eprintln!("  tracing… Ctrl-C to stop\n");
@@ -2535,13 +2673,15 @@ fn run_trace(mut args: Args) -> Result<()> {
                         clear_causal_transients(&mut bpf)?;
                         binder_causal.clear();
                         recent_exit_causal.clear();
+                        followed_last_hop_ns.clear();
+                        policy_blocked_pids.clear();
                         let ts_ns = monotonic_timestamp_ns();
                         let line = live_marker_line(
                             &request,
                             &scenario,
                             ts_ns,
                             args.package.as_deref(),
-                            args.root_uid,
+                            args.root_uid.or(package_uid),
                         );
                         Ok((scenario, ts_ns, line))
                     } else {
@@ -2550,13 +2690,15 @@ fn run_trace(mut args: Args) -> Result<()> {
                         replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
                         clear_causal_transients(&mut bpf)?;
                         recent_exit_causal.clear();
+                        followed_last_hop_ns.clear();
+                        policy_blocked_pids.clear();
                         let ts_ns = monotonic_timestamp_ns();
                         let line = live_marker_line(
                             &request,
                             &scenario,
                             ts_ns,
                             args.package.as_deref(),
-                            args.root_uid,
+                            args.root_uid.or(package_uid),
                         );
                         Ok((scenario, ts_ns, line))
                     }
@@ -2606,6 +2748,41 @@ fn run_trace(mut args: Args) -> Result<()> {
                     Err(error) => return Err(error).context("refreshing causal root process set"),
                 }
             }
+            if args.follow_binder && scenarios.active().is_some() {
+                let roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
+                let now_ns = monotonic_timestamp_ns();
+                for pid in expired_followed_pids(
+                    &followed_last_hop_ns,
+                    &roots,
+                    now_ns,
+                    follow_ttl_ns,
+                ) {
+                    followed_last_hop_ns.remove(&pid);
+                    policy_blocked_pids.remove(&pid);
+                    let Some(context) = remove_followed_process(&mut bpf, pid)? else {
+                        continue;
+                    };
+                    follow_ttl_expired = follow_ttl_expired.saturating_add(1);
+                    write_or_output_cap(
+                        emit_follow_guardrail(
+                            &mut *out,
+                            args.json,
+                            &mut event_id_counter,
+                            "expired",
+                            "pid_ttl",
+                            context.parent_pid,
+                            pid,
+                            context.binder_debug_id,
+                            context.depth,
+                            None,
+                            Some(context),
+                            &scenarios,
+                        ),
+                        &output_cap_hit,
+                    )?;
+                    events_emitted = events_emitted.saturating_add(1);
+                }
+            }
         }
 
         let mut saw_any = false;
@@ -2639,8 +2816,17 @@ fn run_trace(mut args: Args) -> Result<()> {
                     &ev,
                     &scenarios,
                     args.package.as_deref(),
-                    args.root_uid,
+                    args.root_uid.or(package_uid),
                 );
+                let event_pid = { ev.pid };
+                let event_nr = { ev.syscall_nr };
+                if policy_blocked_pids.contains(&event_pid)
+                    && event_nr != SYSCALL_NR_BINDER_RECEIVED
+                    && event_nr != SYSCALL_NR_PROCESS_EXIT
+                    && !root_pids.contains(&event_pid)
+                {
+                    continue;
+                }
 
                 // ── Sprint-2 PR 1: BPF sched_process_exit handoff ────
                 //
@@ -2727,6 +2913,60 @@ fn run_trace(mut args: Args) -> Result<()> {
                         && discovery_seen_pids.insert(callee_pid)
                     {
                         discovery_refresh_pending = true;
+                    }
+                    if args.follow_binder
+                        && callee_pid != 0
+                        && !root_pids.contains(&callee_pid)
+                    {
+                        if let Some(metadata) = causal_event.as_ref() {
+                            let caller_pid = { ev.pid };
+                            let caller_comm = format_comm(&{ ev.comm });
+                            let (_, caller_domain) = follow_process_identity(caller_pid);
+                            let (callee_comm, callee_domain) = follow_process_identity(callee_pid);
+                            let decision = follow_policy.decide(FollowCandidate {
+                                caller_comm: Some(&caller_comm),
+                                caller_domain: caller_domain.as_deref(),
+                                callee_comm: callee_comm.as_deref(),
+                                callee_domain: callee_domain.as_deref(),
+                                caller_relation: metadata.relation,
+                                caller_depth: metadata.depth.saturating_sub(1),
+                            });
+                            match decision {
+                                FollowDecision::Allow => {
+                                    policy_blocked_pids.remove(&callee_pid);
+                                    let ts_ns = { ev.timestamp_ns };
+                                    if !root_pids.contains(&caller_pid) {
+                                        followed_last_hop_ns.insert(caller_pid, ts_ns);
+                                    }
+                                    followed_last_hop_ns.insert(callee_pid, ts_ns);
+                                }
+                                FollowDecision::Block(reason) => {
+                                    let _ = remove_followed_process(&mut bpf, callee_pid)?;
+                                    followed_last_hop_ns.remove(&callee_pid);
+                                    policy_blocked_pids.insert(callee_pid);
+                                    follow_policy_filtered =
+                                        follow_policy_filtered.saturating_add(1);
+                                    write_or_output_cap(
+                                        emit_follow_guardrail(
+                                            &mut *out,
+                                            args.json,
+                                            &mut event_id_counter,
+                                            "blocked",
+                                            reason,
+                                            caller_pid,
+                                            callee_pid,
+                                            debug_id as u32,
+                                            metadata.depth,
+                                            Some(metadata),
+                                            None,
+                                            &scenarios,
+                                        ),
+                                        &output_cap_hit,
+                                    )?;
+                                    events_emitted = events_emitted.saturating_add(1);
+                                }
+                            }
+                        }
                     }
                     if let Some(t) = binder_tracker.as_mut() {
                         let pid = { ev.pid };
@@ -3087,7 +3327,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 context,
                                 scenario,
                                 args.package.as_deref(),
-                                args.root_uid,
+                                args.root_uid.or(package_uid),
                             )
                         })
                     })
@@ -3148,7 +3388,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                 context,
                                 scenario,
                                 args.package.as_deref(),
-                                args.root_uid,
+                                args.root_uid.or(package_uid),
                             )
                         })
                     })
@@ -3302,6 +3542,8 @@ fn run_trace(mut args: Args) -> Result<()> {
         events_sampled_out,
         events_emitted,
         output_cap_hit: output_cap_hit.load(Ordering::Relaxed),
+        follow_policy_filtered,
+        follow_ttl_expired,
         selinux_source_enabled,
         selinux_source_available,
         selinux_parsed: selinux_stats.parsed,
@@ -3339,7 +3581,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                         match_uids: args.match_uid.clone(),
                         match_pids,
                         root_package: args.package.clone(),
-                        root_uid: args.root_uid,
+                        root_uid: args.root_uid.or(package_uid),
                         boot_id: capture_boot_id.clone(),
                         fingerprint: capture_fingerprint.clone(),
                         max_depth: args.max_depth,
