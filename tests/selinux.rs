@@ -2,11 +2,37 @@ use std::io::Cursor;
 
 use clap::Parser;
 use neutron::cli::{Cli, Command};
+use neutron::causal::CausalRelation;
 use neutron::selinux::{
-    explain_from_reader, parse_avc_line, render_explanation_text, DenialDeduper,
+    explain_from_reader, parse_avc_line, process_context_relation, render_explanation_text,
+    DenialDeduper,
 };
+use neutron_common::{ProcessTraceContext, TraceReason};
 
 const ENFORCING_AVC: &str = r#"05-05 12:00:00.000  1000  1000 W auditd: type=1400 audit(1714910400.123:9182): avc: denied { ioctl read } for pid=1234 comm="com.example.app" path="/dev/trusty-ipc-dev0" ioctlcmd=0xc0047401 scontext=u:r:untrusted_app:s0:c123,c456 tcontext=u:object_r:tee_device:s0 tclass=chr_file permissive=0"#;
+
+#[test]
+fn process_wide_binder_context_is_inferred_for_selinux_denials() {
+    let binder = ProcessTraceContext {
+        root_trace_id: 7,
+        parent_pid: 10,
+        binder_debug_id: 5,
+        depth: 1,
+        reason: TraceReason::Binder,
+        scenario_generation: 1,
+    };
+    let root = ProcessTraceContext {
+        depth: 0,
+        reason: TraceReason::Root,
+        ..binder
+    };
+
+    assert_eq!(process_context_relation(root), CausalRelation::Exact);
+    assert_eq!(
+        process_context_relation(binder),
+        CausalRelation::Inferred
+    );
+}
 
 #[test]
 fn parses_enforcing_multi_permission_avc() {
