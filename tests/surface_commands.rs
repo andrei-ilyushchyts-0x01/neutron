@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use neutron::surface::{
     run, CaptureRecord, Device, DeviceIdentity, Evidence, Process, Relation, Service,
-    SurfaceCommand, SurfaceExplainArgs, SurfaceHealth, SurfaceInputArgs, SurfaceProcessArgs,
-    SurfaceReachableArgs, SurfaceScanArgs, SurfaceSnapshot,
+    SurfaceCommand, SurfaceDiffArgs, SurfaceExplainArgs, SurfaceHealth, SurfaceInputArgs,
+    SurfaceProcessArgs, SurfaceReachableArgs, SurfaceScanArgs, SurfaceSnapshot,
 };
 use serde_json::Value;
 
@@ -375,4 +375,60 @@ fn query_commands_canonicalize_schema_valid_unsorted_input() {
             "service:binder:example.IExample/default"
         ]
     );
+}
+
+#[test]
+fn surface_diff_reports_semantic_ota_changes_without_pid_or_boot_noise() {
+    let temp = TestDir::new("surface-diff");
+    let baseline_path = temp.path("baseline.json");
+    let current_path = temp.path("current.json");
+    let output = temp.path("diff.json");
+    let baseline = minimal_snapshot();
+    let mut current = baseline.clone();
+    current.collected_at = "2026-07-11T00:00:00Z".into();
+    current.device.boot_id = "boot-after-ota".into();
+    current.device.fingerprint = "example/fingerprint-ota".into();
+    current.services[0].pid = Some(84);
+    current.services[0].process_id = Some("process:boot-after-ota:84:200".into());
+    current.services[0].selinux_domain = Some("u:r:hal_example_hardened:s0".into());
+    current.services[0].observed_ioctls = vec!["EXAMPLE_IOC_NEW".into()];
+    current.devices[0].selinux_context = Some("u:object_r:example_device:s0".into());
+    current.health.status = "degraded".into();
+    current.health.warnings = vec!["capture output cap reached".into()];
+    current.captures[0].health = "degraded".into();
+    current.relations[0].relation_type = "ioctl".into();
+    current.relations[0].ioctl = Some("EXAMPLE_IOC_NEW".into());
+
+    fs::write(&baseline_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    fs::write(&current_path, serde_json::to_vec(&current).unwrap()).unwrap();
+    run(SurfaceCommand::Diff(SurfaceDiffArgs {
+        baseline: baseline_path.to_string_lossy().into_owned(),
+        current: current_path.to_string_lossy().into_owned(),
+        output: Some(output.to_string_lossy().into_owned()),
+    }))
+    .unwrap();
+
+    let diff = read_json(&output);
+    assert_eq!(diff["schema"], "neutron.surface-diff/v1");
+    assert_eq!(diff["baseline"]["device"]["boot_id"], "boot-test");
+    assert_eq!(
+        diff["current"]["device"]["boot_id"],
+        "boot-after-ota"
+    );
+    assert_eq!(diff["health"]["before"]["status"], "complete");
+    assert_eq!(diff["health"]["after"]["status"], "degraded");
+    assert_eq!(diff["services"]["changed"].as_array().unwrap().len(), 1);
+    assert_eq!(diff["devices"]["changed"].as_array().unwrap().len(), 1);
+    assert_eq!(diff["scenarios"]["changed"].as_array().unwrap().len(), 1);
+    assert!(diff["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("degraded")));
+    assert_secure(&output);
+
+    let service = &diff["services"]["changed"][0];
+    assert_eq!(service["id"], "service:binder:example.IExample/default");
+    assert!(service["before"].get("pid").is_none());
+    assert!(service["after"].get("process_id").is_none());
 }
