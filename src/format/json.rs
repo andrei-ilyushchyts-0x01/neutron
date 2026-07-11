@@ -425,7 +425,18 @@ pub fn format_binder_call_json_with_service(
     event_id: Option<u64>,
     service: Option<&str>,
 ) -> String {
-    format_binder_call_json_fields(pair, event_id, service, None, None, &[])
+    format_binder_call_json_fields(
+        pair,
+        event_id,
+        service,
+        None,
+        None,
+        &[],
+        None,
+        &[],
+        None,
+        None,
+    )
 }
 
 pub fn format_binder_call_json_with_attribution(
@@ -440,9 +451,14 @@ pub fn format_binder_call_json_with_attribution(
         attribution.method.as_deref(),
         attribution.confidence.map(|confidence| confidence.as_str()),
         &attribution.candidates,
+        attribution.interface_descriptor.as_deref(),
+        &attribution.interface_candidates,
+        attribution.aidl_version.as_deref(),
+        attribution.catalog_source.as_deref(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_binder_call_json_fields(
     pair: &crate::sources::binder_tracker::BinderCallEvent,
     event_id: Option<u64>,
@@ -450,6 +466,10 @@ fn format_binder_call_json_fields(
     method: Option<&str>,
     confidence: Option<&str>,
     candidates: &[String],
+    interface_descriptor: Option<&str>,
+    interface_candidates: &[String],
+    aidl_version: Option<&str>,
+    catalog_source: Option<&str>,
 ) -> String {
     let escaped_comm = pair.caller_comm.replace('\\', "\\\\").replace('"', "\\\"");
     let event_id_json = match event_id {
@@ -488,8 +508,41 @@ fn format_binder_call_json_fields(
             serde_json::to_string(candidates).expect("serializing string candidates cannot fail")
         )
     };
+    let interface_descriptor_json = interface_descriptor
+        .map(|value| {
+            format!(
+                r#","interface_descriptor":{}"#,
+                serde_json::to_string(value).expect("serializing descriptor cannot fail")
+            )
+        })
+        .unwrap_or_default();
+    let interface_candidates_json = if interface_candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#","interface_candidates":{}"#,
+            serde_json::to_string(interface_candidates)
+                .expect("serializing interface candidates cannot fail")
+        )
+    };
+    let aidl_version_json = aidl_version
+        .map(|value| {
+            format!(
+                r#","aidl_version":{}"#,
+                serde_json::to_string(value).expect("serializing version cannot fail")
+            )
+        })
+        .unwrap_or_default();
+    let catalog_source_json = catalog_source
+        .map(|value| {
+            format!(
+                r#","catalog_source":{}"#,
+                serde_json::to_string(value).expect("serializing source cannot fail")
+            )
+        })
+        .unwrap_or_default();
     format!(
-        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":"{}"{}{}{}{}{}}}"#,
+        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":"{}"{}{}{}{}{}{}{}{}{}}}"#,
         pair.sent_ts_ns,
         pair.debug_id,
         pair.caller_pid,
@@ -508,6 +561,10 @@ fn format_binder_call_json_fields(
         method_json,
         confidence_json,
         candidates_json,
+        interface_descriptor_json,
+        interface_candidates_json,
+        aidl_version_json,
+        catalog_source_json,
         event_id_json,
     )
 }

@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::aidl::{normalize_descriptor, AidlCatalog};
 use crate::binder_services::BinderServiceMap;
 use crate::summarize::open_capture;
 
@@ -42,6 +43,10 @@ pub struct ReportArgs {
     /// Candidate PID -> services catalog, usually from `binder-map service-list`.
     #[arg(long, value_name = "FILE")]
     pub binder_catalog: Option<String>,
+
+    /// Descriptor-centric AIDL transaction catalog used with exact service maps.
+    #[arg(long, value_name = "FILE")]
+    pub aidl_catalog: Option<String>,
 
     /// Maximum rows per table. `0` prints all rows.
     #[arg(long, default_value_t = 10)]
@@ -87,6 +92,7 @@ pub struct ReportOptions {
     pub package: Option<String>,
     pub binder_services_json: Option<String>,
     pub binder_catalog_json: Option<String>,
+    pub aidl_catalog_json: Option<String>,
     pub baseline_capture: Option<String>,
     pub top: usize,
 }
@@ -116,6 +122,7 @@ type BinderCatalog = BTreeMap<u32, Vec<String>>;
 struct BinderAttribution {
     services: Option<BinderServiceMap>,
     catalog: BinderCatalog,
+    aidl: Option<AidlCatalog>,
 }
 
 impl BinderAttribution {
@@ -128,12 +135,38 @@ impl BinderAttribution {
             Some(raw) => parse_binder_catalog_json(raw).context("parsing binder catalog")?,
             None => BinderCatalog::new(),
         };
-        Ok(Self { services, catalog })
+        let aidl = opts
+            .aidl_catalog_json
+            .as_deref()
+            .map(AidlCatalog::from_json)
+            .transpose()
+            .context("parsing AIDL catalog")?;
+        Ok(Self {
+            services,
+            catalog,
+            aidl,
+        })
     }
 
     fn label_for(&self, obj: &serde_json::Map<String, Value>) -> Option<String> {
         if let Some(service) = str_field(obj, "service") {
-            return Some(service.to_string());
+            let method = str_field(obj, "method").or_else(|| {
+                (str_field(obj, "attribution_confidence") != Some("candidate"))
+                    .then(|| {
+                        u32_field(obj, "code").and_then(|code| {
+                            self.aidl.as_ref().and_then(|catalog| {
+                                catalog
+                                    .lookup(normalize_descriptor(service), code)
+                                    .map(|lookup| lookup.method.method.as_str())
+                            })
+                        })
+                    })
+                    .flatten()
+            });
+            return Some(method.map_or_else(
+                || service.to_string(),
+                |method| format!("{service}.{method}"),
+            ));
         }
         let callee_pid = u32_field(obj, "callee_pid").or_else(|| u32_field(obj, "to_proc"))?;
         let target_node = i32_field(obj, "target_node").unwrap_or_default();
@@ -143,7 +176,16 @@ impl BinderAttribution {
             .as_ref()
             .and_then(|m| m.lookup(callee_pid, target_node))
         {
-            return Some(service.to_string());
+            let method = code.and_then(|code| {
+                self.aidl
+                    .as_ref()
+                    .and_then(|catalog| catalog.lookup(normalize_descriptor(service), code))
+                    .map(|lookup| lookup.method.method.as_str())
+            });
+            return Some(method.map_or_else(
+                || service.to_string(),
+                |method| format!("{service}.{method}"),
+            ));
         }
         let raw = raw_binder_label(callee_pid, target_node, code);
         if let Some(candidates) = self.catalog.get(&callee_pid).filter(|v| !v.is_empty()) {
@@ -171,11 +213,17 @@ pub fn run_report(args: ReportArgs) -> Result<()> {
         .as_deref()
         .map(read_input_to_string)
         .transpose()?;
+    let aidl_catalog_json = args
+        .aidl_catalog
+        .as_deref()
+        .map(read_input_to_string)
+        .transpose()?;
     let opts = ReportOptions {
         title: args.title,
         package: args.package,
         binder_services_json,
         binder_catalog_json,
+        aidl_catalog_json,
         baseline_capture,
         top: args.top,
     };

@@ -1,5 +1,6 @@
 //! Reusable building blocks for the neutron Aya-based loader binary.
 
+pub mod aidl;
 pub mod android;
 pub mod binder_services;
 pub mod capture;

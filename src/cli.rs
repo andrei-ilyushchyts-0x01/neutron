@@ -83,6 +83,18 @@ pub enum Command {
     /// Capture, minimize, and replay authorized regression testcases.
     #[command(subcommand)]
     Harness(HarnessCommand),
+
+    /// Index AIDL interfaces and selectively decode complete harness testcases.
+    #[command(subcommand)]
+    Aidl(AidlCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AidlCommand {
+    /// Build a deterministic descriptor and transaction catalog.
+    Index(crate::aidl::IndexArgs),
+    /// Decode a complete offline Binder harness testcase with a static plugin.
+    Decode(crate::aidl::DecodeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -574,8 +586,16 @@ pub struct Args {
     pub binder_services: Option<String>,
 
     /// JSON map from `service + transaction code` to a verified method name.
-    #[arg(long, value_name = "FILE")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Deprecated legacy Binder method map"
+    )]
     pub binder_methods: Option<String>,
+
+    /// Descriptor-centric AIDL interface and transaction catalog.
+    #[arg(long, value_name = "FILE")]
+    pub aidl_catalog: Option<String>,
 }
 
 #[cfg(test)]

@@ -2055,7 +2055,7 @@ fn load_resources(directory: &Path) -> Result<ResourceCatalog> {
     Ok(value)
 }
 
-fn validate_artifact(directory: &Path) -> Result<Metadata> {
+pub(crate) fn validate_artifact(directory: &Path) -> Result<Metadata> {
     let metadata = load_ready_metadata(directory)?;
     let input = fs::read(directory.join("input.bin"))?;
     let digest = format!("{:x}", Sha256::digest(&input));

@@ -107,6 +107,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--fd-snapshot-on-finding`        | flag             | off                                      | When a finding fires with ioctl evidence, read `/proc/<pid>/fdinfo/<fd>` synchronously and embed as `fdinfo_at_event` on the JSON line. |
 | `--binder-services FILE`          | String           | unset                                    | Path to a JSON `{callee_pid: {target_node: service_name}}` map. Known pairs surface a `service` field on `binder_call` events. |
 | `--binder-methods FILE`           | String           | unset                                    | Verified JSON `{service: {code: method}}` map. Unknown codes remain `code=N`. |
+| `--aidl-catalog FILE`             | String           | unset                                    | `neutron.aidl-catalog/v1` descriptor and transaction catalog. Exact node mappings may add interface/method fields; PID candidates never do. |
 
 <!-- END AUTO-GENERATED -->
 
@@ -428,6 +429,10 @@ are flushed with `status:"callee_crashed"`.
   "latency_us":     500,
   "status":         "completed",
   "service":        "android.hardware.camera2",
+  "interface_descriptor": "android.hardware.camera2.ICameraDeviceUser",
+  "method":         "submitRequest",
+  "aidl_version":   "unversioned",
+  "catalog_source": "aosp:frameworks/av/camera/aidl/android/hardware/camera2/ICameraDeviceUser.aidl",
   "event_id":       18234
 }
 ```
@@ -445,6 +450,11 @@ are flushed with `status:"callee_crashed"`.
 | `latency_us`     | u64     | `(received - sent) / 1000`. **Omitted** when `received_ts_ns` is absent.    |
 | `status`         | string  | `"completed"`, `"callee_crashed"`, or `"unmatched"`.                       |
 | `service`        | string  | Optional. Set when `--binder-services <FILE>` was provided and the `(callee_pid, target_node)` pair is in the map. (1.2.0) |
+| `interface_descriptor` | string | Optional exact descriptor normalized from `descriptor/instance`. |
+| `method`         | string  | Optional verified method for one exact descriptor and catalog code. Never inferred from PID candidates. |
+| `aidl_version`   | string  | Optional catalog version when exactly one version supplies the signature. |
+| `catalog_source` | string  | Optional relative catalog provenance. |
+| `service_candidates` / `interface_candidates` | array | Sorted candidate evidence when exact node attribution is unavailable; no method is emitted. |
 
 The rule engine maps `caller_pid` → the standard `pid` field for
 `per_process` aggregation. `R004_binder_callee_crash` matches

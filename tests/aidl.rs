@@ -1,10 +1,17 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::Cursor;
 
 use clap::Parser;
-use neutron::aidl::{decode_plugin, index_catalog, AidlCatalog, IndexArgs, ParcelView};
+use neutron::aidl::{
+    decode_plugin, index_catalog, run_decode, AidlCatalog, DecodeArgs, IndexArgs, ParcelView,
+};
 use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap};
 use neutron::cli::{AidlCommand, Cli, Command};
+use neutron::format::format_binder_call_json_with_attribution;
+use neutron::report::{render_report_from_reader, ReportOptions};
+use neutron::sources::binder_tracker::BinderCallEvent;
+use neutron_common::BinderCallStatus;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 fn catalog() -> AidlCatalog {
@@ -72,15 +79,23 @@ fn cli_registers_aidl_index_decode_and_trace_catalog() {
         Some(Command::Aidl(AidlCommand::Decode(_)))
     ));
 
+    let cli =
+        Cli::try_parse_from(["neutron", "trace", "--aidl-catalog", "aidl-catalog.json"]).unwrap();
+    let Some(Command::Trace(args)) = cli.command else {
+        panic!("trace command expected")
+    };
+    assert_eq!(args.aidl_catalog.as_deref(), Some("aidl-catalog.json"));
+
     let cli = Cli::try_parse_from([
         "neutron",
-        "trace",
+        "report",
+        "capture.ndjson",
         "--aidl-catalog",
         "aidl-catalog.json",
     ])
     .unwrap();
-    let Some(Command::Trace(args)) = cli.command else {
-        panic!("trace command expected")
+    let Some(Command::Report(args)) = cli.command else {
+        panic!("report command expected")
     };
     assert_eq!(args.aidl_catalog.as_deref(), Some("aidl-catalog.json"));
 }
@@ -107,7 +122,40 @@ fn exact_descriptor_resolves_catalog_but_candidates_never_guess_method() {
     );
     assert_eq!(verified.method.as_deref(), Some("generateKey"));
     assert_eq!(verified.aidl_version.as_deref(), Some("3"));
-    assert!(verified.catalog_source.as_deref().unwrap().starts_with("aosp:"));
+    assert!(verified
+        .catalog_source
+        .as_deref()
+        .unwrap()
+        .starts_with("aosp:"));
+    let line = format_binder_call_json_with_attribution(
+        &BinderCallEvent {
+            debug_id: 1,
+            caller_pid: 10,
+            caller_uid: 10000,
+            caller_comm: "client".into(),
+            callee_pid: 300,
+            code: 1,
+            flags: 0,
+            reply: false,
+            target_node: 7,
+            sent_ts_ns: 1,
+            received_ts_ns: Some(2),
+            status: BinderCallStatus::Completed,
+        },
+        None,
+        &verified,
+    );
+    let value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        value["interface_descriptor"],
+        "android.hardware.security.keymint.IKeyMintDevice"
+    );
+    assert_eq!(value["method"], "generateKey");
+    assert_eq!(value["aidl_version"], "3");
+    assert!(value["catalog_source"]
+        .as_str()
+        .unwrap()
+        .starts_with("aosp:"));
 
     let candidate = candidates
         .resolve_with_aidl(&exact, &legacy, Some(&aidl), 200, 9, 1)
@@ -140,6 +188,23 @@ fn conflicting_legacy_method_is_rejected() {
     assert!(error.to_string().contains("conflicting"));
 }
 
+#[test]
+fn report_catalog_resolves_only_exact_service_fields() {
+    let exact = r#"{"type":"binder_call","callee_pid":300,"target_node":7,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default"}"#;
+    let candidate = r#"{"type":"binder_call","callee_pid":300,"target_node":8,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default","attribution_confidence":"candidate"}"#;
+    let report = render_report_from_reader(
+        Cursor::new(format!("{exact}\n{candidate}\n")),
+        ReportOptions {
+            aidl_catalog_json: Some(catalog().to_pretty_json().unwrap()),
+            top: 0,
+            ..ReportOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(report.contains("IKeyMintDevice/default.generateKey"));
+    assert!(report.contains("IKeyMintDevice/default`"));
+}
+
 fn utf16_token(descriptor: &str) -> Vec<u8> {
     let mut bytes = vec![0; 8];
     let units = descriptor.encode_utf16().collect::<Vec<_>>();
@@ -167,13 +232,15 @@ fn parameter(tag: i32, value_tag: i32, value: &[u8]) -> Vec<u8> {
 fn keymint_parcel() -> Vec<u8> {
     const ALGORITHM: i32 = 0x1000_0002;
     const APPLICATION_ID: i32 = 0x9000_0259u32 as i32;
+    const USER_SECURE_ID: i32 = 0xa000_01f6u32 as i32;
     let mut parcel = utf16_token("android.hardware.security.keymint.IKeyMintDevice");
-    parcel.extend_from_slice(&2i32.to_le_bytes());
+    parcel.extend_from_slice(&3i32.to_le_bytes());
     parcel.extend(parameter(ALGORITHM, 1, &32i32.to_le_bytes()));
     let mut blob = 3i32.to_le_bytes().to_vec();
     blob.extend_from_slice(&[1, 2, 3]);
     blob.push(0);
     parcel.extend(parameter(APPLICATION_ID, 14, &blob));
+    parcel.extend(parameter(USER_SECURE_ID, 12, &42i64.to_le_bytes()));
     parcel
 }
 
@@ -186,18 +253,25 @@ fn keymint_plugin_decodes_known_values_and_redacts_blobs() {
         view,
         "android.hardware.security.keymint.IKeyMintDevice",
         "generateKey",
-        catalog().lookup(
-            "android.hardware.security.keymint.IKeyMintDevice",
-            1,
-        )
-        .unwrap()
-        .method,
+        catalog()
+            .lookup("android.hardware.security.keymint.IKeyMintDevice", 1)
+            .unwrap()
+            .method,
         false,
     );
     assert_eq!(decoded["status"], "decoded");
-    assert_eq!(decoded["arguments"]["keyParams"][0]["tag_name"], "ALGORITHM");
-    assert_eq!(decoded["arguments"]["keyParams"][0]["value"]["variant"], "algorithm");
-    assert_eq!(decoded["arguments"]["keyParams"][1]["tag_name"], "APPLICATION_ID");
+    assert_eq!(
+        decoded["arguments"]["keyParams"][0]["tag_name"],
+        "ALGORITHM"
+    );
+    assert_eq!(
+        decoded["arguments"]["keyParams"][0]["value"]["variant"],
+        "algorithm"
+    );
+    assert_eq!(
+        decoded["arguments"]["keyParams"][1]["tag_name"],
+        "APPLICATION_ID"
+    );
     assert_eq!(decoded["arguments"]["keyParams"][1]["value"]["length"], 3);
     assert_eq!(
         decoded["arguments"]["keyParams"][1]["value"]["sha256"],
@@ -206,6 +280,31 @@ fn keymint_plugin_decodes_known_values_and_redacts_blobs() {
     assert!(decoded["arguments"]["keyParams"][1]["value"]
         .get("bytes")
         .is_none());
+    assert_eq!(
+        decoded["arguments"]["keyParams"][2]["tag_name"],
+        "USER_SECURE_ID"
+    );
+    assert!(decoded["arguments"]["keyParams"][2]["value"]
+        .get("value")
+        .is_none());
+
+    let parcel = keymint_parcel();
+    let revealed = decode_plugin(
+        "keymint",
+        ParcelView::new(&parcel, &[]).unwrap(),
+        "android.hardware.security.keymint.IKeyMintDevice",
+        "generateKey",
+        catalog()
+            .lookup("android.hardware.security.keymint.IKeyMintDevice", 1)
+            .unwrap()
+            .method,
+        true,
+    );
+    assert_eq!(
+        revealed["arguments"]["keyParams"][1]["value"]["bytes"],
+        "010203"
+    );
+    assert_eq!(revealed["arguments"]["keyParams"][2]["value"]["value"], 42);
 }
 
 #[test]
@@ -218,16 +317,17 @@ fn keymint_plugin_preserves_unknown_union_tags_and_rejects_bad_views() {
         ParcelView::new(&parcel, &[]).unwrap(),
         "android.hardware.security.keymint.IKeyMintDevice",
         "generateKey",
-        catalog().lookup(
-            "android.hardware.security.keymint.IKeyMintDevice",
-            1,
-        )
-        .unwrap()
-        .method,
+        catalog()
+            .lookup("android.hardware.security.keymint.IKeyMintDevice", 1)
+            .unwrap()
+            .method,
         false,
     );
     assert_eq!(decoded["status"], "unsupported");
-    assert_eq!(decoded["arguments"]["keyParams"][0]["value"]["union_tag"], 99);
+    assert_eq!(
+        decoded["arguments"]["keyParams"][0]["value"]["union_tag"],
+        99
+    );
 
     assert!(ParcelView::new(&parcel, &[parcel.len() as u64 + 1]).is_err());
     let truncated = &keymint_parcel()[..12];
@@ -236,12 +336,10 @@ fn keymint_plugin_preserves_unknown_union_tags_and_rejects_bad_views() {
         ParcelView::new(truncated, &[]).unwrap(),
         "android.hardware.security.keymint.IKeyMintDevice",
         "generateKey",
-        catalog().lookup(
-            "android.hardware.security.keymint.IKeyMintDevice",
-            1,
-        )
-        .unwrap()
-        .method,
+        catalog()
+            .lookup("android.hardware.security.keymint.IKeyMintDevice", 1)
+            .unwrap()
+            .method,
         false,
     );
     assert_eq!(decoded["status"], "truncated");
@@ -271,7 +369,11 @@ fn index_uses_generated_transaction_constants_and_is_deterministic() {
         "package test;\n@VintfStability interface ITest { oneway void ping(in int value) = 4; }\n",
     )
     .unwrap();
-    fs::write(tree.join("test/Data.aidl"), "package test; parcelable Data;\n").unwrap();
+    fs::write(
+        tree.join("test/Data.aidl"),
+        "package test; parcelable Data;\n",
+    )
+    .unwrap();
 
     let compiler = root.join("fake-aidl");
     fs::write(
@@ -316,6 +418,125 @@ fn decode_output_path_example_is_separate_from_testcase() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("case")).unwrap();
     let output = root.join("decoded-aidl.json");
-    let testcase = PathBuf::from(root.join("case"));
+    let testcase = root.join("case");
     assert!(!output.starts_with(testcase));
+}
+
+fn store_testcase_blob(case: &std::path::Path, bytes: &[u8]) -> (String, u64) {
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    fs::create_dir_all(case.join("blobs")).unwrap();
+    fs::write(case.join("blobs").join(&digest), bytes).unwrap();
+    (digest, bytes.len() as u64)
+}
+
+#[test]
+fn decode_reads_only_complete_harness_blobs_and_writes_separate_output() {
+    let root = std::env::temp_dir().join(format!("neutron-aidl-decode-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let case = root.join("case");
+    fs::create_dir_all(&case).unwrap();
+
+    let input = b"binder-write-read";
+    fs::write(case.join("input.bin"), input).unwrap();
+    let input_digest = format!("{:x}", Sha256::digest(input));
+
+    let parcel = keymint_parcel();
+    let offsets = Vec::new();
+    let command = (1u32 << 30) | (64 << 16) | ((b'c' as u32) << 8);
+    let mut stream = command.to_le_bytes().to_vec();
+    let mut transaction = vec![0u8; 64];
+    transaction[16..20].copy_from_slice(&1u32.to_le_bytes());
+    stream.extend(transaction);
+    let (stream_digest, stream_len) = store_testcase_blob(&case, &stream);
+    let (parcel_digest, parcel_len) = store_testcase_blob(&case, &parcel);
+    let (offsets_digest, offsets_len) = store_testcase_blob(&case, &offsets);
+    let resource = |id: &str, kind: &str, digest: &str, length: u64| {
+        serde_json::json!({
+            "id":id,
+            "kind":kind,
+            "sha256":digest,
+            "length":length,
+            "status":"complete"
+        })
+    };
+    fs::write(
+        case.join("metadata.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"neutron.harness/v1",
+            "revision":0,
+            "source_capture":"capture.ndjson",
+            "selected_event_id":1,
+            "input_sha256":input_digest,
+            "required_identity":{
+                "serial":"USB123","fingerprint":"fp","boot_id":"boot",
+                "package":"com.example","uid":10000,"domain":"u:r:untrusted_app:s0"
+            },
+            "steps":[],
+            "replay_status":"ready",
+            "blocked_reasons":[],
+            "warning":"authorized",
+            "transactions":["binder.transaction.0"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        case.join("resources.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"neutron.harness/v1",
+            "device_paths":[],
+            "binder_services":["android.hardware.security.keymint.IKeyMintDevice/default"],
+            "resources":[
+                resource("binder.write_stream", "binder_stream", &stream_digest, stream_len),
+                resource("binder.transaction.0.parcel", "binder_parcel", &parcel_digest, parcel_len),
+                resource("binder.transaction.0.offsets", "binder_offsets", &offsets_digest, offsets_len)
+            ],
+            "unresolved":[]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let catalog_path = root.join("catalog.json");
+    fs::write(&catalog_path, catalog().to_pretty_json().unwrap()).unwrap();
+    let output = root.join("decoded-aidl.json");
+    run_decode(DecodeArgs {
+        testcase: case.clone(),
+        catalog: catalog_path.clone(),
+        plugin: "keymint".into(),
+        output: output.clone(),
+        show_sensitive_bytes: false,
+    })
+    .unwrap();
+    let decoded: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(decoded["schema"], "neutron.decoded-aidl/v1");
+    assert_eq!(decoded["transactions"][0]["method"], "generateKey");
+    assert_eq!(decoded["transactions"][0]["decoded"]["status"], "decoded");
+
+    let metadata_path = case.join("metadata.json");
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["replay_status"] = Value::String("blocked".into());
+    metadata["blocked_reasons"] = serde_json::json!(["capture truncated"]);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let blocked_output = root.join("blocked-output.json");
+    let error = run_decode(DecodeArgs {
+        testcase: case.clone(),
+        catalog: catalog_path.clone(),
+        plugin: "keymint".into(),
+        output: blocked_output.clone(),
+        show_sensitive_bytes: false,
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("blocked"));
+    assert!(!blocked_output.exists());
+
+    let error = run_decode(DecodeArgs {
+        testcase: case.clone(),
+        catalog: catalog_path,
+        plugin: "keymint".into(),
+        output: case.join("decoded-aidl.json"),
+        show_sensitive_bytes: false,
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("outside the testcase"));
+    assert!(!case.join("decoded-aidl.json").exists());
 }

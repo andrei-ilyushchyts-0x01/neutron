@@ -26,6 +26,7 @@ use aya::programs::{KProbe, TracePoint};
 use aya::{Ebpf, EbpfLoader, VerifierLogLevel};
 use clap::Parser;
 
+use neutron::aidl::AidlCatalog;
 use neutron::android;
 use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap};
 use neutron::capture::{CaptureMode, ContextRing, DEFAULT_MAX_EVENTS};
@@ -34,7 +35,7 @@ use neutron::causal::{
     process_context_from_bytes, process_exit_span_id, root_process_span_id, syscall_span_id,
     CausalMetadata, CausalRelation, CausalWire, ControlServer, ScenarioInfo, ScenarioState,
 };
-use neutron::cli::{Args, Cli, Command, HarnessCommand, IoctlCommand};
+use neutron::cli::{AidlCommand, Args, Cli, Command, HarnessCommand, IoctlCommand};
 use neutron::decode::{compute_latency_us, format_comm, format_data_field, resolve_path_from_fd};
 use neutron::doctor;
 use neutron::fdgraph::poller::{self as poller, PollerConfig, RealProcReader, ScopePolicy};
@@ -1742,16 +1743,20 @@ fn emit_binder_call(
     services: &BinderServiceMap,
     catalog: &BinderCatalog,
     methods: &BinderMethodMap,
+    aidl: Option<&AidlCatalog>,
     causal: Option<&CausalMetadata>,
 ) -> io::Result<()> {
     *event_id_counter = event_id_counter.wrapping_add(1);
-    let attribution = catalog.resolve(
-        services,
-        methods,
-        pair.callee_pid,
-        pair.target_node,
-        pair.code,
-    );
+    let attribution = catalog
+        .resolve_with_aidl(
+            services,
+            methods,
+            aidl,
+            pair.callee_pid,
+            pair.target_node,
+            pair.code,
+        )
+        .expect("legacy method conflicts are validated before tracing");
     let mut line =
         format_binder_call_json_with_attribution(pair, Some(*event_id_counter), &attribution);
     if let Some(metadata) = causal {
@@ -1816,6 +1821,8 @@ fn main() -> Result<()> {
         Some(Command::Harness(HarnessCommand::Extract(args))) => neutron::harness::extract(args),
         Some(Command::Harness(HarnessCommand::Minimize(args))) => neutron::harness::minimize(args),
         Some(Command::Harness(HarnessCommand::Replay(args))) => neutron::harness::replay(args),
+        Some(Command::Aidl(AidlCommand::Index(args))) => neutron::aidl::run_index(args),
+        Some(Command::Aidl(AidlCommand::Decode(args))) => neutron::aidl::run_decode(args),
         None => run_trace(cli.args),
     }
 }
@@ -2093,6 +2100,19 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
         None => BinderMethodMap::default(),
     };
+    let aidl_catalog = args
+        .aidl_catalog
+        .as_deref()
+        .map(AidlCatalog::load_file)
+        .transpose()?;
+    if let Some(catalog) = &aidl_catalog {
+        binder_methods.validate_catalog(catalog)?;
+        eprintln!(
+            "  AIDL catalog: {} interfaces from {}",
+            catalog.interfaces.len(),
+            args.aidl_catalog.as_deref().expect("catalog path present")
+        );
+    }
     let mut binder_catalog = BinderCatalog::discover(args.follow_services, args.follow_hal);
     let mut discovery_seen_pids = HashSet::<u32>::new();
     let mut discovery_refresh_pending = false;
@@ -2540,6 +2560,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                         &binder_services,
                                         &binder_catalog,
                                         &binder_methods,
+                                        aidl_catalog.as_ref(),
                                         pair_causal.as_ref(),
                                     ),
                                     &output_cap_hit,
@@ -2619,6 +2640,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                     &binder_services,
                                     &binder_catalog,
                                     &binder_methods,
+                                    aidl_catalog.as_ref(),
                                     pair_causal.as_ref(),
                                 ),
                                 &output_cap_hit,
@@ -2963,6 +2985,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                     &binder_services,
                                     &binder_catalog,
                                     &binder_methods,
+                                    aidl_catalog.as_ref(),
                                     pair_causal.as_ref(),
                                 ),
                                 &output_cap_hit,
@@ -3023,6 +3046,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                                     &binder_services,
                                     &binder_catalog,
                                     &binder_methods,
+                                    aidl_catalog.as_ref(),
                                     pair_causal.as_ref(),
                                 ),
                                 &output_cap_hit,

@@ -14,6 +14,10 @@ The kernel does not provide a stable human service name for every
 The report treats these differently. Exact service-map entries are labels.
 Catalog entries are candidates and are shown as candidates.
 
+An optional descriptor-centric AIDL catalog maps transaction codes to methods
+only after the exact service map proves the descriptor. See
+[AIDL Intelligence](aidl-intelligence.md).
+
 ## Exact Service Map
 
 Pass an exact map to either capture-time enrichment or report-time rendering:

@@ -32,7 +32,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+
+use crate::aidl::{normalize_descriptor, AidlCatalog};
 
 /// In-memory descriptor map. `HashMap<(callee_pid, target_node) → service>`
 /// is what the lookup wants — a tuple key keeps the read path branch-free.
@@ -98,11 +100,29 @@ impl BinderMethodMap {
     pub fn is_empty(&self) -> bool {
         self.by_service_code.is_empty()
     }
+
+    pub fn validate_catalog(&self, catalog: &AidlCatalog) -> Result<()> {
+        for ((service, code), legacy_method) in &self.by_service_code {
+            if let Some(lookup) = catalog.lookup(normalize_descriptor(service), *code) {
+                if lookup.method.method != *legacy_method {
+                    bail!(
+                        "conflicting Binder method for {} code {}: catalog='{}', legacy='{}'",
+                        normalize_descriptor(service),
+                        code,
+                        lookup.method.method,
+                        legacy_method
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct BinderCatalog {
     by_pid: BTreeMap<u32, Vec<String>>,
+    interfaces_by_pid: BTreeMap<u32, Vec<String>>,
 }
 
 impl BinderCatalog {
@@ -129,10 +149,13 @@ impl BinderCatalog {
         if let Ok(parsed) = crate::report::parse_service_list(output) {
             self.merge(parsed);
         }
+        self.merge_interfaces(parse_service_list_interfaces(output));
     }
 
     pub fn merge_lshal(&mut self, output: &str) {
-        self.merge(parse_lshal(output));
+        let parsed = parse_lshal(output);
+        self.merge_interfaces(parsed.clone());
+        self.merge(parsed);
     }
 
     pub fn candidates(&self, pid: u32) -> &[String] {
@@ -147,28 +170,75 @@ impl BinderCatalog {
         target_node: i32,
         code: u32,
     ) -> BinderAttribution {
+        self.resolve_with_aidl(exact, methods, None, pid, target_node, code)
+            .expect("resolution without an AIDL catalog cannot conflict")
+    }
+
+    pub fn resolve_with_aidl(
+        &self,
+        exact: &BinderServiceMap,
+        methods: &BinderMethodMap,
+        aidl: Option<&AidlCatalog>,
+        pid: u32,
+        target_node: i32,
+        code: u32,
+    ) -> Result<BinderAttribution> {
         if let Some(service) = exact.lookup(pid, target_node) {
-            return BinderAttribution {
+            let descriptor = normalize_descriptor(service);
+            let catalog_match = aidl.and_then(|catalog| catalog.lookup(descriptor, code));
+            let legacy_method = methods
+                .lookup(service, code)
+                .or_else(|| methods.lookup(descriptor, code));
+            if let (Some(catalog_match), Some(legacy_method)) = (&catalog_match, legacy_method) {
+                if catalog_match.method.method != legacy_method {
+                    bail!(
+                        "conflicting Binder method for {descriptor} code {code}: catalog='{}', legacy='{legacy_method}'",
+                        catalog_match.method.method
+                    );
+                }
+            }
+            return Ok(BinderAttribution {
                 service: Some(service.to_string()),
                 candidates: Vec::new(),
-                method: methods.lookup(service, code).map(str::to_string),
+                interface_descriptor: Some(descriptor.to_string()),
+                interface_candidates: Vec::new(),
+                method: catalog_match
+                    .as_ref()
+                    .map(|found| found.method.method.clone())
+                    .or_else(|| legacy_method.map(str::to_string)),
+                aidl_version: catalog_match
+                    .as_ref()
+                    .and_then(|found| found.version.clone()),
+                catalog_source: catalog_match.map(|found| found.source.to_string()),
                 confidence: Some(AttributionConfidence::Exact),
                 code,
-            };
+            });
         }
         let candidates = self.candidates(pid).to_vec();
         let service = (candidates.len() == 1).then(|| candidates[0].clone());
-        let method = service
-            .as_deref()
-            .and_then(|name| methods.lookup(name, code))
-            .map(str::to_string);
-        BinderAttribution {
+        let mut interface_candidates =
+            self.interfaces_by_pid
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| {
+                    candidates
+                        .iter()
+                        .map(|candidate| normalize_descriptor(candidate).to_string())
+                        .collect()
+                });
+        interface_candidates.sort();
+        interface_candidates.dedup();
+        Ok(BinderAttribution {
             service,
             confidence: (!candidates.is_empty()).then_some(AttributionConfidence::Candidate),
             candidates,
-            method,
+            interface_descriptor: None,
+            interface_candidates,
+            method: None,
+            aidl_version: None,
+            catalog_source: None,
             code,
-        }
+        })
     }
 
     fn merge(&mut self, values: BTreeMap<u32, Vec<String>>) {
@@ -182,13 +252,63 @@ impl BinderCatalog {
             entry.sort();
         }
     }
+
+    fn merge_interfaces(&mut self, values: BTreeMap<u32, Vec<String>>) {
+        for (pid, names) in values {
+            let entry = self.interfaces_by_pid.entry(pid).or_default();
+            for name in names {
+                let descriptor = normalize_descriptor(&name).to_string();
+                if !entry.contains(&descriptor) {
+                    entry.push(descriptor);
+                }
+            }
+            entry.sort();
+        }
+    }
+}
+
+fn parse_service_list_interfaces(output: &str) -> BTreeMap<u32, Vec<String>> {
+    let mut parsed = BTreeMap::<u32, Vec<String>>::new();
+    for line in output.lines() {
+        let Some(pid) = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("pid="))
+            .and_then(|value| {
+                value
+                    .trim_matches(|c: char| !c.is_ascii_digit())
+                    .parse()
+                    .ok()
+            })
+        else {
+            continue;
+        };
+        let Some(start) = line.find('[') else {
+            continue;
+        };
+        let Some(end) = line[start + 1..].find(']').map(|end| start + 1 + end) else {
+            continue;
+        };
+        let descriptor = line[start + 1..end].trim();
+        if descriptor.contains('.') {
+            parsed.entry(pid).or_default().push(descriptor.to_string());
+        }
+    }
+    for interfaces in parsed.values_mut() {
+        interfaces.sort();
+        interfaces.dedup();
+    }
+    parsed
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BinderAttribution {
     pub service: Option<String>,
     pub candidates: Vec<String>,
+    pub interface_descriptor: Option<String>,
+    pub interface_candidates: Vec<String>,
     pub method: Option<String>,
+    pub aidl_version: Option<String>,
+    pub catalog_source: Option<String>,
     pub confidence: Option<AttributionConfidence>,
     code: u32,
 }

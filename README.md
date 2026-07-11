@@ -41,7 +41,8 @@ neutron can observe:
 - ioctl families including binder/dma-buf, dma-heap, ashmem, KGSL, Mali, ALSA,
   LWIS, and GXP where the decoder knows the command shape
 - Binder tracepoint metadata and paired `binder_call` events with latency and
-  crash status when `--binder` is enabled
+  crash status when `--binder` is enabled, plus exact descriptor/method
+  attribution from an operator map and deterministic AIDL catalog
 - process exits/crashes from BPF, logcat, and tombstone sources
 - FD pressure through periodic `fd_snapshot` events
 - optional stack IDs and symbols when using `neutron-stacks.bpf.elf`
