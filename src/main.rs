@@ -1657,6 +1657,50 @@ fn follow_process_identity(pid: u32) -> (Option<String>, Option<String>) {
     (comm, domain)
 }
 
+fn pre_admission_follow_deny_domains(args: &Args) -> Result<BTreeSet<String>> {
+    if !args.follow_binder {
+        return Ok(BTreeSet::new());
+    }
+    args.follow_deny_domain
+        .iter()
+        .map(|domain| neutron::causal::normalize_domain(domain))
+        .collect()
+}
+
+fn seed_pre_admission_follow_denies(
+    bpf: &mut Ebpf,
+    deny_domains: &BTreeSet<String>,
+) -> Result<usize> {
+    if deny_domains.is_empty() {
+        return Ok(0);
+    }
+    let map = bpf
+        .map_mut("BINDER_FOLLOW_DENY_PIDS")
+        .context("BINDER_FOLLOW_DENY_PIDS missing")?;
+    let mut denied: AyaHashMap<_, u32, u8> =
+        AyaHashMap::try_from(map).context("BINDER_FOLLOW_DENY_PIDS has unexpected layout")?;
+    let mut seeded = 0;
+    for entry in fs::read_dir("/proc").context("enumerating /proc for follow deny domains")? {
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let (_, domain) = follow_process_identity(pid);
+        if !domain.is_some_and(|domain| deny_domains.contains(&domain)) {
+            continue;
+        }
+        denied
+            .insert(pid, 1, 0)
+            .with_context(|| format!("pre-admission follow deny for PID {pid}"))?;
+        seeded += 1;
+    }
+    Ok(seeded)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_follow_guardrail(
     out: &mut dyn IoWrite,
@@ -2227,6 +2271,19 @@ fn run_trace(mut args: Args) -> Result<()> {
         args.root_uid.or(package_uid),
         args.root_uid.is_some(),
     )?;
+    let pre_admission_follow_denies = pre_admission_follow_deny_domains(&args)?;
+    let seeded_follow_denies =
+        seed_pre_admission_follow_denies(&mut bpf, &pre_admission_follow_denies)?;
+    if seeded_follow_denies > 0 {
+        eprintln!(
+            "  pre-admission Binder follow denies: {seeded_follow_denies} PID(s) in {}",
+            pre_admission_follow_denies
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     set_root_uid_context(&mut bpf, 0, 0)?;
     replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
     populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;

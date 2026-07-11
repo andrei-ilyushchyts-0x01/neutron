@@ -108,6 +108,11 @@ static PID_WHITELIST: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
 #[map]
 static TRACED_PROCESSES: HashMap<u32, ProcessTraceContext> = HashMap::with_max_entries(64, 0);
 
+/// Process IDs that must not be admitted as Binder followers. Userspace seeds
+/// this from explicit `--follow-deny-domain` policy before tracepoints attach.
+#[map]
+static BINDER_FOLLOW_DENY_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
+
 /// Context assigned when explicit `--root-uid` admits a process on its first
 /// event. Userspace swaps this singleton at causal scenario boundaries.
 #[map]
@@ -758,6 +763,9 @@ fn follow_binder_callee(
         return;
     }
     let pid = callee_pid as u32;
+    if unsafe { BINDER_FOLLOW_DENY_PIDS.get(&pid) }.is_some() {
+        return;
+    }
     let existing = unsafe { TRACED_PROCESSES.get(&pid) }.copied();
     let preserve_root = existing.is_some_and(|context| context.reason == TraceReason::Root);
     let process = ProcessTraceContext {
