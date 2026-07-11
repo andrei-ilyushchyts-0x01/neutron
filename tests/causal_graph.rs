@@ -232,6 +232,7 @@ fn causal_graph_merges_pairs_and_uses_solid_and_dotted_edges() {
         Cursor::new(capture),
         &GraphOptions {
             root_package: Some("com.example.app".into()),
+            ..GraphOptions::default()
         },
     )
     .expect("render graph");
@@ -348,7 +349,9 @@ fn json_graph_is_versioned_and_collapses_repeated_syscalls() {
         .collect();
     assert_eq!(syscalls.len(), 1);
     assert_eq!(syscalls[0]["count"], 2);
-    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
-        edge["from"] == "b_00000001" && edge["to"] == syscalls[0]["id"]
-    }));
+    assert!(graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| { edge["from"] == "b_00000001" && edge["to"] == syscalls[0]["id"] }));
 }

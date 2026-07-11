@@ -1,11 +1,11 @@
 //! Streaming NDJSON to Mermaid causal graph renderer.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io::{self, BufRead, Write};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde::Serialize;
 
 use crate::capture_normalize::{
     normalize_capture, BinderSpan, CausalRelation as Relation, ExitSpan, SyscallSpan,
@@ -20,9 +20,13 @@ pub struct GraphArgs {
     #[arg(long)]
     pub root_package: Option<String>,
 
-    /// Output format. Neutron 1.4 supports Mermaid only.
-    #[arg(long, default_value = "mermaid", value_parser = ["mermaid"])]
+    /// Output format.
+    #[arg(long, default_value = "mermaid", value_parser = ["mermaid", "json"])]
     pub format: String,
+
+    /// Merge identical syscalls that share one causal parent.
+    #[arg(long)]
+    pub collapse_syscalls: bool,
 
     /// Write the graph to this file instead of stdout.
     #[arg(long)]
@@ -32,22 +36,25 @@ pub struct GraphArgs {
 #[derive(Clone, Debug, Default)]
 pub struct GraphOptions {
     pub root_package: Option<String>,
+    pub collapse_syscalls: bool,
 }
 
 pub fn run(args: GraphArgs) -> Result<()> {
     let reader = crate::summarize::open_capture(&args.capture)?;
-    let graph = render_mermaid_from_reader(
-        reader,
-        &GraphOptions {
-            root_package: args.root_package,
-        },
-    )?;
+    let options = GraphOptions {
+        root_package: args.root_package,
+        collapse_syscalls: args.collapse_syscalls,
+    };
+    let graph = match args.format.as_str() {
+        "json" => render_json_from_reader(reader, &options)?,
+        _ => render_mermaid_from_reader(reader, &options)?,
+    };
     match args.output {
-        Some(path) => fs::write(&path, graph).with_context(|| format!("writing {path}")),
+        Some(path) => crate::private_output::write(path.as_ref(), graph.as_bytes(), true),
         None => io::stdout()
             .lock()
             .write_all(graph.as_bytes())
-            .context("writing Mermaid graph"),
+            .context("writing causal graph"),
     }
 }
 
@@ -58,7 +65,37 @@ struct Edge {
     relation: Relation,
 }
 
-pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Result<String> {
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphDocument {
+    pub schema: String,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub span_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+}
+
+fn build_graph_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Result<GraphDocument> {
     let capture = normalize_capture(reader)?;
     let has_causal = capture.has_causal;
     let selected_traces: BTreeSet<String> = capture
@@ -142,18 +179,37 @@ pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions)
     }
 
     let binder_ids = binder_ids(&binders);
-    let syscall_ids = syscall_ids(&syscalls);
+    let syscall_ids = syscall_ids(&syscalls, options.collapse_syscalls);
     let exit_ids = exit_ids(&exits);
-    let mut nodes = BTreeMap::<String, String>::new();
+    let mut nodes = BTreeMap::<String, GraphNode>::new();
     let mut span_nodes = BTreeMap::<(Option<String>, String), String>::new();
     for (pid, comm) in &processes {
+        let id = process_id(*pid);
         nodes.insert(
-            process_id(*pid),
-            format!("{} (pid {pid})", label_or_pid(comm, *pid)),
+            id.clone(),
+            GraphNode {
+                id,
+                kind: "process".into(),
+                label: format!("{} (pid {pid})", label_or_pid(comm, *pid)),
+                count: 1,
+                pid: Some(*pid),
+                trace_ids: Vec::new(),
+                span_ids: Vec::new(),
+            },
         );
     }
     for (binder, id) in binders.iter().zip(&binder_ids) {
-        nodes.insert(id.clone(), binder_label(binder));
+        nodes.insert(
+            id.clone(),
+            graph_node(
+                id,
+                "binder",
+                binder_label(binder),
+                Some(binder.caller_pid),
+                binder.trace_id.as_deref(),
+                binder.span_id.as_deref(),
+            ),
+        );
         insert_span_node(
             &mut span_nodes,
             binder.trace_id.as_deref(),
@@ -162,7 +218,26 @@ pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions)
         );
     }
     for (syscall, id) in syscalls.iter().zip(&syscall_ids) {
-        nodes.insert(id.clone(), syscall_label(syscall));
+        match nodes.get_mut(id) {
+            Some(node) => {
+                node.count += 1;
+                push_unique(&mut node.trace_ids, syscall.trace_id.as_deref());
+                push_unique(&mut node.span_ids, syscall.span_id.as_deref());
+            }
+            None => {
+                nodes.insert(
+                    id.clone(),
+                    graph_node(
+                        id,
+                        "syscall",
+                        syscall_label(syscall),
+                        Some(syscall.pid),
+                        syscall.trace_id.as_deref(),
+                        syscall.span_id.as_deref(),
+                    ),
+                );
+            }
+        }
         insert_span_node(
             &mut span_nodes,
             syscall.trace_id.as_deref(),
@@ -171,7 +246,17 @@ pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions)
         );
     }
     for (exit, id) in exits.iter().zip(&exit_ids) {
-        nodes.insert(id.clone(), exit.label.clone());
+        nodes.insert(
+            id.clone(),
+            graph_node(
+                id,
+                "process_exit",
+                exit.label.clone(),
+                Some(exit.pid),
+                exit.trace_id.as_deref(),
+                exit.span_id.as_deref(),
+            ),
+        );
         insert_span_node(&mut span_nodes, exit.trace_id.as_deref(), &exit.span_id, id);
     }
 
@@ -225,29 +310,94 @@ pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions)
         });
     }
 
-    let mut out = String::from("flowchart TD\n");
-    for warning in &capture.health_warnings {
-        out.push_str(&format!(
-            "  %% WARNING: {warning} recorded in capture_health.\n"
+    let mut warnings: Vec<_> = capture
+        .health_warnings
+        .into_iter()
+        .map(|warning| format!("{warning} recorded in capture_health."))
+        .collect();
+    if !has_causal {
+        warnings
+            .push("capture has no causal metadata; syscall edges are process-level only.".into());
+    }
+    Ok(GraphDocument {
+        schema: "neutron.causal-graph/v1".into(),
+        nodes: nodes.into_values().collect(),
+        edges: edges
+            .into_iter()
+            .map(|edge| GraphEdge {
+                from: edge.from,
+                to: edge.to,
+                relation: match edge.relation {
+                    Relation::Exact => "exact",
+                    Relation::Inferred => "inferred",
+                }
+                .into(),
+            })
+            .collect(),
+        warnings,
+    })
+}
+
+pub fn render_json_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Result<String> {
+    let mut output = serde_json::to_string_pretty(&build_graph_from_reader(reader, options)?)?;
+    output.push('\n');
+    Ok(output)
+}
+
+pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Result<String> {
+    let graph = build_graph_from_reader(reader, options)?;
+    let mut output = String::from("flowchart TD\n");
+    for warning in graph.warnings {
+        output.push_str(&format!("  %% WARNING: {warning}\n"));
+    }
+    for node in graph.nodes {
+        let count = if node.count > 1 {
+            format!(" ×{}", node.count)
+        } else {
+            String::new()
+        };
+        output.push_str(&format!(
+            "  {}[\"{}{}\"]\n",
+            node.id,
+            escape_label(&node.label),
+            count
         ));
     }
-    if !has_causal {
-        out.push_str(
-            "  %% WARNING: capture has no causal metadata; syscall edges are process-level only.\n",
-        );
-    }
-    for (id, label) in nodes {
-        out.push_str(&format!("  {id}[\"{}\"]\n", escape_label(&label)));
-    }
-    for edge in edges {
-        match edge.relation {
-            Relation::Exact => out.push_str(&format!("  {} --> {}\n", edge.from, edge.to)),
-            Relation::Inferred => {
-                out.push_str(&format!("  {} -. inferred .-> {}\n", edge.from, edge.to));
-            }
+    for edge in graph.edges {
+        if edge.relation == "exact" {
+            output.push_str(&format!("  {} --> {}\n", edge.from, edge.to));
+        } else {
+            output.push_str(&format!("  {} -. inferred .-> {}\n", edge.from, edge.to));
         }
     }
-    Ok(out)
+    Ok(output)
+}
+
+fn graph_node(
+    id: &str,
+    kind: &str,
+    label: String,
+    pid: Option<u32>,
+    trace_id: Option<&str>,
+    span_id: Option<&str>,
+) -> GraphNode {
+    GraphNode {
+        id: id.into(),
+        kind: kind.into(),
+        label,
+        count: 1,
+        pid,
+        trace_ids: trace_id.into_iter().map(str::to_string).collect(),
+        span_ids: span_id.into_iter().map(str::to_string).collect(),
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: Option<&str>) {
+    if let Some(value) = value {
+        if !values.iter().any(|current| current == value) {
+            values.push(value.into());
+        }
+    }
 }
 
 fn insert_span_node(
@@ -296,7 +446,30 @@ fn binder_ids(nodes: &[&BinderSpan]) -> Vec<String> {
         .collect()
 }
 
-fn syscall_ids(nodes: &[&SyscallSpan]) -> Vec<String> {
+fn syscall_ids(nodes: &[&SyscallSpan], collapse: bool) -> Vec<String> {
+    if collapse {
+        let mut groups = BTreeMap::new();
+        return nodes
+            .iter()
+            .map(|node| {
+                let key = (
+                    node.trace_id.clone(),
+                    node.parent_span_id.clone(),
+                    node.pid,
+                    node.name.clone(),
+                    node.ioctl_name.clone(),
+                    node.fd_path.clone(),
+                    node.ret.map(|ret| ret >= 0),
+                    node.relation,
+                );
+                let next = groups.len();
+                groups
+                    .entry(key)
+                    .or_insert_with(|| format!("s_group_{next:04}"))
+                    .clone()
+            })
+            .collect();
+    }
     let mut counts = BTreeMap::<String, usize>::new();
     for node in nodes {
         if let Some(span) = &node.span_id {
