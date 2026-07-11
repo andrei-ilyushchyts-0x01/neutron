@@ -3058,6 +3058,48 @@ mod tests {
     }
 
     #[test]
+    fn adb_staging_accepts_only_regular_replay_assets() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "neutron-adb-stage-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        for name in ["replay", "input.bin", "metadata.json", "resources.json"] {
+            fs::write(root.join(name), name).unwrap();
+        }
+        let resources = ResourceCatalog {
+            schema: HARNESS_SCHEMA.into(),
+            device_paths: Vec::new(),
+            binder_services: Vec::new(),
+            resources: Vec::new(),
+            object_adapters: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        let files = adb_stage_files(&root, &resources).unwrap();
+        let remote: Vec<_> = files
+            .iter()
+            .map(|asset| asset.remote_path.as_str())
+            .collect();
+        assert_eq!(
+            remote,
+            ["input.bin", "metadata.json", "replay", "resources.json"]
+        );
+
+        fs::remove_file(root.join("replay")).unwrap();
+        symlink(root.join("input.bin"), root.join("replay")).unwrap();
+        assert!(adb_stage_files(&root, &resources)
+            .unwrap_err()
+            .to_string()
+            .contains("regular file"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn binder_object_registry_covers_standard_reconstruction_types() {
         assert_eq!(binder_object_name(0x7362_2a85), Some("binder"));
         assert_eq!(binder_object_name(0x7762_2a85), Some("weak_binder"));
