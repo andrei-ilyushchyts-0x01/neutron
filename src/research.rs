@@ -1625,6 +1625,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_runtime_permission_state_from_package_dump() {
+        let dump = "runtime permissions:\n  android.permission.CAMERA: granted=true, flags=[]\n  android.permission.BLUETOOTH_SCAN: granted=false, flags=[]\n";
+
+        assert!(permission_granted_from_package_dump(dump, "android.permission.CAMERA").unwrap());
+        assert!(
+            !permission_granted_from_package_dump(dump, "android.permission.BLUETOOTH_SCAN")
+                .unwrap()
+        );
+        assert!(permission_granted_from_package_dump(dump, "android.permission.NEARBY_WIFI_DEVICES")
+            .is_err());
+    }
+
+    #[test]
     fn failed_permission_restore_remains_armed_for_drop() {
         let mut granted = vec!["camera".to_string(), "bluetooth".to_string()];
         let result = restore_permissions(&mut granted, |permission| permission == "camera");
