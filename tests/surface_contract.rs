@@ -605,6 +605,45 @@ fn reachability_distinguishes_missing_and_candidate_evidence() {
 }
 
 #[test]
+fn selinux_denials_are_surface_evidence_but_not_reachability_edges() {
+    let mut snapshot = scan_with_reader(&fixture()).unwrap();
+    let capture = r#"
+{"type":"marker","phase":"start","name":"denial","scenario_id":"denial","trace_id":"trace-denial","root_package":"com.example.denied"}
+{"type":"selinux_denial","ts_ns":90,"pid":100,"tid":101,"uid":10123,"comm":"denied-app","source_domain":"untrusted_app","target_type":"tee_device","tclass":"chr_file","permissions":["ioctl"],"path":"/dev/trusty-ipc-dev0","result":"denied","trace_id":"trace-denial","scenario_id":"denial","span_id":"denial-1","depth":0,"causal_relation":"exact"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.denied","boot_id":"boot-a"}
+"#;
+    import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
+
+    let denial = snapshot
+        .relations
+        .iter()
+        .find(|relation| relation.relation_type == "selinux_denial")
+        .expect("SELinux relation");
+    assert_eq!(denial.from, "process:capture:trace-denial:100");
+    assert_eq!(denial.to, snapshot.devices[0].id);
+    assert!(denial
+        .evidence
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("untrusted_app tee_device:chr_file { ioctl } denied")));
+
+    let reached = reachable(
+        &snapshot,
+        &RootSelector::Package("com.example.denied".into()),
+    )
+    .unwrap();
+    assert!(reached
+        .nodes
+        .iter()
+        .any(|node| node == "process:capture:trace-denial:100"));
+    assert!(!reached.nodes.iter().any(|node| node == &snapshot.devices[0].id));
+    assert!(reached
+        .relations
+        .iter()
+        .all(|relation| relation.relation_type != "selinux_denial"));
+}
+
+#[test]
 fn legacy_capture_keeps_edges_as_candidate_and_warns_about_pid_identity() {
     let mut snapshot = scan_with_reader(&fixture()).expect("static scan");
     let legacy = r#"
