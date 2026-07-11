@@ -155,7 +155,7 @@ impl PlatformReader for RealPlatformReader {
         let seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as libc::time_t;
+            .as_secs() as libc::c_long;
         let mut utc = MaybeUninit::<libc::tm>::uninit();
         // SAFETY: `seconds` and `utc` are valid for the duration of gmtime_r.
         let result = unsafe { libc::gmtime_r(&seconds, utc.as_mut_ptr()) };
