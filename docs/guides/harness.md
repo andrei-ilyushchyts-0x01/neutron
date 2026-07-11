@@ -53,7 +53,8 @@ Extraction validates duplicate IDs, resource sizes, blob hashes, and the strict
 - manual `setup.sh` and safety-focused `README.md`
 
 `setup.sh` is documentation; Neutron never executes it. Review and compile
-`replay.rs` for aarch64 yourself. Resolve every blocked resource before replay.
+`replay.rs` for aarch64 yourself, placing the resulting binary at
+`testcase/replay`. Resolve every blocked resource before replay.
 Recorded Binder handles are never reused. Binder callback objects require an
 explicit adapter; service handles require a reacquisition adapter in the runner.
 
@@ -70,9 +71,13 @@ neutron harness replay testcase \
 
 Replay refuses network ADB transports and emulators. Before every run it checks
 the explicit serial, build fingerprint, boot identity, package UID, and SELinux
-domain. Runner `prepare`, `execute`, and `recover` fields are argv arrays executed
-directly without shell interpolation. The default timeout is 30 seconds and the
-hard cap is 1000 runs. Every attempt overwrites `run-result.json` with a distinct
+domain. The generated `runner.json` uses `transport:"adb"`: Neutron validates a
+fixed set of regular assets, stages them below a generated
+`/data/local/tmp/neutron-harness-*` directory, applies a device-side timeout,
+executes argv without `sh -c`, and removes the staging directory. ADB runners do
+not accept prepare/recover hooks; old or custom `transport:"host"` runners keep
+direct host argv semantics. The default timeout is 30 seconds and the hard cap
+is 1000 runs. Every attempt overwrites `run-result.json` with a distinct
 completed, crash, reboot, transport-loss, timeout, hook-failure, identity-drift,
 or recovery-failure result.
 
@@ -96,8 +101,12 @@ The oracle receives `run-result.json` as its final argument. Exit `0` means
 reproduced, `1` means not reproduced, and `2+` is an oracle error. Infrastructure
 failures are never accepted as reproduction.
 
-Deterministic ddmin processes causal steps, Binder transactions, captured fields
-and flags, trailing buffer bytes, and delays. Candidates only delete existing
-elements, replace captured bytes with zero, or shorten a trailing region. The
-source testcase is left intact; accepted output is written under
+Deterministic ddmin always processes captured mutable regions and trailing
+buffer bytes. It processes causal steps, Binder transactions, or timing delays
+only when the selected runner explicitly declares the matching
+`capabilities` value (`causal_steps`, `binder_transactions`, or
+`timing_delays`). The generated ioctl runner declares none because it does not
+consume those metadata fields. Candidates only delete existing elements,
+replace captured bytes with zero, or shorten a trailing region. The source
+testcase is left intact; accepted output is written under
 `testcase/revisions/revision-N/` with a manifest and candidate log.

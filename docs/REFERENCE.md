@@ -13,8 +13,14 @@
 | `mark`        | Switch a live start/end scenario over the control socket, or append with explicit `--output`. (1.3.0) |
 | `graph`       | Render causal NDJSON as a Mermaid `flowchart TD`. (1.3.0) |
 | `surface`     | Collect or query a deterministic Android service/HAL/process/device snapshot. (1.4.0) |
+| `report`      | Render a Markdown kernel-boundary report from one capture. |
 | `recipes`     | Print built-in workflow recipes, e.g. `neutron recipes android-content-provider`. |
 | `ioctl generate` | Build a deterministic `neutron.ioctl-schema/v1` pack from kernel UAPI/vendor headers with host `clang`. |
+| `aidl index` / `aidl decode` | Build an AIDL catalog or run a selective offline decoder plugin. |
+| `harness extract` / `minimize` / `replay` | Build and run bounded regression artifacts on an explicit physical USB device. |
+| `selinux explain` | Explain one captured AVC and exact observed delegation evidence. |
+| `research` | Run a validated data-only subsystem research pack. |
+| `native-map` / `ghidra-export` | Resolve captured native frames and export neutral bookmark JSON. |
 
 For `window`, see [docs/guides/window.md](guides/window.md). For
 `summarize` / `diff`, see the per-subcommand `--help`. For `mark`, see
@@ -33,8 +39,11 @@ the **Marker workflow** section below. For Android provider work, use
 | `--follow-binder`                 | flag             | off                                      | Add Binder callees to the bounded dynamic trace set before publishing the caller event. |
 | `--follow-services`               | flag             | off                                      | Enable `service list -p` candidate discovery; implies `--follow-binder`. |
 | `--follow-hal`                    | flag             | off                                      | Enable `service list -p` and `lshal -ip` HAL candidate discovery; implies `--follow-binder`. |
-| `--max-depth N`                   | u8               | `4`                                      | Maximum causal Binder expansion depth. |
-| `--max-processes N`               | 1..=1024         | `64`                                     | Dynamic `TRACED_PROCESSES` map capacity. A package/UID root exceeding the limit fails the trace. |
+| `--max-depth N` / `--follow-depth N` | u8            | `4`                                      | Maximum causal Binder expansion depth. |
+| `--max-processes N` / `--follow-max-pids N` | 1..=1024 | `64`                                  | Dynamic `TRACED_PROCESSES` map capacity. A package/UID root exceeding the limit fails the trace. |
+| `--follow-ttl DURATION`           | duration         | `30s`                                    | Remove a non-root follower when no later causal Binder hop refreshes it. Accepts `ms`, `s`, or `m`. |
+| `--follow-allow-domain LIST`      | repeatable/comma-separated | empty                           | If non-empty, follow only callees whose current SELinux domain is listed. Unknown domains are rejected. |
+| `--follow-deny-domain LIST`       | repeatable/comma-separated | empty                           | Never follow callees in these SELinux domains. Deny takes precedence over allow. |
 | `--control-socket PATH|off`       | String           | `/data/local/tmp/neutron.control.sock`   | Live scenario marker socket; `off` disables it. |
 | `--pid N`                         | u32              | `0`                                      | Target process ID. `0` traces all processes. |
 | `--object PATH`                   | String           | `/data/local/tmp/neutron.bpf.elf`        | Path to the compiled Aya BPF ELF object on the device. |
@@ -260,6 +269,12 @@ relations. Static `proc_fd` relations describe current scan state but are
 excluded from traversal; static fields only enrich nodes already reached.
 Therefore “reachable” never means a SELinux/VINTF/manifest permission or
 theoretical Binder allow decision.
+
+The query includes `health.status` (`complete`, `degraded`, or `no_evidence`),
+`health.confidence` (`exact`, `candidate`, or `none`), matched capture IDs, and
+warnings. Capture completeness and PID/service identity confidence are
+separate: a complete capture may still contain a candidate join. Imported
+`selinux_denial` relations remain non-traversable attempt evidence.
 
 Capture import is streaming and ignores unknown NDJSON event types and fields.
 Capture health degradation is copied into surface health. A capture without a
@@ -548,6 +563,8 @@ finding is conclusive" on a single field instead of grepping prose.
   "unix_msg_control_nested": 0,
   "fd_graph_miss":           0,
   "fd_graph_backfilled":     0,
+  "follow_policy_filtered":  0,
+  "follow_ttl_expired":      0,
   "degraded":                false,
   "driver_packs":            ["kgsl"],
   "kprobe_packs":            [],
@@ -568,6 +585,8 @@ finding is conclusive" on a single field instead of grepping prose.
 | `*_failed` / `*_missed` / `*_truncated` | u64 | Per-cause degradation counters (see CAPTURE SUMMARY in the man page). |
 | `fd_graph_miss`    | u64  | `(pid, fd)` pairs the userspace FD-graph couldn't resolve.                 |
 | `fd_graph_backfilled` | u64 | Misses that `--resolve-paths` recovered via `/proc/<pid>/fd/<fd>`.         |
+| `follow_policy_filtered` | u64 | Causal branches intentionally stopped by domain/special-process policy. |
+| `follow_ttl_expired` | u64 | Non-root followers removed after the configured PID TTL. |
 | `degraded`         | bool | `true` when any drop or degradation counter is non-zero. Mirrors the stderr WARNING banner predicate. |
 | `driver_packs` / `kprobe_packs` | string[] | Active BPF-oriented decoder/kprobe packs requested for the capture. |
 | `attached_programs` | string[] | BPF programs successfully attached in this session. |

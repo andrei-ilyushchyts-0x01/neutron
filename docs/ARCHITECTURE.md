@@ -436,6 +436,8 @@ config.
   userspace logcat / tombstone sources fill them in. A BTF read would
   let the BPF path emit `exit_signal` directly, useful on hosts where
   logcat is unavailable.
-- Binder Parcel decoding beyond the AIDL `code` field. The 1.1.0
-  correlator pairs caller↔callee and surfaces `code` and lifecycle
-  status; full Parcel byte unmarshalling is V2 territory.
+- Generic Binder Parcel decoding beyond the AIDL `code` field. The correlator
+  pairs caller↔callee and surfaces interface/method attribution where exact
+  catalog evidence exists. A bounded offline KeyMint plugin can decode one
+  complete harness shape; version-independent arbitrary Parcel unmarshalling
+  remains out of scope.

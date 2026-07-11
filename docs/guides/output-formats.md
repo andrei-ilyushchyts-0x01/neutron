@@ -260,6 +260,7 @@ Same counter set as the stderr capture-summary block, plus a
   "fd_lookup_missed":0, "ioctl_refresh_missed":0,
   "unix_msg_control_truncated":0, "unix_msg_control_nested":0,
   "fd_graph_miss":0, "fd_graph_backfilled":0,
+  "follow_policy_filtered":0, "follow_ttl_expired":0,
   "degraded":false, "driver_packs":["kgsl"],
   "attached_programs":["trace_sys_enter","trace_sys_exit"],
   "ioctl_refresh_types":["0x9"], "root_uid":10123,
@@ -269,6 +270,12 @@ Same counter set as the stderr capture-summary block, plus a
 
 A downstream pipeline gating on "absence of finding is conclusive"
 should require `degraded:false`.
+
+`follow_policy_filtered` and `follow_ttl_expired` count intentionally
+incomplete causal branches. They do not by themselves set `degraded:true`,
+but graph and surface consumers surface them as completeness warnings. Each
+individual boundary is also emitted as `type:"follow_guardrail"` with
+`causal_branch_complete:false`.
 
 `root_package`/`root_uid` identify an optional causal root. `boot_id` and
 `fingerprint` let later consumers judge whether current process identities can
@@ -379,7 +386,7 @@ writes a mode-`0600` file instead of stdout.
 
 | Field      | JSON type | Notes                                                                      |
 |------------|-----------|----------------------------------------------------------------------------|
-| `type`     | string    | Event class: `"syscall"`, `"binder"`, `"binder_received"`, `"binder_call"`, `"fd_snapshot"`, `"process_exit"`, `"finding"`, `"marker"` (1.2.0), `"capture_health"` (1.2.0). Stable identifier. |
+| `type`     | string    | Event class: `"syscall"`, `"binder"`, `"binder_received"`, `"binder_call"`, `"fd_snapshot"`, `"process_exit"`, `"selinux_denial"`, `"follow_guardrail"`, `"finding"`, `"marker"`, or `"capture_health"`. Stable identifier. |
 | `ts_ns`    | number    | Kernel monotonic nanoseconds since boot                                    |
 | `pid`      | number    | Linux PID (= POSIX process ID = `tgid`)                                    |
 | `tid`      | number    | Linux TID (= POSIX thread ID = kernel `pid`)                               |

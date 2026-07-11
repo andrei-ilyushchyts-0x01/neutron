@@ -184,12 +184,17 @@ policy model.
 - `surface reachable` means that a matching causal capture actually observed
   a chain. It does not solve SELinux allow rules, Android manifest permissions,
   VINTF compatibility, or theoretical Binder reachability.
+- Reachable output reports capture `status` separately from attribution
+  `confidence`. No matching capture is `no_evidence`, not a successful empty
+  result. Candidate/inferred branches remain visible and explicitly qualified.
 - Static `proc_fd` relations are point-in-time state and are deliberately
   excluded from reachability traversal. Static service/process/device fields
   only enrich a node reached through a causal trace.
 - Reachability accepts only capture-sourced `root_process`, `binder`,
   `served_by`, and `ioctl` edges. A trace ID on any other relation type does
   not make that edge causal.
+- Captured SELinux denials are attempt evidence and are never traversed as
+  successful device reachability.
 - Live `--observe` requires exactly one `--from-package` or `--from-uid`.
   System-wide live observation is not supported, and `--capture` cannot be
   combined with `--observe`.
@@ -271,12 +276,12 @@ vulnerability, a feature, or a false positive is up to the analyst.
 | Limitation | Tracking version | Notes |
 |------------|------------------|-------|
 | Binder service attribution | v1.2 | Exact map/template/catalog helpers; candidate catalogs are not exact attribution |
-| Binder Parcel decoding | future | Full AIDL payload decoding remains out of scope for 1.2.0 |
+| Binder Parcel decoding | selective/future | Catalog attribution and a bounded offline KeyMint plugin exist; generic payload decoding remains out of scope |
 | FD → device/socket attribution for ioctl | v1.1 | Userspace FD graph (landed) |
 | FD-count rules / poller / rlimit awareness | sprint-1 PR 3 | `fd_snapshot` events + `fd_count_*` predicates |
 | ioctl decoder registry | v1.1–v1.4 | Typed/verified mappings grow additively; unknown commands remain numeric |
 | `--package` / `--root-uid` process discovery | v1.3 / v1.4 | Neither is retroactive. Package roots can miss sub-second processes between refreshes; explicit UID roots use first-event kernel admission. |
-| Cross-process causal tracing | v1.3 | Observed, bounded Binder following; it is not a theoretical reachability solver |
+| Cross-process causal tracing | v1.3–v1.4 | Observed Binder following with depth/PID/TTL/domain/special-process guardrails; incomplete branches are explicit |
 | Android surface mapper | v1.4 | Static inventory plus imported/live causal evidence; explicit collector health |
 | `path_truncated` counter wired in BPF | v1.1 | Currently reserved in COUNTERS but not incremented |
 
