@@ -1,15 +1,50 @@
+use std::fs;
 use std::io::Cursor;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use neutron::cli::{Cli, Command};
 use neutron::causal::CausalRelation;
 use neutron::selinux::{
     explain_from_reader, parse_avc_line, process_context_relation, render_explanation_text,
-    DenialDeduper,
+    run as run_selinux, DenialDeduper, ExplainArgs, ExplainFormat, SelinuxCommand,
 };
 use neutron_common::{ProcessTraceContext, TraceReason};
 
 const ENFORCING_AVC: &str = r#"05-05 12:00:00.000  1000  1000 W auditd: type=1400 audit(1714910400.123:9182): avc: denied { ioctl read } for pid=1234 comm="com.example.app" path="/dev/trusty-ipc-dev0" ioctlcmd=0xc0047401 scontext=u:r:untrusted_app:s0:c123,c456 tcontext=u:object_r:tee_device:s0 tclass=chr_file permissive=0"#;
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "neutron-selinux-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn process_wide_binder_context_is_inferred_for_selinux_denials() {
@@ -247,4 +282,53 @@ fn selinux_explain_cli_accepts_public_flags() {
     .unwrap();
 
     assert!(matches!(cli.command, Some(Command::Selinux(_))));
+}
+
+#[test]
+fn explain_output_rejects_unsafe_files_before_truncating() {
+    let temp = TestDir::new();
+    let capture = temp.path("capture.ndjson");
+    fs::write(&capture, positive_capture()).unwrap();
+    let target = temp.path("target.json");
+    fs::write(&target, b"untouched").unwrap();
+
+    let link = temp.path("report-link.json");
+    symlink(&target, &link).unwrap();
+    let error = run_selinux(SelinuxCommand::Explain(ExplainArgs {
+        capture: capture.to_string_lossy().into_owned(),
+        event_id: 9182,
+        format: ExplainFormat::Json,
+        output: Some(link),
+    }))
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("secure output"));
+    assert_eq!(fs::read(&target).unwrap(), b"untouched");
+
+    let hardlink = temp.path("report-hardlink.json");
+    fs::hard_link(&target, &hardlink).unwrap();
+    let error = run_selinux(SelinuxCommand::Explain(ExplainArgs {
+        capture: capture.to_string_lossy().into_owned(),
+        event_id: 9182,
+        format: ExplainFormat::Json,
+        output: Some(hardlink),
+    }))
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("one link"));
+    assert_eq!(fs::read(&target).unwrap(), b"untouched");
+
+    let public = temp.path("report-public.json");
+    fs::write(&public, b"still-private-after-validation").unwrap();
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o644)).unwrap();
+    let error = run_selinux(SelinuxCommand::Explain(ExplainArgs {
+        capture: capture.to_string_lossy().into_owned(),
+        event_id: 9182,
+        format: ExplainFormat::Json,
+        output: Some(public.clone()),
+    }))
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("secure output"));
+    assert_eq!(
+        fs::read(&public).unwrap(),
+        b"still-private-after-validation"
+    );
 }
