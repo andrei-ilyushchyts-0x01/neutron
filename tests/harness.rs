@@ -147,6 +147,11 @@ fn extract_writes_portable_artifact_contract() {
     assert_eq!(metadata["steps"][0]["event_id"], 6);
     assert_eq!(metadata["steps"][1]["event_id"], 7);
     assert_eq!(metadata["required_identity"]["package"], "com.example.app");
+    let runner: Value =
+        serde_json::from_slice(&fs::read(output.join("runner.json")).unwrap()).unwrap();
+    assert_eq!(runner["transport"], "adb");
+    assert_eq!(runner["execute"][0], "{artifact}/replay");
+    assert_eq!(runner["execute"][1], "{artifact}/input.bin");
     let compiled = std::process::Command::new("rustc")
         .arg("--edition=2021")
         .arg(output.join("replay.rs"))
