@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -34,6 +34,12 @@ pub struct ExtractArgs {
     pub event_id: u64,
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BuildArgs {
+    /// Extracted testcase directory containing `replay.rs`.
+    pub directory: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -279,6 +285,16 @@ pub struct RunResult {
     pub warning: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildManifest {
+    schema: String,
+    target: String,
+    compiler: String,
+    source_sha256: String,
+    binary_sha256: String,
+    binary_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1631,7 +1647,7 @@ fn write_artifact(
         fs::write(
             output.join("README.md"),
             format!(
-                "# Neutron regression testcase\n\n{WARNING}\n\nBuild `replay.rs` for aarch64, review `runner.json`, and run through `neutron harness replay`.\n\nReplay status: **{}**.\n{}\n",
+                "# Neutron regression testcase\n\n{WARNING}\n\nRun `neutron harness build .`, review `runner.json`, and then use `neutron harness replay`.\n\nReplay status: **{}**.\n{}\n",
                 metadata.replay_status,
                 metadata
                     .blocked_reasons
@@ -1767,6 +1783,108 @@ fn put_i32(target: &mut [u8], offset: u64, value: i32) -> std::io::Result<()> {{
 unsafe extern "C" {{ fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i32; }}
 "#
     ))
+}
+
+pub fn build(args: BuildArgs) -> Result<()> {
+    const TARGET: &str = "aarch64-unknown-linux-musl";
+
+    validate_artifact(&args.directory)?;
+    validate_private_directory(&args.directory)?;
+    let source = args.directory.join("replay.rs");
+    let source_metadata = fs::symlink_metadata(&source)
+        .with_context(|| format!("inspecting {}", source.display()))?;
+    if !source_metadata.file_type().is_file()
+        || source_metadata.file_type().is_symlink()
+        || source_metadata.len() > MAX_EVENT_BYTES
+    {
+        bail!("replay.rs must be a regular file no larger than 4 MiB");
+    }
+    let source_bytes = fs::read(&source)?;
+    let source_sha256 = format!("{:x}", Sha256::digest(&source_bytes));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary_name = format!(".replay-build-{}-{nonce}", std::process::id());
+    let temporary = args.directory.join(&temporary_name);
+    if fs::symlink_metadata(&temporary).is_ok() {
+        bail!("temporary replay output already exists");
+    }
+
+    let compiler = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .context("running rustc --version")?;
+    if !compiler.status.success() {
+        bail!("rustc --version failed");
+    }
+    let compiler = String::from_utf8(compiler.stdout)
+        .context("rustc --version output is not UTF-8")?
+        .trim()
+        .to_string();
+    let output = Command::new("rustc")
+        .current_dir(&args.directory)
+        .args([
+            "--edition=2021",
+            "--target",
+            TARGET,
+            "-C",
+            "opt-level=2",
+            "-C",
+            "panic=abort",
+            "replay.rs",
+            "-o",
+            &temporary_name,
+        ])
+        .output()
+        .context("cross-building generated replay.rs")?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary);
+        bail!(
+            "replay cross-build failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let result = (|| {
+        let metadata = fs::symlink_metadata(&temporary)?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_REPLAY_BINARY_BYTES
+        {
+            bail!("cross-build output is not a bounded regular file");
+        }
+        let binary = fs::read(&temporary)?;
+        let elf = goblin::elf::Elf::parse(&binary).context("parsing replay ELF")?;
+        if elf.header.e_machine != goblin::elf::header::EM_AARCH64 || elf.interpreter.is_some() {
+            bail!("replay output must be a static AArch64 ELF binary");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
+        }
+        fs::rename(&temporary, args.directory.join("replay"))?;
+        crate::private_output::write_json(
+            &args.directory.join("build.json"),
+            &BuildManifest {
+                schema: HARNESS_SCHEMA.into(),
+                target: TARGET.into(),
+                compiler,
+                source_sha256,
+                binary_sha256: format!("{:x}", Sha256::digest(&binary)),
+                binary_bytes: metadata.len(),
+            },
+            true,
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    println!("{}", args.directory.join("replay").display());
+    Ok(())
 }
 
 pub fn replay(args: ReplayArgs) -> Result<()> {
@@ -2959,6 +3077,22 @@ fn secure_directory(path: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn validate_private_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting testcase directory {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("testcase path must be a real directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            bail!("testcase directory must be owned by the current user and mode-private");
+        }
     }
     Ok(())
 }

@@ -2051,6 +2051,7 @@ fn main() -> Result<()> {
             neutron::ioctl_schema::generate(&args)
         }
         Some(Command::Harness(HarnessCommand::Extract(args))) => neutron::harness::extract(args),
+        Some(Command::Harness(HarnessCommand::Build(args))) => neutron::harness::build(args),
         Some(Command::Harness(HarnessCommand::Minimize(args))) => neutron::harness::minimize(args),
         Some(Command::Harness(HarnessCommand::Replay(args))) => neutron::harness::replay(args),
         Some(Command::Aidl(AidlCommand::Index(args))) => neutron::aidl::run_index(args),

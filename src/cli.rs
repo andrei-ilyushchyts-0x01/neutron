@@ -114,6 +114,8 @@ pub enum AidlCommand {
 pub enum HarnessCommand {
     /// Extract one captured event and its dependencies into a testcase directory.
     Extract(crate::harness::ExtractArgs),
+    /// Cross-build the generated replay for a physical Android device.
+    Build(crate::harness::BuildArgs),
     /// Minimize a testcase without synthesizing new values.
     Minimize(crate::harness::MinimizeArgs),
     /// Replay a testcase on one explicitly selected physical USB device.
