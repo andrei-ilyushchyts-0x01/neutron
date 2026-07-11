@@ -79,7 +79,9 @@ impl SyscallSpan {
 pub struct ExitSpan {
     pub ts_ns: Option<u64>,
     pub pid: u32,
+    pub uid: Option<u32>,
     pub comm: Option<String>,
+    pub classification: String,
     pub label: String,
     pub trace_id: Option<String>,
     pub scenario_id: Option<String>,
@@ -380,16 +382,22 @@ fn merge_syscall(syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>, object: &Map<
                 nr,
             )
         });
+    let name = text(object, "name")
+        .or_else(|| text(object, "syscall"))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("syscall {nr}"));
+    let fd_path = text(object, "fd_path").or_else(|| {
+        matches!(name.as_str(), "open" | "openat" | "openat2")
+            .then(|| text(object, "data"))
+            .flatten()
+    });
     let candidate = SyscallSpan {
         ts_ns: number_u64(object, "ts_ns"),
         pid,
         uid: number_u32(object, "uid"),
         tid,
         nr,
-        name: text(object, "name")
-            .or_else(|| text(object, "syscall"))
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("syscall {nr}")),
+        name,
         comm: text(object, "comm").map(str::to_string),
         phase,
         ret: number_i64(object, "ret"),
@@ -397,7 +405,7 @@ fn merge_syscall(syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>, object: &Map<
         ioctl_cmd: ioctl_cmd(object),
         ioctl_name: text(object, "ioctl_name").map(str::to_string),
         ioctl_family: text(object, "ioctl_family").map(str::to_string),
-        fd_path: text(object, "fd_path").map(str::to_string),
+        fd_path: fd_path.map(str::to_string),
         trace_id: text(object, "trace_id").map(str::to_string),
         scenario_id: text(object, "scenario_id").map(str::to_string),
         span_id: text(object, "span_id").map(str::to_string),
@@ -451,7 +459,11 @@ fn parse_exit(object: &Map<String, Value>) -> Option<ExitSpan> {
     Some(ExitSpan {
         ts_ns: number_u64(object, "ts_ns"),
         pid,
+        uid: number_u32(object, "uid"),
         comm: text(object, "comm").map(str::to_string),
+        classification: text(object, "classification")
+            .unwrap_or("unknown")
+            .to_string(),
         label: text(object, "signal_name")
             .or_else(|| text(object, "classification"))
             .unwrap_or("process exit")

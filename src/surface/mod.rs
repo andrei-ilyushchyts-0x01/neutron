@@ -1447,6 +1447,17 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             root.uid = syscall.root_uid.or(root.uid);
         }
     }
+    for exit in &capture.exits {
+        if let Some(trace_id) = exit.trace_id.as_ref() {
+            let root = roots.entry(trace_id.clone()).or_default();
+            root.scenario_id = exit
+                .scenario_id
+                .clone()
+                .unwrap_or_else(|| root.scenario_id.clone());
+            root.package = exit.root_package.clone().or(root.package.clone());
+            root.uid = exit.root_uid.or(root.uid);
+        }
+    }
     for denial in &capture.denials {
         if let Some(trace_id) = denial.trace_id.as_ref() {
             let root = roots.entry(trace_id.clone()).or_default();
@@ -1629,9 +1640,13 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
                 ));
             }
         }
-        if syscall.name != "ioctl" && syscall.ioctl_cmd.is_none() {
-            continue;
-        }
+        let access_type = match syscall.name.as_str() {
+            "open" | "openat" | "openat2" => "open",
+            "mmap" | "mmap2" => "mmap",
+            "ioctl" => "ioctl",
+            _ if syscall.ioctl_cmd.is_some() => "ioctl",
+            _ => continue,
+        };
         let Some(device_id) = syscall
             .fd_path
             .as_ref()
@@ -1639,13 +1654,20 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
         else {
             continue;
         };
-        let label = syscall
-            .ioctl_name
-            .clone()
-            .or_else(|| syscall.ioctl_cmd.map(ioctl_label))
-            .unwrap_or_else(|| "cmd=unknown".into());
+        let completed_successfully = syscall.is_exit() && syscall.ret.is_some_and(|ret| ret >= 0);
+        let ioctl_label = (access_type == "ioctl").then(|| {
+            syscall
+                .ioctl_name
+                .clone()
+                .or_else(|| syscall.ioctl_cmd.map(ioctl_label))
+                .unwrap_or_else(|| "cmd=unknown".into())
+        });
         let mut relation = make_relation(
-            "ioctl",
+            if completed_successfully {
+                access_type
+            } else {
+                "syscall_attempt"
+            },
             &process_id,
             &device_id,
             "capture",
@@ -1655,9 +1677,23 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             scenario_id.clone(),
             syscall.span_id.clone(),
         );
-        relation.ioctl = Some(label.clone());
-        relation.evidence.detail = Some(label.clone());
+        relation.ioctl = ioctl_label.clone();
+        relation.evidence.detail = Some(if completed_successfully {
+            ioctl_label
+                .clone()
+                .unwrap_or_else(|| format!("{} ret={}", syscall.name, syscall.ret.unwrap_or(0)))
+        } else if let Some(ret) = syscall.ret {
+            format!("{} ret={ret}", syscall.name)
+        } else if syscall.is_exit() {
+            format!("{} result=unknown", syscall.name)
+        } else {
+            format!("{} enter", syscall.name)
+        });
         snapshot.relations.push(relation);
+
+        if !completed_successfully {
+            continue;
+        }
 
         let service_id = syscall
             .parent_span_id
@@ -1680,9 +1716,70 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
                 .find(|service| service.id == service_id)
             {
                 service.observed_devices.push(device_id);
-                service.observed_ioctls.push(label);
+                if let Some(label) = ioctl_label {
+                    service.observed_ioctls.push(label);
+                }
             }
         }
+    }
+
+    for exit in capture.exits {
+        let Some(trace_id) = exit.trace_id.clone() else {
+            continue;
+        };
+        let root = roots.get(&trace_id).cloned().unwrap_or_default();
+        let process_uid = exit
+            .uid
+            .or_else(|| (exit.depth == Some(0)).then_some(root.uid).flatten());
+        let (process_id, process_confidence) = capture_process(
+            snapshot,
+            exit.pid,
+            &trace_id,
+            process_uid,
+            merge_confidence,
+            exit.ts_ns,
+        );
+        let scenario_id = exit
+            .scenario_id
+            .clone()
+            .or_else(|| roots.get(&trace_id).map(|root| root.scenario_id.clone()))
+            .filter(|value| !value.is_empty());
+        if exit.depth == Some(0) {
+            if let Some(root_id) = root_id(&root) {
+                snapshot.relations.push(make_relation(
+                    "root_process",
+                    &root_id,
+                    &process_id,
+                    "capture",
+                    &process_confidence,
+                    Some(relation_name(exit.relation).into()),
+                    Some(trace_id.clone()),
+                    scenario_id.clone(),
+                    exit.span_id.clone(),
+                ));
+            }
+        }
+        let capture_id = format!(
+            "capture:{trace_id}:{}",
+            scenario_id.as_deref().unwrap_or("unknown")
+        );
+        let mut relation = make_relation(
+            if exit.classification == "crash" {
+                "crash"
+            } else {
+                "process_exit"
+            },
+            &process_id,
+            &capture_id,
+            "capture",
+            &process_confidence,
+            Some(relation_name(exit.relation).into()),
+            Some(trace_id),
+            scenario_id,
+            exit.span_id,
+        );
+        relation.evidence.detail = Some(exit.label);
+        snapshot.relations.push(relation);
     }
 
     for denial in capture.denials {
@@ -1960,7 +2057,7 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
                 && relation.evidence.source == "capture"
                 && matches!(
                     relation.relation_type.as_str(),
-                    "root_process" | "binder" | "served_by" | "ioctl"
+                    "root_process" | "binder" | "served_by" | "open" | "mmap" | "ioctl"
                 )
         })
         .cloned()

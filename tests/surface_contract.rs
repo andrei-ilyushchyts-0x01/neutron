@@ -506,7 +506,7 @@ fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges
     let capture = r#"
 {"type":"marker","phase":"start","name":"surface-observe","scenario_id":"surface-observe","trace_id":"0000000000001234","root_package":"com.example.app","generation":1}
 {"type":"binder","pid":100,"comm":"app","to_proc":42,"debug_id":7,"code":1,"target_node":2,"service":"android.hardware.security.keymint.IKeyMintDevice/default","trace_id":"0000000000001234","span_id":"0000000000000011","parent_span_id":"0000000000000010","scenario_id":"surface-observe","depth":1,"causal_relation":"exact"}
-{"type":"syscall","pid":42,"tid":43,"uid":1000,"name":"ioctl","nr":29,"phase":"exit","ts_ns":30,"enter_ts_ns":20,"args":[7,1074295424,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"0000000000001234","span_id":"0000000000000012","parent_span_id":"0000000000000011","scenario_id":"surface-observe","depth":2,"causal_relation":"exact"}
+{"type":"syscall","pid":42,"tid":43,"uid":1000,"name":"ioctl","nr":29,"phase":"exit","ret":0,"ts_ns":30,"enter_ts_ns":20,"args":[7,1074295424,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"0000000000001234","span_id":"0000000000000012","parent_span_id":"0000000000000011","scenario_id":"surface-observe","depth":2,"causal_relation":"exact"}
 {"type":"capture_health","degraded":false,"root_package":"com.example.app","boot_id":"boot-a","fingerprint":"google/husky/test:user/release-keys"}
 {"type":"marker","phase":"end","name":"surface-observe","scenario_id":"surface-observe","trace_id":"0000000000001234"}
 "#;
@@ -617,7 +617,10 @@ fn device_boundary_outcomes_and_crashes_remain_honest() {
         .iter()
         .find(|service| service.name.contains("keymint"))
         .expect("keymint service");
-    assert_eq!(service.observed_devices, vec![snapshot.devices[0].id.clone()]);
+    assert_eq!(
+        service.observed_devices,
+        vec![snapshot.devices[0].id.clone()]
+    );
     assert!(service.observed_ioctls.is_empty());
 
     let reached = reachable(
