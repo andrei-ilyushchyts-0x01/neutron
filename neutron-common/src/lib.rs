@@ -812,4 +812,28 @@ mod causal_pid_policy_tests {
             CAUSAL_PID_FALLTHROUGH
         );
     }
+
+    #[test]
+    fn binder_admission_covers_a_sibling_thread_that_started_before_follow() {
+        assert!(causal_admission_boundary_exit(
+            TraceReason::Binder,
+            false,
+            false,
+        ));
+        assert!(causal_admission_boundary_exit(
+            TraceReason::Binder,
+            true,
+            true,
+        ));
+        assert!(!causal_admission_boundary_exit(
+            TraceReason::Binder,
+            true,
+            false,
+        ));
+        assert!(!causal_admission_boundary_exit(
+            TraceReason::Root,
+            false,
+            false,
+        ));
+    }
 }
