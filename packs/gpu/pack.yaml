@@ -1,0 +1,7 @@
+schema: neutron.research-pack/v1
+id: gpu
+version: "1.0.0"
+compatibility: { android_api_min: 29, vendors: [google, qualcomm, arm, "*"] }
+default_scenario: gpu-default
+components: { services: services.json, devices: devices.json, scenarios: scenarios.yaml, rules: rules.yaml, report: report.md }
+content_hash: sha256:17cccbbd60b668829eddd81ff30b3e72cd0c8f13d34d76451f13510eab0e357b

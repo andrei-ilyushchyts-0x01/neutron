@@ -1,0 +1,11 @@
+schema: neutron.research-scenarios/v1
+scenarios:
+  - id: wifi-default
+    root_package: probe
+    follow_services: true
+    follow_hal: true
+    trace: { driver_packs: [binder], syscalls: [29, 198, 206, 207, 208, 209], resolve_paths: true }
+    stimulus: { action: wifi, timeout: 15s }
+    duration: 6s
+    settle_ms: 500
+    calibration: { scans: "1", identifiers_retained: "false", enable_radio: "false" }

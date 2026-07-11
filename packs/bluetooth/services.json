@@ -1,0 +1,1 @@
+{"schema":"neutron.research-services/v1","services":[{"id":"bluetooth-service","required":true,"alternatives":[{"names":["bluetooth_manager","bluetooth"],"process_patterns":["*bluetooth*"]},{"names":["android.hardware.bluetooth.IBluetoothHci/default"]}]}]}

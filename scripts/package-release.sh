@@ -46,6 +46,10 @@ echo "==> Assembling $NAME"
 install -m 0755 target/aarch64-unknown-linux-musl/release/neutron "$PAYLOAD/neutron"
 install -m 0644 neutron.bpf.elf "$PAYLOAD/neutron.bpf.elf"
 install -m 0644 README.md CHANGELOG.md LICENSE SECURITY.md "$PAYLOAD/"
+mkdir -p "$PAYLOAD/share/neutron"
+cp -R packs "$PAYLOAD/share/neutron/"
+find "$PAYLOAD/share/neutron/packs" -type d -exec chmod 0755 {} \;
+find "$PAYLOAD/share/neutron/packs" -type f -exec chmod 0644 {} \;
 
 cat > "$PAYLOAD/INSTALL.md" <<'EOF'
 # Install
@@ -53,6 +57,9 @@ cat > "$PAYLOAD/INSTALL.md" <<'EOF'
 ```bash
 adb push neutron /data/local/tmp/neutron
 adb push neutron.bpf.elf /data/local/tmp/neutron.bpf.elf
+adb shell mkdir -p /data/local/share/neutron/packs
+adb push share/neutron/packs/. /data/local/share/neutron/packs/
+adb shell "su -c 'chown -R 0:0 /data/local/share/neutron/packs && find /data/local/share/neutron/packs -type d -exec chmod 0755 {} \; && find /data/local/share/neutron/packs -type f -exec chmod 0644 {} \;'"
 adb shell chmod +x /data/local/tmp/neutron
 adb shell "su -c '/data/local/tmp/neutron doctor'"
 ```

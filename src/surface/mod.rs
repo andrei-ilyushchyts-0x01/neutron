@@ -416,6 +416,14 @@ fn run_scan(args: SurfaceScanArgs) -> Result<()> {
     write_json(args.output.as_deref(), &snapshot)
 }
 
+/// Collect the same deterministic static snapshot used by `surface scan`
+/// without routing it through a temporary JSON file.
+pub fn collect_snapshot() -> Result<SurfaceSnapshot> {
+    let mut snapshot = scan_with_reader(&RealPlatformReader)?;
+    finish_snapshot(&mut snapshot);
+    Ok(snapshot)
+}
+
 #[derive(Default)]
 struct HealthBuilder {
     collectors: BTreeMap<String, CollectorHealth>,
@@ -2243,6 +2251,10 @@ fn finish_snapshot(snapshot: &mut SurfaceSnapshot) {
     }
 }
 
+pub fn finalize_snapshot(snapshot: &mut SurfaceSnapshot) {
+    finish_snapshot(snapshot);
+}
+
 fn read_snapshot(path: &str) -> Result<SurfaceSnapshot> {
     let reader = open_input(path)?;
     let mut snapshot: SurfaceSnapshot = serde_json::from_reader(reader)
@@ -2434,6 +2446,33 @@ fn observe_in(
     create_private_file(&capture_path)?;
     create_private_file(&health_path)?;
 
+    let extra_args = ["--follow-services".to_string(), "--follow-hal".to_string()];
+    run_trace_session(
+        &capture_path,
+        &health_path,
+        &socket_path,
+        selector,
+        "surface-observe",
+        &extra_args,
+        |child| wait_trace(child, duration),
+    )
+}
+
+/// Shared child-session primitive used by live surface observation and
+/// validated research scenarios. `extra_args` must be constructed by trusted
+/// Rust code; data packs never reach this interface as argv.
+pub fn run_trace_session<F>(
+    capture_path: &Path,
+    health_path: &Path,
+    socket_path: &Path,
+    selector: &RootSelector,
+    scenario_name: &str,
+    extra_args: &[String],
+    body: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce(&mut Child) -> Result<()>,
+{
     // `/proc/self/exe` retains the running inode even if a shell-writable
     // deployment pathname is replaced between parent startup and child exec.
     let mut command = ProcessCommand::new("/proc/self/exe");
@@ -2447,13 +2486,14 @@ fn observe_in(
         }
     }
     command
-        .args(["--follow-services", "--follow-hal", "--json", "--raw"])
+        .args(["--json", "--raw"])
+        .args(extra_args)
         .arg("--output")
-        .arg(&capture_path)
+        .arg(capture_path)
         .arg("--health-output")
-        .arg(&health_path)
+        .arg(health_path)
         .arg("--control-socket")
-        .arg(&socket_path)
+        .arg(socket_path)
         .args(observation_trace_args())
         .stdout(Stdio::null());
     // SAFETY: the closure only calls async-signal-safe libc functions. The
@@ -2472,10 +2512,10 @@ fn observe_in(
     }
     let mut child = command.spawn().context("starting child neutron trace")?;
     let result = (|| -> Result<Vec<u8>> {
-        wait_for_socket(&mut child, &socket_path, Duration::from_secs(10))?;
-        send_observation_mark(&socket_path, "start")?;
-        wait_observation(&mut child, duration)?;
-        send_observation_mark(&socket_path, "end")?;
+        wait_for_socket(&mut child, socket_path, Duration::from_secs(10))?;
+        send_session_mark(socket_path, scenario_name, "start")?;
+        body(&mut child)?;
+        send_session_mark(socket_path, scenario_name, "end")?;
         // SAFETY: child.id() is a live process ID owned by this parent.
         if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) } != 0 {
             return Err(io::Error::last_os_error()).context("sending SIGINT to child trace");
@@ -2484,33 +2524,31 @@ fn observe_in(
         if !status.success() {
             bail!("child neutron trace exited with {status}");
         }
-        let health = fs::read_to_string(&health_path)
+        let health = fs::read_to_string(health_path)
             .context("reading final child capture_health sidecar")?;
         if !ends_with_capture_health(health.as_bytes()) {
             bail!("child trace did not produce a final capture_health record");
         }
-        let bytes = fs::read(&capture_path).context("reading child causal capture")?;
+        let bytes = fs::read(capture_path).context("reading child causal capture")?;
         let normalized = crate::capture_normalize::normalize_capture(Cursor::new(&bytes))?;
         let starts: Vec<_> = normalized
             .markers
             .iter()
             .filter(|marker| {
-                marker.name == "surface-observe" && marker.phase.as_deref() == Some("start")
+                marker.name == scenario_name && marker.phase.as_deref() == Some("start")
             })
             .collect();
         let ends: Vec<_> = normalized
             .markers
             .iter()
-            .filter(|marker| {
-                marker.name == "surface-observe" && marker.phase.as_deref() == Some("end")
-            })
+            .filter(|marker| marker.name == scenario_name && marker.phase.as_deref() == Some("end"))
             .collect();
         if starts.len() != 1
             || ends.len() != 1
             || starts[0].trace_id.is_none()
             || starts[0].trace_id != ends[0].trace_id
         {
-            bail!("child capture is missing one matched surface-observe start/end pair");
+            bail!("child capture is missing one matched {scenario_name} start/end pair");
         }
         if normalized.health.is_none() || !ends_with_capture_health(&bytes) {
             bail!("child primary capture is missing its final capture_health record");
@@ -2518,11 +2556,21 @@ fn observe_in(
         Ok(bytes)
     })();
     let child_cleanup = stop_child(&mut child);
-    combine_cleanup(result, child_cleanup, "child trace cleanup")
+    let result = combine_cleanup(result, child_cleanup, "child trace cleanup");
+    let socket_cleanup = match fs::remove_file(socket_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("removing child trace control socket"),
+    };
+    combine_cleanup(result, socket_cleanup, "control socket cleanup")
 }
 
 fn observation_trace_args() -> &'static [&'static str] {
     &["--fdgraph-interval", "off", "--lookback-events", "0"]
+}
+
+pub fn wait_trace(child: &mut Child, duration: Duration) -> Result<()> {
+    wait_observation(child, duration)
 }
 
 fn ends_with_capture_health(input: &[u8]) -> bool {
@@ -2623,11 +2671,11 @@ fn wait_observation(child: &mut Child, duration: Duration) -> Result<()> {
     }
 }
 
-fn send_observation_mark(path: &Path, phase: &str) -> Result<()> {
+fn send_session_mark(path: &Path, name: &str, phase: &str) -> Result<()> {
     crate::causal::send_mark_request(
         path,
         &crate::causal::MarkRequest {
-            name: "surface-observe".into(),
+            name: name.into(),
             phase: phase.into(),
             meta: BTreeMap::new(),
         },

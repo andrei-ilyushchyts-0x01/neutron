@@ -1,0 +1,1 @@
+Creates a bounded EGL pbuffer, clears it, reads back a small in-memory buffer, and destroys all EGL objects. Pixels are never persisted. Driver-node alternatives are vendor-specific and a missing required node yields `unsupported`.

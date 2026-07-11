@@ -1,0 +1,12 @@
+schema: neutron.research-pack/v1
+id: keymint
+version: "1.0.0"
+compatibility: { android_api_min: 29, vendors: ["*"] }
+default_scenario: keymint-default
+components:
+  services: services.json
+  devices: devices.json
+  scenarios: scenarios.yaml
+  rules: rules.yaml
+  report: report.md
+content_hash: sha256:384123446168fdac34b8de91efc80a723bd507558236f1b04a4b5fdb28b881b0

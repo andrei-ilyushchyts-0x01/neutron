@@ -1,0 +1,1 @@
+{"schema":"neutron.research-devices/v1","devices":[{"id":"codec-node","required":false,"alternatives":[{"paths":["/dev/video*"]},{"paths":["/dev/media*"]}]}]}

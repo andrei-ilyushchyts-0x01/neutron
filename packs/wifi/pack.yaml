@@ -1,0 +1,7 @@
+schema: neutron.research-pack/v1
+id: wifi
+version: "1.0.0"
+compatibility: { android_api_min: 29, vendors: ["*"] }
+default_scenario: wifi-default
+components: { services: services.json, devices: devices.json, scenarios: scenarios.yaml, rules: rules.yaml, report: report.md }
+content_hash: sha256:4710b17c1118f558cc587ca2733353270fe22380be71aa6edcf46c137568114a

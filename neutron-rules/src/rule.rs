@@ -133,6 +133,11 @@ impl Rule {
         if self.conditions.is_empty() {
             return Err(format!("rule {} has no conditions", self.id));
         }
+        for condition in &self.conditions {
+            condition
+                .validate()
+                .map_err(|error| format!("rule {}: {error}", self.id))?;
+        }
         if let Some(freq) = &self.frequency {
             if freq.window_ms == 0 {
                 return Err(format!("rule {}: frequency.window_ms must be > 0", self.id));

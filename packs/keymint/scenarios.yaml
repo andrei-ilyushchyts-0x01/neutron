@@ -1,0 +1,11 @@
+schema: neutron.research-scenarios/v1
+scenarios:
+  - id: keymint-default
+    root_package: probe
+    follow_services: true
+    follow_hal: true
+    trace: { driver_packs: [binder], syscalls: [29, 56, 57, 64, 222, 226], fd_paths: ["/dev/trusty*", "/dev/tipc*"], resolve_paths: true }
+    stimulus: { action: keymint, timeout: 15s }
+    duration: 5s
+    settle_ms: 500
+    calibration: { tipc_message_threshold: "4096", key_algorithm: AES, key_size: "256" }

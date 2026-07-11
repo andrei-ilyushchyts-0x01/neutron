@@ -1,0 +1,1 @@
+{"schema":"neutron.research-devices/v1","devices":[{"id":"gpu-node","required":true,"alternatives":[{"paths":["/dev/kgsl-3d0"],"drivers":["kgsl*"]},{"paths":["/dev/mali*"],"drivers":["mali*"]},{"paths":["/dev/dri/renderD*"]}]}]}

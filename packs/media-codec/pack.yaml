@@ -1,0 +1,7 @@
+schema: neutron.research-pack/v1
+id: media-codec
+version: "1.0.0"
+compatibility: { android_api_min: 29, vendors: ["*"] }
+default_scenario: media-codec-default
+components: { services: services.json, devices: devices.json, scenarios: scenarios.yaml, rules: rules.yaml, report: report.md }
+content_hash: sha256:0b548495e26304d9d946f0f053eea5a2b9d9b1713a0ab842676ac1c391a04f3c

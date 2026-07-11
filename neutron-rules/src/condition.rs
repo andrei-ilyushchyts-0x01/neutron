@@ -22,6 +22,27 @@ use crate::event::{Event, EventKind};
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatchCondition {
+    /// Match an event from one of these causal scenarios.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_in: Option<Vec<String>>,
+
+    /// Match the beginning of the resolved file-descriptor path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_path_prefix: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_service_in: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_interface_in: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_method_in: Option<Vec<String>>,
+
+    /// Match a causal process crash or a Binder callee-crashed lifecycle event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_service_crash: Option<bool>,
+
     /// Match if the event is a syscall with `nr` in this list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syscall_in: Option<Vec<i32>>,
@@ -83,6 +104,21 @@ pub struct MatchCondition {
     /// Match if `args[0]` is in this list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arg0_in: Option<Vec<u64>>,
+
+    /// Index for the bounded generic argument comparisons below (`0..=5`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_index: Option<u8>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_eq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_gt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_gte: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_lt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_lte: Option<u64>,
 
     /// Match if the resolved `stack` field contains *any* of these substrings.
     /// If the event has no stack, this condition is treated as no-match
@@ -184,8 +220,64 @@ pub struct MatchCondition {
 }
 
 impl MatchCondition {
+    pub fn validate(&self) -> Result<(), String> {
+        let comparisons = [
+            self.arg_eq,
+            self.arg_gt,
+            self.arg_gte,
+            self.arg_lt,
+            self.arg_lte,
+        ];
+        let has_comparison = comparisons.iter().any(Option::is_some);
+        match (self.arg_index, has_comparison) {
+            (Some(0..=5), true) | (None, false) => Ok(()),
+            (Some(index), _) if index > 5 => Err(format!("arg_index {index} is outside 0..=5")),
+            (Some(_), false) => Err("arg_index requires an arg comparison".into()),
+            (None, true) => Err("arg comparison requires arg_index".into()),
+            _ => unreachable!(),
+        }
+    }
+
     /// Returns `true` only if every Some(...) field matches.
     pub fn matches(&self, ev: &Event<'_>) -> bool {
+        if let Some(list) = &self.scenario_in {
+            match ev.scenario_id {
+                Some(value) if list.iter().any(|candidate| candidate == value) => {}
+                _ => return false,
+            }
+        }
+        if let Some(prefix) = &self.fd_path_prefix {
+            if !ev
+                .fd_path
+                .is_some_and(|path| path.starts_with(prefix.as_str()))
+            {
+                return false;
+            }
+        }
+        for (actual, expected) in [
+            (ev.binder_service, &self.binder_service_in),
+            (ev.binder_interface, &self.binder_interface_in),
+            (ev.binder_method, &self.binder_method_in),
+        ] {
+            if let Some(expected) = expected {
+                match actual {
+                    Some(value) if expected.iter().any(|candidate| candidate == value) => {}
+                    _ => return false,
+                }
+            }
+        }
+        if let Some(true) = self.causal_service_crash {
+            let process_crash = ev.kind == EventKind::ProcessExit
+                && matches!(
+                    ev.exit_classification,
+                    Some("crash" | "signal_exit" | "abnormal_exit")
+                );
+            let binder_crash =
+                ev.kind == EventKind::BinderCall && ev.binder_status == Some("callee_crashed");
+            if !process_crash && !binder_crash {
+                return false;
+            }
+        }
         if let Some(list) = &self.syscall_in {
             if ev.kind != EventKind::Syscall || !list.contains(&ev.syscall_nr) {
                 return false;
@@ -264,6 +356,17 @@ impl MatchCondition {
         }
         if let Some(list) = &self.arg0_in {
             if !list.contains(&ev.args[0]) {
+                return false;
+            }
+        }
+        if let Some(index) = self.arg_index {
+            let value = ev.args[index as usize];
+            if self.arg_eq.is_some_and(|limit| value != limit)
+                || self.arg_gt.is_some_and(|limit| value <= limit)
+                || self.arg_gte.is_some_and(|limit| value < limit)
+                || self.arg_lt.is_some_and(|limit| value >= limit)
+                || self.arg_lte.is_some_and(|limit| value > limit)
+            {
                 return false;
             }
         }

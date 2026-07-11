@@ -45,6 +45,14 @@ pub struct Event<'a> {
     pub is_enter: bool,
     pub ret: i64,
     pub args: [u64; 6],
+    /// Active causal scenario stamped by the trace control socket.
+    pub scenario_id: Option<&'a str>,
+    /// Resolved path for the syscall's file descriptor, when known.
+    pub fd_path: Option<&'a str>,
+    /// Verified Binder/AIDL attribution fields, when known.
+    pub binder_service: Option<&'a str>,
+    pub binder_interface: Option<&'a str>,
+    pub binder_method: Option<&'a str>,
     /// Decoded data field — typically a path, sockaddr, or hex blob. May be
     /// absent if the BPF capture failed (PAN on kernel 4.14).
     pub data: Option<&'a str>,
@@ -177,6 +185,14 @@ impl<'a> Event<'a> {
         let rwx_alert = obj.get("rwx_alert").and_then(|v| v.as_str());
         let stack = obj.get("stack").and_then(|v| v.as_str());
         let event_id = obj.get("event_id").and_then(|v| v.as_u64());
+        let scenario_id = obj.get("scenario_id").and_then(|v| v.as_str());
+        let fd_path = obj.get("fd_path").and_then(|v| v.as_str());
+        let binder_service = obj.get("service").and_then(|v| v.as_str());
+        let binder_interface = obj
+            .get("interface_descriptor")
+            .or_else(|| obj.get("interface"))
+            .and_then(|v| v.as_str());
+        let binder_method = obj.get("method").and_then(|v| v.as_str());
         // FdSnapshot-only fields. None for syscall/binder events.
         let fd_count = obj
             .get("fd_count")
@@ -268,6 +284,11 @@ impl<'a> Event<'a> {
             is_enter,
             ret,
             args,
+            scenario_id,
+            fd_path,
+            binder_service,
+            binder_interface,
+            binder_method,
             data,
             rwx_alert,
             stack,

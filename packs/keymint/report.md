@@ -1,0 +1,1 @@
+Creates one ephemeral AndroidKeyStore AES key and deletes it. The pack observes Binder, KeyMint HAL, and optional Trusty device evidence. It does not export key material, attest, persist aliases, or infer absence from a quiet trace.

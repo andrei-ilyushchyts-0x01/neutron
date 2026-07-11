@@ -1,0 +1,1 @@
+{"schema":"neutron.research-devices/v1","devices":[{"id":"wifi-driver","required":false,"alternatives":[{"drivers":["wlan*","wifi*"]},{"modules":["wlan","cfg80211"]}]}]}

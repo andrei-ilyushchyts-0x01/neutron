@@ -1,0 +1,1 @@
+{"schema":"neutron.research-devices/v1","devices":[{"id":"usb-device","required":true,"alternatives":[{"paths":["/dev/bus/usb/*"]}]}]}

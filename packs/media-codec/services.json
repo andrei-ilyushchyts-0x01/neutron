@@ -1,0 +1,1 @@
+{"schema":"neutron.research-services/v1","services":[{"id":"codec-service","required":true,"alternatives":[{"names":["media.codec","media.extractor"],"process_patterns":["*media.codec*"]},{"names":["android.hardware.media.c2.IComponentStore/*"]}]}]}

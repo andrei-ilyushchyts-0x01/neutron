@@ -1,0 +1,7 @@
+schema: neutron.research-pack/v1
+id: camera
+version: "1.0.0"
+compatibility: { android_api_min: 29, vendors: ["*"] }
+default_scenario: camera-default
+components: { services: services.json, devices: devices.json, scenarios: scenarios.yaml, rules: rules.yaml, report: report.md }
+content_hash: sha256:9ffb42e294513d200d927629522231182e438ea847c07ed63da7fe4506508e75

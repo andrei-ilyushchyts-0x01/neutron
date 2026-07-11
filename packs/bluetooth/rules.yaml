@@ -1,0 +1,21 @@
+- id: unexpected_shared_memory
+  name: Unexpected shared memory
+  description: Shared-memory activity outside the expected Bluetooth profile.
+  severity: medium
+  category: ipc
+  conditions:
+    - { scenario_in: [bluetooth-default], ioctl_family_in: [dma_heap, dma_buf, ashmem] }
+- id: service_crash
+  name: Service crash
+  description: A causal Bluetooth Binder callee crashed.
+  severity: high
+  category: crash
+  conditions:
+    - { scenario_in: [bluetooth-default], causal_service_crash: true }
+- id: permission_transition
+  name: Executable writable mapping
+  description: An observed mmap or mprotect created WX/RWX memory.
+  severity: high
+  category: memory
+  conditions:
+    - { scenario_in: [bluetooth-default], syscall_in: [222, 226], rwx_alert_in: [WX, RWX] }

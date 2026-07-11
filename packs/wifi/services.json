@@ -1,0 +1,1 @@
+{"schema":"neutron.research-services/v1","services":[{"id":"wifi-service","required":true,"alternatives":[{"names":["wifi","wifinl80211"],"process_patterns":["*system_server*"]},{"names":["android.hardware.wifi.IWifi/default"]}]}]}

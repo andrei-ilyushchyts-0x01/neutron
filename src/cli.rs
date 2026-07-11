@@ -88,6 +88,15 @@ pub enum Command {
     #[command(subcommand)]
     Aidl(AidlCommand),
 
+    /// Run a validated, bounded on-device security research scenario.
+    Research(crate::research::ResearchArgs),
+
+    /// Resolve captured raw userspace IPs against ELF/APK/symbol artifacts.
+    NativeMap(crate::native::NativeMapArgs),
+
+    /// Aggregate resolved native frames into neutral Ghidra bookmark JSON.
+    GhidraExport(crate::native::GhidraExportArgs),
+
     /// Explain captured SELinux AVC decisions and observed delegation.
     #[command(subcommand)]
     Selinux(crate::selinux::SelinuxCommand),
@@ -686,5 +695,30 @@ mod tests {
         .expect("parse driver/kprobe packs");
         assert_eq!(cli.args.driver_pack, vec!["binder", "kgsl"]);
         assert_eq!(cli.args.kprobe_pack, vec!["mali", "alsa"]);
+    }
+
+    #[test]
+    fn native_mapping_commands_parse_public_flags() {
+        let native = Cli::try_parse_from([
+            "neutron",
+            "native-map",
+            "capture.ndjson",
+            "--symbols",
+            "symbols",
+            "--json-output",
+            "native.json",
+        ])
+        .unwrap();
+        assert!(matches!(native.command, Some(Command::NativeMap(_))));
+
+        let export = Cli::try_parse_from([
+            "neutron",
+            "ghidra-export",
+            "capture.ndjson",
+            "--output",
+            "bookmarks.json",
+        ])
+        .unwrap();
+        assert!(matches!(export.command, Some(Command::GhidraExport(_))));
     }
 }

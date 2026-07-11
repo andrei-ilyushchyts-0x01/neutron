@@ -177,6 +177,98 @@ fn unrelated_events_produce_no_findings() {
 }
 
 #[test]
+fn research_predicates_scope_paths_binder_and_numeric_args() {
+    let yaml = r#"
+- id: research_rule
+  name: Research rule
+  description: Scoped research event
+  severity: high
+  category: ipc
+  conditions:
+    - scenario_in: [keymint-default]
+      fd_path_prefix: /dev/trusty
+      binder_service_in: [android.system.keystore2.IKeystoreService/default]
+      binder_interface_in: [android.system.keystore2.IKeystoreService]
+      binder_method_in: [generateKey]
+      arg_index: 2
+      arg_gt: 4096
+      arg_lte: 8192
+"#;
+    let rules = neutron_rules::load_rules_yaml_str(yaml).unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"syscall","ts_ns":1,"pid":7,"tid":7,"uid":0,"nr":64,"name":"write","comm":"tee","phase":"exit","ret":5000,"args":[1,2,5000,0,0,0],"scenario_id":"keymint-default","fd_path":"/dev/trusty-ipc-dev0","service":"android.system.keystore2.IKeystoreService/default","interface":"android.system.keystore2.IKeystoreService","method":"generateKey"}"#,
+            r#"{"type":"syscall","ts_ns":2,"pid":7,"tid":7,"uid":0,"nr":64,"name":"write","comm":"tee","phase":"exit","ret":5000,"args":[1,2,5000,0,0,0],"scenario_id":"other","fd_path":"/dev/trusty-ipc-dev0","service":"android.system.keystore2.IKeystoreService/default","interface":"android.system.keystore2.IKeystoreService","method":"generateKey"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "research_rule");
+}
+
+#[test]
+fn research_numeric_arg_index_is_bounded() {
+    let yaml = r#"
+- id: invalid_arg
+  name: Invalid arg
+  description: Out of range
+  severity: low
+  category: ipc
+  conditions:
+    - arg_index: 6
+      arg_gt: 1
+"#;
+    assert!(neutron_rules::load_rules_yaml_str(yaml).is_err());
+}
+
+#[test]
+fn keymint_reference_findings_are_causal_and_scenario_scoped() {
+    let rules = neutron_rules::load_rules_yaml_file(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("packs/keymint/rules.yaml"),
+    )
+    .unwrap();
+    let mut engine = RuleEngine::new(rules).unwrap();
+    feed_lines(
+        &mut engine,
+        &[
+            r#"{"type":"syscall","ts_ns":1,"pid":1,"tid":1,"uid":0,"nr":29,"name":"ioctl","comm":"tee","phase":"exit","ret":0,"args":[1,0,0,0,0,0],"scenario_id":"keymint-default","ioctl_family":"dma_heap"}"#,
+            r#"{"type":"binder_call","ts_ns":2,"caller_pid":1,"callee_pid":2,"code":1,"status":"callee_crashed","scenario_id":"keymint-default"}"#,
+            r#"{"type":"process_exit","ts_ns":2,"pid":2,"tid":2,"uid":0,"comm":"keymint","classification":"crash","source":"tracepoint","scenario_id":"keymint-default"}"#,
+            r#"{"type":"syscall","ts_ns":3,"pid":1,"tid":1,"uid":0,"nr":64,"name":"write","comm":"tee","phase":"exit","ret":5000,"args":[1,0,5000,0,0,0],"scenario_id":"keymint-default","fd_path":"/dev/trusty-ipc-dev0"}"#,
+            r#"{"type":"syscall","ts_ns":4,"pid":1,"tid":1,"uid":0,"nr":226,"name":"mprotect","comm":"tee","phase":"exit","ret":0,"args":[0,4096,6,0,0,0],"scenario_id":"keymint-default","rwx_alert":"WX"}"#,
+            r#"{"type":"syscall","ts_ns":5,"pid":1,"tid":1,"uid":0,"nr":64,"name":"write","comm":"tee","phase":"exit","ret":9000,"args":[1,0,9000,0,0,0],"scenario_id":"unrelated","fd_path":"/dev/trusty-ipc-dev0"}"#,
+        ],
+    );
+    let findings = engine.drain_ready();
+    let ids: std::collections::BTreeSet<_> = findings
+        .iter()
+        .map(|finding| finding.rule_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "unexpected_shared_memory",
+            "service_crash",
+            "oversized_tipc_message",
+            "permission_transition",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding.rule_id == "service_crash")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn t015_does_not_fire_on_proc_self_maps() {
     // Regression: on-device run of v0.1 fired T015 on /proc/self/maps,
     // duplicating T001. Self-paths must be excluded.

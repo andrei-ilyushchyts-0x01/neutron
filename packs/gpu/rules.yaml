@@ -1,0 +1,14 @@
+- id: service_crash
+  name: Service crash
+  description: A causal Binder callee crashed during the GPU scenario.
+  severity: high
+  category: crash
+  conditions:
+    - { scenario_in: [gpu-default], causal_service_crash: true }
+- id: permission_transition
+  name: Executable writable mapping
+  description: An observed mmap or mprotect created WX/RWX memory.
+  severity: high
+  category: memory
+  conditions:
+    - { scenario_in: [gpu-default], syscall_in: [222, 226], rwx_alert_in: [WX, RWX] }

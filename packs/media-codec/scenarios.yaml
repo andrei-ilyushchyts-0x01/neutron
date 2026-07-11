@@ -1,0 +1,11 @@
+schema: neutron.research-scenarios/v1
+scenarios:
+  - id: media-codec-default
+    root_package: probe
+    follow_services: true
+    follow_hal: true
+    trace: { driver_packs: [binder, media-hal], syscalls: [29, 56, 57, 63, 64, 222, 226], fd_paths: ["/dev/video*", "/dev/media*"], resolve_paths: true }
+    stimulus: { action: media-codec, timeout: 20s }
+    duration: 6s
+    settle_ms: 500
+    calibration: { mime: video/avc, width: "32", height: "32", input_bytes_max: "4096" }

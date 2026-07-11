@@ -4,12 +4,8 @@
 //! function symbols (STT_FUNC) from `.symtab` ∪ `.dynsym`, sort them by virtual
 //! address, and binary-search per IP. Cached per file path.
 //!
-//! Address translation:
-//! - Shared library (ET_DYN): runtime address = entry.start + (sym.st_value - segment_file_offset).
-//!   In practice we approximate with `entry.start - entry.offset` as the
-//!   "load bias" when `entry` is the executable r-xp segment of the .so.
-//! - Executable (ET_EXEC): runtime address = sym.st_value (PIE-disabled
-//!   binaries are rare on modern Android, so this branch is mostly a fallback).
+//! Address translation uses the `PT_LOAD` segment covering the mapping's file
+//! offset, including non-zero and page-aligned segment offsets.
 
 use goblin::elf::{sym::STT_FUNC, Elf};
 use std::fs;
@@ -33,6 +29,15 @@ pub struct ElfSymbols {
     pub syms: Vec<ElfSymbol>,
     /// `true` for shared objects (ET_DYN) where the runtime IP is biased.
     pub is_dyn: bool,
+    load_segments: Vec<LoadSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadSegment {
+    offset: u64,
+    vaddr: u64,
+    file_size: u64,
+    align: u64,
 }
 
 impl ElfSymbols {
@@ -85,7 +90,23 @@ impl ElfSymbols {
 
         let is_dyn = matches!(elf.header.e_type, goblin::elf::header::ET_DYN);
 
-        Some(ElfSymbols { syms, is_dyn })
+        let load_segments = elf
+            .program_headers
+            .iter()
+            .filter(|header| header.p_type == goblin::elf::program_header::PT_LOAD)
+            .map(|header| LoadSegment {
+                offset: header.p_offset,
+                vaddr: header.p_vaddr,
+                file_size: header.p_filesz,
+                align: header.p_align.max(1),
+            })
+            .collect();
+
+        Some(ElfSymbols {
+            syms,
+            is_dyn,
+            load_segments,
+        })
     }
 
     /// Look up the symbol containing `runtime_ip` given the executable
@@ -93,16 +114,32 @@ impl ElfSymbols {
     /// `None` if no symbol covers the address.
     pub fn lookup(&self, runtime_ip: u64, entry: &MapEntry) -> Option<String> {
         // Translate runtime IP to ELF file vaddr.
-        let file_vaddr = if self.is_dyn {
-            // load_bias = entry.start - entry.offset (assumes the entry is the
-            // r-xp segment of this ELF file). For multi-segment ELFs this is
-            // the correct bias for ANY segment, since p_vaddr alignment = file
-            // offset alignment.
-            let load_bias = entry.start.wrapping_sub(entry.offset);
-            runtime_ip.wrapping_sub(load_bias)
-        } else {
-            runtime_ip
-        };
+        let file_vaddr = self
+            .load_segments
+            .iter()
+            .find_map(|segment| {
+                let file_start = segment.offset / segment.align * segment.align;
+                let file_end = segment
+                    .offset
+                    .saturating_add(segment.file_size)
+                    .saturating_add(segment.align - 1)
+                    / segment.align
+                    * segment.align;
+                (entry.offset >= file_start && entry.offset < file_end).then(|| {
+                    let vaddr_start = segment.vaddr / segment.align * segment.align;
+                    let load_bias = entry
+                        .start
+                        .wrapping_sub(vaddr_start + (entry.offset - file_start));
+                    runtime_ip.wrapping_sub(load_bias)
+                })
+            })
+            .unwrap_or_else(|| {
+                if self.is_dyn {
+                    runtime_ip.wrapping_sub(entry.start.wrapping_sub(entry.offset))
+                } else {
+                    runtime_ip
+                }
+            });
 
         // Binary search for the largest vaddr <= file_vaddr.
         let idx = match self.syms.binary_search_by_key(&file_vaddr, |s| s.vaddr) {
@@ -117,6 +154,20 @@ impl ElfSymbols {
         }
         let offset = file_vaddr - sym.vaddr;
         Some(format!("{}+{:#x}", sym.name, offset))
+    }
+
+    /// Resolve an already-translated ELF virtual address.
+    pub fn lookup_vaddr(&self, file_vaddr: u64) -> Option<String> {
+        let idx = match self.syms.binary_search_by_key(&file_vaddr, |s| s.vaddr) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let sym = &self.syms[idx];
+        if sym.size > 0 && file_vaddr >= sym.vaddr.saturating_add(sym.size) {
+            return None;
+        }
+        Some(format!("{}+{:#x}", sym.name, file_vaddr - sym.vaddr))
     }
 }
 
@@ -152,6 +203,7 @@ mod tests {
                 name: "foo".into(),
             }],
             is_dyn: false,
+            load_segments: Vec::new(),
         };
         let entry = MapEntry {
             start: 0x0,
@@ -180,6 +232,7 @@ mod tests {
                 },
             ],
             is_dyn: false,
+            load_segments: Vec::new(),
         };
         let entry = MapEntry {
             start: 0x0,
@@ -201,6 +254,7 @@ mod tests {
                 name: "malloc".into(),
             }],
             is_dyn: true,
+            load_segments: Vec::new(),
         };
         // Library mapped at 0x7f0000000000, .text segment file offset 0.
         let entry = MapEntry {
@@ -216,6 +270,36 @@ mod tests {
     }
 
     #[test]
+    fn lookup_uses_covering_load_segment_for_non_zero_offsets() {
+        let bias = 0x7000_0000_0000;
+        let syms = ElfSymbols {
+            syms: vec![ElfSymbol {
+                vaddr: 0x4100,
+                size: 0x20,
+                name: "target".into(),
+            }],
+            is_dyn: true,
+            load_segments: vec![LoadSegment {
+                offset: 0x1800,
+                vaddr: 0x3800,
+                file_size: 0x2000,
+                align: 0x1000,
+            }],
+        };
+        let entry = MapEntry {
+            start: bias + 0x4000,
+            end: bias + 0x5000,
+            offset: 0x2000,
+            perms: "r-xp".into(),
+            name: "lib.so".into(),
+        };
+        assert_eq!(
+            syms.lookup(bias + 0x4104, &entry).as_deref(),
+            Some("target+0x4")
+        );
+    }
+
+    #[test]
     fn lookup_rejects_addr_past_symbol_size() {
         let syms = ElfSymbols {
             syms: vec![ElfSymbol {
@@ -224,6 +308,7 @@ mod tests {
                 name: "tiny".into(),
             }],
             is_dyn: false,
+            load_segments: Vec::new(),
         };
         let entry = MapEntry {
             start: 0,

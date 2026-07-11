@@ -1,0 +1,1 @@
+Configures, starts, and stops one codec using a bounded synthetic in-memory buffer. No media file or user data is read. Codec absence or configuration rejection is `unsupported` rather than evidence of a security property.

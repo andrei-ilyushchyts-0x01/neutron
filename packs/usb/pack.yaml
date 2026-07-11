@@ -1,0 +1,7 @@
+schema: neutron.research-pack/v1
+id: usb
+version: "1.0.0"
+compatibility: { android_api_min: 29, vendors: ["*"] }
+default_scenario: usb-default
+components: { services: services.json, devices: devices.json, scenarios: scenarios.yaml, rules: rules.yaml, report: report.md }
+content_hash: sha256:129b2fd04042bc6a5ea8930d50c88256052033ae20dc2c828efda4101eff2548

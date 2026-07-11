@@ -1,0 +1,11 @@
+schema: neutron.research-scenarios/v1
+scenarios:
+  - id: camera-default
+    root_package: probe
+    follow_services: true
+    follow_hal: true
+    trace: { driver_packs: [binder, media-hal], syscalls: [29, 56, 57, 63, 64, 222, 226], fd_paths: ["/dev/video*", "/dev/media*"], resolve_paths: true }
+    stimulus: { action: camera, timeout: 30s }
+    duration: 8s
+    settle_ms: 1000
+    calibration: { camera_id: auto, width_max: "320", height_max: "240", frames: "1" }

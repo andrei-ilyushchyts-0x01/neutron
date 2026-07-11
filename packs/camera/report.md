@@ -1,0 +1,1 @@
+Opens one selected camera, acquires one low-resolution frame, discards image bytes, and closes the device. No image is written. Camera permission is temporary and restored; unavailable or busy hardware is reported without partial stimulus.

@@ -1,0 +1,1 @@
+Requests one Wi-Fi scan only when Wi-Fi is already enabled. It never enables the radio and never retains SSIDs, BSSIDs, information elements, or scan results. Permission changes are temporary and restored.

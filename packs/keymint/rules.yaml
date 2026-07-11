@@ -1,0 +1,36 @@
+- id: unexpected_shared_memory
+  name: Unexpected shared memory
+  description: Shared-memory allocation in the KeyMint scenario.
+  severity: medium
+  category: ipc
+  conditions:
+    - scenario_in: [keymint-default]
+      ioctl_family_in: [dma_heap, dma_buf, ashmem]
+- id: service_crash
+  name: Service crash
+  description: A causal Binder callee crashed during the scenario.
+  severity: high
+  category: crash
+  conditions:
+    - scenario_in: [keymint-default]
+      causal_service_crash: true
+- id: oversized_tipc_message
+  name: Oversized Trusty message
+  description: A causal Trusty write exceeds the calibrated pack threshold.
+  severity: high
+  category: ipc
+  conditions:
+    - scenario_in: [keymint-default]
+      syscall_in: [64, 206]
+      fd_path_prefix: /dev/trusty
+      arg_index: 2
+      arg_gt: 4096
+- id: permission_transition
+  name: Executable writable mapping
+  description: An observed mmap or mprotect created WX/RWX memory.
+  severity: high
+  category: memory
+  conditions:
+    - scenario_in: [keymint-default]
+      syscall_in: [222, 226]
+      rwx_alert_in: [WX, RWX]

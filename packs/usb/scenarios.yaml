@@ -1,0 +1,11 @@
+schema: neutron.research-scenarios/v1
+scenarios:
+  - id: usb-default
+    root_package: probe
+    follow_services: true
+    follow_hal: true
+    trace: { driver_packs: [binder], syscalls: [29, 56, 57, 63, 64], fd_paths: ["/dev/bus/usb/*"], resolve_paths: true }
+    stimulus: { action: usb, timeout: 15s }
+    duration: 5s
+    settle_ms: 500
+    calibration: { request: device_descriptor, transfer_bytes_max: "18", write_requests: "false" }

@@ -191,6 +191,11 @@ pub struct UserspaceHealth {
     /// Binder branches intentionally bounded by userspace follow guardrails.
     pub follow_policy_filtered: u64,
     pub follow_ttl_expired: u64,
+    /// Native map/stack records exceeded a bound or could not be refreshed.
+    pub native_capture_degraded: bool,
+    pub native_maps_truncated: u64,
+    pub native_stacks_truncated: u64,
+    pub native_refresh_failed: u64,
     /// AVC logcat source state and bounded ingestion counters.
     pub selinux_source_enabled: bool,
     pub selinux_source_available: bool,
@@ -271,6 +276,14 @@ pub fn format_summary_with(
             user.follow_policy_filtered, user.follow_ttl_expired
         ));
     }
+    if user.native_capture_degraded {
+        out.push_str(&format!(
+            "  native capture: {} map/path truncation(s), {} stack truncation(s), {} refresh failure(s)\n",
+            user.native_maps_truncated,
+            user.native_stacks_truncated,
+            user.native_refresh_failed,
+        ));
+    }
     if user.selinux_source_enabled {
         let status = if user.selinux_source_available {
             "available"
@@ -285,7 +298,7 @@ pub fn format_summary_with(
             user.selinux_out_of_scope,
         ));
     }
-    if health.has_degradation() || user.selinux_degraded() {
+    if health.has_degradation() || user.native_capture_degraded || user.selinux_degraded() {
         out.push_str(
             "\nWARNING: capture had drops or degraded paths. Absence of a finding\n\
              is NOT conclusive — the relevant event may have been dropped, the\n\
@@ -338,7 +351,7 @@ pub fn format_capture_health_json_with_metadata(
     }
     let _ = write!(
         s,
-        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"output_cap_hit":{},"follow_policy_filtered":{},"follow_ttl_expired":{},"selinux_avc_source":"{}","selinux_parsed":{},"selinux_malformed":{},"selinux_deduplicated":{},"selinux_out_of_scope":{},"degraded":{}"#,
+        r#","fd_graph_miss":{},"fd_graph_backfilled":{},"events_matched":{},"events_sampled_out":{},"events_emitted":{},"output_cap_hit":{},"follow_policy_filtered":{},"follow_ttl_expired":{},"native_maps_truncated":{},"native_stacks_truncated":{},"native_refresh_failed":{},"selinux_avc_source":"{}","selinux_parsed":{},"selinux_malformed":{},"selinux_deduplicated":{},"selinux_out_of_scope":{},"degraded":{}"#,
         user.fd_graph_miss,
         user.fd_graph_backfilled,
         user.events_matched,
@@ -347,6 +360,9 @@ pub fn format_capture_health_json_with_metadata(
         user.output_cap_hit,
         user.follow_policy_filtered,
         user.follow_ttl_expired,
+        user.native_maps_truncated,
+        user.native_stacks_truncated,
+        user.native_refresh_failed,
         if !user.selinux_source_enabled {
             "disabled"
         } else if user.selinux_source_available {
@@ -358,7 +374,7 @@ pub fn format_capture_health_json_with_metadata(
         user.selinux_malformed,
         user.selinux_deduplicated,
         user.selinux_out_of_scope,
-        health.has_degradation() || user.selinux_degraded()
+        health.has_degradation() || user.native_capture_degraded || user.selinux_degraded()
     );
     write_string_array(&mut s, "driver_packs", &meta.driver_packs);
     write_string_array(&mut s, "kprobe_packs", &meta.kprobe_packs);
@@ -557,6 +573,20 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(v["output_cap_hit"], true);
+    }
+
+    #[test]
+    fn native_capture_bounds_mark_health_degraded() {
+        let user = UserspaceHealth {
+            native_capture_degraded: true,
+            native_maps_truncated: 1,
+            ..UserspaceHealth::default()
+        };
+        let health = CaptureHealth::default();
+        let value: serde_json::Value =
+            serde_json::from_str(&format_capture_health_json(&health, &user, 1)).unwrap();
+        assert_eq!(value["degraded"], true);
+        assert!(format_summary_with(&health, &user, 1).contains("native capture"));
     }
 
     #[test]

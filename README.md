@@ -329,6 +329,26 @@ neutron surface reachable --from-package com.example.app --input surface.json
 neutron surface reachable --from-uid 10123 --input surface.json
 ```
 
+## Run A Reproducible Research Pack
+
+After installing the companion APK and built-in packs, preflight a pack without
+stimulating hardware:
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron research --pack keymint'"
+```
+
+This exits `2` and writes a private `authorization_required` report. Add
+`--authorized-use` only on a device you are authorized to assess:
+
+```bash
+adb shell "su -c '/data/local/tmp/neutron research --pack camera \
+  --param camera_id=0 --authorized-use'"
+```
+
+Packs are data-only and compile into allowlisted trace flags plus one of seven
+typed companion actions. See [the research-pack guide](docs/guides/research-packs.md).
+
 `reachable` means observed causal reachability through capture-sourced
 `root_process`, `binder`, `served_by`, and successful `open`, `mmap`, or
 `ioctl` relations. It does not solve SELinux, VINTF, manifest permissions, or
@@ -616,7 +636,9 @@ after maintainers have approved the tag, notes, and assets.
 - [docs/guides/quickstart.md](docs/guides/quickstart.md): longer first-trace walkthrough
 - [docs/guides/security-assessment.md](docs/guides/security-assessment.md): assessment workflow
 - [docs/guides/bpf-tracing.md](docs/guides/bpf-tracing.md): profiles, filtering, capture, stacks
+- [docs/guides/native-mapping.md](docs/guides/native-mapping.md): offline ELF/APK mapping and Ghidra bookmark export
 - [docs/guides/harness.md](docs/guides/harness.md): capture, minimize, and replay regression testcases
+- [docs/guides/research-packs.md](docs/guides/research-packs.md): validated on-device research packs
 - [docs/guides/writing-rules.md](docs/guides/writing-rules.md): custom detectors
 - [docs/guides/output-formats.md](docs/guides/output-formats.md): text and JSON schemas
 - [docs/REFERENCE.md](docs/REFERENCE.md): complete trace and Surface CLI/schema reference

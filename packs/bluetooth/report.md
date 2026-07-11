@@ -1,0 +1,1 @@
+Runs a short LE scan only when Bluetooth is already enabled. It never enables the radio and never retains device names, addresses, advertisements, or identifiers. Permission changes are temporary and restored.

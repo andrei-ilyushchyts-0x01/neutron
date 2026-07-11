@@ -1,0 +1,1 @@
+Performs one read-only USB device-descriptor request. The selector is explicit; automatic selection is intentionally unavailable when more than one non-hub device is present. No control write, configuration change, or payload retention occurs.

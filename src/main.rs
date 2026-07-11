@@ -90,6 +90,9 @@ const SYSCALL_OPENAT: i32 = 56;
 const SYSCALL_CLOSE: i32 = 57;
 const SYSCALL_MMAP: i32 = 222;
 const SYSCALL_MPROTECT: i32 = 226;
+const SYSCALL_MUNMAP: i32 = 215;
+const SYSCALL_EXECVE: i32 = 221;
+const SYSCALL_EXECVEAT: i32 = 281;
 
 /// Maximum time `poll(2)` blocks waiting for the ring buffer to become
 /// readable. Short enough to keep Ctrl-C latency bounded, long enough that
@@ -1249,12 +1252,17 @@ fn write_health_sidecar<P: AsRef<Path>>(path: Option<P>, line: &str) -> Result<(
 
 /// Render one stack-trace map entry. Picks the right symbolizer per frame
 /// based on the canonical aarch64 user/kernel split.
+struct RenderedStack {
+    ips: Vec<u64>,
+    rendered: Vec<String>,
+}
+
 fn format_stack(
     stack_traces: &StackTraceMap<&aya::maps::MapData>,
     stackid: i32,
     proc_sym: Option<&mut ProcSymbolizer>,
     kernel_resolver: Option<&KernelResolver>,
-) -> Option<String> {
+) -> Option<RenderedStack> {
     if stackid < 0 {
         return None;
     }
@@ -1266,9 +1274,11 @@ fn format_stack(
     // We can't borrow `proc_sym` mutably from inside the closure once we've
     // taken &mut to it, so collect into Strings via an explicit loop.
     let mut rendered: Vec<String> = Vec::with_capacity(frames.len());
+    let mut ips = Vec::with_capacity(frames.len());
     let mut proc_sym = proc_sym;
     for f in frames.iter() {
         let ip = f.ip;
+        ips.push(ip);
         let s = if is_kernel_addr(ip) {
             // KernelResolver bundles kallsyms + /proc/modules. When
             // kallsyms is masked by kptr_restrict, modules still gives
@@ -1286,7 +1296,7 @@ fn format_stack(
         };
         rendered.push(s);
     }
-    Some(rendered.join(" <- "))
+    Some(RenderedStack { ips, rendered })
 }
 
 // ── Event filtering ──────────────────────────────────────────────────────────
@@ -2045,6 +2055,9 @@ fn main() -> Result<()> {
         Some(Command::Harness(HarnessCommand::Replay(args))) => neutron::harness::replay(args),
         Some(Command::Aidl(AidlCommand::Index(args))) => neutron::aidl::run_index(args),
         Some(Command::Aidl(AidlCommand::Decode(args))) => neutron::aidl::run_decode(args),
+        Some(Command::Research(args)) => std::process::exit(neutron::research::run(args)),
+        Some(Command::NativeMap(args)) => neutron::native::run_native_map(args),
+        Some(Command::GhidraExport(args)) => neutron::native::run_ghidra_export(args),
         Some(Command::Selinux(command)) => neutron::selinux::run(command),
         None => run_trace(cli.args),
     }
@@ -2441,6 +2454,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     // Per-PID symbolizer cache. `None` means we tried and failed to read
     // `/proc/<pid>/maps` (process exited, or insufficient permissions).
     let mut proc_sym_cache: HashMap<u32, Option<ProcSymbolizer>> = HashMap::new();
+    let mut native_capture = neutron::native::CaptureNativeState::default();
     // Build the kernel-side resolver once. Two layers: kallsyms gives
     // `name+0x<offset>` when readable; /proc/modules still gives
     // `[<ko>]+0x<offset>` when kptr_restrict masks kallsyms. Phase 5b.
@@ -3004,7 +3018,22 @@ fn run_trace(mut args: Args) -> Result<()> {
                 // Resolve the stack BEFORE building the JSON line so the
                 // rule engine can pattern-match against `stack_contains`.
                 // This must happen before `format_event_json_with_stack`.
-                let stack_str: Option<String> = if args.stacks {
+                let mapping_changed = { ev.is_enter } == 0
+                    && { ev.ret } >= 0
+                    && matches!(
+                        { ev.syscall_nr },
+                        SYSCALL_MMAP | SYSCALL_MUNMAP | SYSCALL_MPROTECT
+                    );
+                if mapping_changed {
+                    native_capture.invalidate(ev.pid);
+                    proc_sym_cache.remove(&{ ev.pid });
+                }
+                let exec_event = matches!({ ev.syscall_nr }, SYSCALL_EXECVE | SYSCALL_EXECVEAT);
+                if exec_event && { ev.is_enter } == 0 && { ev.ret } < 0 {
+                    native_capture.clear_invalidation(ev.pid);
+                }
+
+                let (stack_str, stack_refs): (Option<String>, Vec<String>) = if args.stacks {
                     let kstk = { ev.kernel_stackid };
                     let ustk = { ev.user_stackid };
                     if kstk >= 0 || ustk >= 0 {
@@ -3015,32 +3044,66 @@ fn run_trace(mut args: Args) -> Result<()> {
                         if let Some(stmap) = bpf.map("STACK_TRACES") {
                             if let Ok(stack_traces) = StackTraceMap::try_from(stmap) {
                                 let proc_sym_mut = proc_sym_opt.as_mut();
-                                let kernel_str = format_stack(
+                                let kernel_stack = format_stack(
                                     &stack_traces,
                                     kstk,
                                     None,
                                     kernel_resolver.as_ref(),
                                 );
-                                let user_str =
+                                let user_stack =
                                     format_stack(&stack_traces, ustk, proc_sym_mut, None);
-                                match (kernel_str, user_str) {
+                                let mut references = Vec::new();
+                                for (kind, id, stack) in [
+                                    ("user", ustk, user_stack.as_ref()),
+                                    ("kernel", kstk, kernel_stack.as_ref()),
+                                ] {
+                                    let Some(stack) = stack else { continue };
+                                    let Some(captured) = native_capture.capture_stack(
+                                        pid,
+                                        ev.timestamp_ns,
+                                        kind,
+                                        id,
+                                        &stack.ips,
+                                        &stack.rendered,
+                                    ) else {
+                                        continue;
+                                    };
+                                    if args.json && !suppress_raw {
+                                        for record in captured.records {
+                                            write_or_output_cap(
+                                                writeln!(out, "{record}"),
+                                                &output_cap_hit,
+                                            )?;
+                                        }
+                                    }
+                                    references.push(captured.reference);
+                                }
+                                let kernel_str =
+                                    kernel_stack.map(|stack| stack.rendered.join(" <- "));
+                                let user_str = user_stack.map(|stack| stack.rendered.join(" <- "));
+                                let rendered = match (kernel_str, user_str) {
                                     (Some(k), Some(u)) => Some(format!("{k} ;; {u}")),
                                     (Some(k), None) => Some(k),
                                     (None, Some(u)) => Some(u),
                                     (None, None) => None,
-                                }
+                                };
+                                (rendered, references)
                             } else {
-                                None
+                                (None, Vec::new())
                             }
                         } else {
-                            None
+                            (None, Vec::new())
                         }
                     } else {
-                        None
+                        (None, Vec::new())
                     }
                 } else {
-                    None
+                    (None, Vec::new())
                 };
+                if exec_event && { ev.is_enter } == 1 {
+                    native_capture.invalidate(ev.pid);
+                    proc_sym_cache.remove(&{ ev.pid });
+                }
 
                 // Update the FD graph from this event (open/close/dup/socket/
                 // memfd_create/etc. drive state transitions). Pass the
@@ -3100,6 +3163,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     fd_hint.as_ref(),
                     Some(event_id_counter),
                 );
+                json_line = neutron::native::add_stack_references(&json_line, &stack_refs);
                 if let Some(metadata) = causal_event.as_ref() {
                     if let Ok(enriched) = enrich_json(&json_line, metadata) {
                         json_line = enriched;
@@ -3533,6 +3597,10 @@ fn run_trace(mut args: Args) -> Result<()> {
         output_cap_hit: output_cap_hit.load(Ordering::Relaxed),
         follow_policy_filtered,
         follow_ttl_expired,
+        native_capture_degraded: native_capture.degraded(),
+        native_maps_truncated: native_capture.maps_truncated,
+        native_stacks_truncated: native_capture.stacks_truncated,
+        native_refresh_failed: native_capture.refresh_failed,
         selinux_source_enabled,
         selinux_source_available,
         selinux_parsed: selinux_stats.parsed,

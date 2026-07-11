@@ -1,0 +1,10 @@
+schema: neutron.research-scenarios/v1
+scenarios:
+  - id: gpu-default
+    root_package: probe
+    follow_services: true
+    trace: { driver_packs: [binder, kgsl, mali], syscalls: [29, 56, 57, 63, 64, 222, 226], fd_paths: ["/dev/kgsl*", "/dev/mali*", "/dev/dri/*"], resolve_paths: true }
+    stimulus: { action: gpu, timeout: 15s }
+    duration: 5s
+    settle_ms: 500
+    calibration: { pbuffer_width: "32", pbuffer_height: "32", readback_bytes_max: "4096" }

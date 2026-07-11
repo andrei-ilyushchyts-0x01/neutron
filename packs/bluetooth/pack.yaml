@@ -1,0 +1,7 @@
+schema: neutron.research-pack/v1
+id: bluetooth
+version: "1.0.0"
+compatibility: { android_api_min: 29, vendors: ["*"] }
+default_scenario: bluetooth-default
+components: { services: services.json, devices: devices.json, scenarios: scenarios.yaml, rules: rules.yaml, report: report.md }
+content_hash: sha256:a64976fb6562720d211f1281e5a2f9d5832d90e90b77c887ce2c2d539521df41

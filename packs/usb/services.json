@@ -1,0 +1,1 @@
+{"schema":"neutron.research-services/v1","services":[{"id":"usb-service","required":true,"alternatives":[{"names":["usb"],"process_patterns":["*system_server*"]},{"names":["android.hardware.usb.IUsb/default"]}]}]}

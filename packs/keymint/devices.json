@@ -1,0 +1,1 @@
+{"schema":"neutron.research-devices/v1","devices":[{"id":"trusty-ipc","required":false,"alternatives":[{"paths":["/dev/trusty-ipc-dev*"]},{"paths":["/dev/tipc*"]}]}]}
