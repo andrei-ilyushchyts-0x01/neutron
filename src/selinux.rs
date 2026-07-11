@@ -901,3 +901,15 @@ pub fn render_explanation_text(explanation: &SelinuxExplanation) -> String {
     }
     out.trim_end().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::selinux_logcat_args;
+
+    #[test]
+    fn logcat_starts_at_the_capture_boundary() {
+        assert!(selinux_logcat_args()
+            .windows(2)
+            .any(|args| args == ["-T", "0"]));
+    }
+}
