@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use neutron::cli::{Cli, Command, HarnessCommand};
-use neutron::harness::{self, ExtractArgs, HARNESS_SCHEMA};
+use neutron::harness::{self, BuildArgs, ExtractArgs, HARNESS_SCHEMA};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -73,6 +73,12 @@ fn cli_registers_harness_commands_and_capture_guard() {
     assert!(matches!(
         cli.command,
         Some(Command::Harness(HarnessCommand::Extract(_)))
+    ));
+
+    let cli = Cli::try_parse_from(["neutron", "harness", "build", "case"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Harness(HarnessCommand::Build(_)))
     ));
 
     let cli = Cli::try_parse_from([
@@ -164,6 +170,23 @@ fn extract_writes_portable_artifact_contract() {
         compiled.status.success(),
         "generated replay.rs did not compile:\n{}",
         String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    harness::build(BuildArgs {
+        directory: output.clone(),
+    })
+    .expect("cross-build generated replay");
+    assert!(output.join("replay").is_file());
+    let build: Value =
+        serde_json::from_slice(&fs::read(output.join("build.json")).unwrap()).unwrap();
+    assert_eq!(build["schema"], HARNESS_SCHEMA);
+    assert_eq!(build["target"], "aarch64-unknown-linux-musl");
+    assert_eq!(
+        build["source_sha256"],
+        format!(
+            "{:x}",
+            Sha256::digest(fs::read(output.join("replay.rs")).unwrap())
+        )
     );
 }
 
