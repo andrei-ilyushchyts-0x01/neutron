@@ -23,7 +23,6 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -131,7 +130,6 @@ pub fn run(args: MarkArgs) -> Result<()> {
     if args.output.is_none()
         && args.phase.is_some()
         && args.control_socket != "off"
-        && Path::new(&args.control_socket).exists()
     {
         let phase = normalize_phase(args.phase.as_deref())?.context("marker phase required")?;
         let mut meta = std::collections::BTreeMap::new();
@@ -151,7 +149,8 @@ pub fn run(args: MarkArgs) -> Result<()> {
                 phase: phase.to_string(),
                 meta,
             },
-        )?;
+        )
+        .with_context(|| format!("live marker control socket {} is unavailable", args.control_socket))?;
         return Ok(());
     }
     let line = render_line(&args)?;

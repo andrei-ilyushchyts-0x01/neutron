@@ -120,25 +120,25 @@ pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions)
     let mut processes = BTreeMap::<u32, String>::new();
     for binder in &binders {
         if binder.caller_pid != 0 {
-            processes
-                .entry(binder.caller_pid)
-                .or_insert_with(|| binder.caller_comm.clone().unwrap_or_default());
+            insert_process_label(
+                &mut processes,
+                binder.caller_pid,
+                binder.caller_comm.as_deref(),
+            );
         }
         if binder.callee_pid != 0 {
-            processes
-                .entry(binder.callee_pid)
-                .or_insert_with(|| binder.callee_comm.clone().unwrap_or_default());
+            insert_process_label(
+                &mut processes,
+                binder.callee_pid,
+                binder.callee_comm.as_deref(),
+            );
         }
     }
     for syscall in &syscalls {
-        processes
-            .entry(syscall.pid)
-            .or_insert_with(|| syscall.comm.clone().unwrap_or_default());
+        insert_process_label(&mut processes, syscall.pid, syscall.comm.as_deref());
     }
     for exit in &exits {
-        processes
-            .entry(exit.pid)
-            .or_insert_with(|| exit.comm.clone().unwrap_or_default());
+        insert_process_label(&mut processes, exit.pid, exit.comm.as_deref());
     }
 
     let binder_ids = binder_ids(&binders);
@@ -378,10 +378,22 @@ fn syscall_label(node: &SyscallSpan) -> String {
         label.push(' ');
         label.push_str(ioctl);
     }
+    if let Some(path) = &node.fd_path {
+        label.push(' ');
+        label.push_str(path);
+    }
     if let Some(latency) = node.latency_us {
         label.push_str(&format!(" ({latency}us)"));
     }
     label
+}
+
+fn insert_process_label(processes: &mut BTreeMap<u32, String>, pid: u32, label: Option<&str>) {
+    let label = label.unwrap_or_default();
+    let current = processes.entry(pid).or_default();
+    if current.is_empty() && !label.is_empty() {
+        *current = label.to_string();
+    }
 }
 
 fn label_or_pid(comm: &str, pid: u32) -> String {

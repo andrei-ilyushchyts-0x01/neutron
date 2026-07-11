@@ -170,6 +170,10 @@ pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
                 capture.has_causal |= has_causal(object);
                 merge_binder(&mut binders, object);
             }
+            "binder_received" => {
+                capture.has_causal |= has_causal(object);
+                merge_binder_received(&mut binders, object);
+            }
             "syscall" => {
                 capture.has_causal |= has_causal(object);
                 merge_syscall(&mut syscalls, object);
@@ -232,6 +236,37 @@ fn merge_binder(binders: &mut BTreeMap<BinderKey, BinderSpan>, object: &Map<Stri
         ..BinderSpan::default()
     });
     apply_binder_fields(node, object);
+}
+
+fn merge_binder_received(
+    binders: &mut BTreeMap<BinderKey, BinderSpan>,
+    object: &Map<String, Value>,
+) {
+    let Some(debug_id) = number_i64(object, "debug_id") else {
+        return;
+    };
+    let key = causal_key(object)
+        .map(|(trace, span)| BinderKey::Causal(trace, span))
+        .unwrap_or_else(|| BinderKey::Legacy(debug_id));
+    let node = binders.entry(key).or_insert_with(|| BinderSpan {
+        debug_id,
+        ..BinderSpan::default()
+    });
+    node.ts_ns = node.ts_ns.or_else(|| number_u64(object, "ts_ns"));
+    node.callee_pid = number_u32(object, "pid").unwrap_or(node.callee_pid);
+    replace_text(&mut node.callee_comm, object, "comm");
+    replace_text(&mut node.trace_id, object, "trace_id");
+    replace_text(&mut node.scenario_id, object, "scenario_id");
+    replace_text(&mut node.span_id, object, "span_id");
+    replace_text(&mut node.parent_span_id, object, "parent_span_id");
+    node.depth = number_u64(object, "depth")
+        .and_then(|value| u8::try_from(value).ok())
+        .or(node.depth);
+    replace_text(&mut node.root_package, object, "root_package");
+    node.root_uid = number_u32(object, "root_uid").or(node.root_uid);
+    if let Some(relation) = relation(object) {
+        node.relation = relation;
+    }
 }
 
 fn apply_binder_fields(node: &mut BinderSpan, object: &Map<String, Value>) {
@@ -434,10 +469,36 @@ fn merge_health(capture: &mut NormalizedCapture, object: &Map<String, Value>) {
         (health.traced_process_limit, "traced process limit"),
         (health.binder_depth_limit, "Binder depth limit"),
         (health.binder_follow_failed, "Binder follow failure"),
+        (
+            number_u64(object, "ringbuf_reserve_failed").unwrap_or(0),
+            "ring buffer event loss",
+        ),
+        (
+            number_u64(object, "inflight_update_failed").unwrap_or(0),
+            "syscall correlation update failure",
+        ),
+        (
+            number_u64(object, "inflight_lookup_missed").unwrap_or(0),
+            "syscall correlation lookup miss",
+        ),
+        (
+            number_u64(object, "thread_context_update_failed").unwrap_or(0),
+            "Binder thread-context failure",
+        ),
     ] {
         if value > 0 {
             capture.health_warnings.insert(label.to_string());
         }
+    }
+    if health.degraded {
+        capture
+            .health_warnings
+            .insert("capture health is degraded".into());
+    }
+    if health.output_cap_hit {
+        capture
+            .health_warnings
+            .insert("output cap truncated the capture".into());
     }
     capture.health = Some(health);
 }
