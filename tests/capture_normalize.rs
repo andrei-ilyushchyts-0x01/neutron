@@ -122,6 +122,22 @@ fn capture_health_retains_uid_and_device_identity_metadata() {
 }
 
 #[test]
+fn capture_health_marks_intentionally_incomplete_follow_branches() {
+    let input = r#"{"type":"capture_health","degraded":false,"follow_policy_filtered":3,"follow_ttl_expired":2}"#;
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+    let health = capture.health.unwrap();
+
+    assert_eq!(health.follow_policy_filtered, 3);
+    assert_eq!(health.follow_ttl_expired, 2);
+    assert!(capture
+        .health_warnings
+        .contains("Binder branches were policy-filtered"));
+    assert!(capture
+        .health_warnings
+        .contains("Binder followers expired by TTL"));
+}
+
+#[test]
 fn markers_retain_scenario_and_root_selector_metadata() {
     let input = r#"
 {"type":"marker","ts_ns":99,"name":"surface-observe","phase":"start","scenario_id":"surface-observe","trace_id":"trace-a","root_package":"com.example.app","root_uid":10123}
