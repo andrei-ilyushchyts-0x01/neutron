@@ -1288,6 +1288,7 @@ fn execute(
     } else {
         scenario.root_package.clone()
     };
+    let root_selector = research_root_selector(&root_package, crate::android::resolve_package_uid)?;
     let timeout = parse_timeout(&scenario.stimulus.timeout)?;
     let stimulus = || {
         run_stimulus(
@@ -1304,7 +1305,7 @@ fn execute(
         &capture_path,
         &health_path,
         &socket_path,
-        &surface::RootSelector::Package(root_package),
+        &root_selector,
         &scenario.id,
         &trace_args,
         |child| {
@@ -1346,6 +1347,15 @@ fn execute(
         unsupported: None,
         granted_permissions,
     })
+}
+
+fn research_root_selector(
+    root_package: &str,
+    resolve_uid: impl FnOnce(&str) -> Result<u32>,
+) -> Result<surface::RootSelector> {
+    let uid = resolve_uid(root_package)
+        .with_context(|| format!("resolving research root package {root_package}"))?;
+    Ok(surface::RootSelector::Uid(uid))
 }
 
 fn command_success(program: &str, args: &[&str]) -> Result<bool> {
