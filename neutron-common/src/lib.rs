@@ -330,6 +330,10 @@ pub const COUNTER_BINDER_DEPTH_LIMIT: u32 = 14;
 pub const COUNTER_BINDER_FOLLOW_FAILED: u32 = 15;
 /// Per-thread exact Binder context could not be recorded.
 pub const COUNTER_THREAD_CONTEXT_UPDATE_FAILED: u32 = 16;
+/// A dynamic Binder callee exited its first causally scoped syscall after the
+/// process was admitted, so no enter-side arguments were available yet.
+/// This is an explicit causal-boundary observation, not ring-buffer loss.
+pub const COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT: u32 = 17;
 
 /// Number of slots in the COUNTERS map. New counters extend the tail; bumping
 /// requires updating the `Array::with_max_entries(...)` size in BPF and the

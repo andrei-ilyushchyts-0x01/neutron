@@ -39,7 +39,8 @@ use neutron_common::{
     causal_pid_action, encode_causal_relation_depth, is_state_tracking_nr, ret_matches_class,
     ExitSource, ProcessTraceContext, SyscallEvent, TraceReason, CAUSAL_PID_ADMIT_ROOT,
     CAUSAL_PID_FALLTHROUGH, CAUSAL_PID_MATCH, CAUSAL_RELATION_EXACT, CAUSAL_RELATION_INFERRED,
-    COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED, COUNTER_EVENTS_SUBMITTED,
+    COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED,
+    COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT, COUNTER_EVENTS_SUBMITTED,
     COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
     COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_THREAD_CONTEXT_UPDATE_FAILED,
     COUNTER_TRACED_PROCESS_LIMIT, COUNTER_UNIX_MSG_CONTROL_NESTED,
@@ -119,6 +120,7 @@ struct BinderTransactionContext {
     flags: u32,
     parent_debug_id: u32,
     relation: u8,
+    admission_boundary: u8,
 }
 
 #[map]
@@ -131,6 +133,7 @@ struct BinderThreadContext {
     debug_id: u32,
     scenario_generation: u16,
     depth: u8,
+    admission_boundary: u8,
 }
 
 #[map]
@@ -754,6 +757,9 @@ fn follow_binder_callee(
         bump_counter(COUNTER_BINDER_DEPTH_LIMIT);
         return;
     }
+    let pid = callee_pid as u32;
+    let existing = unsafe { TRACED_PROCESSES.get(&pid) }.copied();
+    let preserve_root = existing.is_some_and(|context| context.reason == TraceReason::Root);
     let process = ProcessTraceContext {
         root_trace_id: caller.root_trace_id,
         parent_pid: caller_pid,
@@ -767,6 +773,7 @@ fn follow_binder_callee(
         flags,
         parent_debug_id,
         relation,
+        admission_boundary: u8::from(existing.is_none()),
     };
     if BINDER_TRANSACTION_CONTEXT
         .insert(&(debug_id as u32), &transaction, 0)
@@ -775,15 +782,30 @@ fn follow_binder_callee(
         bump_counter(COUNTER_BINDER_FOLLOW_FAILED);
         return;
     }
-    let pid = callee_pid as u32;
-    let preserve_root = unsafe { TRACED_PROCESSES.get(&pid) }
-        .copied()
-        .is_some_and(|context| context.reason == TraceReason::Root);
     if !preserve_root && TRACED_PROCESSES.insert(&pid, &process, 0).is_err() {
         let _ = BINDER_TRANSACTION_CONTEXT.remove(&(debug_id as u32));
         bump_counter(COUNTER_TRACED_PROCESS_LIMIT);
         bump_counter(COUNTER_BINDER_FOLLOW_FAILED);
     }
+}
+
+#[inline(always)]
+fn consume_admission_boundary_exit(pid_tgid: u64) -> bool {
+    let Some(context) = unsafe { THREAD_BINDER_CONTEXT.get(&pid_tgid) }.copied() else {
+        return false;
+    };
+    if context.admission_boundary == 0 {
+        return false;
+    }
+    let consumed = BinderThreadContext {
+        debug_id: context.debug_id,
+        scenario_generation: context.scenario_generation,
+        depth: context.depth,
+        admission_boundary: 0,
+    };
+    THREAD_BINDER_CONTEXT
+        .insert(&pid_tgid, &consumed, 0)
+        .is_ok()
 }
 
 #[inline(always)]
@@ -1210,6 +1232,7 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
     // enter timestamp (for latency). The borrow is released before the
     // ringbuf reservation.
     let saved_ptr: *const SyscallEvent = INFLIGHT.get_ptr(&pid_tgid).unwrap_or_default();
+    let admission_boundary_exit = consume_admission_boundary_exit(pid_tgid);
 
     if !should_submit_exit(nr, uid_now, saved_ptr, ret, now) {
         // Reclaim the INFLIGHT entry that the unconditional enter-side
@@ -1297,7 +1320,11 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
                 }
             }
         } else {
-            bump_counter(COUNTER_INFLIGHT_LOOKUP_MISSED);
+            if admission_boundary_exit {
+                bump_counter(COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT);
+            } else {
+                bump_counter(COUNTER_INFLIGHT_LOOKUP_MISSED);
+            }
             addr_of_mut!((*ev).syscall_nr).write_unaligned(nr);
             addr_of_mut!((*ev).kernel_stackid).write_unaligned(-1);
             addr_of_mut!((*ev).user_stackid).write_unaligned(-1);
@@ -1462,6 +1489,7 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
                 debug_id: debug_id as u32,
                 scenario_generation: context.process.scenario_generation,
                 depth: context.process.depth,
+                admission_boundary: context.admission_boundary,
             };
             if THREAD_BINDER_CONTEXT.insert(&pid_tgid, &thread, 0).is_err() {
                 bump_counter(COUNTER_THREAD_CONTEXT_UPDATE_FAILED);

@@ -1454,13 +1454,14 @@ fn set_root_uid_context(bpf: &mut Ebpf, trace_id: u64, generation: u16) -> Resul
 
 fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
     // These are internal packed BPF-map wire sizes:
-    // ProcessTraceContext(20) + flags(4) + parent_debug_id(4) + relation(1),
-    // and debug_id(4) + scenario_generation(2) + depth(1).
+    // ProcessTraceContext(20) + flags(4) + parent_debug_id(4) + relation(1)
+    // + admission_boundary(1), and debug_id(4) + scenario_generation(2)
+    // + depth(1) + admission_boundary(1).
     {
         let map = bpf
             .map_mut("BINDER_TRANSACTION_CONTEXT")
             .context("BINDER_TRANSACTION_CONTEXT missing")?;
-        let mut transactions: AyaHashMap<_, u32, [u8; 29]> = AyaHashMap::try_from(map)
+        let mut transactions: AyaHashMap<_, u32, [u8; 30]> = AyaHashMap::try_from(map)
             .context("BINDER_TRANSACTION_CONTEXT has unexpected layout")?;
         let keys: Vec<u32> = transactions
             .keys()
@@ -1481,7 +1482,7 @@ fn clear_causal_transients(bpf: &mut Ebpf) -> Result<()> {
         let map = bpf
             .map_mut("THREAD_BINDER_CONTEXT")
             .context("THREAD_BINDER_CONTEXT missing")?;
-        let mut threads: AyaHashMap<_, u64, [u8; 7]> =
+        let mut threads: AyaHashMap<_, u64, [u8; 8]> =
             AyaHashMap::try_from(map).context("THREAD_BINDER_CONTEXT has unexpected layout")?;
         let keys: Vec<u64> = threads
             .keys()
@@ -1610,7 +1611,7 @@ fn remove_followed_process(bpf: &mut Ebpf, pid: u32) -> Result<Option<ProcessTra
         let map = bpf
             .map_mut("BINDER_TRANSACTION_CONTEXT")
             .context("BINDER_TRANSACTION_CONTEXT missing")?;
-        let mut transactions: AyaHashMap<_, u32, [u8; 29]> = AyaHashMap::try_from(map)
+        let mut transactions: AyaHashMap<_, u32, [u8; 30]> = AyaHashMap::try_from(map)
             .context("BINDER_TRANSACTION_CONTEXT has unexpected layout")?;
         match transactions.remove(&binder_debug_id) {
             Ok(()) => {}
@@ -1622,7 +1623,7 @@ fn remove_followed_process(bpf: &mut Ebpf, pid: u32) -> Result<Option<ProcessTra
     let map = bpf
         .map_mut("THREAD_BINDER_CONTEXT")
         .context("THREAD_BINDER_CONTEXT missing")?;
-    let mut threads: AyaHashMap<_, u64, [u8; 7]> =
+    let mut threads: AyaHashMap<_, u64, [u8; 8]> =
         AyaHashMap::try_from(map).context("THREAD_BINDER_CONTEXT has unexpected layout")?;
     let keys: Vec<u64> = threads
         .keys()
