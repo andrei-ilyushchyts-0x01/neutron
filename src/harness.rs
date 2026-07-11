@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{ArgGroup, Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -60,6 +60,7 @@ pub struct ReplayArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(group(ArgGroup::new("oracle_choice").required(true).multiple(false).args(["oracle", "oracle_command"])))]
 pub struct MinimizeArgs {
     pub directory: PathBuf,
     #[arg(long)]
@@ -68,9 +69,18 @@ pub struct MinimizeArgs {
     pub package: String,
     #[arg(long)]
     pub runner: PathBuf,
-    #[arg(long, value_name = "EXEC")]
-    pub oracle_command: PathBuf,
-    #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
+    #[arg(long, value_enum, group = "oracle_choice")]
+    pub oracle: Option<OracleKind>,
+    #[arg(long, value_name = "SIGNAL", requires = "oracle")]
+    pub signal: Option<String>,
+    #[arg(long, value_name = "EXEC", group = "oracle_choice")]
+    pub oracle_command: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        requires = "oracle_command"
+    )]
     pub oracle_arg: Vec<String>,
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=1000))]
     pub max_runs: u32,
@@ -78,6 +88,15 @@ pub struct MinimizeArgs {
     pub timeout: u64,
     #[arg(long)]
     pub authorized_use: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OracleKind {
+    Crash,
+    Reboot,
+    Timeout,
+    Nonzero,
+    Signal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +282,7 @@ pub enum RunnerCapability {
 pub enum RunStatus {
     Completed,
     Crash,
+    Nonzero,
     Reboot,
     TransportLoss,
     Timeout,
@@ -280,11 +300,24 @@ pub struct RunResult {
     pub status: RunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
     pub timed_out: bool,
     pub recovered: bool,
     pub warning: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+enum OracleConfig {
+    BuiltIn {
+        kind: OracleKind,
+        signal: Option<i32>,
+    },
+    Command {
+        program: PathBuf,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +335,14 @@ struct AdbDevice {
     serial: String,
     state: String,
     usb: bool,
+}
+
+struct ReplayOutcome {
+    status: RunStatus,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    recovered: bool,
 }
 
 #[derive(Debug)]
@@ -1934,6 +1975,7 @@ pub fn replay(args: ReplayArgs) -> Result<()> {
 pub fn minimize(args: MinimizeArgs) -> Result<()> {
     require_authorized(args.authorized_use)?;
     validate_serial_syntax(&args.serial)?;
+    let oracle = oracle_config(&args)?;
     eprintln!("neutron: WARNING: {WARNING}");
     let mut metadata = validate_artifact(&args.directory)?;
     let resources = load_resources(&args.directory)?;
@@ -1961,8 +2003,7 @@ pub fn minimize(args: MinimizeArgs) -> Result<()> {
         runner: &runner,
         serial: &args.serial,
         package: &args.package,
-        oracle: &args.oracle_command,
-        oracle_args: &args.oracle_arg,
+        oracle: &oracle,
         timeout: Duration::from_secs(args.timeout.min(runner.timeout_seconds)),
         max_runs: args.max_runs.min(1000),
         runs: 0,
@@ -2083,6 +2124,68 @@ fn require_authorized(authorized: bool) -> Result<()> {
         bail!("--authorized-use is required");
     }
     Ok(())
+}
+
+fn oracle_config(args: &MinimizeArgs) -> Result<OracleConfig> {
+    match (args.oracle, args.oracle_command.as_ref()) {
+        (Some(kind), None) => {
+            let signal = args.signal.as_deref().map(parse_signal).transpose()?;
+            if kind == OracleKind::Signal && signal.is_none() {
+                bail!("--oracle signal requires --signal SIG_NAME_OR_NUMBER");
+            }
+            if kind != OracleKind::Signal && signal.is_some() {
+                bail!("--signal is valid only with --oracle signal");
+            }
+            Ok(OracleConfig::BuiltIn { kind, signal })
+        }
+        (None, Some(program)) => {
+            if args.signal.is_some() {
+                bail!("--signal cannot be combined with --oracle-command");
+            }
+            Ok(OracleConfig::Command {
+                program: program.clone(),
+                args: args.oracle_arg.clone(),
+            })
+        }
+        _ => bail!("choose exactly one --oracle or --oracle-command"),
+    }
+}
+
+fn parse_signal(value: &str) -> Result<i32> {
+    if let Ok(number) = value.parse::<i32>() {
+        if (1..=64).contains(&number) {
+            return Ok(number);
+        }
+        bail!("signal number must be in 1..=64");
+    }
+    let name = value.trim().to_ascii_uppercase();
+    let name = name.strip_prefix("SIG").unwrap_or(&name);
+    let signal = match name {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "ILL" => libc::SIGILL,
+        "TRAP" => libc::SIGTRAP,
+        "ABRT" => libc::SIGABRT,
+        "BUS" => libc::SIGBUS,
+        "FPE" => libc::SIGFPE,
+        "KILL" => libc::SIGKILL,
+        "USR1" => libc::SIGUSR1,
+        "SEGV" => libc::SIGSEGV,
+        "USR2" => libc::SIGUSR2,
+        "PIPE" => libc::SIGPIPE,
+        "ALRM" => libc::SIGALRM,
+        "TERM" => libc::SIGTERM,
+        "CHLD" => libc::SIGCHLD,
+        "CONT" => libc::SIGCONT,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "SYS" => libc::SIGSYS,
+        _ => bail!("unsupported signal '{value}'; use a SIG name or number in 1..=64"),
+    };
+    Ok(signal)
 }
 
 fn parse_adb_devices(output: &str) -> Result<Vec<AdbDevice>> {
@@ -2576,13 +2679,14 @@ fn replay_once(
     expected: &mut RequiredIdentity,
 ) -> RunResult {
     match replay_once_inner(directory, serial, package, runner, timeout, expected) {
-        Ok((status, exit_code, timed_out, recovered)) => RunResult {
+        Ok(outcome) => RunResult {
             schema: HARNESS_SCHEMA.into(),
             run,
-            status,
-            exit_code,
-            timed_out,
-            recovered,
+            status: outcome.status,
+            exit_code: outcome.exit_code,
+            signal: outcome.signal,
+            timed_out: outcome.timed_out,
+            recovered: outcome.recovered,
             warning: WARNING.into(),
             error: None,
         },
@@ -2606,6 +2710,7 @@ fn replay_once(
                 RunStatus::RecoveryFailed
             },
             exit_code: None,
+            signal: None,
             timed_out: false,
             recovered: false,
             warning: WARNING.into(),
@@ -2621,7 +2726,7 @@ fn replay_once_inner(
     runner: &RunnerContract,
     timeout: Duration,
     expected: &mut RequiredIdentity,
-) -> Result<(RunStatus, Option<i32>, bool, bool)> {
+) -> Result<ReplayOutcome> {
     let devices = adb_inventory(timeout)?;
     validate_usb_device(&devices, serial)?;
     let before = query_identity(serial, package, timeout)?;
@@ -2637,12 +2742,13 @@ fn replay_once_inner(
                 timeout,
             )?;
             if output.timed_out || !output.status.success() {
-                return Ok((
-                    RunStatus::HookFailure,
-                    output.status.code(),
-                    output.timed_out,
-                    false,
-                ));
+                return Ok(ReplayOutcome {
+                    status: RunStatus::HookFailure,
+                    exit_code: output.status.code(),
+                    signal: exit_signal(&output.status),
+                    timed_out: output.timed_out,
+                    recovered: false,
+                });
             }
         }
         let output = match remote.as_deref() {
@@ -2659,12 +2765,15 @@ fn replay_once_inner(
         };
         let timed_out = output.timed_out
             || (runner.transport == RunnerTransport::Adb && output.status.code() == Some(124));
+        let signal = exit_signal(&output.status);
         let mut status = if timed_out {
             RunStatus::Timeout
         } else if output.status.success() {
             RunStatus::Completed
-        } else {
+        } else if signal.is_some() {
             RunStatus::Crash
+        } else {
+            RunStatus::Nonzero
         };
         let mut recovered = false;
         let after = query_identity(serial, package, timeout);
@@ -2692,7 +2801,13 @@ fn replay_once_inner(
             }
             recovered = true;
         }
-        Ok((status, output.status.code(), timed_out, recovered))
+        Ok(ReplayOutcome {
+            status,
+            exit_code: output.status.code(),
+            signal,
+            timed_out,
+            recovered,
+        })
     })();
     let cleanup = remote
         .as_deref()
@@ -2706,6 +2821,20 @@ fn replay_once_inner(
             Err(error.context(format!("remote staging cleanup also failed: {cleanup:#}")))
         }
     }
+}
+
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return Some(signal);
+        }
+    }
+    status
+        .code()
+        .filter(|code| (129..=192).contains(code))
+        .map(|code| code - 128)
 }
 
 fn recover_device(
@@ -2885,8 +3014,7 @@ struct MinimizeState<'a> {
     runner: &'a RunnerContract,
     serial: &'a str,
     package: &'a str,
-    oracle: &'a Path,
-    oracle_args: &'a [String],
+    oracle: &'a OracleConfig,
     timeout: Duration,
     max_runs: u32,
     runs: u32,
@@ -2984,7 +3112,6 @@ impl MinimizeState<'_> {
         if matches!(
             result.status,
             RunStatus::TransportLoss
-                | RunStatus::Timeout
                 | RunStatus::HookFailure
                 | RunStatus::IdentityDrift
                 | RunStatus::RecoveryFailed
@@ -2995,34 +3122,49 @@ impl MinimizeState<'_> {
                 result.status
             );
         }
-        let mut argv = vec![self.oracle.display().to_string()];
-        argv.extend(self.oracle_args.iter().cloned());
-        argv.push(result_path.display().to_string());
-        let oracle = match run_argv(&argv, Some(self.work), self.timeout) {
-            Ok(output) => output,
-            Err(error) => {
-                result.status = RunStatus::OracleError;
-                result.error = Some(format!("oracle execution failed: {error:#}"));
-                write_json(&result_path, &result)?;
-                return Err(error).context("oracle execution failed");
+        match self.oracle {
+            OracleConfig::BuiltIn { kind, signal } => Ok(builtin_oracle(&result, *kind, *signal)),
+            OracleConfig::Command { program, args } => {
+                let mut argv = vec![program.display().to_string()];
+                argv.extend(args.iter().cloned());
+                argv.push(result_path.display().to_string());
+                let oracle = match run_argv(&argv, Some(self.work), self.timeout) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        result.status = RunStatus::OracleError;
+                        result.error = Some(format!("oracle execution failed: {error:#}"));
+                        write_json(&result_path, &result)?;
+                        return Err(error).context("oracle execution failed");
+                    }
+                };
+                if oracle.timed_out {
+                    result.status = RunStatus::OracleError;
+                    result.error = Some("oracle timed out".into());
+                    write_json(&result_path, &result)?;
+                    bail!("oracle timed out");
+                }
+                match oracle.status.code() {
+                    Some(0) => Ok(true),
+                    Some(1) => Ok(false),
+                    code => {
+                        result.status = RunStatus::OracleError;
+                        result.error = Some(format!("oracle error (exit {code:?})"));
+                        write_json(&result_path, &result)?;
+                        bail!("oracle error (exit {:?})", code)
+                    }
+                }
             }
-        };
-        if oracle.timed_out {
-            result.status = RunStatus::OracleError;
-            result.error = Some("oracle timed out".into());
-            write_json(&result_path, &result)?;
-            bail!("oracle timed out");
         }
-        match oracle.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            code => {
-                result.status = RunStatus::OracleError;
-                result.error = Some(format!("oracle error (exit {code:?})"));
-                write_json(&result_path, &result)?;
-                bail!("oracle error (exit {:?})", code)
-            }
-        }
+    }
+}
+
+fn builtin_oracle(result: &RunResult, kind: OracleKind, signal: Option<i32>) -> bool {
+    match kind {
+        OracleKind::Crash => matches!(result.status, RunStatus::Crash),
+        OracleKind::Reboot => matches!(result.status, RunStatus::Reboot),
+        OracleKind::Timeout => matches!(result.status, RunStatus::Timeout),
+        OracleKind::Nonzero => matches!(result.status, RunStatus::Crash | RunStatus::Nonzero),
+        OracleKind::Signal => signal.is_some() && result.signal == signal,
     }
 }
 
@@ -3479,6 +3621,50 @@ mod tests {
             &runner,
             RunnerCapability::BinderTransactions
         ));
+    }
+
+    #[test]
+    fn built_in_oracles_distinguish_crashes_errors_reboots_and_signals() {
+        let result = |status, exit_code, signal| RunResult {
+            schema: HARNESS_SCHEMA.into(),
+            run: 1,
+            status,
+            exit_code,
+            signal,
+            timed_out: false,
+            recovered: false,
+            warning: WARNING.into(),
+            error: None,
+        };
+        let crash = result(RunStatus::Crash, Some(139), Some(libc::SIGSEGV));
+        assert!(builtin_oracle(&crash, OracleKind::Crash, None));
+        assert!(builtin_oracle(
+            &crash,
+            OracleKind::Signal,
+            Some(libc::SIGSEGV)
+        ));
+        assert!(!builtin_oracle(
+            &crash,
+            OracleKind::Signal,
+            Some(libc::SIGABRT)
+        ));
+
+        let error = result(RunStatus::Nonzero, Some(1), None);
+        assert!(!builtin_oracle(&error, OracleKind::Crash, None));
+        assert!(builtin_oracle(&error, OracleKind::Nonzero, None));
+        assert!(builtin_oracle(
+            &result(RunStatus::Reboot, None, None),
+            OracleKind::Reboot,
+            None
+        ));
+        assert!(builtin_oracle(
+            &result(RunStatus::Timeout, Some(124), None),
+            OracleKind::Timeout,
+            None
+        ));
+        assert_eq!(parse_signal("SIGSEGV").unwrap(), libc::SIGSEGV);
+        assert_eq!(parse_signal("11").unwrap(), libc::SIGSEGV);
+        assert!(parse_signal("SIG_NOT_REAL").is_err());
     }
 
     #[test]
