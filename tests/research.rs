@@ -227,3 +227,24 @@ fn local_pack_rejects_duplicate_ids_unsupported_schema_and_oversized_files() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn local_pack_rejects_unbounded_settle_time() {
+    let root = temp_dir("settle");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("packs")
+        .join("camera");
+    let pack = root.join("pack");
+    copy_dir(&source, &pack);
+    let scenarios = fs::read_to_string(pack.join("scenarios.yaml"))
+        .unwrap()
+        .replace("settle_ms: 1000", "settle_ms: 18446744073709551615");
+    fs::write(pack.join("scenarios.yaml"), scenarios).unwrap();
+    reseal(&pack);
+
+    assert!(load_pack(&pack, true)
+        .unwrap_err()
+        .to_string()
+        .contains("settle_ms"));
+    fs::remove_dir_all(root).unwrap();
+}
