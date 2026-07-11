@@ -3835,7 +3835,7 @@ mod tests {
     }
 
     #[test]
-    fn selinux_denial_uses_exact_binder_process_context() {
+    fn selinux_denial_marks_binder_process_context_inferred() {
         let mut denial = test_denial();
         denial.ts_ns = 99;
         let scenario = ScenarioInfo {
@@ -3858,7 +3858,7 @@ mod tests {
             Some("com.example.app"),
             Some(10123),
         );
-        assert_eq!(metadata.relation, CausalRelation::Exact);
+        assert_eq!(metadata.relation, CausalRelation::Inferred);
         assert_eq!(metadata.parent_span_id, binder_span_id(7, 5));
         assert_eq!(metadata.root_package.as_deref(), Some("com.example.app"));
         assert_eq!(metadata.root_uid, Some(10123));
