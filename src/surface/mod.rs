@@ -2357,13 +2357,7 @@ fn observe_in(
         .arg(&health_path)
         .arg("--control-socket")
         .arg(&socket_path)
-        .args([
-            "--fdgraph-interval",
-            "off",
-            "--lookback-events",
-            "0",
-            "--no-logcat",
-        ])
+        .args(observation_trace_args())
         .stdout(Stdio::null());
     // SAFETY: the closure only calls async-signal-safe libc functions. The
     // death signal prevents an orphan root tracer if the surface parent is
@@ -2428,6 +2422,10 @@ fn observe_in(
     })();
     let child_cleanup = stop_child(&mut child);
     combine_cleanup(result, child_cleanup, "child trace cleanup")
+}
+
+fn observation_trace_args() -> &'static [&'static str] {
+    &["--fdgraph-interval", "off", "--lookback-events", "0"]
 }
 
 fn ends_with_capture_health(input: &[u8]) -> bool {
