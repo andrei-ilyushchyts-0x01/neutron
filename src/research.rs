@@ -1585,6 +1585,13 @@ mod tests {
     }
 
     #[test]
+    fn research_trace_uses_dynamic_uid_root_for_a_receiver_only_probe() {
+        let selector = research_root_selector("dev.neutron.probe", |_| Ok(10_123)).unwrap();
+
+        assert!(matches!(selector, surface::RootSelector::Uid(10_123)));
+    }
+
+    #[test]
     fn failed_permission_restore_remains_armed_for_drop() {
         let mut granted = vec!["camera".to_string(), "bluetooth".to_string()];
         let result = restore_permissions(&mut granted, |permission| permission == "camera");
