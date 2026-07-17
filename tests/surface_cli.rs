@@ -36,6 +36,44 @@ fn scan_accepts_package_scoped_observation() {
 }
 
 #[test]
+fn coverage_accepts_target_scoped_minimal_repeat_outputs() {
+    assert_surface(&[
+        "neutron",
+        "surface",
+        "coverage",
+        "--targets",
+        "vendor_hal_targets.txt",
+        "--minimal",
+        "--repeat",
+        "2",
+        "--json",
+        "coverage.json",
+        "--tsv",
+        "coverage.tsv",
+        "--fail-unresolved",
+    ]);
+}
+
+#[test]
+fn coverage_rejects_zero_repeat() {
+    assert!(Cli::try_parse_from([
+        "neutron",
+        "surface",
+        "coverage",
+        "--targets",
+        "vendor_hal_targets.txt",
+        "--minimal",
+        "--repeat",
+        "0",
+        "--json",
+        "coverage.json",
+        "--tsv",
+        "coverage.tsv",
+    ])
+    .is_err());
+}
+
+#[test]
 fn query_commands_accept_input_and_output() {
     for args in [
         &[
