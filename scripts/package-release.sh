@@ -509,8 +509,8 @@ ANDROID_BUILD_TOOLS=$(sed -n 's/^ *buildToolsVersion "\([0-9][0-9.]*\)"$/\1/p' \
 JAVA_PROPERTIES=$(java -XshowSettings:properties -version 2>&1)
 JAVA_RUNTIME=$(printf '%s\n' "$JAVA_PROPERTIES" | sed -n 's/^ *java\.runtime\.version = //p' | head -n 1)
 JAVA_VENDOR=$(printf '%s\n' "$JAVA_PROPERTIES" | sed -n 's/^ *java\.vendor = //p' | head -n 1)
-AAPT2_VERSION=$(aapt2 version | head -n 1)
-APKSIGNER_VERSION=$(apksigner --version | head -n 1)
+AAPT2_VERSION=$(aapt2 version 2>&1 | head -n 1)
+APKSIGNER_VERSION=$(apksigner --version 2>&1 | head -n 1)
 RUNNER_IMAGE_OS=${ImageOS:-local-$(uname -s)}
 RUNNER_IMAGE_VERSION=${ImageVersion:-unqualified}
 BUILD_RUNNER_ARCH=${RUNNER_ARCH:-$(uname -m)}
@@ -525,7 +525,8 @@ if [[ "$STRICT_RELEASE" == "true" ]]; then
 fi
 for value in \
   "$GRADLE_VERSION" "$GRADLE_SHA256" "$AGP_VERSION" \
-  "$ANDROID_COMPILE_SDK" "$ANDROID_BUILD_TOOLS" "$JAVA_RUNTIME" "$JAVA_VENDOR"; do
+  "$ANDROID_COMPILE_SDK" "$ANDROID_BUILD_TOOLS" "$JAVA_RUNTIME" "$JAVA_VENDOR" \
+  "$AAPT2_VERSION" "$APKSIGNER_VERSION"; do
   if [[ -z "$value" ]]; then
     echo "could not derive complete release toolchain provenance" >&2
     exit 1

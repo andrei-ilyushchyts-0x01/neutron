@@ -81,6 +81,15 @@ release_sbom_and_provenance_include_dependency_and_build_inputs() {
         contains "$provenance" 'identity_sha256'
 }
 
+release_tool_versions_capture_stderr_and_fail_early_when_missing() {
+    local package="$root/scripts/package-release.sh"
+
+    contains "$package" 'AAPT2_VERSION=$(aapt2 version 2>&1 | head -n 1)' &&
+        contains "$package" 'APKSIGNER_VERSION=$(apksigner --version 2>&1 | head -n 1)' &&
+        contains "$package" '"$AAPT2_VERSION" "$APKSIGNER_VERSION"' &&
+        contains "$package" 'could not derive complete release toolchain provenance'
+}
+
 release_sbom_uses_resolved_gradle_graph_and_validates_spdx() {
     local package="$root/scripts/package-release.sh"
     local build_gradle="$root/probe-app/build.gradle"
@@ -283,6 +292,7 @@ run_test unwrapped_builds_cannot_claim_clean_provenance
 run_test xtask_deploy_and_demo_require_explicit_serial
 run_test release_package_declares_complete_payload
 run_test release_sbom_and_provenance_include_dependency_and_build_inputs
+run_test release_tool_versions_capture_stderr_and_fail_early_when_missing
 run_test release_sbom_uses_resolved_gradle_graph_and_validates_spdx
 run_test release_install_docs_authenticate_before_root_execution
 run_test release_signing_identity_is_fail_closed

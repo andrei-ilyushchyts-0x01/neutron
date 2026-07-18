@@ -59,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed release-pack staging for root-owned Android directories by creating
   them as root, temporarily granting `shell` write access for `adb push`, and
   restoring root ownership afterwards.
+- Fixed release provenance collection for Android tools whose version output
+  is emitted on stderr, with an early completeness gate before artifact output.
 
 ## [1.4.0] — 2026-07-10
 
