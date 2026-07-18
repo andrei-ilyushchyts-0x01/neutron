@@ -210,6 +210,14 @@ workflows_pin_actions_to_immutable_commits() {
     done
 }
 
+ci_and_release_gate_rustsec_advisories() {
+    local workflow
+    for workflow in "$root/.github/workflows/ci.yml" "$root/.github/workflows/release.yml"; do
+        contains "$workflow" 'cargo install cargo-audit --version 0.22.2 --locked' &&
+            contains "$workflow" 'cargo audit' || return 1
+    done
+}
+
 release_archives_and_probe_identity_are_reproducible_inputs() {
     local script="$root/scripts/package-release.sh" gradle="$root/probe-app/app/build.gradle"
     contains "$script" '--sort=name --mtime="@$ARCHIVE_EPOCH" --owner=0 --group=0' &&
@@ -271,6 +279,7 @@ run_test shipped_release_schemas_are_valid_json
 run_test ci_runs_for_release_lines_and_assembles_probe
 run_test signed_tag_workflow_requires_keys_and_attests_assets
 run_test workflows_pin_actions_to_immutable_commits
+run_test ci_and_release_gate_rustsec_advisories
 run_test release_archives_and_probe_identity_are_reproducible_inputs
 run_test current_abi_docs_match_257_byte_contract
 run_test evidence_docs_do_not_overstate_capture_or_domain_filter_support
