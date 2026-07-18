@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read, Write as IoWrite};
+use std::io::{self, IsTerminal, Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2585,6 +2585,19 @@ fn emit_binder_call(
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
+fn maturity_warning_for(
+    command: Option<&Command>,
+    stderr_is_terminal: bool,
+) -> Option<&'static str> {
+    if !stderr_is_terminal {
+        return None;
+    }
+    match command {
+        Some(command) => command.maturity().warning(),
+        None => CommandMaturity::Preview.warning(),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.version {
@@ -2595,10 +2608,7 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let maturity_warning = match cli.command.as_ref() {
-        Some(command) => command.maturity().warning(),
-        None => CommandMaturity::Preview.warning(),
-    };
+    let maturity_warning = maturity_warning_for(cli.command.as_ref(), io::stderr().is_terminal());
     if let Some(warning) = maturity_warning {
         eprintln!("warning: {warning}");
     }
@@ -5192,6 +5202,19 @@ mod tests {
     use neutron::mark::{self, MarkArgs};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn maturity_warning_is_suppressed_for_non_interactive_transports() {
+        let doctor = Cli::try_parse_from(["neutron", "doctor", "--json"])
+            .expect("doctor JSON command should parse");
+
+        assert_eq!(maturity_warning_for(doctor.command.as_ref(), false), None);
+        assert_eq!(
+            maturity_warning_for(doctor.command.as_ref(), true),
+            CommandMaturity::Preview.warning()
+        );
+        assert_eq!(maturity_warning_for(None, false), None);
+    }
 
     fn private_test_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("neutron-{label}-{}", std::process::id()));
