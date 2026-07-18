@@ -27,6 +27,22 @@ public class ResearchReceiverTest {
 
         assertThrows(IllegalArgumentException.class,
                 () -> ResearchReceiver.copyParameter(output, "operation", 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> ResearchReceiver.copyParameter(output, "finish_delay_ms", 1));
         assertTrue(output.isEmpty());
+    }
+
+    @Test public void identifiesOnlyTheRequestedPendingFinishWindow() throws Exception {
+        Thread worker = Thread.currentThread();
+        String originalName = worker.getName();
+        try {
+            ResearchReceiver.delayPendingFinish(null);
+            assertEquals(originalName, worker.getName());
+
+            ResearchReceiver.delayPendingFinish("0");
+            assertEquals("neutron-finish", worker.getName());
+        } finally {
+            worker.setName(originalName);
+        }
     }
 }

@@ -15,7 +15,8 @@ final class Request {
         for (String action : Arrays.asList("gpu", "bluetooth", "wifi")) {
             values.put(action, Collections.emptySet());
         }
-        values.put("keymint", new HashSet<>(Arrays.asList("operation", "delay_ms")));
+        values.put("keymint", new HashSet<>(Arrays.asList(
+                "operation", "delay_ms", "finish_delay_ms")));
         values.put("camera", new HashSet<>(Collections.singletonList("camera_id")));
         values.put("media-codec", new HashSet<>(Collections.singletonList("mime")));
         values.put("usb", new HashSet<>(Collections.singletonList("usb_device_id")));
@@ -37,19 +38,26 @@ final class Request {
         if (operation != null && !"lookup".equals(operation)) {
             throw new IllegalArgumentException("unsupported keymint operation");
         }
-        if (parameters.containsKey("delay_ms")) {
-            if (operation == null) {
-                throw new IllegalArgumentException("keymint delay requires read-only lookup");
+        int totalDelayMs = 0;
+        for (String key : Arrays.asList("delay_ms", "finish_delay_ms")) {
+            if (parameters.containsKey(key)) {
+                if (operation == null) {
+                    throw new IllegalArgumentException("keymint delay requires read-only lookup");
+                }
+                int delay;
+                try {
+                    delay = Integer.parseInt(parameters.get(key));
+                } catch (NumberFormatException error) {
+                    throw new IllegalArgumentException("invalid keymint delay", error);
+                }
+                if (delay < 0 || delay > MAX_DELAY_MS) {
+                    throw new IllegalArgumentException("keymint delay is out of range");
+                }
+                totalDelayMs += delay;
             }
-            int delay;
-            try {
-                delay = Integer.parseInt(parameters.get("delay_ms"));
-            } catch (NumberFormatException error) {
-                throw new IllegalArgumentException("invalid keymint delay", error);
-            }
-            if (delay < 0 || delay > MAX_DELAY_MS) {
-                throw new IllegalArgumentException("keymint delay is out of range");
-            }
+        }
+        if (totalDelayMs > MAX_DELAY_MS) {
+            throw new IllegalArgumentException("combined keymint delay is out of range");
         }
         return Collections.unmodifiableMap(new HashMap<>(parameters));
     }

@@ -417,6 +417,12 @@ cd ..
 `pm path` must print a `package:` path before continuing. Use the probe only
 through `neutron research`; its `DUMP`-protected receiver accepts exactly the
 pack's typed action and parameters, not arbitrary broadcasts or shell commands.
+For marker-bounded read-only checks, the `keymint` action accepts
+`operation=lookup` with optional `delay_ms` and `finish_delay_ms` values from 0
+through 5000 and a combined delay budget of 5000 ms. The latter holds the
+pending result after the lookup under the `neutron-finish` worker name,
+allowing the marker to end first. This observes an Android Keystore query path,
+not a KeyMint HAL handoff.
 
 After installing the companion APK and built-in packs, preflight a pack without
 stimulating hardware:

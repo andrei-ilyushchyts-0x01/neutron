@@ -104,7 +104,14 @@ public final class ResearchReceiver extends BroadcastReceiver {
             case "usb": usb(context, params.get("usb_device_id")); break;
             default: throw new IllegalArgumentException("unknown action");
         }
+        delayPendingFinish(params.get("finish_delay_ms"));
         return COMPLETE;
+    }
+
+    static void delayPendingFinish(String delay) throws InterruptedException {
+        if (delay == null) return;
+        Thread.currentThread().setName("neutron-finish");
+        Thread.sleep(Integer.parseInt(delay));
     }
 
     private static void keymint(String operation) throws Exception {

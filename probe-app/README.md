@@ -4,9 +4,12 @@ Install this minimal companion APK before `neutron research`. Its explicit recei
 
 The `keymint` action defaults to ephemeral key generation. For a deterministic,
 read-only capture smoke test it also accepts `operation=lookup` and a bounded
-`delay_ms` from 0 through 5000. The delay is accepted only with the read-only
-lookup and lets the incoming protected broadcast finish admission before a
-marker-bounded trace begins. The lookup checks a nonce-derived alias expected
+`delay_ms` and `finish_delay_ms` from 0 through 5000. Both delays are accepted
+only with the read-only lookup and their combined budget is 5000 ms. `delay_ms`
+lets the incoming protected broadcast finish admission before a marker-bounded
+trace begins. After the lookup returns, `finish_delay_ms` renames the worker to
+`neutron-finish` and holds its pending broadcast result so the marker can end
+before the receiver finishes. The lookup checks a nonce-derived alias expected
 to be absent and does not create or retain key material. It proves only the
 Android Keystore query path, not a KeyMint HAL handoff.
 
