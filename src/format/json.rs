@@ -1374,13 +1374,14 @@ mod tests {
     #[test]
     fn ioctl_disambiguates_b_magic_via_fd_kind_hint() {
         // BINDER_WRITE_READ-shaped cmd (type='b', dir=RW) — without an FdHint
-        // we default to dma_buf; with a Binder hint we get binder.
+        // we preserve the Binder/dma-buf ambiguity; with a Binder hint we get
+        // binder.
         let cmd: u32 = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
         let ev = ioctl_exit_event(cmd, &[0u8; 48]);
         let v = parse(&format_event_json(&ev, false));
         assert_eq!(
             v.get("ioctl_family").and_then(|x| x.as_str()),
-            Some("dma_buf")
+            Some("binder_or_dma_buf")
         );
 
         let hint = FdHint {

@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn format_ioctl_deep_recognizes_binder_device() {
+    fn format_ioctl_deep_preserves_binder_dma_buf_ambiguity_without_fd_context() {
         // type='b' (0x62), nr=0, size=4, dir=W(1)
         // dir is the top 2 bits in 32-bit cmd: 1 << 30 = 0x40000000
         // size in bits 16..30 (14 bits): 4 << 16 = 0x00040000
@@ -639,7 +639,7 @@ mod tests {
         let cmd: u32 = (1 << 30) | (4 << 16) | (0x62 << 8);
         let buf = buf_with_cmd(cmd);
         let s = format_ioctl_deep(&buf);
-        assert_eq!(s, "binder:_IOC(W,0,4)");
+        assert_eq!(s, "binder_or_dma_buf:_IOC(W,0,4)");
     }
 
     #[test]
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn format_ioctl_deep_includes_payload_when_nonzero() {
-        // type='b' binder + payload bytes after byte 4
+        // type='b' Binder/dma-buf collision + payload bytes after byte 4
         let cmd: u32 = (0x62u32) << 8;
         let mut buf = buf_with_cmd(cmd);
         buf[4] = 0xde;
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn ioctl_family_disambiguates_b_magic_via_fd_kind() {
         // type=0x62 collides between binder and dma-buf. With a Binder fd it
-        // resolves to Binder; with anything else it falls back to DmaBuf.
+        // resolves to Binder; an absent hint must preserve the ambiguity.
         let cmd = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1; // BINDER_WRITE_READ
         assert_eq!(
             IoctlFamily::from_cmd(cmd, Some(FdKind::Binder)),
@@ -721,7 +721,10 @@ mod tests {
             IoctlFamily::from_cmd(cmd, Some(FdKind::File)),
             IoctlFamily::DmaBuf
         );
-        assert_eq!(IoctlFamily::from_cmd(cmd, None), IoctlFamily::DmaBuf);
+        assert_eq!(
+            IoctlFamily::from_cmd(cmd, None).as_str(),
+            "binder_or_dma_buf"
+        );
     }
 
     #[test]
