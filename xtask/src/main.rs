@@ -154,8 +154,13 @@ fn checked_adb_output(serial: &str, args: &[&str], action: &str) -> Result<Strin
     checked_command_output(adb(serial), args, action)
 }
 
+fn quote_remote_shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn checked_su_output(serial: &str, command: &str, action: &str) -> Result<String> {
-    checked_adb_output(serial, &["shell", "su", "-c", command], action)
+    let command = quote_remote_shell_word(command);
+    checked_adb_output(serial, &["shell", "su", "-c", &command], action)
 }
 
 fn device_list_has_physical_usb_serial(output: &str, serial: &str) -> bool {
@@ -1105,10 +1110,15 @@ mod tests {
     #[test]
     fn su_command_is_quoted_as_one_remote_shell_word() {
         assert_eq!(
-            quote_remote_shell_word("test -f /data/local/share/neutron && chmod 0700 /data/local/share/neutron"),
+            quote_remote_shell_word(
+                "test -f /data/local/share/neutron && chmod 0700 /data/local/share/neutron"
+            ),
             "'test -f /data/local/share/neutron && chmod 0700 /data/local/share/neutron'"
         );
-        assert_eq!(quote_remote_shell_word("printf '%s' safe"), "'printf '\"'\"'%s'\"'\"' safe'");
+        assert_eq!(
+            quote_remote_shell_word("printf '%s' safe"),
+            "'printf '\"'\"'%s'\"'\"' safe'"
+        );
     }
 
     #[test]
