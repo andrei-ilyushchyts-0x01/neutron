@@ -34,11 +34,11 @@ jobs:
           components: clippy
           targets: aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user ripgrep zstd
       - run: bash tests/release_contract.sh
       - run: bash tests/package_release.sh
       - run: bash tests/release_identity.sh
       - run: bash tests/provenance_generation.sh
-      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user zstd
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo audit
       - run: cargo check --workspace --exclude neutron-ebpf
