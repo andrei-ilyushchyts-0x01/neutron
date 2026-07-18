@@ -41,6 +41,16 @@ export NEUTRON_BUILD_GIT_COMMIT="$GIT_COMMIT"
 export NEUTRON_BUILD_GIT_DIRTY="$GIT_DIRTY"
 export NEUTRON_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
 
+BUILD_ARCH=$(uname -m)
+if [[ "$BUILD_ARCH" != "x86_64" ]]; then
+  X86_64_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-x86_64-linux-gnu-gcc}"
+  if ! command -v "$X86_64_LINKER" >/dev/null 2>&1; then
+    echo "release packaging on $BUILD_ARCH requires a usable x86_64-linux-gnu linker: $X86_64_LINKER" >&2
+    exit 1
+  fi
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$X86_64_LINKER"
+fi
+
 DIST_ROOT="$ROOT/dist"
 FINAL_DIST="$DIST_ROOT/v$VERSION"
 mkdir -p "$DIST_ROOT"

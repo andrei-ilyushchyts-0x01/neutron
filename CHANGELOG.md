@@ -71,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stopped syscall-whitelist rejects before they populate BPF `INFLIGHT` state,
   preventing long-blocking, non-emittable syscalls from falsely degrading a
   clean scenario boundary while retaining state for allowlisted exit filters.
+- Fixed clean release packaging on non-x86_64 build hosts by selecting and
+  validating an explicit x86_64 GNU cross-linker before host-binary and shell
+  completion builds.
 
 ## [1.4.0] — 2026-07-10
 
