@@ -1622,19 +1622,11 @@ mod tests {
     }
 
     #[test]
-    fn research_trace_blocks_global_binder_coordinators() {
+    fn research_trace_does_not_inject_rejected_domain_flags() {
         let mut args = Vec::new();
         add_research_follow_guardrails(&mut args);
 
-        assert_eq!(
-            args,
-            [
-                "--follow-deny-domain",
-                "servicemanager",
-                "--follow-deny-domain",
-                "system_server",
-            ]
-        );
+        assert!(args.is_empty());
     }
 
     #[test]
