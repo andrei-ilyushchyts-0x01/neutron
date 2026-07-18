@@ -14,8 +14,9 @@ app action
   -> denial, allocation, state change, crash, or reboot
 ```
 
-The current workspace package version is `1.5.0-rc.1`. It is a release
-candidate, not a stable support claim. Command maturity is defined in
+The current workspace package version is `1.5.0`. Stable refers to the
+distribution and versioned schema contract, not universal Android runtime
+support. Command maturity and qualified device rows are defined in
 [`PRODUCT.md`](../PRODUCT.md); this ledger records capability maturity.
 
 Status meanings:
@@ -83,7 +84,7 @@ Guardrails are evidence, not silent filtering:
 
 ## Release-gate evidence and remaining external gates
 
-### Completed execution evidence (one authorized Pixel build, 2026-07-11)
+### Historical pre-1.5 execution evidence (Android 16, 2026-07-11)
 
 - The Android companion passed `testDebugUnitTest` and `assembleDebug` on the
   host with JDK 17, Android SDK platform 35, Build Tools 35.0.0, and Gradle
@@ -98,9 +99,12 @@ Guardrails are evidence, not silent filtering:
   its typed-device preflight found no eligible USB device.
 
 The exact identity, artifact paths, health counters, and status caveats are in
-[the Pixel 8 Pro device profile](devices/pixel8pro.md#authorized-device-release-evidence-2026-07-11).
+[the Pixel 8 Pro device profile](devices/pixel8pro.md#historical-authorized-device-evidence-2026-07-11).
 This closes the previously missing host/companion/one-device execution work;
 it does not promote every pack or every device line to release-validated.
+Android 16 was not rerun with the exact 1.5 payload and is not a supported 1.5
+runtime row. The published 1.5 release evidence records the narrower Android
+17 qualification and the unavailable original 33-target fixture.
 
 ### 1. Device matrix and clean scenario evidence
 

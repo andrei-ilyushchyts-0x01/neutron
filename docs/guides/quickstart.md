@@ -23,7 +23,8 @@ ADB=(adb -s "$ANDROID_SERIAL")
 
 ```bash
 REPO=andrei-ilyushchyts-0x01/neutron
-ASSET=neutron-agent-v1.5.0-rc.1-android-aarch64.tar.zst
+VERSION=1.5.0
+ASSET="neutron-agent-v${VERSION}-android-aarch64.tar.zst"
 : "${NEUTRON_RELEASE_PUBKEY:?Set the separately verified minisign public-key path}"
 
 gh attestation verify "$ASSET" --repo "$REPO"
@@ -32,8 +33,8 @@ minisign -Vm SHA256SUMS -x SHA256SUMS.minisig \
   -p "$NEUTRON_RELEASE_PUBKEY"
 sha256sum --check --strict --ignore-missing SHA256SUMS
 
-tar --zstd -xf neutron-agent-v1.5.0-rc.1-android-aarch64.tar.zst
-cd neutron-agent-v1.5.0-rc.1-android-aarch64
+tar --zstd -xf "$ASSET"
+cd "neutron-agent-v${VERSION}-android-aarch64"
 ./install-android.sh
 ```
 

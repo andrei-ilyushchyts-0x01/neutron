@@ -292,11 +292,13 @@ use Frida / Ghidra / radare2 to inspect or modify deeper.
 
 ### General Android device support
 
-neutron explicitly targets the documented Pixel 8 Pro / Android 16 baseline
-on an Android 14 GKI 6.1.x kernel.
-Other devices may work — the `neutron doctor` subcommand will tell you
-whether the kernel exposes everything required — but only the documented
-profile is verified end-to-end.
+Neutron 1.5 runtime qualification is limited to the exact Pixel 8 Pro /
+Android 17 build and release payload recorded in the published release
+evidence. That evidence covers a bounded positive filtered path and three
+representative surface targets; it does not establish unfiltered negative
+claims or 33-target coverage. The Android 16 profile is historical and was not
+validated with the exact 1.5 payload. Other devices may work, but `doctor`
+compatibility alone does not make them supported.
 
 ### Proactive vulnerability discovery
 
@@ -317,7 +319,7 @@ vulnerability, a feature, or a false positive is up to the analyst.
 | ioctl decoder registry | v1.1–v1.4 | Typed/verified mappings grow additively; unknown commands remain numeric |
 | `--package` / `--root-uid` process discovery | v1.3 / v1.4 | Neither is retroactive. Package roots can miss sub-second processes between refreshes; explicit UID roots use first-event kernel admission. |
 | Cross-process causal tracing | v1.3–v1.4 | Observed Binder following with depth/PID/TTL/domain/special-process guardrails; incomplete branches are explicit |
-| Android surface mapper | v1.4 + Unreleased | Static/imported/live causal evidence, resource lifetimes, semantic diff, and explicit collector health |
+| Android surface mapper | v1.4-v1.5 | Static/imported/live causal evidence, resource lifetimes, semantic diff, and explicit collector health |
 | Path and ioctl payload truncation counters wired in BPF | v1.5 | `path_truncated` and `ioctl_payload_truncated` are explicit degradation counters |
 
 See [docs/ROADMAP.md](ROADMAP.md) for the full multi-version plan.

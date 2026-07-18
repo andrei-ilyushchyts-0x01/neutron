@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.5.0-rc.1] — Unreleased
+## [1.5.0] — 2026-07-18
+
+- Promoted the 1.5 release candidate to a stable distribution and schema
+  release while keeping live Android commands device-matrix-bound.
+- Retained the missing Android 16 runtime validation and unavailable original
+  33-target fixture as explicit limitations; neither is implied by the stable
+  version number.
+
+## [1.5.0-rc.1] — 2026-07-18
 
 - Reframed the supported core around evidence-grade Android boundary ownership
   and bounded causal tracing, with explicit STABLE/PREVIEW/EXPERIMENTAL command

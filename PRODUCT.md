@@ -23,8 +23,8 @@ Supported device rows remain narrower than the CLI surface.
 
 | Command | Maturity | Contract |
 |---|---|---|
-| `neutron trace` | PREVIEW | RC command/schema contract; runtime support remains unqualified until the release SHA passes the Android 16/17 device matrix. |
-| `neutron doctor` | PREVIEW | RC compatibility workflow; it becomes stable only with signed smoke evidence for every supported device row. |
+| `neutron trace` | PREVIEW | 1.5 command/schema contract; runtime claims are limited to qualified device rows and matching run evidence. |
+| `neutron doctor` | PREVIEW | 1.5 compatibility workflow; runtime claims require signed smoke evidence for the exact published payload and device row. |
 | `neutron self-info` | STABLE | Machine-readable source, toolchain, target, and default BPF ABI identity. |
 | `neutron evidence` | STABLE | Run-bundle verification and explicitly attributed external evidence import. |
 | `neutron window` | STABLE | Deterministic host-side capture windowing. |
@@ -51,24 +51,26 @@ through the 1.5 release line.
 
 | Device/build line | Static ownership | Syscall BPF | Binder BPF | Causal follow |
 |---|---|---|---|---|
-| Pixel 8 Pro Android 16 documented baseline | fixture validated; device rerun required | validation required | validation required | validation required |
-| Pixel 8 Pro Android 17 `CP2A.260705.006` | RC-qualified 3-target minimal smoke; original 33-target acceptance pending | layout/load/attach/event/health/cleanup qualified | positive event delivery observed; health-complete positive run pending | exact depth-1 edges observed; complete positive-chain gate pending |
+| Pixel 8 Pro Android 16 documented baseline | historical fixture only; 1.5 unverified | 1.5 unverified | 1.5 unverified | 1.5 unverified |
+| Pixel 8 Pro Android 17 `CP2A.260705.006` | 3-target minimal coverage qualified; original 33-target fixture unavailable | layout/load/attach/event/health/cleanup qualified | health-complete filtered positive path qualified | exact depth-1 app-to-servicemanager/keystore2 path; no HAL handoff claim |
 | Other Pixel/GKI 6.1 devices | experimental | best effort | best effort | best effort |
 | Vendor devices | best effort | unverified | unverified | unverified |
 
-The Android 17 row is capture-compatible for target-scoped ownership and the
-raw-syscall path on the exact clean RC userspace/BPF pair. Its Binder row stays
-PREVIEW: one bounded run proves positive transaction/received delivery and
-exact correlation, but ended with one in-flight syscall; a separate complete
-run contained no Binder transaction. Neither run supports negative evidence
-or a claim of a health-complete positive causal chain. The original 33-target
-list was not available in this release workspace, so its 3-target smoke cannot
-be promoted to the earlier 33/33 claim.
+The Android 17 qualification is deliberately narrow. The release evidence
+records compatible tracepoint layout and ABI, successful load/attach/sentinel
+delivery, readable per-CPU health, clean teardown, 3/3 exact representative
+surface rows with no drift, and one health-complete filtered run with 11
+submitted/userspace/matched events. That run contains completed exact depth-1
+calls to servicemanager and keystore2. Its `claim_scope_complete` is false
+because BPF filters were active, so it cannot support unfiltered negative
+claims. It does not demonstrate stack frames, a KeyMint HAL or driver handoff,
+method-level authorization, an authorization bypass, or a vulnerability. The
+original 33-target list was unavailable, so 3/3 cannot be promoted to 33/33.
 
-Android 16 currently has no connected device in this release workspace. Its
-exact-release runtime rerun remains an external release blocker, not a
-host-testable completion claim. Each published support claim must retain the
-matching doctor and run manifests, artifact hashes, and clean teardown audit.
+Android 16 has no exact-1.5 runtime validation and is not a supported 1.5
+device row. This is an accepted release limitation, not a host-testable
+completion claim. Each published support claim must retain matching doctor
+and run manifests, artifact hashes, and a clean teardown audit.
 
 ## Evidence classes
 

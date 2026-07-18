@@ -39,7 +39,10 @@ fn assert_git_commit(value: &str) {
 #[test]
 fn version_verbose_reports_release_and_build_identity() {
     let output = stdout(&neutron(&["--version", "--verbose"]));
-    assert_eq!(output.lines().next(), Some("neutron 1.5.0-rc.1"));
+    assert_eq!(
+        output.lines().next(),
+        Some(concat!("neutron ", env!("CARGO_PKG_VERSION")))
+    );
 
     assert_git_commit(text_field(&output, "git_commit"));
     assert!(matches!(text_field(&output, "git_dirty"), "true" | "false"));
@@ -61,7 +64,7 @@ fn self_info_json_matches_neutron_self_info_v1() {
     let value: Value = serde_json::from_str(&output).expect("self-info emits one JSON document");
 
     assert_eq!(value["schema"], "neutron.self-info/v1");
-    assert_eq!(value["tool"]["version"], "1.5.0-rc.1");
+    assert_eq!(value["tool"]["version"], env!("CARGO_PKG_VERSION"));
     assert_git_commit(
         value["tool"]["git_commit"]
             .as_str()

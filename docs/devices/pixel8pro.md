@@ -1,6 +1,7 @@
 # Pixel 8 Pro — Device Profile
 
-This is the documented Android 16 baseline profile. It does not imply
+This is the historical Android 16 baseline profile; it was not validated with
+the exact 1.5 payload. It does not imply
 support for every Android 14+, GKI 6.1, BTF, or rooted device. Runtime
 support is limited to rows explicitly qualified in `PRODUCT.md`; other
 Pixel/GKI devices are best-effort and vendor devices remain unverified.
@@ -86,11 +87,12 @@ bpf    on /sys/fs/bpf       type bpf    (rw,nosuid,nodev,noexec,relatime)
   inventory is read off `/proc/config.gz` plus runtime probing. For
   `bpftool feature probe`, cross-build it from the AOSP/kernel tree.
 
-## Authorized-device release evidence (2026-07-11)
+## Historical authorized-device evidence (2026-07-11)
 
-This section records one authorized rooted-device run. It is evidence for the
-exact build above, not a claim that another Pixel build or vendor device has
-the same results.
+This section records one authorized rooted-device run predating the exact 1.5
+payload. It is evidence for the exact build above, not current 1.5 runtime
+qualification or a claim that another Pixel build or vendor device has the
+same results.
 
 - `neutron doctor` passed privilege, BTF, tracefs, bpffs, raw-syscall,
   stack-map, and Binder checks. Its only warnings were the expected masked

@@ -52,7 +52,7 @@ will credit the reporter (with consent) in `CHANGELOG.md`.
 
 | Version | Status | Notes |
 |---------|--------|-------|
-| `1.5.x` | Pre-release support | Release candidates receive fixes while the device matrix is completed. |
+| `1.5.x` | Supported | Stable distribution; Android runtime workflows remain limited to qualified rows in `PRODUCT.md`. |
 | `1.4.x` | Supported | Maintenance line. Aya 0.13, kernel 6.1+ aarch64, BTF + CO-RE. |
 | `< 1.4` | Unsupported | Historical releases; reproduce against the current line. |
 

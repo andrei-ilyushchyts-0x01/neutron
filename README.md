@@ -9,6 +9,10 @@ records bounded Binder-to-syscall/ioctl/device handoffs with explicit capture
 health and provenance. See [PRODUCT.md](PRODUCT.md) for command maturity and
 non-goals.
 
+Version 1.5 is a stable distribution and schema release. Live Android
+commands remain PREVIEW and support-matrix-bound: Android 16 is not qualified
+for the 1.5 payload, and other unlisted device builds remain best effort.
+
 [![kernel: 6.1+](https://img.shields.io/badge/kernel-6.1%2B_aarch64-blue.svg)](#requirements)
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
@@ -80,13 +84,15 @@ Device:
 - bpffs at `/sys/fs/bpf`
 - `CAP_BPF` and `CAP_SYS_ADMIN` in the domain that runs neutron
 
-Documented historical baseline (current 1.5 release-SHA runtime revalidation
-is still required; see [PRODUCT.md](PRODUCT.md#support-matrix)):
+Runtime-qualified release line (see [PRODUCT.md](PRODUCT.md#support-matrix)):
 
 - Google Pixel 8 Pro (`husky`)
-- Android 16
-- kernel `6.1.145-android14-11`
+- Android 17 build `CP2A.260705.006`
+- kernel `6.1.157-android14-11`
 - KernelSU, run with `adb -s SERIAL shell "su -c '...'"`.
+
+The Android 16 device profile is retained as historical evidence, not as a
+qualified 1.5 runtime row.
 
 Host build tools:
 
@@ -110,7 +116,7 @@ cargo install bpf-linker
 Use this path when a release with Android assets has been published.
 
 ```bash
-VERSION=1.5.0-rc.1
+VERSION=1.5.0
 TAG="v${VERSION}"
 REPO=andrei-ilyushchyts-0x01/neutron
 ASSET="neutron-agent-v${VERSION}-android-aarch64.tar.zst"
