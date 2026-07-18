@@ -3,8 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +27,8 @@ const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_EVENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PARCEL_BYTES: u64 = 64 * 1024;
 const MAX_REPLAY_BINARY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const WARNING: &str =
     "AUTHORIZED USE ONLY: replay may crash or reboot the selected physical device.";
 
@@ -2611,62 +2616,147 @@ fn run_argv(argv: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<Co
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     let mut child = command
         .spawn()
         .with_context(|| format!("spawning '{}'", argv[0]))?;
-    let stdout = child.stdout.take().map(|mut pipe| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes)?;
-            Ok::<_, std::io::Error>(bytes)
-        })
-    });
-    let stderr = child.stderr.take().map(|mut pipe| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes)?;
-            Ok::<_, std::io::Error>(bytes)
-        })
-    });
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_process_group(&mut child).context("terminating runner without stdout")?;
+            bail!("runner stdout is not piped");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            kill_process_group(&mut child).context("terminating runner without stderr")?;
+            bail!("runner stderr is not piped");
+        }
+    };
+    let oversized = Arc::new(AtomicBool::new(false));
+    let stdout = match drain_output(stdout, Arc::clone(&oversized)) {
+        Ok(reader) => reader,
+        Err(error) => {
+            drop(stderr);
+            kill_process_group(&mut child).context("terminating runner without stdout reader")?;
+            return Err(error).context("starting runner stdout reader");
+        }
+    };
+    let stderr = match drain_output(stderr, Arc::clone(&oversized)) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let cleanup = kill_process_group(&mut child);
+            let stdout_cleanup = join_output(stdout);
+            cleanup.context("terminating runner without stderr reader")?;
+            stdout_cleanup.context("draining runner stdout during cleanup")?;
+            return Err(error).context("starting runner stderr reader");
+        }
+    };
     let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(CommandOutput {
-                status,
-                stdout: join_output(stdout)?,
-                stderr: join_output(stderr)?,
-                timed_out: false,
-            });
+    let mut leader_status = None;
+    let mut timed_out = false;
+    let mut output_too_large = false;
+    let status = loop {
+        if oversized.load(Ordering::Acquire) {
+            output_too_large = true;
+            break kill_process_group(&mut child);
+        }
+        if leader_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => leader_status = Some(status),
+                Ok(None) => {}
+                Err(error) => break kill_process_group(&mut child).and(Err(error)),
+            }
+        }
+        if leader_status.is_some() && stdout.is_finished() && stderr.is_finished() {
+            break Ok(leader_status.take().expect("leader status was checked"));
         }
         if started.elapsed() >= timeout {
-            child.kill()?;
-            let status = child.wait()?;
-            return Ok(CommandOutput {
-                status,
-                stdout: join_output(stdout)?,
-                stderr: join_output(stderr)?,
-                timed_out: true,
-            });
+            timed_out = true;
+            break kill_process_group(&mut child);
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(COMMAND_POLL_INTERVAL);
+    }?;
+    let stdout = join_output(stdout)?;
+    let stderr = join_output(stderr)?;
+    if output_too_large || oversized.load(Ordering::Acquire) {
+        bail!("runner output exceeds {MAX_COMMAND_OUTPUT_BYTES} byte per-stream limit");
+    }
+    Ok(CommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn drain_output<R>(
+    mut pipe: R,
+    oversized: Arc<AtomicBool>,
+) -> std::io::Result<thread::JoinHandle<std::io::Result<Vec<u8>>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name("neutron-harness-output".into())
+        .spawn(move || {
+            let mut output = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let read = pipe.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                let keep = MAX_COMMAND_OUTPUT_BYTES
+                    .saturating_sub(output.len())
+                    .min(read);
+                output.extend_from_slice(&chunk[..keep]);
+                if keep != read {
+                    oversized.store(true, Ordering::Release);
+                }
+            }
+            Ok(output)
+        })
+}
+
+fn kill_process_group(child: &mut Child) -> std::io::Result<ExitStatus> {
+    let process_group = i32::try_from(child.id()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "runner process id is out of range",
+        )
+    })?;
+    let killed = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    let kill_error = if killed == 0 {
+        None
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            None
+        } else {
+            child.kill().err()
+        }
+    };
+    let waited = child.wait();
+    match (kill_error, waited) {
+        (_, Err(error)) | (Some(error), Ok(_)) => Err(error),
+        (None, Ok(status)) => Ok(status),
     }
 }
 
-fn join_output(handle: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>) -> Result<Vec<u8>> {
+fn join_output(handle: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
     handle
-        .map(|handle| {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("command output reader panicked"))?
-                .map_err(anyhow::Error::from)
-        })
-        .transpose()
-        .map(|output| output.unwrap_or_default())
+        .join()
+        .map_err(|_| anyhow::anyhow!("command output reader panicked"))?
+        .map_err(anyhow::Error::from)
 }
 
 fn replay_once(
@@ -3276,11 +3366,7 @@ mod tests {
     #[allow(clippy::zombie_processes)]
     fn spawn_pipe_holding_descendant() {
         Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "bounded_harness_command_child",
-                "--nocapture",
-            ])
+            .args(["--ignored", "bounded_harness_command_child", "--nocapture"])
             .env("NEUTRON_HARNESS_COMMAND_CHILD", "pipe-descendant")
             .spawn()
             .unwrap();
@@ -3290,8 +3376,11 @@ mod tests {
     #[ignore = "subprocess fixture for bounded harness command tests"]
     fn bounded_harness_command_child() {
         match std::env::var("NEUTRON_HARNESS_COMMAND_CHILD").as_deref() {
-            Ok("oversize") => std::io::stdout()
+            Ok("oversize-stdout") => std::io::stdout()
                 .write_all(&vec![b'o'; 2 * 1024 * 1024])
+                .unwrap(),
+            Ok("oversize-stderr") => std::io::stderr()
+                .write_all(&vec![b'e'; 2 * 1024 * 1024])
                 .unwrap(),
             Ok("pipe-holder") => spawn_pipe_holding_descendant(),
             Ok("pipe-descendant") => {
@@ -3580,16 +3669,14 @@ mod tests {
 
     #[test]
     fn runner_rejects_oversized_output() {
-        let started = Instant::now();
-        let error = run_argv(
-            &command_fixture("oversize", None),
-            None,
-            Duration::from_secs(3),
-        )
-        .unwrap_err();
+        for mode in ["oversize-stdout", "oversize-stderr"] {
+            let started = Instant::now();
+            let error =
+                run_argv(&command_fixture(mode, None), None, Duration::from_secs(3)).unwrap_err();
 
-        assert!(error.to_string().contains("output exceeds"));
-        assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(error.to_string().contains("output exceeds"));
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
     }
 
     #[test]
@@ -3611,7 +3698,10 @@ mod tests {
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_millis(1500));
         std::thread::sleep(Duration::from_millis(500));
-        assert!(!marker.exists(), "descendant survived the process-group kill");
+        assert!(
+            !marker.exists(),
+            "descendant survived the process-group kill"
+        );
     }
 
     #[test]
