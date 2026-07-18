@@ -239,13 +239,16 @@ evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
     local architecture="$root/docs/ARCHITECTURE.md"
     local reference="$root/docs/REFERENCE.md"
     local cli="$root/src/cli.rs"
+    local changelog="$root/CHANGELOG.md"
 
     ! rg -qi 'lossless from the producer|handles silently' "$architecture" &&
         contains "$reference" 'rejected in 1.5' &&
         contains "$cli" 'rejected in 1.5' &&
         ! rg -qi 'uid.*falls back to.*active' "$reference" "$cli" &&
         contains "$reference" '`uid` is rejected in 1.5' &&
-        contains "$cli" '`uid` is rejected in 1.5'
+        contains "$cli" '`uid` is rejected in 1.5' &&
+        ! contains "$changelog" 'Seeded PIDs matching explicit `--follow-deny-domain`' &&
+        contains "$changelog" 'domain follow-policy flags are rejected in 1.5'
 }
 
 security_policy_has_private_only_reporting() {
