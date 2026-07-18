@@ -553,10 +553,9 @@ fn ioctl_matches_predicate(cmd: u32, payload_ptr: *const u8) -> bool {
 }
 
 /// Combined enter-side predicate. Evaluates the BPF-evaluable AND-conjunction
-/// of `--match-*` flags. Returns `true` when all configured predicates
-/// match — or when the syscall is in the state-tracking set and userspace
-/// requested state events. The userspace post-filter still applies the
-/// remaining (non-BPF-evaluable) clauses on its side.
+/// of `--match-*` flags. The caller separately applies the state-tracking
+/// exemption after syscall-whitelist admission. The userspace post-filter
+/// still applies the remaining (non-BPF-evaluable) clauses on its side.
 #[inline(always)]
 fn enter_predicate_match(nr: i32, uid: u32, ev: *const SyscallEvent) -> bool {
     if !uid_matches_predicate(uid) {
@@ -634,7 +633,8 @@ fn exit_predicate_match(nr: i32, uid: u32, saved: *const SyscallEvent, ret: i64,
 /// Composition (safe over-approximation):
 /// 1. Legacy `syscall_allowed` whitelist (gated by `FILTER_KEY_ACTIVE`).
 /// 2. Predicate AND-conjunction across configured `MATCH_*` clauses.
-/// 3. Always-pass for state-tracking syscalls when userspace requested it.
+/// 3. Predicate exemption for admitted state-tracking syscalls when userspace
+///    requested it; this never expands the legacy syscall whitelist.
 /// 4. When an exit-only predicate (`MATCH_BIT_RET` / `MATCH_BIT_LATENCY`)
 ///    is configured, drop enter events outright before ringbuf
 ///    reservation. The matching exit will still emit if it satisfies

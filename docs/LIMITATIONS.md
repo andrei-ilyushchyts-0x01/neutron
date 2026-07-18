@@ -174,6 +174,28 @@ second after attach and can miss a process that starts and exits between
 refreshes. Explicit UID roots are admitted by eBPF on their first observed
 kernel event; their refresh is only for reconciliation and limit enforcement.
 
+### 9. FD-state enrichment under syscall whitelists
+
+When a syscall whitelist is active (for example, through
+`--profile security` or `--match-syscall`), neutron does **not** automatically
+add the lifecycle syscalls needed by stateful userspace features.
+`STATE_EMIT_REQUIRED` lets state events bypass later predicate filtering, but
+it does not bypass the earlier `SYSCALL_FILTER` whitelist.
+
+As a result, `--resolve-paths`, `--match-fd` and other `fd_path` predicates,
+`--capture-reads`, and `--follow-children` can be incomplete unless the active
+whitelist explicitly includes the lifecycle syscalls each feature needs. For
+example, FD state depends on observed `openat`/`openat2`, `close`, and
+duplication events, while child following depends on `clone`.
+
+The userspace `FdGraph` also does not model `fcntl` FD duplication or
+`close_range`. Its `/proc/<pid>/fd/<fd>` fallback can repair an individual
+cache miss, but retained entries can still become stale. A cached `fd_path` is
+enrichment, not proof of a current live FD binding. Likewise, a missing path or
+failed path predicate is not proof that the process did not access the
+resource; use a complete lifecycle trace or contemporaneous `/proc` evidence
+when the binding itself matters to a claim.
+
 ---
 
 ## Surface mapper limitations (1.4.0)

@@ -147,13 +147,13 @@ subcommands.
   the ringbuf predicate decision is a separate gate. Exit-time predicates (ret class,
   latency threshold) can fire on syscalls whose enter was filtered
   from output without losing args / data / stack / enter_ts.
-- **State-tracking always-emit.** When a predicate references
+- **State-tracking predicate exemption.** When a predicate references
   `fd_path` (or other fdgraph-state-dependent clauses), the BPF
   prefilter lets `openat`/`openat2`/`dup`/`dup3`/`close`/`socket`/
   `socketpair`/`accept`/`accept4`/`pipe2`/`eventfd2`/`memfd_create`/
-  `clone` bypass the predicate so userspace fdgraph stays consistent.
-  Exposed via `FILTER_KEY_STATE_EMIT_REQUIRED` (slot 7 of
-  `FILTER_MAP`).
+  `clone` bypass later predicates after any active syscall-whitelist
+  admission. It does not expand that whitelist. Exposed via
+  `FILTER_KEY_STATE_EMIT_REQUIRED` (slot 7 of `FILTER_MAP`).
 - **`--capture matched+context=<DUR>` mode.** Always-on userspace
   ring of recently-rejected events; on a predicate match the ring
   flushes (the previous `<DUR>` of context) and arms a forward window

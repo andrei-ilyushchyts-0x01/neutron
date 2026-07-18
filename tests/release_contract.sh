@@ -295,6 +295,29 @@ evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
         contains "$changelog" 'domain follow-policy flags are rejected in 1.5'
 }
 
+limitations_disclose_filtered_fd_state_ceiling() {
+    local limitations="$root/docs/LIMITATIONS.md"
+    local reference="$root/docs/REFERENCE.md"
+    local manpage="$root/man/man1/neutron.1"
+    local main="$root/src/main.rs"
+    local common="$root/neutron-common/src/lib.rs"
+
+    rg -Uq 'does \*\*not\*\* automatically[[:space:]]+add the lifecycle syscalls' "$limitations" &&
+        contains "$limitations" '`--resolve-paths`' &&
+        contains "$limitations" '`fd_path` predicates' &&
+        contains "$limitations" '`--capture-reads`' &&
+        contains "$limitations" '`--follow-children`' &&
+        contains "$limitations" '`fcntl` FD duplication' &&
+        contains "$limitations" '`close_range`' &&
+        contains "$limitations" 'not proof of a current live FD binding' &&
+        contains "$reference" 'after any active `SYSCALL_FILTER` admission' &&
+        contains "$manpage" 'only after admission by any active' &&
+        contains "$main" 'only after syscall-whitelist admission' &&
+        contains "$common" 'This flag never expands' &&
+        contains "$common" '`SYSCALL_FILTER`. Userspace flips it' &&
+        ! contains "$main" 'state-tracking syscalls always-emit'
+}
+
 security_policy_has_private_only_reporting() {
     local policy="$root/SECURITY.md"
     contains "$policy" 'private security advisory' &&
@@ -335,6 +358,7 @@ run_test ci_and_release_gate_rustsec_advisories
 run_test release_archives_and_probe_identity_are_reproducible_inputs
 run_test current_abi_docs_match_257_byte_contract
 run_test evidence_docs_do_not_overstate_capture_or_domain_filter_support
+run_test limitations_disclose_filtered_fd_state_ceiling
 run_test security_policy_has_private_only_reporting
 run_test product_contract_labels_every_command
 

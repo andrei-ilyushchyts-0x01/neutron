@@ -473,9 +473,10 @@ pub const FILTER_KEY_ARG_U32_OFF: u32 = 5;
 /// Phase 1a — required `_IOC_DIR` value (`0..=3`). Gated by
 /// `MATCH_BIT_IOCTL_DIR`.
 pub const FILTER_KEY_IOCTL_DIR: u32 = 6;
-/// Phase 1a — when set to `1`, BPF programs let
-/// state-tracking syscalls (see [`is_state_tracking_nr`]) bypass the
-/// predicate filter. Userspace flips this on whenever a feature relies on
+/// Phase 1a — when set to `1`, BPF programs let state-tracking syscalls
+/// (see [`is_state_tracking_nr`]) bypass later match-predicate gates after
+/// any legacy syscall-whitelist admission. This flag never expands
+/// `SYSCALL_FILTER`. Userspace flips it on whenever a feature relies on
 /// `FdGraph` state (e.g. `--match-fd`, `--resolve-paths`,
 /// `--follow-children`).
 pub const FILTER_KEY_STATE_EMIT_REQUIRED: u32 = 7;
@@ -584,21 +585,23 @@ pub const fn ret_matches_class(ret: i64, class: u32) -> bool {
 
 // ── State-tracking syscalls (Phase 1a) ───────────────────────────────────────
 //
-// These syscalls drive the userspace `FdGraph`: openat, dup, close, socket,
-// pipe, eventfd, memfd_create, accept, clone (for follow-children). When a
-// `--match-fd` / `--resolve-paths` / `--follow-children` feature is active,
-// `FILTER_KEY_STATE_EMIT_REQUIRED` is set and BPF lets these syscalls
-// bypass the predicate filter so userspace fdgraph stays consistent. The
-// matching userspace post-filter still decides whether the event is
-// written to NDJSON or only consumed for state.
+// These syscalls can drive the userspace `FdGraph`: openat, dup, close,
+// socket, pipe, eventfd, memfd_create, accept, clone (for follow-children).
+// When a `--match-fd` / `--resolve-paths` / `--follow-children` feature is
+// active, `FILTER_KEY_STATE_EMIT_REQUIRED` lets an already-admitted syscall
+// bypass later match and sampling gates. An active `SYSCALL_FILTER` still
+// applies first, so callers that need complete lifecycle state must include
+// the required syscalls explicitly. The userspace post-filter decides
+// whether the event is written to NDJSON or consumed only for state.
 //
 // Numbers are aarch64 generic (kernel/uapi/asm-generic/unistd.h). They
 // must stay in sync with `src/decode/syscalls.rs`.
 
-/// Authoritative list of state-tracking syscall numbers. Userspace iterates
-/// this slice to populate `SYSCALL_FILTER` when `--match-syscall` is in use
-/// alongside fd-aware features. BPF uses [`is_state_tracking_nr`] for the
-/// same predicate via a `match` expression that compiles to a jump table.
+/// Stable set of state-tracking syscall numbers used for predicate and
+/// userspace-sampling exemptions. This is not a complete FD lifecycle model:
+/// for example, `fcntl` duplication and `close_range` are not represented.
+/// BPF uses [`is_state_tracking_nr`] for the same classification via a
+/// `match` expression that compiles to a jump table.
 pub const STATE_TRACKING_NRS: &[i32] = &[
     19,  // eventfd2
     23,  // dup

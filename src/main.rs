@@ -1222,8 +1222,8 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
         bits |= MATCH_BIT_ARG_U32;
     }
 
-    // STATE_EMIT_REQUIRED bit — flip on whenever userspace will need state
-    // events to keep fdgraph consistent.
+    // STATE_EMIT_REQUIRED bit — flip on whenever userspace needs admitted
+    // state events. An active syscall whitelist remains the earlier gate.
     let state_required = if spec.needs_state_events() {
         1u32
     } else {
@@ -3125,8 +3125,8 @@ fn run_trace(mut args: Args) -> Result<()> {
             || capture_predicate.needs_state_events_via_ast()
         {
             eprintln!(
-                "    [bpf]  state-tracking syscalls always-emit (fd_path \
-                 enrichment requires fdgraph state)"
+                "    [bpf]  state-tracking syscalls bypass later match gates \
+                 only after syscall-whitelist admission; lifecycle state may be incomplete"
             );
         }
         if let Some(spec) = capture_predicate.bpf_spec() {
@@ -3148,9 +3148,9 @@ fn run_trace(mut args: Args) -> Result<()> {
         }
     };
 
-    // 2d. Phase 1d — sampling and rate limiting. State-tracking syscalls
-    // bypass both inside `SamplerChain`, so fdgraph stays consistent
-    // regardless of the configured probability or QPS cap.
+    // 2d. Phase 1d — sampling and rate limiting. Admitted state-tracking
+    // syscalls bypass both inside `SamplerChain`; an earlier active syscall
+    // whitelist can still make fdgraph state incomplete.
     let mut sampler = SamplerChain::from_args(args.sample, args.rate_limit)?;
 
     // 2e. Phase 4b — optional binder service descriptor map for

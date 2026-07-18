@@ -650,15 +650,17 @@ in
 .B \-\-match \fIEXPR\fR
 falls through to userspace as a safe over-approximation.
 .PP
-Per the assessment workflow:
-.BR \-\-match-fd " toggles " STATE_EMIT_REQUIRED
-so kernel-side state-tracking syscalls
+Per the assessment workflow,
+.BR \-\-match-fd " toggles " STATE_EMIT_REQUIRED .
+Kernel-side state-tracking syscalls bypass later predicate gates only after admission by any active
+.BR SYSCALL_FILTER ;
+the flag does not add lifecycle syscalls to that whitelist. The tracked set includes
 .RB ( open ", " close ", " dup ", " dup3 ", " socket ", " pipe2 ", "
 .BR memfd_create ", " clone )
-bypass the predicate and keep the userspace
+and can enrich the userspace
 .B FdGraph
-consistent. Sampling and rate-limiting also bypass these so the
-binder correlator never loses pair halves.
+when those events are admitted. Sampling and rate-limiting exempt admitted
+state events, but a filtered lifecycle remains incomplete.
 .TP
 .BI \-\-match-pid " LIST"
 Multi-PID match (comma-separated u32). BPF-evaluable.
