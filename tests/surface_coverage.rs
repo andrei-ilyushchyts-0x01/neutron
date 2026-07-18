@@ -131,13 +131,43 @@ fn is_sha256(value: &str) -> bool {
 }
 
 #[test]
-fn targets_are_normalized_without_fuzzy_matching() {
+fn qualified_targets_preserve_and_enforce_transport() {
     let targets = parse_targets(&format!(
         "# authorized target set\n  service:binder:{TARGET}  \n\n"
     ))
     .expect("target list should parse");
 
-    assert_eq!(targets, vec![TARGET.to_string()]);
+    assert_eq!(targets, vec![format!("service:binder:{TARGET}")]);
+
+    let reader = FakeReader::default();
+    let coverage = collect_coverage_with_reader(
+        &reader,
+        &[format!("service:hwbinder:{TARGET}")],
+        &CoverageOptions::default(),
+    )
+    .expect("a missing qualified transport is unresolved evidence");
+    let row = &coverage.rows[0];
+    assert_eq!(row.endpoint, TARGET);
+    assert_eq!(row.transport, "hwbinder");
+    assert!(!row.live);
+    assert!(!row.declared);
+    assert_eq!(row.attribution.confidence, "unresolved");
+    assert!(row.owner.is_none());
+    assert!(!reader
+        .operations()
+        .iter()
+        .any(|operation| operation == &format!("command:dumpsys --pid {TARGET}")));
+}
+
+#[test]
+fn targets_reject_invalid_transport_qualifiers() {
+    for target in [
+        format!("service:rpc:{TARGET}"),
+        "service:binder:".to_string(),
+        format!("service:binder {TARGET}"),
+    ] {
+        assert!(parse_targets(&target).is_err(), "accepted {target}");
+    }
 }
 
 #[test]

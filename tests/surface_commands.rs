@@ -202,6 +202,106 @@ fn query_command_variants_emit_secure_json_envelopes() {
 }
 
 #[test]
+fn explain_accepts_coverage_and_emits_a_deterministic_chain_of_proof() {
+    let temp = TestDir::new("surface-coverage-explain");
+    let input = temp.path("coverage.json");
+    let first_output = temp.path("first.json");
+    let second_output = temp.path("second.json");
+    let endpoint = "example.IExample/default";
+    let sha = "0".repeat(64);
+    let source = |collector: &str, source: &str, evidence: &str| {
+        serde_json::json!({
+            "measured_by": "neutron",
+            "collector": collector,
+            "source": source,
+            "evidence": evidence,
+            "evidence_sha256": sha,
+        })
+    };
+    let coverage = serde_json::json!({
+        "schema": "neutron.surface-coverage/v1",
+        "neutron_version": "1.5.0-rc.1",
+        "collected_at": "2026-07-17T00:00:00Z",
+        "device": {"fingerprint": "example/fingerprint", "boot_id": "boot-test"},
+        "collection": {"target_count": 1, "minimal": true, "full_snapshot_retained": false},
+        "repeat": {"count": 1, "semantic_drift": []},
+        "health": {"status": "complete", "warnings": []},
+        "summary": {"exact": 1, "unresolved": 0, "ambiguous": 0},
+        "rows": [{
+            "endpoint": endpoint,
+            "declared": true,
+            "live": true,
+            "transport": "binder",
+            "owner": {
+                "pid": 42,
+                "uid": 1000,
+                "gid": 1000,
+                "starttime": 100,
+                "boot_id": "boot-test",
+                "selinux_domain": "u:r:hal_example_default:s0",
+                "executable": "/vendor/bin/example"
+            },
+            "attribution": {
+                "confidence": "exact",
+                "sources": [
+                    source("vintf", "/vendor/etc/vintf/manifest.xml", "declared endpoint"),
+                    source("proc_exe", "/proc/42/exe", "executable=/vendor/bin/example"),
+                    source("proc_attr", "/proc/42/attr/current", "domain=u:r:hal_example_default:s0"),
+                    source("proc_stat", "/proc/42/stat", "pid=42 starttime=100"),
+                    source("dumpsys_pid", "dumpsys --pid example.IExample/default", "pid=42"),
+                    source("service_list", "service list", "live endpoint")
+                ]
+            }
+        }]
+    });
+    fs::write(&input, serde_json::to_vec(&coverage).unwrap()).unwrap();
+
+    for output in [&first_output, &second_output] {
+        run(SurfaceCommand::Explain(SurfaceExplainArgs {
+            selector: format!("service:binder:{endpoint}"),
+            io: input_args(&input, output),
+        }))
+        .expect("coverage explain should succeed");
+    }
+
+    assert_eq!(fs::read(&first_output).unwrap(), fs::read(&second_output).unwrap());
+    let result = read_json(&first_output);
+    assert_eq!(result["schema"], "neutron.surface/query/v1");
+    assert_eq!(result["entity"]["kind"], "coverage");
+    assert_eq!(result["entity"]["value"]["endpoint"], endpoint);
+    let claims: Vec<_> = result["chain_of_proof"]
+        .as_array()
+        .expect("proof chain")
+        .iter()
+        .map(|step| step["claim"].as_str().expect("human-readable claim"))
+        .collect();
+    assert_eq!(
+        claims,
+        [
+            "live binder service example.IExample/default",
+            "owner PID 42",
+            "process identity PID 42, starttime 100, boot ID boot-test",
+            "SELinux domain u:r:hal_example_default:s0",
+            "executable /vendor/bin/example",
+            "declared binder service example.IExample/default",
+        ]
+    );
+    assert!(result["chain_of_proof"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|step| !step["sources"].as_array().unwrap().is_empty()));
+    assert_secure(&first_output);
+
+    let error = run(SurfaceCommand::Explain(SurfaceExplainArgs {
+        selector: format!("service:hwbinder:{endpoint}"),
+        io: input_args(&input, &temp.path("wrong-transport.json")),
+    }))
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("did not match"));
+}
+
+#[test]
 fn static_scan_with_real_reader_writes_a_secure_round_trip_snapshot() {
     let temp = TestDir::new("surface-real-scan");
     let output = temp.path("surface.json");
