@@ -70,6 +70,9 @@ pub fn format_ioctl_deep(raw: &[u8; 128]) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoctlFamily {
     DmaHeap,
+    /// Concrete dma-buf attribution. The built-in classifier does not assign
+    /// this from path text alone; it is retained for schema compatibility and
+    /// future kernel-derived FD provenance.
     DmaBuf,
     /// The shared `'b'` magic was observed without enough FD context to
     /// distinguish Binder from dma-buf. Evidence consumers must not collapse
@@ -119,16 +122,17 @@ impl IoctlFamily {
     /// Classify by `_IOC_TYPE` byte. The `'b'` (0x62) magic is reused by
     /// both binder and dma-buf in the kernel headers — they only diverge by
     /// the file_operations of the target fd. We use the FD-graph kind as the
-    /// disambiguator: `Binder` fd → binder, a known non-Binder fd → dma-buf,
-    /// and absent/unknown context → an explicit ambiguous family.
+    /// disambiguator only when it positively identifies a Binder fd. A merely
+    /// non-Binder or unknown kind does not prove dma-buf ownership and remains
+    /// an explicit ambiguous family.
     pub fn from_cmd(cmd: u32, fd_kind: Option<FdKind>) -> Self {
         Self::from_cmd_with_path(cmd, fd_kind, None)
     }
 
     /// Classify with optional fd path context. Driver packs intentionally
-    /// avoid arbitrary pointer walking; the fd graph path is the safest way
-    /// to disambiguate ioctl magic collisions (`'H'` dma-heap vs ALSA hwdep,
-    /// `'b'` binder vs dma-buf) when it is available.
+    /// avoid arbitrary pointer walking. Well-known device paths can provide
+    /// Binder and driver context, but dma-buf-looking path text alone is not
+    /// treated as positive dma-buf evidence.
     pub fn from_cmd_with_path(cmd: u32, fd_kind: Option<FdKind>, fd_path: Option<&str>) -> Self {
         if let Some(path) = fd_path {
             if path.starts_with("/dev/snd/") || path == "/dev/snd" {
@@ -142,9 +146,6 @@ impl IoctlFamily {
             }
             if crate::fdgraph::classify(path) == FdKind::Binder {
                 return IoctlFamily::Binder;
-            }
-            if is_dma_buf_path(path) {
-                return IoctlFamily::DmaBuf;
             }
             if path.starts_with("/dev/trusty-ipc") {
                 return IoctlFamily::TrustyTipc;
@@ -178,14 +179,6 @@ impl IoctlFamily {
             _ => IoctlFamily::Unknown,
         }
     }
-}
-
-fn is_dma_buf_path(path: &str) -> bool {
-    path == "/dev/dmabuf"
-        || path.starts_with("/dev/dmabuf/")
-        || path.starts_with("/dmabuf:")
-        || path.starts_with("anon_inode:dmabuf")
-        || path.starts_with("anon_inode:[dmabuf")
 }
 
 fn is_alsa_type(ty: u32) -> bool {
