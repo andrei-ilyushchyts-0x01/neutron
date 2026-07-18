@@ -137,3 +137,36 @@ fn bpf_object_reader_rejects_shared_write_modes_and_symlinks() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn sys_enter_filters_disallowed_syscalls_before_tracking_inflight() {
+    let source = include_str!("../neutron-ebpf/src/main.rs");
+    let start = source
+        .find("fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {")
+        .expect("try_sys_enter definition");
+    let end = source[start..]
+        .find("\n#[tracepoint]\npub fn trace_sys_exit")
+        .map(|offset| start + offset)
+        .expect("trace_sys_exit boundary");
+    let body = &source[start..end];
+
+    let admission = body
+        .find("mark_admitted_thread_enter")
+        .expect("causal admission bookkeeping");
+    let syscall_number = body.find("let nr =").expect("syscall number read");
+    let allow_gate = body
+        .find("if !syscall_allowed(nr) {")
+        .expect("sys_enter must reject disallowed syscalls");
+    let argument_read = body.find("let args =").expect("syscall argument read");
+    let inflight_insert = body
+        .find("if INFLIGHT.insert")
+        .expect("INFLIGHT insertion");
+
+    assert!(
+        admission < syscall_number
+            && syscall_number < allow_gate
+            && allow_gate < argument_read
+            && argument_read < inflight_insert,
+        "sys_enter must preserve causal admission, then filter disallowed syscalls before reading arguments or inserting INFLIGHT state"
+    );
+}
