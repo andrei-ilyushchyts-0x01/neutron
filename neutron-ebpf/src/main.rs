@@ -1374,8 +1374,8 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
     if !should_submit_exit(nr, uid_now, saved_ptr, ret, now) {
         // Reclaim the allowlisted INFLIGHT entry that enter-side predicates
         // retained for possible exit matching. Without this, predicate-
-        // filtered syscalls would gradually exhaust map capacity and cause
-        // update failures that hurt correlation.
+        // filtered syscalls would gradually fill the cap and trigger LRU
+        // evictions that hurt correlation.
         let _ = INFLIGHT.remove(&pid_tgid);
         return Err(());
     }

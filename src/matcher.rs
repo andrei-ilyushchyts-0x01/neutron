@@ -201,18 +201,6 @@ impl MatchSpec {
         !self.fd_globs.is_empty()
     }
 
-    /// Return the syscall numbers that userspace must install in the BPF
-    /// whitelist. An empty explicit set keeps the kernel filter disabled;
-    /// when it is active, fdgraph-dependent features also need every state
-    /// transition that can establish or retire an FD mapping.
-    pub fn effective_bpf_syscalls(&self, state_events_required: bool) -> BTreeSet<i32> {
-        let mut syscalls = self.syscalls.clone();
-        if state_events_required && !syscalls.is_empty() {
-            syscalls.extend(neutron_common::STATE_TRACKING_NRS.iter().copied());
-        }
-        syscalls
-    }
-
     /// Render a human-readable audit of where each active clause lands —
     /// `bpf` for kernel-side prefilter, `user` for userspace post-filter.
     /// One line per non-empty clause; empty result for an empty spec.
@@ -1600,7 +1588,9 @@ mod tests {
             neutron_common::STATE_TRACKING_NRS.len() + 1
         );
 
-        assert!(MatchSpec::default().effective_bpf_syscalls(true).is_empty());
+        assert!(MatchSpec::default()
+            .effective_bpf_syscalls(true)
+            .is_empty());
     }
 
     #[test]
