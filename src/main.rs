@@ -743,16 +743,21 @@ impl CapturePredicate {
         matches!(self, CapturePredicate::Empty)
     }
 
-    fn needs_state_events_via_ast(&self) -> bool {
+    fn needs_state_events(&self) -> bool {
         match self {
+            CapturePredicate::Empty => false,
+            CapturePredicate::Spec(spec) => spec.needs_state_events(),
             CapturePredicate::Expr {
                 ast_mentions_fd_path,
                 bpf_spec,
                 ..
-            } => *ast_mentions_fd_path && !bpf_spec.needs_state_events(),
-            _ => false,
+            } => *ast_mentions_fd_path || bpf_spec.needs_state_events(),
         }
     }
+}
+
+fn workflow_needs_state_events(args: &Args, predicate: &CapturePredicate) -> bool {
+    args.resolve_paths || args.follow_children || predicate.needs_state_events()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1075,12 +1080,17 @@ fn resolve_match_android_providers(args: &mut Args) -> Result<()> {
 
 /// Phase 1a — push every BPF-evaluable clause of `spec` into its kernel
 /// map, compute the `MATCH_BITS` mask, and toggle
-/// `STATE_EMIT_REQUIRED` if any clause depends on userspace fdgraph state.
+/// `STATE_EMIT_REQUIRED` when the configured workflow depends on userspace
+/// fdgraph state.
 ///
 /// Idempotent: setting a slot to its default zero value is the
 /// authoritative "off" signal. Userspace clauses (fd globs, comm globs,
 /// non-u32 arg widths, binder fields) leave no kernel residue.
-fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
+fn populate_match_maps(
+    bpf: &mut Ebpf,
+    spec: &MatchSpec,
+    state_events_required: bool,
+) -> Result<()> {
     let mut bits: u32 = 0;
 
     // Multi-PID via existing PID_WHITELIST. The single --pid case is still
@@ -1112,15 +1122,19 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
         bits |= MATCH_BIT_UID;
     }
 
-    // Syscall whitelist via existing SYSCALL_FILTER. Toggling
-    // FILTER_KEY_ACTIVE is what the BPF-side `syscall_allowed` consults.
-    if !spec.syscalls.is_empty() {
+    // Syscall whitelist via existing SYSCALL_FILTER. State-dependent
+    // workflows extend an active explicit filter with the authoritative
+    // fdgraph transition set; an empty explicit set still leaves filtering
+    // disabled. Toggling FILTER_KEY_ACTIVE is what the BPF-side
+    // `syscall_allowed` consults.
+    let effective_syscalls = spec.effective_bpf_syscalls(state_events_required);
+    if !effective_syscalls.is_empty() {
         let map = bpf
             .map_mut("SYSCALL_FILTER")
             .context("SYSCALL_FILTER missing")?;
         let mut sf: AyaHashMap<_, u32, u8> =
             AyaHashMap::try_from(map).context("SYSCALL_FILTER is not HashMap<u32,u8>")?;
-        for nr in &spec.syscalls {
+        for nr in &effective_syscalls {
             sf.insert(*nr as u32, 1u8, 0)
                 .with_context(|| format!("SYSCALL_FILTER.insert({nr})"))?;
         }
@@ -1224,11 +1238,7 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
 
     // STATE_EMIT_REQUIRED bit — flip on whenever userspace will need state
     // events to keep fdgraph consistent.
-    let state_required = if spec.needs_state_events() {
-        1u32
-    } else {
-        0u32
-    };
+    let state_required = if state_events_required { 1u32 } else { 0u32 };
     let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
     let mut filter: Array<_, u32> = Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
     filter
@@ -3064,20 +3074,13 @@ fn run_trace(mut args: Args) -> Result<()> {
     replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
     populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
     let capture_predicate = build_capture_predicate(&args)?;
+    let state_events_required = workflow_needs_state_events(&args, &capture_predicate);
     let (selinux_scope_pids, selinux_scope_uids) = capture_predicate
         .bpf_spec()
         .map(|spec| (spec.pids.clone(), spec.uids.clone()))
         .unwrap_or_default();
     if let Some(bpf_spec) = capture_predicate.bpf_spec() {
-        populate_match_maps(&mut bpf, bpf_spec)?;
-    }
-    if capture_predicate.needs_state_events_via_ast() {
-        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
-        let mut filter: Array<_, u32> =
-            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
-        filter
-            .set(FILTER_KEY_STATE_EMIT_REQUIRED, 1u32, 0)
-            .context("FILTER_MAP[STATE_EMIT_REQUIRED]=1")?;
+        populate_match_maps(&mut bpf, bpf_spec, state_events_required)?;
     }
 
     attach_tracepoint(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
@@ -3119,14 +3122,10 @@ fn run_trace(mut args: Args) -> Result<()> {
         for line in audit {
             eprintln!("    {line}");
         }
-        if capture_predicate
-            .bpf_spec()
-            .is_some_and(|s| s.needs_state_events())
-            || capture_predicate.needs_state_events_via_ast()
-        {
+        if state_events_required {
             eprintln!(
-                "    [bpf]  state-tracking syscalls always-emit (fd_path \
-                 enrichment requires fdgraph state)"
+                "    [bpf]  state-tracking syscalls always-emit (path resolution \
+                 or child following requires state)"
             );
         }
         if let Some(spec) = capture_predicate.bpf_spec() {
@@ -6095,6 +6094,31 @@ mod tests {
         };
 
         assert!(any_individual_match_flag(&args));
+    }
+
+    #[test]
+    fn workflow_state_events_cover_path_resolution_child_follow_and_fd_predicates() {
+        let empty = CapturePredicate::Empty;
+        assert!(!workflow_needs_state_events(&Args::default(), &empty));
+
+        let resolve = Args {
+            resolve_paths: true,
+            ..Args::default()
+        };
+        assert!(workflow_needs_state_events(&resolve, &empty));
+
+        let follow = Args {
+            follow_children: true,
+            ..Args::default()
+        };
+        assert!(workflow_needs_state_events(&follow, &empty));
+
+        let mut spec = MatchSpec::default();
+        spec.fd_globs.push("/dev/*".into());
+        assert!(workflow_needs_state_events(
+            &Args::default(),
+            &CapturePredicate::Spec(spec)
+        ));
     }
 
     fn test_denial() -> neutron::selinux::SelinuxDenial {
