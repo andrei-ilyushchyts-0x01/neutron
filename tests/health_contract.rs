@@ -4,8 +4,8 @@ use neutron::health::{
     KprobePackScope, UserspaceHealth,
 };
 use neutron_common::{
-    COUNTER_EVENTS_SUBMITTED, COUNTER_PAYLOAD_READ_FAILED, COUNTER_RINGBUF_RESERVE_FAILED,
-    COUNTER_SLOT_COUNT,
+    COUNTER_EVENTS_SUBMITTED, COUNTER_IOCTL_PAYLOAD_TRUNCATED, COUNTER_PAYLOAD_READ_FAILED,
+    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT,
 };
 use serde_json::Value;
 
@@ -458,6 +458,16 @@ fn payload_read_failure_is_explicit_and_degrades_capture() {
 
     let value = render(&health, &UserspaceHealth::default());
     assert_eq!(value["payload_read_failed"], 1);
+    assert_eq!(value["status"], "degraded");
+}
+
+#[test]
+fn ioctl_payload_truncation_is_explicit_and_degrades_capture() {
+    let mut health = CaptureHealth::default();
+    health.slots[COUNTER_IOCTL_PAYLOAD_TRUNCATED as usize] = 1;
+
+    let value = render(&health, &UserspaceHealth::default());
+    assert_eq!(value["ioctl_payload_truncated"], 1);
     assert_eq!(value["status"], "degraded");
 }
 
