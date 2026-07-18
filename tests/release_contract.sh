@@ -242,7 +242,10 @@ evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
 
     ! rg -qi 'lossless from the producer|handles silently' "$architecture" &&
         contains "$reference" 'rejected in 1.5' &&
-        contains "$cli" 'rejected in 1.5'
+        contains "$cli" 'rejected in 1.5' &&
+        ! rg -qi 'uid.*falls back to.*active' "$reference" "$cli" &&
+        contains "$reference" '`uid` is rejected in 1.5' &&
+        contains "$cli" '`uid` is rejected in 1.5'
 }
 
 security_policy_has_private_only_reporting() {
