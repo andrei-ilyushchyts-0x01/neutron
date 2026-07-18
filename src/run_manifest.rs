@@ -2943,6 +2943,36 @@ mod tests {
     }
 
     #[test]
+    fn shipped_manifest_schema_embeds_capture_scope_for_offline_resolution() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../schemas/neutron.run-manifest-v1.schema.json"
+        ))
+        .unwrap();
+        let health: Value = serde_json::from_str(include_str!(
+            "../schemas/neutron.capture-health-v1.schema.json"
+        ))
+        .unwrap();
+        let embedded = &manifest["$defs"]["captureHealthResource"];
+        let embedded_id = embedded["$id"].as_str().unwrap();
+
+        assert_ne!(embedded["$id"], health["$id"]);
+        assert_eq!(
+            embedded_id,
+            "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.run-manifest-capture-scope-v1.schema.json"
+        );
+        for definition in ["sha256", "strings", "captureScope"] {
+            assert_eq!(
+                embedded["$defs"][definition], health["$defs"][definition],
+                "embedded {definition} drifted from the capture-health schema"
+            );
+        }
+        assert_eq!(
+            manifest["properties"]["capture_scope"]["$ref"],
+            format!("{embedded_id}#/$defs/captureScope")
+        );
+    }
+
+    #[test]
     fn private_bundle_is_content_addressed() {
         let directory = TestDir::new();
         create_private_run_directory(&directory.0).unwrap();

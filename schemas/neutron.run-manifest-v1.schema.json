@@ -40,7 +40,7 @@
     "health": { "$ref": "#/$defs/health" },
     "transport_health": { "$ref": "#/$defs/health" },
     "capture_scope": {
-      "$ref": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.capture-health-v1.schema.json#/$defs/captureScope"
+      "$ref": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.run-manifest-capture-scope-v1.schema.json#/$defs/captureScope"
     },
     "bpf_loaded": { "type": "boolean" },
     "stimulus_executed": { "const": false },
@@ -51,6 +51,588 @@
     }
   },
   "$defs": {
+    "captureHealthResource": {
+      "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.run-manifest-capture-scope-v1.schema.json",
+      "$defs": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "strings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "captureScope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "output",
+            "observation",
+            "filters",
+            "sampling",
+            "instrumentation",
+            "packs",
+            "sources",
+            "findings",
+            "enrichment",
+            "producer",
+            "claim_scope_complete",
+            "claim_scope_reasons"
+          ],
+          "properties": {
+            "schema": {
+              "const": "neutron.capture-scope/v1"
+            },
+            "output": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "event_mode",
+                "serialization",
+                "capture_mode",
+                "context_duration_ns",
+                "destination",
+                "max_output_bytes",
+                "rotate_output_bytes"
+              ],
+              "properties": {
+                "event_mode": {
+                  "enum": [
+                    "raw_only",
+                    "raw_and_findings",
+                    "findings_only"
+                  ]
+                },
+                "serialization": {
+                  "enum": [
+                    "ndjson",
+                    "text"
+                  ]
+                },
+                "capture_mode": {
+                  "enum": [
+                    "matched",
+                    "matched_with_context"
+                  ]
+                },
+                "context_duration_ns": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1
+                },
+                "destination": {
+                  "enum": [
+                    "stdout",
+                    "file"
+                  ]
+                },
+                "max_output_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1
+                },
+                "rotate_output_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1
+                }
+              }
+            },
+            "observation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "target_pid",
+                "root_package",
+                "root_uid",
+                "follow_children"
+              ],
+              "properties": {
+                "target_pid": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295
+                },
+                "root_package": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "root_uid": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 4294967295
+                },
+                "follow_children": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "filters": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "bpf",
+                "userspace",
+                "exclude_comm",
+                "match_expression",
+                "match_packages",
+                "match_android_providers",
+                "alert_rwx_only"
+              ],
+              "properties": {
+                "bpf": {
+                  "$ref": "#/$defs/strings"
+                },
+                "userspace": {
+                  "$ref": "#/$defs/strings"
+                },
+                "exclude_comm": {
+                  "$ref": "#/$defs/strings"
+                },
+                "match_expression": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "match_packages": {
+                  "$ref": "#/$defs/strings"
+                },
+                "match_android_providers": {
+                  "$ref": "#/$defs/strings"
+                },
+                "alert_rwx_only": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "sampling": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "probability",
+                "rate_limit_per_second"
+              ],
+              "properties": {
+                "probability": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "rate_limit_per_second": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1
+                }
+              }
+            },
+            "instrumentation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "binder_tracepoints",
+                "binder_correlation",
+                "causal_follow",
+                "follow_services",
+                "follow_hal",
+                "stacks",
+                "capture_reads",
+                "resolve_paths",
+                "max_depth",
+                "max_processes",
+                "follow_ttl_ns",
+                "follow_allow_domains",
+                "follow_deny_domains"
+              ],
+              "properties": {
+                "binder_tracepoints": {
+                  "type": "boolean"
+                },
+                "binder_correlation": {
+                  "type": "boolean"
+                },
+                "causal_follow": {
+                  "type": "boolean"
+                },
+                "follow_services": {
+                  "type": "boolean"
+                },
+                "follow_hal": {
+                  "type": "boolean"
+                },
+                "stacks": {
+                  "type": "boolean"
+                },
+                "capture_reads": {
+                  "type": "boolean"
+                },
+                "resolve_paths": {
+                  "type": "boolean"
+                },
+                "max_depth": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "max_processes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295
+                },
+                "follow_ttl_ns": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "follow_allow_domains": {
+                  "$ref": "#/$defs/strings"
+                },
+                "follow_deny_domains": {
+                  "$ref": "#/$defs/strings"
+                }
+              }
+            },
+            "packs": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "driver",
+                "kprobe",
+                "schema",
+                "schema_identities"
+              ],
+              "properties": {
+                "driver": {
+                  "$ref": "#/$defs/strings"
+                },
+                "kprobe": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name",
+                      "requested_sources",
+                      "attached_sources",
+                      "failures"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "requested_sources": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "attached_sources": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "failures": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/$defs/strings"
+                },
+                "schema_identities": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name",
+                      "sha256"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "sha256": {
+                        "$ref": "#/$defs/sha256"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "sources": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "fdgraph_enabled",
+                "fdgraph_interval",
+                "fdgraph_pid_scope",
+                "fdgraph_thresholds",
+                "fdgraph_top_paths_n",
+                "logcat_requested",
+                "logcat_available",
+                "selinux_logcat_requested",
+                "selinux_logcat_available",
+                "tombstone_requested",
+                "tombstone_available",
+                "tombstone_dir",
+                "lookback_events",
+                "binder_inflight_capacity"
+              ],
+              "properties": {
+                "fdgraph_enabled": {
+                  "type": "boolean"
+                },
+                "fdgraph_interval": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "fdgraph_pid_scope": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "fdgraph_thresholds": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "fdgraph_top_paths_n": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "logcat_requested": {
+                  "type": "boolean"
+                },
+                "logcat_available": {
+                  "type": "boolean"
+                },
+                "selinux_logcat_requested": {
+                  "type": "boolean"
+                },
+                "selinux_logcat_available": {
+                  "type": "boolean"
+                },
+                "tombstone_requested": {
+                  "type": "boolean"
+                },
+                "tombstone_available": {
+                  "type": "boolean"
+                },
+                "tombstone_dir": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lookback_events": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "binder_inflight_capacity": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "findings": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "enabled",
+                "rules_sha256",
+                "drain_interval",
+                "raw_window",
+                "fd_snapshot_on_finding"
+              ],
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "rules_sha256": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/$defs/sha256"
+                    }
+                  ]
+                },
+                "drain_interval": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "raw_window": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "fd_snapshot_on_finding": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "enrichment": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "binder_services_sha256",
+                "binder_methods_sha256",
+                "aidl_catalog_sha256",
+                "dynamic_service_inventory_sha256",
+                "dynamic_hal_inventory_sha256"
+              ],
+              "properties": {
+                "binder_services_sha256": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/$defs/sha256"
+                    }
+                  ]
+                },
+                "binder_methods_sha256": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/$defs/sha256"
+                    }
+                  ]
+                },
+                "aidl_catalog_sha256": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/$defs/sha256"
+                    }
+                  ]
+                },
+                "dynamic_service_inventory_sha256": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/$defs/sha256"
+                    }
+                  ]
+                },
+                "dynamic_hal_inventory_sha256": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/$defs/sha256"
+                    }
+                  ]
+                }
+              }
+            },
+            "producer": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "bpf_object_sha256",
+                "bpf_build_id",
+                "bpf_feature_bits",
+                "userspace_binary_sha256",
+                "userspace_version",
+                "userspace_git_commit",
+                "userspace_git_dirty"
+              ],
+              "properties": {
+                "bpf_object_sha256": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "bpf_build_id": {
+                  "type": "string",
+                  "pattern": "^(?!0{40}$)[0-9a-f]{40}$"
+                },
+                "bpf_feature_bits": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "userspace_binary_sha256": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "userspace_version": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "userspace_git_commit": {
+                  "type": "string",
+                  "pattern": "^(?!0{40}$)[0-9a-f]{40}$"
+                },
+                "userspace_git_dirty": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "claim_scope_complete": {
+              "type": "boolean"
+            },
+            "claim_scope_reasons": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "findings_only_output",
+                  "non_ndjson_event_output",
+                  "bpf_filters",
+                  "userspace_filters",
+                  "excluded_commands",
+                  "match_expression",
+                  "alert_rwx_filter",
+                  "read_content_capture_unsupported",
+                  "fdgraph_source_disabled",
+                  "logcat_source_disabled",
+                  "logcat_source_unavailable",
+                  "selinux_source_disabled",
+                  "selinux_source_unavailable",
+                  "tombstone_source_disabled",
+                  "tombstone_source_unavailable",
+                  "userspace_source_dirty",
+                  "probabilistic_sampling",
+                  "rate_limit",
+                  "kprobe_attachment_failure"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"

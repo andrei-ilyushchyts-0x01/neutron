@@ -13,3 +13,8 @@ the same schema major version.
 - `neutron.evidence-verification-v1.schema.json` — successful run-bundle verification result.
 - `neutron.capture-health-v1.schema.json` — final capture health record and tri-state failure details.
 - `neutron.doctor-v1.schema.json` — tracepoint, object ABI, and bounded runtime-smoke evidence.
+
+The run-manifest schema embeds the canonical capture-scope resource so a
+Draft 2020-12 validator can validate a manifest offline without fetching a
+remote `$ref`. A contract test keeps the embedded definitions synchronized
+with the capture-health schema.

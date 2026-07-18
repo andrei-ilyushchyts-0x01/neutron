@@ -98,6 +98,18 @@ fn bounded_capture(events: &str, scenario: &str, trace_id: &str) -> String {
 }
 
 #[test]
+fn marker_names_are_not_counted_as_syscalls() {
+    let capture = bounded_capture("", "probe_keystore_lookup", "0000000000001234");
+
+    let md = report(&capture, ReportOptions::default());
+
+    assert!(
+        md.contains("## Top Syscalls\n\n_No entries observed._"),
+        "{md}"
+    );
+}
+
+#[test]
 fn markdown_report_renders_expected_sections() {
     let capture = r#"
 {"type":"syscall","pid":42,"tid":43,"uid":10341,"name":"openat","comm":"wallet","phase":"exit","ret":3,"ok":true,"fd_path":"/proc/self/maps","latency_us":7}

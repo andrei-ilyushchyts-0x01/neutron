@@ -517,6 +517,9 @@ fn ingest_event(
     attribution: &BinderAttribution,
 ) {
     let ty = str_field(obj, "type").unwrap_or("");
+    if ty == "marker" {
+        return;
+    }
     let syscall = syscall_name(obj);
     if let Some(name) = syscall.as_deref() {
         increment(&mut snapshot.syscalls, name.to_string());
@@ -550,9 +553,6 @@ fn ingest_event(
     let Some(scenario_id) = str_field(obj, "scenario_id").filter(|value| !value.is_empty()) else {
         return;
     };
-    if ty == "marker" {
-        return;
-    }
     snapshot.scenario_event_bindings.insert((
         scenario_id.to_string(),
         str_field(obj, "trace_id").unwrap_or_default().to_string(),
