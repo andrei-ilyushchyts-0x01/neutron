@@ -14,4 +14,34 @@ public class RequestTest {
         assertThrows(IllegalArgumentException.class,
                 () -> Request.validate("shell", Map.of()));
     }
+
+    @Test public void acceptsBoundedReadOnlyKeymintLookup() {
+        Map<String, String> request = Request.validate("keymint", Map.of(
+                "operation", "lookup",
+                "delay_ms", "2000"));
+
+        assertEquals("lookup", request.get("operation"));
+        assertEquals("2000", request.get("delay_ms"));
+        assertEquals("0", Request.validate("keymint", Map.of(
+                "operation", "lookup", "delay_ms", "0")).get("delay_ms"));
+        assertEquals("5000", Request.validate("keymint", Map.of(
+                "operation", "lookup", "delay_ms", "5000")).get("delay_ms"));
+    }
+
+    @Test public void rejectsUnboundedOrUntypedKeymintControls() {
+        assertThrows(IllegalArgumentException.class,
+                () -> Request.validate("keymint", Map.of("operation", "shell")));
+        assertThrows(IllegalArgumentException.class,
+                () -> Request.validate("keymint", Map.of("operation", "generate")));
+        assertThrows(IllegalArgumentException.class,
+                () -> Request.validate("keymint", Map.of("delay_ms", "1")));
+        assertThrows(IllegalArgumentException.class,
+                () -> Request.validate("keymint", Map.of(
+                        "operation", "lookup", "delay_ms", "5001")));
+        assertThrows(IllegalArgumentException.class,
+                () -> Request.validate("keymint", Map.of(
+                        "operation", "lookup", "delay_ms", "soon")));
+        assertThrows(IllegalArgumentException.class,
+                () -> Request.validate("gpu", Map.of("delay_ms", "1")));
+    }
 }

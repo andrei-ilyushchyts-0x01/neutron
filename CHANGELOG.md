@@ -87,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counters emitted by a successful runtime smoke test.
 - Removed unauthenticated unpacked payload copies from the final release
   directory; consumers receive only checksum-covered archives and metadata.
+- Added a bounded probe-only KeyMint delay and read-only nonexistent-alias
+  lookup so device validation can establish the trace boundary after protected
+  broadcast admission without creating key material.
 
 ## [1.4.0] — 2026-07-10
 

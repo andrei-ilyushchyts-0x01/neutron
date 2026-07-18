@@ -77,17 +77,25 @@ public final class ResearchReceiver extends BroadcastReceiver {
         Map<String, String> values = new HashMap<>();
         if (extras == null) return values;
         for (String key : extras.keySet()) {
-            if (!"action".equals(key) && extras.get(key) instanceof String) {
-                values.put(key, (String) extras.get(key));
-            }
+            copyParameter(values, key, extras.get(key));
         }
         return values;
     }
 
+    static void copyParameter(Map<String, String> values, String key, Object value) {
+        if ("action".equals(key)) return;
+        if (!(value instanceof String)) {
+            throw new IllegalArgumentException("typed parameter must be a string");
+        }
+        values.put(key, (String) value);
+    }
+
     static int dispatch(Context context, String action, Map<String, String> raw) throws Exception {
         Map<String, String> params = Request.validate(action, raw);
+        String delay = params.get("delay_ms");
+        if (delay != null) Thread.sleep(Integer.parseInt(delay));
         switch (action) {
-            case "keymint": keymint(); break;
+            case "keymint": keymint(params.getOrDefault("operation", "generate")); break;
             case "gpu": gpu(); break;
             case "camera": camera(context, params.get("camera_id")); break;
             case "media-codec": codec(params.getOrDefault("mime", "video/avc")); break;
@@ -99,10 +107,14 @@ public final class ResearchReceiver extends BroadcastReceiver {
         return COMPLETE;
     }
 
-    private static void keymint() throws Exception {
+    private static void keymint(String operation) throws Exception {
         String alias = "neutron-ephemeral-" + Long.toUnsignedString(System.nanoTime());
         KeyStore store = KeyStore.getInstance("AndroidKeyStore");
         store.load(null);
+        if ("lookup".equals(operation)) {
+            store.containsAlias(alias);
+            return;
+        }
         try {
             KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
             generator.init(new KeyGenParameterSpec.Builder(alias,

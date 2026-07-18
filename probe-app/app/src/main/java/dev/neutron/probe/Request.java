@@ -8,12 +8,14 @@ import java.util.Set;
 import java.util.Arrays;
 
 final class Request {
+    private static final int MAX_DELAY_MS = 5_000;
     private static final Map<String, Set<String>> PARAMETERS;
     static {
         Map<String, Set<String>> values = new HashMap<>();
-        for (String action : Arrays.asList("keymint", "gpu", "bluetooth", "wifi")) {
+        for (String action : Arrays.asList("gpu", "bluetooth", "wifi")) {
             values.put(action, Collections.emptySet());
         }
+        values.put("keymint", new HashSet<>(Arrays.asList("operation", "delay_ms")));
         values.put("camera", new HashSet<>(Collections.singletonList("camera_id")));
         values.put("media-codec", new HashSet<>(Collections.singletonList("mime")));
         values.put("usb", new HashSet<>(Collections.singletonList("usb_device_id")));
@@ -31,7 +33,25 @@ final class Request {
                 throw new IllegalArgumentException("invalid parameter value");
             }
         }
-        return Collections.unmodifiableMap(parameters);
+        String operation = parameters.get("operation");
+        if (operation != null && !"lookup".equals(operation)) {
+            throw new IllegalArgumentException("unsupported keymint operation");
+        }
+        if (parameters.containsKey("delay_ms")) {
+            if (operation == null) {
+                throw new IllegalArgumentException("keymint delay requires read-only lookup");
+            }
+            int delay;
+            try {
+                delay = Integer.parseInt(parameters.get("delay_ms"));
+            } catch (NumberFormatException error) {
+                throw new IllegalArgumentException("invalid keymint delay", error);
+            }
+            if (delay < 0 || delay > MAX_DELAY_MS) {
+                throw new IllegalArgumentException("keymint delay is out of range");
+            }
+        }
+        return Collections.unmodifiableMap(new HashMap<>(parameters));
     }
 
     private Request() {}

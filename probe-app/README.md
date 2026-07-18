@@ -2,6 +2,14 @@
 
 Install this minimal companion APK before `neutron research`. Its explicit receiver is restricted to callers holding Android's platform `DUMP` permission (shell/root), dispatches exactly seven typed actions, and returns only a result code. Camera frames, GPU pixels, Bluetooth/Wi-Fi identifiers, USB descriptors, keys, and codec buffers are discarded in memory.
 
+The `keymint` action defaults to ephemeral key generation. For a deterministic,
+read-only capture smoke test it also accepts `operation=lookup` and a bounded
+`delay_ms` from 0 through 5000. The delay is accepted only with the read-only
+lookup and lets the incoming protected broadcast finish admission before a
+marker-bounded trace begins. The lookup checks a nonce-derived alias expected
+to be absent and does not create or retain key material. It proves only the
+Android Keystore query path, not a KeyMint HAL handoff.
+
 Device instrumentation should cover each action on the authorized hardware matrix; radio-off, absent hardware, ambiguous USB selection, and missing USB permission must return `unsupported`.
 
 On Android 16, CameraService may reject this broadcast-only probe as an idle
