@@ -51,6 +51,7 @@ rg -F 'cmp -s "$output" "$check"' "$script"
 rg -F 'create_archive_twice "$DIST/$HOST_NAME.tar.zst" create_payload_archive "$HOST_NAME"' "$script"
 rg -F 'create_archive_twice "$DIST/$AGENT_NAME.tar.zst" create_payload_archive "$AGENT_NAME"' "$script"
 rg -F 'create_archive_twice "$DIST/$SOURCE_NAME" create_source_archive' "$script"
+rg -F 'rm -rf -- "$HOST_PAYLOAD" "$AGENT_PAYLOAD"' "$script"
 rg -F 'git archive --format=tar --mtime="$BUILD_TIMESTAMP"' "$script"
 rg -F 'gzip -n -9' "$script"
 rg -F 'BUILD_ARCH=$(uname -m)' "$script"
@@ -73,9 +74,14 @@ linker_line=$(rg -n -m1 -F 'export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=
 host_build_line=$(rg -n -m1 -F 'cargo build --release --target x86_64-unknown-linux-gnu --bin neutron' "$script" | cut -d: -f1)
 host_runner_line=$(rg -n -m1 -F 'HOST_RUNNER=(qemu-x86_64 -L "$X86_64_SYSROOT")' "$script" | cut -d: -f1)
 host_self_info_line=$(rg -n -m1 -F '"${HOST_RUNNER[@]}" "$HOST_PAYLOAD/neutron" self-info --json' "$script" | cut -d: -f1)
+agent_archive_line=$(rg -n -m1 -F 'create_archive_twice "$DIST/$AGENT_NAME.tar.zst" create_payload_archive "$AGENT_NAME"' "$script" | cut -d: -f1)
+payload_cleanup_line=$(rg -n -m1 -F 'rm -rf -- "$HOST_PAYLOAD" "$AGENT_PAYLOAD"' "$script" | cut -d: -f1)
+outer_manifest_line=$(rg -n -m1 -F 'SBOM.spdx.json \' "$script" | cut -d: -f1)
 [[ "$arch_line" -lt "$linker_line" ]]
 [[ "$linker_line" -lt "$host_build_line" ]]
 [[ "$host_runner_line" -lt "$host_self_info_line" ]]
+[[ "$agent_archive_line" -lt "$payload_cleanup_line" ]]
+[[ "$payload_cleanup_line" -lt "$outer_manifest_line" ]]
 
 if rg -F 'cargo run --locked --release --target x86_64-unknown-linux-gnu --example generate-completions' "$script"; then
     echo "completion generation must run natively" >&2

@@ -1,6 +1,7 @@
 use clap::Parser;
 use neutron::cli::{Cli, Command};
 use neutron::doctor::{validate_tracepoint_format, TracepointCompatibility, TracepointKind};
+use serde_json::Value;
 
 // Sanitized Android 17 tracefs excerpts for the release-gate contract. These
 // fixtures intentionally retain only kernel-provided format metadata; they are
@@ -157,4 +158,18 @@ fn doctor_cli_accepts_json_smoke_and_object() {
     assert!(args.json);
     assert!(args.smoke);
     assert_eq!(args.object, "/tmp/neutron.bpf.elf");
+}
+
+#[test]
+fn doctor_schema_accepts_every_shared_health_counter_slot() {
+    let schema: Value =
+        serde_json::from_str(include_str!("../schemas/neutron.doctor-v1.schema.json"))
+            .expect("doctor schema must be valid JSON");
+    let health_totals = &schema["$defs"]["smokeReport"]["properties"]["health_totals"];
+
+    assert_eq!(
+        health_totals["maxItems"].as_u64(),
+        Some(u64::from(neutron_common::COUNTER_SLOT_COUNT)),
+        "doctor smoke output must admit every slot returned by the shared per-CPU health map"
+    );
 }

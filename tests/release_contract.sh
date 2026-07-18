@@ -267,13 +267,14 @@ release_archives_and_probe_identity_are_reproducible_inputs() {
         contains "$gradle" 'signingConfig signingConfigs.research'
 }
 
-current_abi_docs_match_257_byte_contract() {
+current_abi_docs_match_wire_and_health_contracts() {
     local contributing="$root/docs/CONTRIBUTING.md"
     local architecture="$root/docs/ARCHITECTURE.md"
 
     contains "$contributing" 'SyscallEvent` (`#[repr(C, packed)]`, **257 bytes**)' &&
         ! rg -q 'SyscallEvent.*241|is 241 bytes' "$contributing" &&
-        ! rg -q 'SyscallEvent.*\(241\)' "$architecture"
+        ! rg -q 'SyscallEvent.*\(241\)' "$architecture" &&
+        contains "$architecture" '| `COUNTERS` | `PerCpuArray<u64>` | u32 slot | per-CPU u64 | 21 |'
 }
 
 evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
@@ -371,7 +372,7 @@ run_test signed_tag_workflow_requires_keys_and_attests_assets
 run_test workflows_pin_actions_to_immutable_commits
 run_test ci_and_release_gate_rustsec_advisories
 run_test release_archives_and_probe_identity_are_reproducible_inputs
-run_test current_abi_docs_match_257_byte_contract
+run_test current_abi_docs_match_wire_and_health_contracts
 run_test evidence_docs_do_not_overstate_capture_or_domain_filter_support
 run_test limitations_disclose_filtered_fd_state_ceiling
 run_test security_policy_has_private_only_reporting

@@ -83,6 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clarified that only fd-path predicates enable the state-event exemption;
   `--resolve-paths`, `--follow-children`, and `--capture-reads` remain bounded
   by active BPF predicates and do not prove a complete FD lifecycle.
+- Fixed the shipped doctor schema to accept all 21 shared per-CPU health
+  counters emitted by a successful runtime smoke test.
+- Removed unauthenticated unpacked payload copies from the final release
+  directory; consumers receive only checksum-covered archives and metadata.
 
 ## [1.4.0] — 2026-07-10
 

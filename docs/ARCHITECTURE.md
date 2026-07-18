@@ -415,7 +415,7 @@ evicted, `latency_us` is `null` in JSON output.
 | `MATCH_ARG_U32_VALS` | `HashMap` | u32 value | u8 | 32 | Bounded captured-argument predicates. |
 | `IOCTL_REFRESH_CMD_SET` | `HashMap` | u32 cmd | u8 | 64 | Schema-selected post-exit refresh commands. |
 | `IOCTL_REFRESH_TYPE_SET` | `HashMap` | u32 type | u8 | 32 | Schema-selected post-exit refresh families. |
-| `COUNTERS` | `PerCpuArray<u64>` | u32 slot | per-CPU u64 | 20 | Capture-health counters aggregated by userspace without racy read/add/write updates. |
+| `COUNTERS` | `PerCpuArray<u64>` | u32 slot | per-CPU u64 | 21 | Capture-health counters aggregated by userspace without racy read/add/write updates. |
 
 Map names are the **exact** Rust static identifiers in
 `neutron-ebpf/src/main.rs`. Aya does not lowercase them. The userspace

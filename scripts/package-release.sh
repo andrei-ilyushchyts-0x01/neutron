@@ -536,6 +536,11 @@ create_archive_twice "$DIST/$HOST_NAME.tar.zst" create_payload_archive "$HOST_NA
 create_archive_twice "$DIST/$AGENT_NAME.tar.zst" create_payload_archive "$AGENT_NAME"
 create_archive_twice "$DIST/$SOURCE_NAME" create_source_archive
 
+# The payload trees are build inputs for the authenticated archives, not
+# top-level release assets. Keeping mutable unpacked copies beside SHA256SUMS
+# would give CI artifact consumers an unauthenticated path to the installer.
+rm -rf -- "$HOST_PAYLOAD" "$AGENT_PAYLOAD"
+
 RUSTC_VERSION=$(rustc --version)
 CARGO_VERSION=$(cargo --version)
 BPF_LINKER_VERSION=$(bpf-linker --version | head -n 1)

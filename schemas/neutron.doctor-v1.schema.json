@@ -204,7 +204,7 @@
         "health_totals": {
           "type": "array",
           "items": { "type": "integer", "minimum": 0 },
-          "maxItems": 20
+          "maxItems": 21
         },
         "cleanup": { "type": "boolean" },
         "passed": { "type": "boolean" },
