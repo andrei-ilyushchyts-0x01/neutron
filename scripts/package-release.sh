@@ -61,7 +61,7 @@ HOST_PAYLOAD="$DIST/$HOST_NAME"
 AGENT_PAYLOAD="$DIST/$AGENT_NAME"
 SOURCE_NAME="neutron-v${VERSION}-source.tar.gz"
 
-mkdir -p "$HOST_PAYLOAD/man/man1" "$HOST_PAYLOAD/schemas"
+mkdir -p "$HOST_PAYLOAD/man/man1" "$HOST_PAYLOAD/schemas" "$HOST_PAYLOAD/completions"
 mkdir -p "$AGENT_PAYLOAD/packs" "$AGENT_PAYLOAD/probe" "$AGENT_PAYLOAD/schemas"
 
 echo "==> Building stackless BPF object"
@@ -72,6 +72,9 @@ cargo xtask build-ebpf --stacks release
 
 echo "==> Building Linux x86_64 host binary"
 cargo build --release --target x86_64-unknown-linux-gnu --bin neutron
+
+echo "==> Generating shell completions"
+cargo run --locked --release --target x86_64-unknown-linux-gnu --example generate-completions -- "$HOST_PAYLOAD/completions"
 
 echo "==> Building Android aarch64 userspace binary"
 cargo build --release --target aarch64-unknown-linux-musl --bin neutron
