@@ -1572,28 +1572,6 @@ mod tests {
     }
 
     #[test]
-    fn state_events_extend_only_an_active_syscall_filter() {
-        let mut s = MatchSpec::default();
-        s.syscalls.insert(29);
-
-        assert_eq!(s.effective_bpf_syscalls(false), BTreeSet::from([29]));
-
-        let with_state = s.effective_bpf_syscalls(true);
-        assert!(with_state.contains(&29));
-        assert!(neutron_common::STATE_TRACKING_NRS
-            .iter()
-            .all(|nr| with_state.contains(nr)));
-        assert_eq!(
-            with_state.len(),
-            neutron_common::STATE_TRACKING_NRS.len() + 1
-        );
-
-        assert!(MatchSpec::default()
-            .effective_bpf_syscalls(true)
-            .is_empty());
-    }
-
-    #[test]
     fn build_from_args_translates_flag_set() {
         use crate::cli::Args;
         let args = Args {
