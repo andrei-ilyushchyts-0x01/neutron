@@ -22,10 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added target-scoped `surface coverage` collection, repeat/drift validation,
   proof-chain explanations, private content-addressed run bundles, and typed
   external behavioral-evidence import with explicit probe attribution.
-- Added host and Android release payloads containing both BPF variants,
-  schemas, packs, and a content-identified probe APK; deployment now requires
-  one explicit physical USB serial and verifies root-private candidate hashes
-  before publication.
+- Added host and Android release payloads containing generated Bash/Zsh/Fish
+  completions, man pages, both BPF variants, schemas, packs, and a
+  content-identified probe APK; deployment now requires one explicit physical
+  USB serial and verifies root-private candidate hashes before publication.
 - Added signed-tag release automation with exact-tag tests, minisign manifests,
   GitHub build-provenance attestations, deterministic archive metadata, and a
   fixed secret-backed research-probe signing identity.

@@ -52,15 +52,23 @@ through the 1.5 release line.
 | Device/build line | Static ownership | Syscall BPF | Binder BPF | Causal follow |
 |---|---|---|---|---|
 | Pixel 8 Pro Android 16 documented baseline | fixture validated; device rerun required | validation required | validation required | validation required |
-| Pixel 8 Pro Android 17 `CP2A.260705.006` | observed compatible; release-SHA rerun required | validation required | validation required | validation required |
+| Pixel 8 Pro Android 17 `CP2A.260705.006` | RC-qualified 3-target minimal smoke; original 33-target acceptance pending | layout/load/attach/event/health/cleanup qualified | positive event delivery observed; health-complete positive run pending | exact depth-1 edges observed; complete positive-chain gate pending |
 | Other Pixel/GKI 6.1 devices | experimental | best effort | best effort | best effort |
 | Vendor devices | best effort | unverified | unverified | unverified |
 
-Neither Android build line is runtime-qualified for the eventual 1.5 release
-SHA yet. Qualification requires a successful doctor smoke run, bounded
-capture, health read, and clean teardown using the exact clean userspace/BPF
-pair. Android 16 currently has no connected device in this release workspace;
-that is an external release blocker, not a host-testable completion claim.
+The Android 17 row is capture-compatible for target-scoped ownership and the
+raw-syscall path on the exact clean RC userspace/BPF pair. Its Binder row stays
+PREVIEW: one bounded run proves positive transaction/received delivery and
+exact correlation, but ended with one in-flight syscall; a separate complete
+run contained no Binder transaction. Neither run supports negative evidence
+or a claim of a health-complete positive causal chain. The original 33-target
+list was not available in this release workspace, so its 3-target smoke cannot
+be promoted to the earlier 33/33 claim.
+
+Android 16 currently has no connected device in this release workspace. Its
+exact-release runtime rerun remains an external release blocker, not a
+host-testable completion claim. Each published support claim must retain the
+matching doctor and run manifests, artifact hashes, and clean teardown audit.
 
 ## Evidence classes
 
