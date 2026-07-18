@@ -212,8 +212,9 @@ removes its private temporary directory. Static collection follows the live
 interval so current `/proc` starttimes can reject PID reuse. Child failure,
 timeout, missing health, or incomplete cleanup fails the scan.
 
-All query commands read `neutron.surface/v1` and emit
-`neutron.surface/query/v1` JSON:
+Query commands emit `neutron.surface/query/v1` JSON. All read
+`neutron.surface/v1`; `surface explain` also accepts
+`neutron.surface-coverage/v1`:
 
 ```bash
 neutron surface services  --input surface.json --output services.json
@@ -221,12 +222,16 @@ neutron surface hals      --input surface.json
 neutron surface devices   --input surface.json
 neutron surface process 1234 --input surface.json --output process.json
 neutron surface explain SERVICE_OR_DEVICE --input surface.json
+neutron surface explain SERVICE --input surface.coverage.json
 neutron surface reachable --from-package com.example.app --input surface.json
 neutron surface reachable --from-uid 10123 --input surface.json
 neutron surface diff baseline.json current.json --output surface-diff.json
 ```
 
-`--input -` reads stdin. `process` rejects a PID absent from the snapshot and a
+`--input -` reads stdin. For a coverage input, `explain` emits an ordered
+human-readable `chain_of_proof` whose steps retain the structured source
+evidence and hashes. A transport-qualified selector matches only that
+transport. `process` rejects a PID absent from the snapshot and a
 PID shared by multiple stored identities. `explain` accepts a service ID/name,
 device ID/path/alias, or resource ID and rejects zero or ambiguous matches.
 Every command writes JSON to stdout unless `--output` is set; a

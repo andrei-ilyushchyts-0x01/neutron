@@ -1,9 +1,13 @@
 //! Deterministic Android service/process/device/resource surface snapshots.
 
+pub mod coverage;
 pub mod parse;
 pub mod platform;
 mod surface_diff;
 
+pub use coverage::{
+    collect_coverage_with_reader, parse_targets, CoverageArgs, CoverageDocument, CoverageOptions,
+};
 pub use parse::{
     ioctl_label, parse_dumpsys_pid, parse_lshal_inventory, parse_module_names,
     parse_process_starttime, parse_process_status, parse_service_list_inventory,
@@ -33,6 +37,8 @@ const QUERY_SCHEMA: &str = "neutron.surface/query/v1";
 pub enum SurfaceCommand {
     /// Collect a deterministic on-device surface snapshot.
     Scan(SurfaceScanArgs),
+    /// Prove ownership for an exact target set without a full process snapshot.
+    Coverage(CoverageArgs),
     /// List Binder services.
     Services(SurfaceInputArgs),
     /// List declared and running HAL services.
@@ -354,6 +360,7 @@ pub struct ReachabilityHealth {
 pub fn run(command: SurfaceCommand) -> Result<()> {
     match command {
         SurfaceCommand::Scan(args) => run_scan(args),
+        SurfaceCommand::Coverage(args) => coverage::run(args),
         SurfaceCommand::Services(args) => {
             let snapshot = read_snapshot(&args.input)?;
             write_json(
@@ -410,8 +417,7 @@ pub fn run(command: SurfaceCommand) -> Result<()> {
             )
         }
         SurfaceCommand::Explain(args) => {
-            let snapshot = read_snapshot(&args.io.input)?;
-            let value = explain(&snapshot, &args.selector)?;
+            let value = explain_input(&args.io.input, &args.selector)?;
             write_json(args.io.output.as_deref(), &value)
         }
         SurfaceCommand::Reachable(args) => {
@@ -2610,6 +2616,26 @@ fn explain(snapshot: &SurfaceSnapshot, selector: &str) -> Result<Value> {
         "entity": entity,
         "relations": relations,
     }))
+}
+
+fn explain_input(path: &str, selector: &str) -> Result<Value> {
+    let value: Value = serde_json::from_reader(open_input(path)?)
+        .with_context(|| format!("parsing surface explain input {path}"))?;
+    match value.get("schema").and_then(Value::as_str) {
+        Some(SURFACE_SCHEMA) => {
+            let mut snapshot: SurfaceSnapshot = serde_json::from_value(value)
+                .with_context(|| format!("parsing surface snapshot {path}"))?;
+            finish_snapshot(&mut snapshot);
+            explain(&snapshot, selector)
+        }
+        Some("neutron.surface-coverage/v1") => {
+            let document: CoverageDocument = serde_json::from_value(value)
+                .with_context(|| format!("parsing surface coverage {path}"))?;
+            coverage::explain(&document, selector)
+        }
+        Some(schema) => bail!("unsupported surface schema '{schema}'"),
+        None => bail!("surface input has no string schema"),
+    }
 }
 
 fn finish_snapshot(snapshot: &mut SurfaceSnapshot) {
