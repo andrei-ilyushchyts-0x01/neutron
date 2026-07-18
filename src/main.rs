@@ -2587,9 +2587,16 @@ fn emit_binder_call(
 
 fn maturity_warning_for(
     command: Option<&Command>,
+    legacy_trace_json: bool,
     stderr_is_terminal: bool,
 ) -> Option<&'static str> {
-    if !stderr_is_terminal {
+    let machine_readable_stream = match command {
+        Some(Command::Trace(args)) => args.json,
+        Some(Command::Doctor(args)) => args.json,
+        None => legacy_trace_json,
+        _ => false,
+    };
+    if machine_readable_stream || !stderr_is_terminal {
         return None;
     }
     match command {
@@ -2608,7 +2615,11 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let maturity_warning = maturity_warning_for(cli.command.as_ref(), io::stderr().is_terminal());
+    let maturity_warning = maturity_warning_for(
+        cli.command.as_ref(),
+        cli.args.json,
+        io::stderr().is_terminal(),
+    );
     if let Some(warning) = maturity_warning {
         eprintln!("warning: {warning}");
     }
@@ -5204,16 +5215,28 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn maturity_warning_is_suppressed_for_non_interactive_transports() {
-        let doctor = Cli::try_parse_from(["neutron", "doctor", "--json"])
+    fn maturity_warning_never_contaminates_machine_readable_streams() {
+        let doctor_json = Cli::try_parse_from(["neutron", "doctor", "--json"])
             .expect("doctor JSON command should parse");
+        let doctor_text =
+            Cli::try_parse_from(["neutron", "doctor"]).expect("doctor command should parse");
+        let trace_json = Cli::try_parse_from(["neutron", "trace", "--json"])
+            .expect("trace JSON command should parse");
 
-        assert_eq!(maturity_warning_for(doctor.command.as_ref(), false), None);
         assert_eq!(
-            maturity_warning_for(doctor.command.as_ref(), true),
+            maturity_warning_for(doctor_json.command.as_ref(), false, true),
+            None
+        );
+        assert_eq!(
+            maturity_warning_for(trace_json.command.as_ref(), false, true),
+            None
+        );
+        assert_eq!(maturity_warning_for(None, true, true), None);
+        assert_eq!(
+            maturity_warning_for(doctor_text.command.as_ref(), false, true),
             CommandMaturity::Preview.warning()
         );
-        assert_eq!(maturity_warning_for(None, false), None);
+        assert_eq!(maturity_warning_for(None, false, false), None);
     }
 
     fn private_test_dir(label: &str) -> std::path::PathBuf {
