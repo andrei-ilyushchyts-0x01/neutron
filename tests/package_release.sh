@@ -53,9 +53,23 @@ rg -F 'create_archive_twice "$DIST/$AGENT_NAME.tar.zst" create_payload_archive "
 rg -F 'create_archive_twice "$DIST/$SOURCE_NAME" create_source_archive' "$script"
 rg -F 'git archive --format=tar --mtime="$BUILD_TIMESTAMP"' "$script"
 rg -F 'gzip -n -9' "$script"
+rg -F 'BUILD_ARCH=$(uname -m)' "$script"
+rg -F 'if [[ "$BUILD_ARCH" != "x86_64" ]]; then' "$script"
+rg -F 'X86_64_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-x86_64-linux-gnu-gcc}"' "$script"
+rg -F 'if ! command -v "$X86_64_LINKER" >/dev/null 2>&1; then' "$script"
+rg -F 'release packaging on $BUILD_ARCH requires a usable x86_64-linux-gnu linker: $X86_64_LINKER' "$script"
+rg -F 'export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$X86_64_LINKER"' "$script"
 rg -F 'path: dist/v*/' "$root/.github/workflows/ci.yml"
 rg -F 'installs only the agent, both BPF variants, and packs' "$quickstart"
 rg -F "jq '{schema, compatible, object, smoke}' neutron.doctor.json" "$quickstart"
+
+arch_line=$(rg -n -m1 -F 'BUILD_ARCH=$(uname -m)' "$script" | cut -d: -f1)
+linker_line=$(rg -n -m1 -F 'export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$X86_64_LINKER"' "$script" | cut -d: -f1)
+host_build_line=$(rg -n -m1 -F 'cargo build --release --target x86_64-unknown-linux-gnu --bin neutron' "$script" | cut -d: -f1)
+completions_build_line=$(rg -n -m1 -F 'cargo run --locked --release --target x86_64-unknown-linux-gnu --example generate-completions' "$script" | cut -d: -f1)
+[[ "$arch_line" -lt "$linker_line" ]]
+[[ "$linker_line" -lt "$host_build_line" ]]
+[[ "$linker_line" -lt "$completions_build_line" ]]
 
 checksum_line=$(rg -n -m1 'sha256sum --check --strict --quiet SHA256SUMS' "$script" | cut -d: -f1)
 push_line=$(rg -n -m1 -F '"${ADB[@]}" push neutron-agent' "$script" | cut -d: -f1)
