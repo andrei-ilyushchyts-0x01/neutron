@@ -54,7 +54,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--max-output-size SIZE`          | String           | unset                                    | Stop capture after the output stream reaches SIZE. Accepts bytes or binary suffixes (`kb`, `mb`, `gb`). |
 | `--rotate-output-size SIZE`       | String           | unset                                    | Rotate file output after SIZE bytes per segment. Requires `--output`; writes `PATH`, `PATH.1`, `PATH.2`, ... Mutually exclusive with `--max-output-size`. |
 | `--json`                          | flag             | off                                      | Emit events and findings as NDJSON (one JSON object per line). |
-| `--profile security`              | String           | off                                      | Enable BPF-side syscall whitelisting: only security-relevant syscalls are captured. Also captures file paths via `bpf_probe_read_user_str_bytes` and auto-populates `--exclude-comm` with kernel-worker noise. |
+| `--profile security`              | String           | off                                      | Unless `--match-syscall` or `--match EXPR` is explicit, enable the documented 17-syscall BPF whitelist. Also auto-populates `--exclude-comm` with common high-volume Android thread names. |
 | `--schema-pack NAME\|PATH`        | repeatable       | auto                                     | Load data-only ioctl schema packs in the given order. Any explicit pack disables auto-selection. |
 | `--no-schema-auto`                | flag             | off                                      | Disable schema auto-selection from trusted system install directories. |
 | `--binder`                        | flag             | off                                      | Enable binder transaction tracing via the `binder/binder_transaction` tracepoint. Emits events with `syscall_nr = -1`. |
@@ -86,7 +86,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--match-package LIST`            | comma-separated  | empty                                    | Android package-name match. Resolved on-device to UID(s) through `cmd package` / `pm`, then applied through the BPF UID prefilter. |
 | `--match-android-provider LIST`   | comma-separated  | empty                                    | Android content-provider authority match. Accepts `authority` or `content://authority/path`, resolves through `dumpsys package providers` to the provider package, then applies the package UID through the BPF UID prefilter. |
 | `--match-syscall LIST`            | comma-separated  | empty                                    | Syscall whitelist by aarch64 nr. Reuses `SYSCALL_FILTER`. BPF-evaluable. |
-| `--match-fd LIST`                 | comma-separated  | empty                                    | Glob-matched fd path (e.g. `'/dev/lwis*,/dev/gxp'`). Userspace-only — needs `--resolve-paths` or an established fdgraph entry. Toggles `STATE_EMIT_REQUIRED` so admitted state syscalls bypass later predicates after any active `SYSCALL_FILTER` admission; it does not expand that whitelist. |
+| `--match-fd LIST`                 | comma-separated  | empty                                    | Glob-matched fd path (e.g. `'/dev/lwis*,/dev/gxp'`). Userspace-only — needs `--resolve-paths` or an established fdgraph entry. Enables `STATE_EMIT_REQUIRED` for admitted lifecycle events; it does not expand an active syscall whitelist. |
 | `--match-comm LIST`               | comma-separated  | empty                                    | Glob-matched `comm`. Userspace-only. |
 | `--match-ioctl-cmd LIST`          | comma-separated  | empty                                    | ioctl `cmd` 32-bit word. BPF-evaluable. |
 | `--match-ioctl-type LIST`         | comma-separated  | empty                                    | `_IOC_TYPE` byte (e.g. `0x4c` for LWIS). BPF-evaluable. |
@@ -104,7 +104,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--match-binder-to-thread LIST`   | comma-separated  | empty                                    | Match `to_thread`. Userspace-only. |
 | `--match-binder-target-node LIST` | comma-separated, signed | empty                              | Match `target_node` handle. Userspace-only. |
 | `--match-binder-reply true\|false`| bool             | unset                                    | Match the reply flag. Userspace-only. |
-| `--match EXPR`                    | string           | unset                                    | Recursive-descent boolean expression: `AND`/`OR`/`NOT`/parens, `=`/`!=`/`<`/`<=`/`>`/`>=`/`IN`/`GLOB` over the same field vocabulary. Mutually exclusive with the individual `--match-*` flags. Compiler labels each clause `[bpf]` or `[user]` at startup. |
+| `--match EXPR`                    | string           | unset                                    | Recursive-descent boolean expression: `AND`/`OR`/`NOT`/parens, `=`/`!=`/`<`/`<=`/`>`/`>=`/`IN`/`GLOB` over the same field vocabulary. Mutually exclusive with the individual `--match-*` flags. Compiler labels each clause `[bpf]` or `[user]` at startup. `--match-expr` remains a visible compatibility alias. |
 | `--capture MODE`                  | string           | unset                                    | Capture mode. `matched+context=<DUR>` arms a backward+forward window of `<DUR>` (cap 30s) around every match. Anything else (including `default` / `matched`) preserves Phase 1a/1b emit-on-match-only behaviour. |
 | `--sample P`                      | f64 in [0.0, 1.0] | unset                                  | Uniform Bernoulli drop with probability `1-P`. State-tracking syscalls bypass. |
 | `--rate-limit N`                  | u64              | unset                                    | Token-bucket cap on emitted events per second. State-tracking syscalls bypass. |
@@ -822,18 +822,26 @@ unlisted numbers display as `syscall_<NR>`.
 
 ## Security Profile Syscall Whitelist
 
-When `--profile security` is active, the BPF filter passes only these
-syscall numbers:
+When `--profile security` is active, the BPF filter passes only these syscall
+numbers unless an explicit `--match-syscall` list or `--match EXPR` replaces
+the profile default:
 
 ```
 56 (openat)   48 (faccessat)   221 (execve)   281 (execveat)
 79 (fstatat)  78 (readlinkat)  203 (connect)  200 (bind)
 206 (sendto)  207 (recvfrom)   29 (ioctl)     222 (mmap)
-226 (mprotect) 167 (prctl)     129 (kill)     220 (clone)
+198 (socket)  226 (mprotect)   167 (prctl)    129 (kill)
+220 (clone)
 ```
 
-All other syscall numbers are silently discarded in BPF before any
-RingBuf reservation.
+With the default list, all other syscall numbers are discarded in BPF before
+any RingBuf reservation.
+
+`STATE_EMIT_REQUIRED` is enabled by fd-path predicates. An active `SYSCALL_FILTER` remains an earlier gate.
+`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically.
+Without that fd-path exemption, active BPF predicates can suppress lifecycle events.
+The `FdGraph` does not model `fcntl` duplication or `close_range`; a cached
+path is enrichment, not proof of a current live FD binding.
 
 ## Binder Transaction Fields (`args[0..5]`)
 

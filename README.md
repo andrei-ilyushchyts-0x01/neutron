@@ -713,7 +713,12 @@ crate is not host-testable in the normal Rust test harness.
 
 To exercise packaging locally with unpublished, explicitly unauthenticated
 assets, install `qemu-aarch64` (the `qemu-user` package on Debian/Ubuntu) so the
-packager can execute and measure the static Android agent:
+packager can execute and measure the static Android agent. A non-x86_64 build
+host additionally needs `x86_64-linux-gnu-gcc`, `qemu-x86_64`, and a matching
+x86_64 sysroot (Debian/Ubuntu packages: `gcc-x86-64-linux-gnu`, `qemu-user`,
+and `libc6-dev-amd64-cross`). Override the defaults only with
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` and
+`NEUTRON_X86_64_SYSROOT`:
 
 ```bash
 # Run from a clean committed tree. Never publish this unsigned local output.

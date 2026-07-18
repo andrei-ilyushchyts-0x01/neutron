@@ -339,6 +339,15 @@ fn apply_profile(args: &mut Args) -> Result<()> {
     };
     match profile {
         SECURITY_PROFILE => {
+            if args.match_expr.is_none() {
+                add_match_syscalls_if_empty(
+                    args,
+                    &[
+                        29, 48, 56, 78, 79, 129, 167, 198, 200, 203, 206, 207, 220, 221, 222, 226,
+                        281,
+                    ],
+                );
+            }
             if args.exclude_comm.is_empty() {
                 args.exclude_comm = SECURITY_EXCLUDE_COMM
                     .iter()
@@ -1075,7 +1084,7 @@ fn resolve_match_android_providers(args: &mut Args) -> Result<()> {
 
 /// Phase 1a — push every BPF-evaluable clause of `spec` into its kernel
 /// map, compute the `MATCH_BITS` mask, and toggle
-/// `STATE_EMIT_REQUIRED` if any clause depends on userspace fdgraph state.
+/// `STATE_EMIT_REQUIRED` when a clause contains an fd-path predicate.
 ///
 /// Idempotent: setting a slot to its default zero value is the
 /// authoritative "off" signal. Userspace clauses (fd globs, comm globs,
@@ -1222,8 +1231,9 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
         bits |= MATCH_BIT_ARG_U32;
     }
 
-    // STATE_EMIT_REQUIRED bit — flip on whenever userspace needs admitted
-    // state events. An active syscall whitelist remains the earlier gate.
+    // Only fd-path predicates drive `STATE_EMIT_REQUIRED`; without that fd-path exemption,
+    // active BPF predicates can suppress required lifecycle events. An active syscall
+    // whitelist remains the earlier gate even when the exemption is enabled.
     let state_required = if spec.needs_state_events() {
         1u32
     } else {
@@ -6065,6 +6075,25 @@ mod tests {
                 .map(|value| (*value).to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn security_profile_preserves_explicit_match_expression() {
+        let expression = "uid = 10361 AND syscall = ioctl";
+        let mut args = Args {
+            profile: Some(SECURITY_PROFILE.into()),
+            match_expr: Some(expression.into()),
+            ..Args::default()
+        };
+
+        apply_profile(&mut args).expect("security profile applies");
+
+        assert_eq!(args.match_expr.as_deref(), Some(expression));
+        assert!(args.match_syscall.is_empty());
+        assert!(matches!(
+            build_capture_predicate(&args).expect("expression remains usable"),
+            CapturePredicate::Expr { .. }
+        ));
     }
 
     #[test]

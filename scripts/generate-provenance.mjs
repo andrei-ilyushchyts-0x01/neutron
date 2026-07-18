@@ -183,6 +183,7 @@ const provenance = {
     rustc: measuredRustc,
     cargo: required("NEUTRON_PROV_CARGO"),
     bpf_linker: required("NEUTRON_PROV_BPF_LINKER"),
+    x86_64_linker: required("NEUTRON_PROV_X86_64_LINKER"),
     java_runtime: required("NEUTRON_PROV_JAVA_RUNTIME"),
     java_vendor: required("NEUTRON_PROV_JAVA_VENDOR"),
     gradle: required("NEUTRON_PROV_GRADLE"),

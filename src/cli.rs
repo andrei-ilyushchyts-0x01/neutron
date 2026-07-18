@@ -689,7 +689,7 @@ pub struct Args {
     //   --match 'ret < 0 OR latency_us >= 5000'
     //   --match 'pid = 970 AND (ioctl.cmd IN (0xc0104c64, 0xc0084c01))'
     /// Boolean predicate expression. See man page for grammar.
-    #[arg(long, value_name = "EXPR")]
+    #[arg(long = "match", visible_alias = "match-expr", value_name = "EXPR")]
     pub match_expr: Option<String>,
 
     // ── Phase 1c — capture mode ────────────────────────────────────────────
@@ -969,6 +969,26 @@ mod tests {
         .expect("parse driver/kprobe packs");
         assert_eq!(cli.args.driver_pack, vec!["binder", "kgsl"]);
         assert_eq!(cli.args.kprobe_pack, vec!["mali", "alsa"]);
+    }
+
+    #[test]
+    fn match_expression_accepts_documented_name_and_legacy_alias() {
+        let expression = "uid = 10361 AND syscall = ioctl";
+        for flag in ["--match", "--match-expr"] {
+            let cli = Cli::try_parse_from([
+                "neutron",
+                "trace",
+                "--profile",
+                "security",
+                flag,
+                expression,
+            ])
+            .unwrap_or_else(|error| panic!("{flag} should parse: {error}"));
+            let Some(Command::Trace(args)) = cli.command else {
+                panic!("expected trace command for {flag}");
+            };
+            assert_eq!(args.match_expr.as_deref(), Some(expression));
+        }
     }
 
     #[test]

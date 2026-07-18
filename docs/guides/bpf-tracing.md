@@ -70,8 +70,10 @@ relevant syscalls pass the filter:
 - IPC: `ioctl`
 
 Events for other syscalls never reach userspace — they are discarded in
-the kernel before `RingBuf::reserve()`. The `--profile security`
-shorthand also auto-populates `--exclude-comm` with kernel worker noise.
+the kernel before `RingBuf::reserve()`. The `--profile security` shorthand
+applies this list only when neither `--match-syscall` nor `--match EXPR` was
+supplied, and also auto-populates `--exclude-comm` with common high-volume
+Android thread names.
 
 In security profile mode, the BPF program calls
 `bpf_probe_read_user_str_bytes` (helper 114) to capture the first argument
@@ -104,6 +106,14 @@ The userspace `--resolve-paths` flag is still useful as a safety net:
 
 This is independent of the BPF read path — it kicks in when the in-kernel
 read returned a truncated buffer or a closed/reused fd.
+
+`STATE_EMIT_REQUIRED` is enabled by fd-path predicates. It exempts admitted
+lifecycle events from later predicate gates; it does not expand an active
+syscall whitelist.
+`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically.
+Without that fd-path exemption, active BPF predicates can suppress lifecycle events.
+The fdgraph does not model `fcntl` duplication or `close_range`, so a cached
+path is enrichment rather than proof of a current live FD binding.
 
 ## Network Event Decoding
 

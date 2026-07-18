@@ -9,6 +9,7 @@
 | `rustup` + `cargo`                       | Build everything                         | https://rustup.rs — **nightly** required (pinned via `rust-toolchain.toml`) |
 | `bpf-linker`                             | Link Aya BPF programs                    | `cargo install bpf-linker`                   |
 | `aarch64-linux-gnu-gcc`                  | Cross-linker for the musl userspace      | `apt install gcc-aarch64-linux-gnu` (or distro equivalent) |
+| `x86_64-linux-gnu-gcc` + `qemu-x86_64`  | Build and measure the host release payload from a non-x86_64 build host | `apt install gcc-x86-64-linux-gnu qemu-user libc6-dev-amd64-cross` |
 | `adb`                                    | Deploy + run on device                   | Android SDK platform-tools                   |
 | `bpfel-unknown-none`                     | BPF target specification                 | built from `rust-src` by `cargo xtask`; no prebuilt rustup target exists |
 | `rustup target add aarch64-unknown-linux-musl` | musl cross-compile target          | automatic via `rust-toolchain.toml`          |

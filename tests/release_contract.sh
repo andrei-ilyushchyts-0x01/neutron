@@ -72,7 +72,7 @@ release_host_archive_contains_useful_shell_completions() {
 
     [[ -f "$generator" ]] || return 1
     contains "$package" 'mkdir -p "$HOST_PAYLOAD/man/man1" "$HOST_PAYLOAD/schemas" "$HOST_PAYLOAD/completions"' || return 1
-    contains "$package" 'cargo run --locked --release --target x86_64-unknown-linux-gnu --example generate-completions -- "$HOST_PAYLOAD/completions"' || return 1
+    contains "$package" 'cargo run --locked --release --example generate-completions -- "$HOST_PAYLOAD/completions"' || return 1
 
     mkdir -p "$root/target/tmp"
     output=$(mktemp -d "$root/target/tmp/completions-contract.XXXXXX") || return 1
@@ -104,6 +104,8 @@ release_sbom_and_provenance_include_dependency_and_build_inputs() {
         contains "$sbom" 'relationshipType: "DEPENDS_ON"' &&
         contains "$sbom" 'licenseDeclared: pkg.license || "NOASSERTION"' &&
         contains "$provenance" 'bpf_linker:' &&
+        contains "$provenance" 'x86_64_linker:' &&
+        contains "$package" 'NEUTRON_PROV_X86_64_LINKER' &&
         contains "$provenance" 'gradle_distribution_sha256:' &&
         contains "$provenance" 'android_build_tools:' &&
         contains "$provenance" 'runner_image_version:' &&
@@ -200,6 +202,7 @@ release_provenance_comes_from_measured_artifacts() {
         ! contains "$provenance" 'bpf_abi: { major: 2, event_size: 257 }' &&
         contains "$schema" '"binaries"' &&
         contains "$schema" '"bpf_objects"' &&
+        contains "$schema" '"x86_64_linker"' &&
         contains "$schema" '"release_authentication"' &&
         contains "$root/schemas/README.md" 'neutron.provenance-v1.schema.json'
 }
@@ -307,7 +310,7 @@ limitations_disclose_filtered_fd_state_ceiling() {
     for document in "$limitations" "$reference" "$guide"; do
         contains "$document" '`STATE_EMIT_REQUIRED` is enabled by fd-path predicates' || return 1
         contains "$document" '`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically' || return 1
-        contains "$document" 'active BPF predicates can suppress lifecycle events' || return 1
+        contains "$document" 'Without that fd-path exemption, active BPF predicates can suppress lifecycle events' || return 1
     done
 
     contains "$limitations" '`fd_path` predicates' &&
@@ -317,8 +320,9 @@ limitations_disclose_filtered_fd_state_ceiling() {
         contains "$reference" 'An active `SYSCALL_FILTER` remains an earlier gate' &&
         contains "$manpage" 'Only fd-path predicates enable' &&
         contains "$manpage" 'do not enable it automatically' &&
-        contains "$manpage" 'active BPF predicates can suppress lifecycle events' &&
+        contains "$manpage" 'Without that fd-path exemption, active BPF predicates can suppress lifecycle events' &&
         contains "$main" 'Only fd-path predicates drive `STATE_EMIT_REQUIRED`' &&
+        contains "$main" 'without that fd-path exemption' &&
         contains "$main" 'active BPF predicates can suppress required lifecycle events' &&
         contains "$matcher" 'Only fd-path predicates require state-event exemption' &&
         contains "$common" 'This flag never expands' &&

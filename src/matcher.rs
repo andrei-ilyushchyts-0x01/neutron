@@ -193,10 +193,10 @@ impl MatchSpec {
             && self.binder.is_empty()
     }
 
-    /// `true` when any clause depends on userspace-derived state: fd-graph
-    /// path resolution, comm globbing, binder semantics, or arg accessors
-    /// at non-u32 widths. Drives the BPF
-    /// `FILTER_KEY_STATE_EMIT_REQUIRED` toggle.
+    /// `true` when an fd-path predicate needs fdgraph lifecycle events.
+    /// Only fd-path predicates require state-event exemption; other
+    /// userspace-only predicates do not drive
+    /// `FILTER_KEY_STATE_EMIT_REQUIRED`.
     pub fn needs_state_events(&self) -> bool {
         !self.fd_globs.is_empty()
     }

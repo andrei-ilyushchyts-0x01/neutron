@@ -42,14 +42,44 @@ export NEUTRON_BUILD_GIT_DIRTY="$GIT_DIRTY"
 export NEUTRON_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
 
 BUILD_ARCH=$(uname -m)
+HOST_RUNNER=()
 if [[ "$BUILD_ARCH" != "x86_64" ]]; then
   X86_64_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-x86_64-linux-gnu-gcc}"
-  if ! command -v "$X86_64_LINKER" >/dev/null 2>&1; then
-    echo "release packaging on $BUILD_ARCH requires a usable x86_64-linux-gnu linker: $X86_64_LINKER" >&2
+  X86_64_SYSROOT="${NEUTRON_X86_64_SYSROOT:-/usr/x86_64-linux-gnu}"
+  if ! command -v qemu-x86_64 >/dev/null 2>&1; then
+    echo "release packaging on $BUILD_ARCH requires qemu-x86_64 to measure the x86_64 host binary" >&2
     exit 1
   fi
-  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$X86_64_LINKER"
+  if [[ "$X86_64_SYSROOT" != /* || ! -d "$X86_64_SYSROOT" ||
+        ( ! -r "$X86_64_SYSROOT/lib/ld-linux-x86-64.so.2" &&
+          ! -r "$X86_64_SYSROOT/lib64/ld-linux-x86-64.so.2" ) ]]; then
+    echo "release packaging on $BUILD_ARCH requires an absolute x86_64 sysroot with a readable dynamic loader: $X86_64_SYSROOT" >&2
+    exit 1
+  fi
+  HOST_RUNNER=(qemu-x86_64 -L "$X86_64_SYSROOT")
+else
+  X86_64_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-cc}"
 fi
+if ! command -v "$X86_64_LINKER" >/dev/null 2>&1; then
+  echo "release packaging on $BUILD_ARCH requires a usable x86_64-linux-gnu linker: $X86_64_LINKER" >&2
+  exit 1
+fi
+X86_64_LINKER=$(command -v "$X86_64_LINKER")
+if [[ ! -x "$X86_64_LINKER" ]]; then
+  echo "resolved x86_64 linker is not executable: $X86_64_LINKER" >&2
+  exit 1
+fi
+if ! X86_64_LINKER_OUTPUT=$("$X86_64_LINKER" --version 2>&1); then
+  echo "could not execute the x86_64 linker to measure its version: $X86_64_LINKER" >&2
+  exit 1
+fi
+X86_64_LINKER_VERSION=$(printf '%s\n' "$X86_64_LINKER_OUTPUT" | sed -n '1p')
+if [[ -z "$X86_64_LINKER_VERSION" ]]; then
+  echo "x86_64 linker returned an empty version identity: $X86_64_LINKER" >&2
+  exit 1
+fi
+X86_64_LINKER_IDENTITY="$X86_64_LINKER: $X86_64_LINKER_VERSION"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$X86_64_LINKER"
 
 DIST_ROOT="$ROOT/dist"
 FINAL_DIST="$DIST_ROOT/v$VERSION"
@@ -84,7 +114,7 @@ echo "==> Building Linux x86_64 host binary"
 cargo build --release --target x86_64-unknown-linux-gnu --bin neutron
 
 echo "==> Generating shell completions"
-cargo run --locked --release --target x86_64-unknown-linux-gnu --example generate-completions -- "$HOST_PAYLOAD/completions"
+cargo run --locked --release --example generate-completions -- "$HOST_PAYLOAD/completions"
 
 echo "==> Building Android aarch64 userspace binary"
 cargo build --release --target aarch64-unknown-linux-musl --bin neutron
@@ -186,7 +216,7 @@ command -v qemu-aarch64 >/dev/null || {
 }
 HOST_SELF_INFO="$DIST/host-self-info.json"
 AGENT_SELF_INFO="$DIST/agent-self-info.json"
-"$HOST_PAYLOAD/neutron" self-info --json \
+"${HOST_RUNNER[@]}" "$HOST_PAYLOAD/neutron" self-info --json \
   --bpf-object "$AGENT_PAYLOAD/neutron.bpf.elf" \
   --bpf-object "$AGENT_PAYLOAD/neutron-stacks.bpf.elf" \
   > "$HOST_SELF_INFO"
@@ -564,6 +594,7 @@ export NEUTRON_PROV_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
 export NEUTRON_PROV_RUSTC="$RUSTC_VERSION"
 export NEUTRON_PROV_CARGO="$CARGO_VERSION"
 export NEUTRON_PROV_BPF_LINKER="$BPF_LINKER_VERSION"
+export NEUTRON_PROV_X86_64_LINKER="$X86_64_LINKER_IDENTITY"
 export NEUTRON_PROV_JAVA_RUNTIME="$JAVA_RUNTIME"
 export NEUTRON_PROV_JAVA_VENDOR="$JAVA_VENDOR"
 export NEUTRON_PROV_GRADLE="$GRADLE_VERSION"

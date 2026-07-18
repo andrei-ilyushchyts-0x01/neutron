@@ -430,13 +430,23 @@ Print extra diagnostic context to standard error during attach and at exit.
 .TP
 .BI \-\-profile " NAME"
 Apply a named profile.
-Currently only the
-.B security
-profile is recognised; it pre-populates
+Recognised profiles are
+.BR security ,
+.BR kernel-lpe ,
+and
+.BR driver-harness .
+Unless an explicit
+.B \-\-match-syscall
+list or
+.B \-\-match \fIEXPR\fR
+is present, the security profile installs its documented 17-syscall BPF
+whitelist. It also pre-populates
 .B \-\-exclude\-comm
 with a small set of high-volume Android system threads
 .RI ( "RenderThread, FrameMetricsAgg, PerfStat, Profile Saver, Jit thread pool" )
-that drown the trace in idle noise but never carry security-relevant signal.
+that commonly add noise to Android captures. Supply an explicit
+.B \-\-exclude\-comm
+list to replace these defaults.
 .TP
 .BI \-\-exclude\-comm " LIST"
 Comma-separated substring matches; any event whose
@@ -650,11 +660,17 @@ in
 .B \-\-match \fIEXPR\fR
 falls through to userspace as a safe over-approximation.
 .PP
-Per the assessment workflow,
-.BR \-\-match-fd " toggles " STATE_EMIT_REQUIRED .
-Kernel-side state-tracking syscalls bypass later predicate gates only after admission by any active
-.BR SYSCALL_FILTER ;
-the flag does not add lifecycle syscalls to that whitelist. The tracked set includes
+Only fd-path predicates enable
+.BR STATE_EMIT_REQUIRED .
+.BR \-\-resolve-paths ,
+.BR \-\-follow-children ,
+and
+.B \-\-capture-reads
+do not enable it automatically. Kernel-side state-tracking syscalls bypass
+later predicate gates only after earlier BPF gates admit them; an active
+.B SYSCALL_FILTER
+is always enforced. Without that fd-path exemption, active BPF predicates can suppress lifecycle events.
+The tracked set includes
 .RB ( open ", " close ", " dup ", " dup3 ", " socket ", " pipe2 ", "
 .BR memfd_create ", " clone )
 and can enrich the userspace
@@ -680,7 +696,8 @@ Glob-matched fd path (e.g.
 .BR '/dev/lwis*,/dev/gxp' ).
 Userspace-only; toggles
 .B STATE_EMIT_REQUIRED
-so kernel-side fd-state syscalls bypass the predicate.
+so admitted kernel-side fd-state syscalls bypass later predicates. It does
+not expand an active syscall whitelist.
 .TP
 .BI \-\-match-comm " LIST"
 Glob-matched
@@ -776,6 +793,9 @@ Audit-print at startup labels each clause
 or
 .B [user]
 so volume reduction is visible.
+The visible
+.B \-\-match-expr
+alias is retained for compatibility.
 .SS Capture mode (1.2.0)
 .TP
 .BI \-\-capture " MODE"

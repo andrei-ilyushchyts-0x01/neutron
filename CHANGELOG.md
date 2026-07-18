@@ -71,9 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stopped syscall-whitelist rejects before they populate BPF `INFLIGHT` state,
   preventing long-blocking, non-emittable syscalls from falsely degrading a
   clean scenario boundary while retaining state for allowlisted exit filters.
-- Fixed clean release packaging on non-x86_64 build hosts by selecting and
-  validating an explicit x86_64 GNU cross-linker before host-binary and shell
-  completion builds.
+- Fixed clean release packaging on non-x86_64 build hosts by generating shell
+  completions natively, selecting and recording an explicit x86_64 GNU
+  cross-linker, and measuring the packaged host binary through a validated
+  qemu/sysroot runner.
+- Fixed `--profile security` to install its documented 17-syscall BPF
+  whitelist (including `socket`) unless the operator supplies an explicit
+  `--match-syscall` or `--match EXPR` override.
+- Exposed the documented `--match EXPR` spelling and retained
+  `--match-expr` as a visible compatibility alias.
+- Clarified that only fd-path predicates enable the state-event exemption;
+  `--resolve-paths`, `--follow-children`, and `--capture-reads` remain bounded
+  by active BPF predicates and do not prove a complete FD lifecycle.
 
 ## [1.4.0] — 2026-07-10
 

@@ -76,7 +76,7 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 │    4. resolve stack via STACK_TRACES + ProcSymbolizer + KernelResolver │
 │    5. format JSON (always) + optional text                             │
 │    6. CapturePredicate.evaluate(...)                                   │
-│       → SamplerChain.keep(ts, nr) (state-tracking exempt)              │
+│       → SamplerChain.keep(ts, nr) (admitted state-tracking exempt)     │
 │       → ContextRing.observe(...) when --capture matched+context        │
 │    7. RuleEngine::feed → drain_ready (matched events only)             │
 │       (--fd-snapshot-on-finding splices fdinfo_at_event on emit)       │

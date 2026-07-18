@@ -476,9 +476,7 @@ pub const FILTER_KEY_IOCTL_DIR: u32 = 6;
 /// Phase 1a — when set to `1`, BPF programs let state-tracking syscalls
 /// (see [`is_state_tracking_nr`]) bypass later match-predicate gates after
 /// any legacy syscall-whitelist admission. This flag never expands
-/// `SYSCALL_FILTER`. Userspace flips it on whenever a feature relies on
-/// `FdGraph` state (e.g. `--match-fd`, `--resolve-paths`,
-/// `--follow-children`).
+/// `SYSCALL_FILTER`. Only fd-path predicates make userspace enable this flag.
 pub const FILTER_KEY_STATE_EMIT_REQUIRED: u32 = 7;
 /// Enable matching through `TRACED_PROCESSES` instead of broad PID 0 mode.
 pub const FILTER_KEY_CAUSAL_MODE: u32 = 8;
@@ -586,12 +584,10 @@ pub const fn ret_matches_class(ret: i64, class: u32) -> bool {
 // ── State-tracking syscalls (Phase 1a) ───────────────────────────────────────
 //
 // These syscalls can drive the userspace `FdGraph`: openat, dup, close,
-// socket, pipe, eventfd, memfd_create, accept, clone (for follow-children).
-// When a `--match-fd` / `--resolve-paths` / `--follow-children` feature is
-// active, `FILTER_KEY_STATE_EMIT_REQUIRED` lets an already-admitted syscall
-// bypass later match and sampling gates. An active `SYSCALL_FILTER` still
-// applies first, so callers that need complete lifecycle state must include
-// the required syscalls explicitly. The userspace post-filter decides
+// socket, pipe, eventfd, memfd_create, accept, and clone. When an fd-path
+// predicate is active, `FILTER_KEY_STATE_EMIT_REQUIRED` lets an already-
+// admitted syscall bypass later match gates. Earlier BPF gates still apply,
+// so lifecycle state can be incomplete. The userspace post-filter decides
 // whether the event is written to NDJSON or consumed only for state.
 //
 // Numbers are aarch64 generic (kernel/uapi/asm-generic/unistd.h). They
