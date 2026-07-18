@@ -216,7 +216,11 @@ ci_runs_for_release_lines_and_assembles_probe() {
     rg -q '(^|[[:space:],\[])dev([[:space:],\]]|$)' "$workflow" &&
         contains "$workflow" 'release/**' &&
         rg -q '^[[:space:]]*workflow_dispatch:' "$workflow" &&
+        contains "$workflow" 'NEUTRON_BUILD_GIT_COMMIT: ${{ github.sha }}' &&
+        contains "$workflow" 'NEUTRON_BUILD_GIT_DIRTY: "false"' &&
         rg -q 'assemble(Debug|Release|Research)' "$workflow" &&
+        contains "$workflow" '$ANDROID_HOME/build-tools/35.0.0' &&
+        contains "$workflow" '$GITHUB_PATH' &&
         contains "$workflow" 'tests/release_contract.sh'
 }
 
@@ -224,12 +228,19 @@ signed_tag_workflow_requires_keys_and_attests_assets() {
     local workflow="$root/.github/workflows/release.yml"
     [[ -f "$workflow" ]] &&
         contains "$workflow" 'git verify-tag "$RELEASE_TAG"' &&
-        contains "$workflow" 'test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"' &&
+        contains "$workflow" 'commit=$(git rev-list -n 1 "$RELEASE_TAG")' &&
+        contains "$workflow" 'test "$commit" = "$(git rev-parse HEAD)"' &&
         ! contains "$workflow" 'test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$GITHUB_SHA"' &&
         ! contains "$workflow" 'test "$GITHUB_EVENT_NAME" = workflow_dispatch' &&
         contains "$workflow" 'RELEASE_GPG_PUBLIC_KEY_B64' &&
         contains "$workflow" 'MINISIGN_SECRET_KEY_B64' &&
         contains "$workflow" 'PROBE_KEYSTORE_B64' &&
+        contains "$workflow" 'echo "NEUTRON_BUILD_GIT_COMMIT=$commit"' &&
+        contains "$workflow" 'echo "NEUTRON_BUILD_GIT_DIRTY=false"' &&
+        contains "$workflow" 'echo "commit=$commit" >> "$GITHUB_OUTPUT"' &&
+        contains "$workflow" 'steps.verify_tag.outputs.commit' &&
+        contains "$workflow" '$ANDROID_HOME/build-tools/35.0.0' &&
+        contains "$workflow" '$GITHUB_PATH' &&
         contains "$workflow" 'REQUIRE_SIGNATURES=1' &&
         contains "$workflow" 'cargo test --workspace --exclude neutron-ebpf' &&
         contains "$workflow" 'cargo clippy --workspace --exclude neutron-ebpf --all-targets -- -D warnings' &&

@@ -29,6 +29,9 @@ const MAX_PARCEL_BYTES: u64 = 64 * 1024;
 const MAX_REPLAY_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const REPLAY_TARGET: &str = "aarch64-unknown-linux-musl";
+const DEFAULT_REPLAY_LINKER: &str = "aarch64-linux-gnu-gcc";
+const REPLAY_LINKER_ENV: &str = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER";
 const WARNING: &str =
     "AUTHORIZED USE ONLY: replay may crash or reboot the selected physical device.";
 
@@ -1831,9 +1834,26 @@ unsafe extern "C" {{ fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i32; }}
     ))
 }
 
-pub fn build(args: BuildArgs) -> Result<()> {
-    const TARGET: &str = "aarch64-unknown-linux-musl";
+fn replay_rustc_command(directory: &Path, temporary_name: &str, linker: &str) -> Command {
+    let mut command = Command::new("rustc");
+    command
+        .current_dir(directory)
+        .args([
+            "--edition=2021",
+            "--target",
+            REPLAY_TARGET,
+            "-C",
+            "opt-level=2",
+            "-C",
+            "panic=abort",
+            "-C",
+        ])
+        .arg(format!("linker={linker}"))
+        .args(["replay.rs", "-o", temporary_name]);
+    command
+}
 
+pub fn build(args: BuildArgs) -> Result<()> {
     validate_artifact(&args.directory)?;
     validate_private_directory(&args.directory)?;
     let source = args.directory.join("replay.rs");
@@ -1868,20 +1888,11 @@ pub fn build(args: BuildArgs) -> Result<()> {
         .context("rustc --version output is not UTF-8")?
         .trim()
         .to_string();
-    let output = Command::new("rustc")
-        .current_dir(&args.directory)
-        .args([
-            "--edition=2021",
-            "--target",
-            TARGET,
-            "-C",
-            "opt-level=2",
-            "-C",
-            "panic=abort",
-            "replay.rs",
-            "-o",
-            &temporary_name,
-        ])
+    let linker = std::env::var(REPLAY_LINKER_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_REPLAY_LINKER.into());
+    let output = replay_rustc_command(&args.directory, &temporary_name, &linker)
         .output()
         .context("cross-building generated replay.rs")?;
     if !output.status.success() {
@@ -1915,7 +1926,7 @@ pub fn build(args: BuildArgs) -> Result<()> {
             &args.directory.join("build.json"),
             &BuildManifest {
                 schema: HARNESS_SCHEMA.into(),
-                target: TARGET.into(),
+                target: REPLAY_TARGET.into(),
                 compiler,
                 source_sha256,
                 binary_sha256: format!("{:x}", Sha256::digest(&binary)),
@@ -3361,6 +3372,26 @@ mod tests {
             "--nocapture".into(),
         ]);
         argv
+    }
+
+    #[test]
+    fn replay_cross_build_passes_the_configured_aarch64_linker_to_rustc() {
+        let command = replay_rustc_command(
+            Path::new("artifact"),
+            "replay-output",
+            "/opt/toolchains/aarch64-linux-gnu-gcc",
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["-C", "linker=/opt/toolchains/aarch64-linux-gnu-gcc"] }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--target", REPLAY_TARGET]));
     }
 
     #[allow(clippy::zombie_processes)]

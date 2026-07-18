@@ -2380,7 +2380,9 @@ mod tests {
         manifest.tool.git_commit = "8".repeat(40);
         variants.push(("userspace source commit", manifest));
         let mut manifest = baseline.clone();
-        manifest.tool.git_dirty = !manifest.tool.git_dirty;
+        let scope = manifest.capture_scope.as_mut().unwrap();
+        scope.producer.userspace_git_dirty = !manifest.tool.git_dirty;
+        *scope = scope.clone().recompute_claim_scope();
         variants.push(("userspace dirty state", manifest));
         let mut manifest = baseline.clone();
         manifest.bpf.object_sha256 = Some("7".repeat(64));

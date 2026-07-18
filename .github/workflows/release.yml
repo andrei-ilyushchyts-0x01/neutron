@@ -33,6 +33,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Import the configured release tag verifier
+        id: verify_tag
         env:
           RELEASE_GPG_PUBLIC_KEY_B64: ${{ secrets.RELEASE_GPG_PUBLIC_KEY_B64 }}
         run: |
@@ -42,8 +43,14 @@ jobs:
           gpg --batch --import "$RUNNER_TEMP/release-signing-key.asc"
           rm -f "$RUNNER_TEMP/release-signing-key.asc"
           git verify-tag "$RELEASE_TAG"
-          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
-          echo "RELEASE_COMMIT=$(git rev-list -n 1 "$RELEASE_TAG")" >> "$GITHUB_ENV"
+          commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          test "$commit" = "$(git rev-parse HEAD)"
+          {
+            echo "RELEASE_COMMIT=$commit"
+            echo "NEUTRON_BUILD_GIT_COMMIT=$commit"
+            echo "NEUTRON_BUILD_GIT_DIRTY=false"
+          } >> "$GITHUB_ENV"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
       - name: Verify tag and package versions agree
         run: |
@@ -71,6 +78,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu minisign qemu-user ripgrep zstd
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt2"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
           cargo install bpf-linker --version 0.10.3 --locked
           cargo install cargo-audit --version 0.22.2 --locked
 
@@ -133,7 +143,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: neutron-${{ env.RELEASE_TAG }}-${{ env.RELEASE_COMMIT }}
+          name: neutron-${{ env.RELEASE_TAG }}-${{ steps.verify_tag.outputs.commit }}
           path: dist/${{ env.RELEASE_TAG }}/
           if-no-files-found: error
           retention-days: 30
