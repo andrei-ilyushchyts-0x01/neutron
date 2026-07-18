@@ -24,7 +24,7 @@ use std::path::Path;
 use aya::maps::{Array, PerCpuArray, RingBuf};
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::TracePoint;
-use aya::{Ebpf, EbpfLoader};
+use aya::{Ebpf, EbpfLoader, VerifierLogLevel};
 use clap::Args;
 use serde::Serialize;
 
@@ -1139,7 +1139,29 @@ pub fn run_syscall_smoke(object_path: &str) -> SmokeReport {
     report
 }
 
+fn smoke_verifier_log_level() -> VerifierLogLevel {
+    // DEBUG logs every verifier step. Aya 0.13 starts with a 10 KiB buffer,
+    // so Android can return EACCES before that buffer grows and the useful
+    // final rejection is lost. STATS retains the terminal reason and summary.
+    VerifierLogLevel::STATS
+}
+
+fn combine_smoke_outcome(
+    primary: Result<(), String>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(format!("smoke cleanup failed: {cleanup}")),
+        (Err(primary), Err(cleanup)) => Err(format!("{primary}; smoke cleanup failed: {cleanup}")),
+    }
+}
+
 fn run_syscall_smoke_inner(object_path: &str, report: &mut SmokeReport) -> Result<(), String> {
+    // Until a link is attached there is no persistent kernel side effect to
+    // clean up: all maps and loaded programs are unpinned, FD-owned objects.
+    report.cleanup = true;
     let env = RealEnv;
     for kind in [TracepointKind::RawSysEnter, TracepointKind::RawSysExit] {
         let layout = inspect_installed_tracepoint_layout(&env, kind);
@@ -1173,87 +1195,97 @@ fn run_syscall_smoke_inner(object_path: &str, report: &mut SmokeReport) -> Resul
     let expected_tid = expected_tid as u32;
 
     let mut bpf = EbpfLoader::new()
+        .verifier_log_level(smoke_verifier_log_level())
         .load(&object_bytes)
-        .map_err(|error| format!("BPF load failed: {error}"))?;
-    report.bpf_load = true;
+        .map_err(|error| format!("BPF object/map creation failed: {error}"))?;
     configure_smoke_filter(&mut bpf, expected_pid)?;
 
-    let enter_link =
-        attach_smoke_tracepoint(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
-    let exit_link =
-        attach_smoke_tracepoint(&mut bpf, "trace_sys_exit", "raw_syscalls", "sys_exit")?;
-    report.syscall_attach = true;
+    load_smoke_tracepoint(&mut bpf, "trace_sys_enter")?;
+    load_smoke_tracepoint(&mut bpf, "trace_sys_exit")?;
+    report.bpf_load = true;
 
-    let events_map = bpf
-        .take_map("EVENTS")
-        .ok_or_else(|| "EVENTS map missing from BPF object".to_string())?;
-    let mut ring = RingBuf::try_from(events_map)
-        .map_err(|error| format!("EVENTS is not a ring buffer: {error}"))?;
-    report.ringbuf_open = true;
+    let mut enter_link = None;
+    let mut exit_link = None;
+    let outcome = (|| {
+        enter_link = Some(attach_smoke_tracepoint(
+            &mut bpf,
+            "trace_sys_enter",
+            "raw_syscalls",
+            "sys_enter",
+        )?);
+        report.cleanup = false;
+        exit_link = Some(attach_smoke_tracepoint(
+            &mut bpf,
+            "trace_sys_exit",
+            "raw_syscalls",
+            "sys_exit",
+        )?);
+        report.syscall_attach = true;
 
-    while ring.next().is_some() {}
-    let sentinel_result = unsafe { libc::syscall(libc::SYS_getpid) };
-    if sentinel_result < 0 {
-        return Err(format!(
-            "sentinel getpid failed: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    report.sentinel_syscall = true;
+        let events_map = bpf
+            .take_map("EVENTS")
+            .ok_or_else(|| "EVENTS map missing from BPF object".to_string())?;
+        let mut ring = RingBuf::try_from(events_map)
+            .map_err(|error| format!("EVENTS is not a ring buffer: {error}"))?;
+        report.ringbuf_open = true;
 
-    let mut saw_enter = false;
-    let mut saw_exit = false;
-    let mut drained = 0usize;
-    while let Some(item) = ring.next() {
-        drained += 1;
-        if drained > 4096 {
-            return Err("smoke ring drain exceeded 4096 records".to_string());
-        }
-        let event = decode_exact_smoke_event(&item)?;
-        let pid = packed_event_pid(&event);
-        let tid = packed_event_tid(&event);
-        let syscall_nr = packed_event_syscall_nr(&event);
-        if pid != expected_pid || tid != expected_tid || syscall_nr != libc::SYS_getpid as i32 {
-            continue;
-        }
-        let is_enter = packed_event_is_enter(&event);
-        if is_enter == 1 {
-            saw_enter = true;
-        } else if is_enter == 0 && packed_event_ret(&event) == sentinel_result as i64 {
-            saw_exit = true;
-        }
-    }
-    if !(saw_enter && saw_exit) {
-        return Err(format!(
-            "sentinel event pair incomplete: enter={saw_enter} exit={saw_exit}"
-        ));
-    }
-    report.exact_event = true;
-
-    report.health_totals = read_percpu_health(&bpf)?;
-    report.percpu_health_read = true;
-    let submitted = report
-        .health_totals
-        .get(neutron_common::COUNTER_EVENTS_SUBMITTED as usize)
-        .copied()
-        .unwrap_or(0);
-    if submitted < 2 {
-        return Err(format!(
-            "per-CPU health reported only {submitted} submitted events; expected at least 2"
-        ));
-    }
-
-    let exit_detached = detach_smoke_tracepoint(&mut bpf, "trace_sys_exit", exit_link);
-    let enter_detached = detach_smoke_tracepoint(&mut bpf, "trace_sys_enter", enter_link);
-    match (exit_detached, enter_detached) {
-        (Ok(()), Ok(())) => report.cleanup = true,
-        (exit, enter) => {
+        while ring.next().is_some() {}
+        let sentinel_result = unsafe { libc::syscall(libc::SYS_getpid) };
+        if sentinel_result < 0 {
             return Err(format!(
-                "smoke cleanup failed: sys_exit={exit:?} sys_enter={enter:?}"
-            ))
+                "sentinel getpid failed: {}",
+                io::Error::last_os_error()
+            ));
         }
-    }
-    Ok(())
+        report.sentinel_syscall = true;
+
+        let mut saw_enter = false;
+        let mut saw_exit = false;
+        let mut drained = 0usize;
+        while let Some(item) = ring.next() {
+            drained += 1;
+            if drained > 4096 {
+                return Err("smoke ring drain exceeded 4096 records".to_string());
+            }
+            let event = decode_exact_smoke_event(&item)?;
+            let pid = packed_event_pid(&event);
+            let tid = packed_event_tid(&event);
+            let syscall_nr = packed_event_syscall_nr(&event);
+            if pid != expected_pid || tid != expected_tid || syscall_nr != libc::SYS_getpid as i32 {
+                continue;
+            }
+            let is_enter = packed_event_is_enter(&event);
+            if is_enter == 1 {
+                saw_enter = true;
+            } else if is_enter == 0 && packed_event_ret(&event) == sentinel_result as i64 {
+                saw_exit = true;
+            }
+        }
+        if !(saw_enter && saw_exit) {
+            return Err(format!(
+                "sentinel event pair incomplete: enter={saw_enter} exit={saw_exit}"
+            ));
+        }
+        report.exact_event = true;
+
+        report.health_totals = read_percpu_health(&bpf)?;
+        report.percpu_health_read = true;
+        let submitted = report
+            .health_totals
+            .get(neutron_common::COUNTER_EVENTS_SUBMITTED as usize)
+            .copied()
+            .unwrap_or(0);
+        if submitted < 2 {
+            return Err(format!(
+                "per-CPU health reported only {submitted} submitted events; expected at least 2"
+            ));
+        }
+        Ok(())
+    })();
+
+    let cleanup = cleanup_smoke_tracepoints(&mut bpf, exit_link, enter_link);
+    report.cleanup = cleanup.is_ok();
+    combine_smoke_outcome(outcome, cleanup)
 }
 
 fn configure_smoke_filter(bpf: &mut Ebpf, pid: u32) -> Result<(), String> {
@@ -1271,6 +1303,17 @@ fn configure_smoke_filter(bpf: &mut Ebpf, pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn load_smoke_tracepoint(bpf: &mut Ebpf, program_name: &str) -> Result<(), String> {
+    let program: &mut TracePoint = bpf
+        .program_mut(program_name)
+        .ok_or_else(|| format!("program {program_name} missing from BPF object"))?
+        .try_into()
+        .map_err(|error| format!("program {program_name} is not a tracepoint: {error}"))?;
+    program
+        .load()
+        .map_err(|error| format!("loading {program_name} failed: {error}"))
+}
+
 fn attach_smoke_tracepoint(
     bpf: &mut Ebpf,
     program_name: &str,
@@ -1283,11 +1326,31 @@ fn attach_smoke_tracepoint(
         .try_into()
         .map_err(|error| format!("program {program_name} is not a tracepoint: {error}"))?;
     program
-        .load()
-        .map_err(|error| format!("loading {program_name} failed: {error}"))?;
-    program
         .attach(category, event)
         .map_err(|error| format!("attaching {program_name} failed: {error}"))
+}
+
+fn cleanup_smoke_tracepoints(
+    bpf: &mut Ebpf,
+    exit_link: Option<TracePointLinkId>,
+    enter_link: Option<TracePointLinkId>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Some(link) = exit_link {
+        if let Err(error) = detach_smoke_tracepoint(bpf, "trace_sys_exit", link) {
+            errors.push(format!("sys_exit={error}"));
+        }
+    }
+    if let Some(link) = enter_link {
+        if let Err(error) = detach_smoke_tracepoint(bpf, "trace_sys_enter", link) {
+            errors.push(format!("sys_enter={error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn detach_smoke_tracepoint(
@@ -1731,5 +1794,33 @@ mod tests {
         assert_eq!(result.status, Status::Warn);
         assert!(result.reason.contains("STACK_TRACES"));
         assert!(result.reason.contains("EPERM"));
+    }
+
+    #[test]
+    fn smoke_verifier_logging_preserves_the_final_rejection() {
+        assert_eq!(
+            smoke_verifier_log_level().bits(),
+            aya::VerifierLogLevel::STATS.bits()
+        );
+    }
+
+    #[test]
+    fn smoke_outcome_reports_primary_and_cleanup_failures() {
+        let error = combine_smoke_outcome(
+            Err("capture failed".to_string()),
+            Err("detach failed".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("capture failed"));
+        assert!(error.contains("detach failed"));
+    }
+
+    #[test]
+    fn smoke_outcome_keeps_primary_failure_when_cleanup_passes() {
+        assert_eq!(
+            combine_smoke_outcome(Err("capture failed".to_string()), Ok(())).unwrap_err(),
+            "capture failed"
+        );
     }
 }
