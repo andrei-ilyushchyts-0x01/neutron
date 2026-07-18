@@ -1014,7 +1014,7 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
     if matches!(nr, 203 | 200) {
         let ptr = args[1];
         addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
-        let len = (args[2] as usize).min(128);
+        let len = neutron_common::bounded_sockaddr_len(args[2]) as usize;
         if len != 0 {
             if ptr != 0 {
                 let dst = data_slice(ev, 0, len);
@@ -1030,7 +1030,7 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
     if nr == 206 {
         let ptr = args[4];
         addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
-        let len = (args[5] as usize).min(128);
+        let len = neutron_common::bounded_sockaddr_len(args[5]) as usize;
         if len != 0 {
             if ptr != 0 {
                 let dst = data_slice(ev, 0, len);

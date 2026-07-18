@@ -72,6 +72,17 @@ pub const fn syscall_path_arg_index(syscall_nr: i32) -> Option<usize> {
     }
 }
 
+/// Bounds an aarch64 socket-address length to the event payload capacity.
+///
+/// Linux defines `socklen_t` as an unsigned 32-bit value. Syscall registers
+/// are 64-bit, so the upper half is outside that ABI value and must be cleared
+/// before the length reaches a BPF read helper. The explicit narrowing also
+/// gives older Android verifiers a non-negative scalar bound.
+#[inline]
+pub fn bounded_sockaddr_len(raw: u64) -> u32 {
+    (raw as u32).min(128)
+}
+
 #[inline]
 pub fn event_ioctl_exit_refreshed(event: &SyscallEvent) -> bool {
     let reserved = event._reserved;
@@ -1185,5 +1196,19 @@ mod causal_pid_policy_tests {
             false,
             false,
         ));
+    }
+}
+
+#[cfg(test)]
+mod sockaddr_capture_tests {
+    use super::*;
+
+    #[test]
+    fn sockaddr_length_uses_low_socklen_t_bits_and_event_cap() {
+        assert_eq!(bounded_sockaddr_len(0), 0);
+        assert_eq!(bounded_sockaddr_len(28), 28);
+        assert_eq!(bounded_sockaddr_len(129), 128);
+        assert_eq!(bounded_sockaddr_len(0xffff_ffff_0000_001c), 28);
+        assert_eq!(bounded_sockaddr_len(u64::MAX), 128);
     }
 }
