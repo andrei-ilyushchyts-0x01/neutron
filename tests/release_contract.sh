@@ -65,6 +65,35 @@ release_package_declares_complete_payload() {
     done
 }
 
+release_host_archive_contains_useful_shell_completions() {
+    local package="$root/scripts/package-release.sh"
+    local generator="$root/examples/generate-completions.rs"
+    local output
+
+    [[ -f "$generator" ]] || return 1
+    contains "$package" 'mkdir -p "$HOST_PAYLOAD/man/man1" "$HOST_PAYLOAD/schemas" "$HOST_PAYLOAD/completions"' || return 1
+    contains "$package" 'cargo run --locked --release --target x86_64-unknown-linux-gnu --example generate-completions -- "$HOST_PAYLOAD/completions"' || return 1
+
+    mkdir -p "$root/target/tmp"
+    output=$(mktemp -d "$root/target/tmp/completions-contract.XXXXXX") || return 1
+    if ! cargo run --quiet --locked --example generate-completions -- "$output"; then
+        rm -rf -- "$output"
+        return 1
+    fi
+    for completion in neutron.bash _neutron neutron.fish; do
+        [[ -s "$output/$completion" ]] || {
+            rm -rf -- "$output"
+            return 1
+        }
+    done
+    rg -q 'doctor' "$output/neutron.bash" &&
+        rg -q 'surface' "$output/_neutron" &&
+        rg -q 'evidence' "$output/neutron.fish"
+    local status=$?
+    rm -rf -- "$output"
+    return "$status"
+}
+
 release_sbom_and_provenance_include_dependency_and_build_inputs() {
     local package="$root/scripts/package-release.sh"
     local sbom="$root/scripts/generate-sbom.mjs"
@@ -291,6 +320,7 @@ run_test build_requires_android_serial_before_cargo
 run_test unwrapped_builds_cannot_claim_clean_provenance
 run_test xtask_deploy_and_demo_require_explicit_serial
 run_test release_package_declares_complete_payload
+run_test release_host_archive_contains_useful_shell_completions
 run_test release_sbom_and_provenance_include_dependency_and_build_inputs
 run_test release_tool_versions_capture_stderr_and_fail_early_when_missing
 run_test release_sbom_uses_resolved_gradle_graph_and_validates_spdx
