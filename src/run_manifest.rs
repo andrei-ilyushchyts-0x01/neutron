@@ -805,6 +805,8 @@ fn verify_capture_stream(run_dir: &Path, expected_health: &Value) -> Result<()> 
     let mut record_number = 0_usize;
     let mut health_record = None;
     let mut last_nonempty = 0_usize;
+    let mut invalid_binder_caller_records = 0_usize;
+    let mut zero_binder_receive_records = 0_usize;
     let mut scenarios = LiveScenarioLifecycle::default();
     loop {
         record_number = record_number.saturating_add(1);
@@ -828,6 +830,18 @@ fn verify_capture_stream(run_dir: &Path, expected_health: &Value) -> Result<()> 
             bail!(
                 "capture.ndjson record {record_number} is not a semantically valid recognized event"
             );
+        }
+        let scenario_bound = object.contains_key("scenario_id") || object.contains_key("trace_id");
+        if scenario_bound && unusable_raw_binder_identity(kind, object) {
+            match kind {
+                "binder" => {
+                    invalid_binder_caller_records = invalid_binder_caller_records.saturating_add(1);
+                }
+                "binder_received" => {
+                    zero_binder_receive_records = zero_binder_receive_records.saturating_add(1);
+                }
+                _ => {}
+            }
         }
         if kind != "capture_health" {
             scenarios.observe(kind, object).with_context(|| {
@@ -853,6 +867,40 @@ fn verify_capture_stream(run_dir: &Path, expected_health: &Value) -> Result<()> 
             .and_then(Value::as_bool)
             == Some(true) => {}
         None => bail!("capture.ndjson is missing its final capture_health record"),
+    }
+    let unusable_binder_identity_records =
+        invalid_binder_caller_records.saturating_add(zero_binder_receive_records);
+    if unusable_binder_identity_records > 0 {
+        let status = expected_health.get("status").and_then(Value::as_str);
+        if !matches!(status, Some("incomplete" | "unknown")) {
+            bail!(
+                "capture contains {unusable_binder_identity_records} scenario-bound raw Binder identity record(s) without matching incomplete health accounting"
+            );
+        }
+        if expected_health
+            .get("binder_tracker_enabled")
+            .and_then(Value::as_bool)
+            != Some(false)
+        {
+            let invalid_callers = expected_health
+                .get("binder_invalid_callers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if invalid_callers < invalid_binder_caller_records as u64 {
+                bail!(
+                    "binder_invalid_callers health counter {invalid_callers} is below {invalid_binder_caller_records} observed scenario-bound invalid caller record(s)"
+                );
+            }
+            let unmatched_receives = expected_health
+                .get("binder_unmatched_receives")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if unmatched_receives < zero_binder_receive_records as u64 {
+                bail!(
+                    "binder_unmatched_receives health counter {unmatched_receives} is below {zero_binder_receive_records} observed scenario-bound zero-identity receive record(s)"
+                );
+            }
+        }
     }
     scenarios.finish(expected_health)?;
     Ok(())
@@ -1112,6 +1160,13 @@ fn valid_live_capture_record(kind: &str, object: &serde_json::Map<String, Value>
             .and_then(Value::as_u64)
             .is_some_and(|value| value > 0)
     };
+    let u32_value = |field| {
+        object
+            .get(field)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .is_some()
+    };
     let text = |field| object.get(field).and_then(Value::as_str);
     let syscall_named = text("name").is_some_and(|value| !value.is_empty())
         || text("syscall").is_some_and(|value| !value.is_empty())
@@ -1124,13 +1179,16 @@ fn valid_live_capture_record(kind: &str, object: &serde_json::Map<String, Value>
         "syscall" => positive("pid") && syscall_named,
         "binder" => {
             positive("pid")
-                && positive("to_proc")
+                && u32_value("to_proc")
                 && object.get("debug_id").and_then(Value::as_i64).is_some()
         }
         "binder_call" => {
             positive("caller_pid")
                 && positive("callee_pid")
-                && object.get("debug_id").and_then(Value::as_i64).is_some()
+                && object
+                    .get("debug_id")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|value| value != 0)
         }
         "binder_received" => {
             positive("pid") && object.get("debug_id").and_then(Value::as_i64).is_some()
@@ -1161,6 +1219,17 @@ fn valid_live_capture_record(kind: &str, object: &serde_json::Map<String, Value>
                 && text("status").is_some()
                 && text("reason").is_some()
         }
+        _ => false,
+    }
+}
+
+fn unusable_raw_binder_identity(kind: &str, object: &serde_json::Map<String, Value>) -> bool {
+    match kind {
+        "binder" => {
+            object.get("debug_id").and_then(Value::as_i64) == Some(0)
+                || object.get("to_proc").and_then(Value::as_u64) == Some(0)
+        }
+        "binder_received" => object.get("debug_id").and_then(Value::as_i64) == Some(0),
         _ => false,
     }
 }
@@ -2161,6 +2230,13 @@ mod tests {
     }
 
     fn live_manifest(artifacts: Vec<ArtifactIdentity>, status: RunHealthStatus) -> RunManifest {
+        live_manifest_with_health(artifacts, live_health(status))
+    }
+
+    fn live_manifest_with_health(
+        artifacts: Vec<ArtifactIdentity>,
+        capture_health: Value,
+    ) -> RunManifest {
         RunManifest::live_capture(LiveCaptureManifest {
             run_id: "trace-test".into(),
             started_at: "2026-07-17T06:39:01Z".into(),
@@ -2171,7 +2247,7 @@ mod tests {
                 attacker_capability: "not_tested".into(),
             },
             bpf: live_bpf_identity(),
-            capture_health: live_health(status),
+            capture_health,
             artifacts,
         })
         .unwrap()
@@ -2394,6 +2470,238 @@ mod tests {
             let error = finalize_bundle(&directory.0, &manifest).unwrap_err();
             assert!(error.to_string().contains("semantically valid"));
         }
+    }
+
+    #[test]
+    fn incomplete_live_capture_accepts_structural_zero_binder_identity() {
+        let trace_id = "0000000000001234";
+        let mut health = live_health(RunHealthStatus::Incomplete);
+        health["binder_invalid_callers"] = 1.into();
+        health["incomplete_reasons"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(
+                "Binder tracker rejected 1 caller event(s) with unusable identity"
+            ));
+        let records = [
+            live_marker("start", "scenario", trace_id, 1, 10),
+            serde_json::json!({
+                "type": "binder",
+                "ts_ns": 15,
+                "pid": 42,
+                "to_proc": 0,
+                "debug_id": 0,
+                "scenario_id": "scenario",
+                "trace_id": trace_id,
+                "root_package": "com.example.app",
+                "root_uid": 10123,
+                "root_pid": 42
+            }),
+            live_marker("end", "scenario", trace_id, 1, 20),
+            health.clone(),
+        ];
+        let mut capture_bytes = records
+            .into_iter()
+            .map(|record| serde_json::to_string(&record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        capture_bytes.push(b'\n');
+
+        let directory = TestDir::new();
+        create_private_run_directory(&directory.0).unwrap();
+        let capture = write_artifact(&directory.0, "capture.ndjson", &capture_bytes).unwrap();
+        let sidecar = write_artifact(
+            &directory.0,
+            "capture.health.json",
+            format!("{}\n", serde_json::to_string(&health).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        let manifest = live_manifest_with_health(vec![capture, sidecar], health);
+
+        finalize_bundle(&directory.0, &manifest).unwrap();
+    }
+
+    #[test]
+    fn complete_live_capture_rejects_structural_zero_binder_identity() {
+        let trace_id = "0000000000001234";
+        let records = vec![
+            live_marker("start", "scenario", trace_id, 1, 10),
+            serde_json::json!({
+                "type": "binder",
+                "ts_ns": 15,
+                "pid": 42,
+                "to_proc": 0,
+                "debug_id": 0,
+                "scenario_id": "scenario",
+                "trace_id": trace_id,
+                "root_package": "com.example.app",
+                "root_uid": 10123,
+                "root_pid": 42
+            }),
+            live_marker("end", "scenario", trace_id, 1, 20),
+        ];
+
+        let error = verify_live_records(records).unwrap_err();
+        assert!(error.to_string().contains("Binder identity"), "{error:#}");
+    }
+
+    #[test]
+    fn unscoped_zero_binder_outside_markers_does_not_taint_bounded_health() {
+        let trace_id = "0000000000001234";
+        verify_live_records(vec![
+            serde_json::json!({
+                "type": "binder",
+                "ts_ns": 5,
+                "pid": 1545,
+                "to_proc": 0,
+                "debug_id": 0
+            }),
+            live_marker("start", "scenario", trace_id, 1, 10),
+            live_marker("end", "scenario", trace_id, 1, 20),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn binder_received_zero_identity_requires_incomplete_health() {
+        let trace_id = "0000000000001234";
+        let event = serde_json::json!({
+            "type": "binder_received",
+            "ts_ns": 15,
+            "pid": 536,
+            "debug_id": 0,
+            "scenario_id": "scenario",
+            "trace_id": trace_id,
+            "root_package": "com.example.app",
+            "root_uid": 10123,
+            "root_pid": 42
+        });
+        let records = || {
+            vec![
+                live_marker("start", "scenario", trace_id, 1, 10),
+                event.clone(),
+                live_marker("end", "scenario", trace_id, 1, 20),
+            ]
+        };
+
+        let error = verify_live_records(records()).unwrap_err();
+        assert!(error.to_string().contains("Binder identity"), "{error:#}");
+
+        let mut health = live_health(RunHealthStatus::Incomplete);
+        health["binder_unmatched_receives"] = 1.into();
+        health["incomplete_reasons"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(
+                "Binder tracker observed 1 receive event(s) without a matching caller"
+            ));
+        verify_live_records_with_health(records(), health).unwrap();
+    }
+
+    #[test]
+    fn unrelated_incomplete_reason_cannot_mask_missing_binder_identity_counters() {
+        let trace_id = "0000000000001234";
+        for event in [
+            serde_json::json!({
+                "type": "binder",
+                "ts_ns": 15,
+                "pid": 42,
+                "to_proc": 0,
+                "debug_id": 0,
+                "scenario_id": "scenario",
+                "trace_id": trace_id
+            }),
+            serde_json::json!({
+                "type": "binder_received",
+                "ts_ns": 15,
+                "pid": 536,
+                "debug_id": 0,
+                "scenario_id": "scenario",
+                "trace_id": trace_id
+            }),
+        ] {
+            let records = vec![
+                live_marker("start", "scenario", trace_id, 1, 10),
+                event,
+                live_marker("end", "scenario", trace_id, 1, 20),
+            ];
+            let error =
+                verify_live_records_with_health(records, live_health(RunHealthStatus::Incomplete))
+                    .unwrap_err();
+            assert!(error.to_string().contains("health counter"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn disabled_binder_tracker_is_explicit_zero_identity_accounting() {
+        let trace_id = "0000000000001234";
+        let mut health = live_health(RunHealthStatus::Incomplete);
+        health["binder_tracker_enabled"] = false.into();
+        health["incomplete_reasons"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(
+                "Binder transaction correlation was disabled for this capture"
+            ));
+        verify_live_records_with_health(
+            vec![
+                live_marker("start", "scenario", trace_id, 1, 10),
+                serde_json::json!({
+                    "type": "binder",
+                    "ts_ns": 15,
+                    "pid": 42,
+                    "to_proc": 0,
+                    "debug_id": 0,
+                    "scenario_id": "scenario",
+                    "trace_id": trace_id
+                }),
+                live_marker("end", "scenario", trace_id, 1, 20),
+            ],
+            health,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn synthetic_binder_call_requires_nonzero_debug_identity() {
+        let object = serde_json::json!({
+            "type": "binder_call",
+            "caller_pid": 42,
+            "callee_pid": 536,
+            "debug_id": 0
+        });
+
+        assert!(!valid_live_capture_record(
+            "binder_call",
+            object.as_object().unwrap()
+        ));
+    }
+
+    #[test]
+    fn live_capture_rejects_missing_or_invalid_binder_identity_fields() {
+        let valid = serde_json::json!({
+            "type": "binder",
+            "pid": 42,
+            "to_proc": 0,
+            "debug_id": 0
+        });
+        for invalid in [
+            serde_json::json!({"type": "binder", "pid": 42, "to_proc": 0}),
+            serde_json::json!({"type": "binder", "pid": 42, "debug_id": 0}),
+            serde_json::json!({"type": "binder", "pid": 42, "to_proc": "0", "debug_id": 0}),
+            serde_json::json!({"type": "binder", "pid": 42, "to_proc": 0, "debug_id": "0"}),
+        ] {
+            let object = invalid.as_object().unwrap();
+            assert!(
+                !valid_live_capture_record("binder", object),
+                "accepted {invalid}"
+            );
+        }
+        assert!(valid_live_capture_record(
+            "binder",
+            valid.as_object().unwrap()
+        ));
     }
 
     #[test]

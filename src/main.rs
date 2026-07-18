@@ -3731,7 +3731,14 @@ fn run_trace(mut args: Args) -> Result<()> {
                             return Err(error);
                         }
                         if let Some(tracker) = binder_tracker.as_mut() {
-                            tracker.reset_baseline();
+                            if !tracker.begin_scenario(scenario.generation) {
+                                let error = format!(
+                                    "Binder tracker rejected scenario generation {}",
+                                    scenario.generation
+                                );
+                                marker_transition_error = Some(error.clone());
+                                bail!(error);
+                            }
                         }
                         recent_exit_causal.clear();
                         followed_last_hop_ns.clear();
@@ -3903,6 +3910,7 @@ fn run_trace(mut args: Args) -> Result<()> {
 
                 let event_pid = { ev.pid };
                 let event_nr = { ev.syscall_nr };
+                let event_generation = { ev.maps_generation };
                 if event_nr != SYSCALL_NR_PROCESS_EXIT
                     && should_skip_for_exclude_comm(&ev, &args.exclude_comm)
                 {
@@ -3987,7 +3995,7 @@ fn run_trace(mut args: Args) -> Result<()> {
                     // status=callee_crashed, feeding R004.
                     if pe.classify() == neutron::sources::ExitClassification::Crash {
                         if let Some(t) = binder_tracker.as_mut() {
-                            for pair in t.on_callee_crash(pe.pid) {
+                            for pair in t.on_callee_crash_for_generation(event_generation, pe.pid) {
                                 write_or_output_cap(
                                     emit_binder_call(
                                         &pair,
@@ -4113,7 +4121,8 @@ fn run_trace(mut args: Args) -> Result<()> {
                         let pid = { ev.pid };
                         let uid = { ev.uid };
                         let ts = { ev.timestamp_ns };
-                        t.record_caller(
+                        t.record_caller_for_generation(
+                            event_generation,
                             debug_id,
                             pid,
                             uid,
@@ -4131,7 +4140,9 @@ fn run_trace(mut args: Args) -> Result<()> {
                     if let Some(t) = binder_tracker.as_mut() {
                         let debug_id = { ev.ptr_hint } as u32 as i32;
                         let ts = { ev.timestamp_ns };
-                        if let Some(pair) = t.record_received(debug_id, ts) {
+                        if let Some(pair) =
+                            t.record_received_for_generation(event_generation, debug_id, ts)
+                        {
                             write_or_output_cap(
                                 emit_binder_call(
                                     &pair,
@@ -4550,29 +4561,6 @@ fn run_trace(mut args: Args) -> Result<()> {
                     }
                     continue;
                 };
-                if pe.classify() == neutron::sources::ExitClassification::Crash {
-                    if let Some(t) = binder_tracker.as_mut() {
-                        for pair in t.on_callee_crash(pe.pid) {
-                            write_or_output_cap(
-                                emit_binder_call(
-                                    &pair,
-                                    lookback.as_mut(),
-                                    &mut engine,
-                                    &mut *out,
-                                    suppress_raw,
-                                    args.json,
-                                    &mut event_id_counter,
-                                    &binder_services,
-                                    &binder_catalog,
-                                    &binder_methods,
-                                    aidl_catalog.as_ref(),
-                                    pair.causal_metadata.as_ref(),
-                                ),
-                                &output_cap_hit,
-                            )?;
-                        }
-                    }
-                }
                 write_or_output_cap(
                     emit_process_exit(
                         &pe,
@@ -4606,29 +4594,6 @@ fn run_trace(mut args: Args) -> Result<()> {
                     }
                     continue;
                 };
-                if pe.classify() == neutron::sources::ExitClassification::Crash {
-                    if let Some(t) = binder_tracker.as_mut() {
-                        for pair in t.on_callee_crash(pe.pid) {
-                            write_or_output_cap(
-                                emit_binder_call(
-                                    &pair,
-                                    lookback.as_mut(),
-                                    &mut engine,
-                                    &mut *out,
-                                    suppress_raw,
-                                    args.json,
-                                    &mut event_id_counter,
-                                    &binder_services,
-                                    &binder_catalog,
-                                    &binder_methods,
-                                    aidl_catalog.as_ref(),
-                                    pair.causal_metadata.as_ref(),
-                                ),
-                                &output_cap_hit,
-                            )?;
-                        }
-                    }
-                }
                 write_or_output_cap(
                     emit_process_exit(
                         &pe,
@@ -4786,6 +4751,20 @@ fn run_trace(mut args: Args) -> Result<()> {
             match writeln!(out, "{line}") {
                 Ok(()) => match scenarios.end(&pending.request.name) {
                     Ok(committed) if committed == pending.scenario => {
+                        if binder_tracker
+                            .as_mut()
+                            .is_some_and(|tracker| !tracker.finish_scenario(committed.generation))
+                        {
+                            marker_transition_error = Some(
+                                "Binder tracker scenario boundary diverged after marker write"
+                                    .into(),
+                            );
+                            let _ = pending
+                                .pending
+                                .respond_error("Binder tracker scenario boundary diverged");
+                            running.store(false, Ordering::Relaxed);
+                            continue;
+                        }
                         recent_exit_causal.clear();
                         followed_last_hop_ns.clear();
                         policy_blocked_pids.clear();

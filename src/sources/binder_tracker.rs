@@ -96,6 +96,8 @@ pub struct BinderTracker {
     inflight: HashMap<i32, Inflight>,
     tick: u64,
     stats: BinderTrackerStats,
+    scenario_bounded: bool,
+    active_generation: Option<u16>,
 }
 
 impl Default for BinderTracker {
@@ -111,6 +113,8 @@ impl BinderTracker {
             inflight: HashMap::new(),
             tick: 0,
             stats: BinderTrackerStats::default(),
+            scenario_bounded: false,
+            active_generation: None,
         }
     }
 
@@ -124,6 +128,45 @@ impl BinderTracker {
 
     pub fn stats(&self) -> BinderTrackerStats {
         self.stats
+    }
+
+    /// Begin a marker-bounded evidence interval. The first boundary discards
+    /// whole-run correlation telemetry gathered before the marker, while
+    /// retaining the number of pre-boundary caller halves as non-degrading
+    /// baseline accounting. Later scenarios accumulate into the same health
+    /// totals. Events are admitted only when their BPF-stamped generation
+    /// matches the active interval.
+    pub fn begin_scenario(&mut self, generation: u16) -> bool {
+        if generation == 0 || self.active_generation.is_some() {
+            return false;
+        }
+        let baseline = self.inflight.len() as u64;
+        self.inflight.clear();
+        if self.scenario_bounded {
+            self.stats.baseline_discarded = self.stats.baseline_discarded.saturating_add(baseline);
+        } else {
+            self.stats = BinderTrackerStats {
+                baseline_discarded: baseline,
+                ..BinderTrackerStats::default()
+            };
+            self.scenario_bounded = true;
+        }
+        self.active_generation = Some(generation);
+        true
+    }
+
+    /// Freeze correlation telemetry at a completed marker boundary.
+    pub fn finish_scenario(&mut self, generation: u16) -> bool {
+        if self.active_generation != Some(generation) {
+            return false;
+        }
+        self.discard_inflight();
+        self.active_generation = None;
+        true
+    }
+
+    fn accepts_generation(&self, generation: u16) -> bool {
+        !self.scenario_bounded || self.active_generation == Some(generation)
     }
 
     /// Clear caller halves collected before a scenario evidence boundary.
@@ -162,9 +205,10 @@ impl BinderTracker {
 
     /// Record a caller-side `binder_transaction` event. `callee_pid` is the
     /// `to_proc` field from the BPF-decoded args. `debug_id == 0` is treated
-    /// as "no usable id" and counted as an invalid caller (the kernel has
-    /// been observed to emit `0` on early-init paths before the binder driver
-    /// assigned an id; we cannot pair those).
+    /// as "no usable id" and counted as an invalid caller. A zero caller or
+    /// callee PID is likewise unusable because it cannot form a causal edge.
+    /// Raw tracepoint records can contain zero identity fields; we preserve
+    /// those records but cannot pair them.
     #[allow(clippy::too_many_arguments)]
     pub fn record_caller(
         &mut self,
@@ -180,7 +224,42 @@ impl BinderTracker {
         sent_ts_ns: u64,
         causal_metadata: Option<CausalMetadata>,
     ) {
-        if debug_id == 0 || caller_pid == 0 {
+        self.record_caller_for_generation(
+            0,
+            debug_id,
+            caller_pid,
+            caller_uid,
+            caller_comm,
+            callee_pid,
+            code,
+            flags,
+            reply,
+            target_node,
+            sent_ts_ns,
+            causal_metadata,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_caller_for_generation(
+        &mut self,
+        generation: u16,
+        debug_id: i32,
+        caller_pid: u32,
+        caller_uid: u32,
+        caller_comm: impl Into<String>,
+        callee_pid: u32,
+        code: u32,
+        flags: u32,
+        reply: bool,
+        target_node: i32,
+        sent_ts_ns: u64,
+        causal_metadata: Option<CausalMetadata>,
+    ) {
+        if !self.accepts_generation(generation) {
+            return;
+        }
+        if debug_id == 0 || caller_pid == 0 || callee_pid == 0 {
             self.stats.invalid_callers = self.stats.invalid_callers.saturating_add(1);
             if causal_metadata.is_some() {
                 self.stats.causal_metadata_discarded =
@@ -231,6 +310,18 @@ impl BinderTracker {
         debug_id: i32,
         received_ts_ns: u64,
     ) -> Option<BinderCallEvent> {
+        self.record_received_for_generation(0, debug_id, received_ts_ns)
+    }
+
+    pub fn record_received_for_generation(
+        &mut self,
+        generation: u16,
+        debug_id: i32,
+        received_ts_ns: u64,
+    ) -> Option<BinderCallEvent> {
+        if !self.accepts_generation(generation) {
+            return None;
+        }
         if debug_id == 0 {
             self.stats.unmatched_receives = self.stats.unmatched_receives.saturating_add(1);
             return None;
@@ -260,6 +351,17 @@ impl BinderTracker {
     /// emit them as [`BinderCallStatus::CalleeCrashed`]. Called by the main
     /// loop on every `process_exit` event with `classification == "crash"`.
     pub fn on_callee_crash(&mut self, crashed_pid: u32) -> Vec<BinderCallEvent> {
+        self.on_callee_crash_for_generation(0, crashed_pid)
+    }
+
+    pub fn on_callee_crash_for_generation(
+        &mut self,
+        generation: u16,
+        crashed_pid: u32,
+    ) -> Vec<BinderCallEvent> {
+        if !self.accepts_generation(generation) {
+            return Vec::new();
+        }
         if crashed_pid == 0 {
             return Vec::new();
         }
@@ -330,9 +432,10 @@ mod tests {
         let mut t = BinderTracker::new(64);
         record_call(&mut t, 0, 100, 200, 1_000_000);
         record_call(&mut t, 1, 0, 200, 1_000_001);
+        record_call(&mut t, 2, 100, 0, 1_000_002);
         assert_eq!(t.inflight_count(), 0);
         assert!(t.record_received(0, 1_000_000).is_none());
-        assert_eq!(t.stats().invalid_callers, 2);
+        assert_eq!(t.stats().invalid_callers, 3);
         assert_eq!(t.stats().unmatched_receives, 1);
     }
 
@@ -451,12 +554,69 @@ mod tests {
     }
 
     #[test]
-    fn on_callee_crash_with_pid_zero_is_noop() {
+    fn zero_callee_is_rejected_and_zero_crash_is_noop() {
         let mut t = BinderTracker::new(64);
         record_call(&mut t, 1, 100, 0, 1_000);
         let drained = t.on_callee_crash(0);
         assert!(drained.is_empty());
-        assert_eq!(t.inflight_count(), 1, "entries with callee_pid=0 untouched");
+        assert_eq!(t.inflight_count(), 0);
+        assert_eq!(t.stats().invalid_callers, 1);
+    }
+
+    #[test]
+    fn scenario_boundary_discards_baseline_and_freezes_post_marker_health() {
+        let mut t = BinderTracker::new(64);
+        record_call(&mut t, 1, 100, 200, 1_000);
+        record_call(&mut t, 0, 100, 200, 1_001);
+        assert!(t.record_received(99, 1_002).is_none());
+
+        assert!(t.begin_scenario(1));
+        assert_eq!(t.inflight_count(), 0);
+        assert_eq!(t.stats().baseline_discarded, 1);
+        assert_eq!(t.stats().invalid_callers, 0);
+        assert_eq!(t.stats().unmatched_receives, 0);
+
+        t.record_caller_for_generation(0, 2, 100, 1000, "caller", 200, 7, 0, false, 0, 2_000, None);
+        t.record_caller_for_generation(1, 0, 100, 1000, "caller", 200, 7, 0, false, 0, 2_001, None);
+        assert_eq!(t.stats().invalid_callers, 1);
+        t.record_caller_for_generation(1, 3, 100, 1000, "caller", 200, 7, 0, false, 0, 2_002, None);
+        assert!(t.record_received_for_generation(0, 3, 2_003).is_none());
+        assert_eq!(t.inflight_count(), 1);
+        assert!(t.record_received_for_generation(1, 3, 2_004).is_some());
+
+        assert!(t.finish_scenario(1));
+        let frozen = t.stats();
+        t.record_caller_for_generation(0, 0, 100, 1000, "caller", 200, 7, 0, false, 0, 3_000, None);
+        assert!(t.record_received_for_generation(1, 77, 3_001).is_none());
+        assert_eq!(t.stats(), frozen);
+    }
+
+    #[test]
+    fn sequential_scenarios_accumulate_only_matching_generation_loss() {
+        let mut t = BinderTracker::new(64);
+        assert!(t.begin_scenario(1));
+        t.record_caller_for_generation(1, 0, 100, 1000, "caller", 200, 7, 0, false, 0, 1_000, None);
+        assert!(t.finish_scenario(1));
+
+        assert!(t.begin_scenario(2));
+        assert!(t.record_received_for_generation(1, 44, 2_000).is_none());
+        assert!(t.record_received_for_generation(2, 45, 2_001).is_none());
+        assert!(t.finish_scenario(2));
+
+        assert_eq!(t.stats().invalid_callers, 1);
+        assert_eq!(t.stats().unmatched_receives, 1);
+    }
+
+    #[test]
+    fn wrong_generation_crash_cannot_drain_active_scenario_entry() {
+        let mut t = BinderTracker::new(64);
+        assert!(t.begin_scenario(7));
+        t.record_caller_for_generation(7, 1, 100, 1000, "caller", 200, 7, 0, false, 0, 1_000, None);
+
+        assert!(t.on_callee_crash_for_generation(0, 200).is_empty());
+        assert_eq!(t.inflight_count(), 1);
+        assert_eq!(t.on_callee_crash_for_generation(7, 200).len(), 1);
+        assert_eq!(t.inflight_count(), 0);
     }
 
     #[test]

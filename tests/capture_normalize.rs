@@ -6,6 +6,32 @@ use neutron::health::{
     CaptureScope, UserspaceHealth,
 };
 
+fn capture_metadata(scope: CaptureScope) -> CaptureMetadata {
+    CaptureMetadata {
+        max_depth: scope.instrumentation.max_depth,
+        max_processes: scope.instrumentation.max_processes,
+        capture_scope: Some(scope),
+        attached_programs: vec![
+            "trace_sys_enter".into(),
+            "trace_sys_exit".into(),
+            "trace_sched_process_exit".into(),
+        ],
+        boot_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        bpf_object_sha256: Some("1".repeat(64)),
+        bpf_build_id: Some("2".repeat(40)),
+        bpf_abi_major: Some(neutron_common::BPF_ABI_MAJOR),
+        bpf_abi_minor: Some(neutron_common::BPF_ABI_MINOR),
+        bpf_event_size: Some(core::mem::size_of::<neutron_common::SyscallEvent>() as u32),
+        bpf_feature_bits: Some(
+            neutron_common::BPF_FEATURE_SYSCALL_TRACE
+                | neutron_common::BPF_FEATURE_PROCESS_EXIT
+                | neutron_common::BPF_FEATURE_PER_CPU_HEALTH,
+        ),
+        ring_size_bytes: Some(1 << 20),
+        ..CaptureMetadata::default()
+    }
+}
+
 #[test]
 fn syscall_enter_and_exit_merge_into_one_exit_span() {
     let input = r#"
@@ -192,6 +218,38 @@ fn malformed_binder_endpoints_and_oversized_debug_ids_are_ignored() {
 }
 
 #[test]
+fn zero_identity_raw_binder_does_not_override_explicit_incomplete_health() {
+    let mut userspace = UserspaceHealth {
+        binder_invalid_callers: 1,
+        ..UserspaceHealth::default()
+    };
+    userspace.events_emitted = 1;
+    let health = format_capture_health_json_with_metadata(
+        &RuntimeHealth::default(),
+        &userspace,
+        1,
+        &capture_metadata(CaptureScope::unfiltered_raw_ndjson()),
+    );
+    let input = format!(
+        "{}\n{}\n",
+        r#"{"type":"binder","pid":1545,"to_proc":0,"debug_id":0,"trace_id":"trace-a","span_id":"raw-zero"}"#,
+        health
+    );
+
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+
+    assert!(capture.binders.is_empty());
+    assert_eq!(capture.health.unwrap().status, "incomplete");
+    assert!(capture
+        .health_warnings
+        .contains("ignored Binder span with a missing process endpoint"));
+    assert!(!capture
+        .health_warnings
+        .iter()
+        .any(|warning| warning.contains("invalid required fields")));
+}
+
+#[test]
 fn binder_received_enriches_the_callee_process_identity() {
     let capture = r#"
 {"type":"binder","ts_ns":10,"pid":100,"comm":"app","to_proc":200,"debug_id":11,"code":1,"trace_id":"trace-a","span_id":"binder-1","causal_relation":"exact"}
@@ -330,29 +388,7 @@ fn normalized_health_exposes_restricted_claim_scope_without_degrading_transport(
     let mut scope = CaptureScope::unfiltered_raw_ndjson();
     scope.filters.userspace = vec!["fd_path glob {/dev/kgsl*}".into()];
     let scope = scope.recompute_claim_scope();
-    let metadata = CaptureMetadata {
-        max_depth: scope.instrumentation.max_depth,
-        max_processes: scope.instrumentation.max_processes,
-        capture_scope: Some(scope),
-        attached_programs: vec![
-            "trace_sys_enter".into(),
-            "trace_sys_exit".into(),
-            "trace_sched_process_exit".into(),
-        ],
-        boot_id: Some("11111111-2222-3333-4444-555555555555".into()),
-        bpf_object_sha256: Some("1".repeat(64)),
-        bpf_build_id: Some("2".repeat(40)),
-        bpf_abi_major: Some(neutron_common::BPF_ABI_MAJOR),
-        bpf_abi_minor: Some(neutron_common::BPF_ABI_MINOR),
-        bpf_event_size: Some(core::mem::size_of::<neutron_common::SyscallEvent>() as u32),
-        bpf_feature_bits: Some(
-            neutron_common::BPF_FEATURE_SYSCALL_TRACE
-                | neutron_common::BPF_FEATURE_PROCESS_EXIT
-                | neutron_common::BPF_FEATURE_PER_CPU_HEALTH,
-        ),
-        ring_size_bytes: Some(1 << 20),
-        ..CaptureMetadata::default()
-    };
+    let metadata = capture_metadata(scope);
     let line = format_capture_health_json_with_metadata(
         &RuntimeHealth::default(),
         &UserspaceHealth::default(),

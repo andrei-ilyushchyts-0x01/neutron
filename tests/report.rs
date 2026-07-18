@@ -191,10 +191,10 @@ fn formatter_crash_classification_reaches_the_report() {
 #[test]
 fn binder_attribution_prefers_exact_service_then_map_then_catalog_then_raw() {
     let capture = r#"
-{"type":"binder_call","caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"android.hardware.security.keymint.IKeyMintDevice/default"}
-{"type":"binder_call","caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":201,"target_node":2,"code":8,"status":"completed"}
-{"type":"binder_call","caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":202,"target_node":3,"code":9,"status":"completed"}
-{"type":"binder_call","caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":203,"target_node":4,"code":10,"status":"completed"}
+{"type":"binder_call","debug_id":1,"caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"android.hardware.security.keymint.IKeyMintDevice/default"}
+{"type":"binder_call","debug_id":2,"caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":201,"target_node":2,"code":8,"status":"completed"}
+{"type":"binder_call","debug_id":3,"caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":202,"target_node":3,"code":9,"status":"completed"}
+{"type":"binder_call","debug_id":4,"caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":203,"target_node":4,"code":10,"status":"completed"}
 "#;
     let md = report(
         capture,
@@ -221,7 +221,7 @@ fn baseline_diff_reports_new_and_removed_behavior() {
         r#"
 {"type":"syscall","pid":10,"name":"openat","fd_path":"/proc/version"}
 {"type":"syscall","pid":10,"name":"ioctl","ioctl_family":"binder","fd_path":"/dev/binder"}
-{"type":"binder_call","caller_pid":10,"callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"activity"}
+{"type":"binder_call","debug_id":1,"caller_pid":10,"callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"activity"}
 "#,
         "procedure",
         "trace-base",
@@ -230,7 +230,7 @@ fn baseline_diff_reports_new_and_removed_behavior() {
         r#"
 {"type":"syscall","pid":10,"name":"openat","fd_path":"/proc/self/maps"}
 {"type":"syscall","pid":10,"name":"ioctl","ioctl_family":"kgsl","fd_path":"/dev/kgsl-3d0"}
-{"type":"binder_call","caller_pid":10,"callee_pid":201,"target_node":2,"code":8,"status":"completed","service":"package"}
+{"type":"binder_call","debug_id":2,"caller_pid":10,"callee_pid":201,"target_node":2,"code":8,"status":"completed","service":"package"}
 {"type":"syscall","pid":10,"name":"socket","fd_path":"socket:[1]"}
 "#,
         "procedure",
@@ -405,6 +405,102 @@ fn recognized_record_missing_required_fields_makes_report_health_unknown() {
     assert!(md.contains("malformed, invalid, or unknown NDJSON"));
     assert!(md.contains("status is `unknown`"));
     assert!(md.contains("Absence of evidence is not conclusive"));
+}
+
+#[test]
+fn zero_identity_raw_binder_preserves_explicit_incomplete_report_health() {
+    let mut health: serde_json::Value = serde_json::from_str(&complete_health()).unwrap();
+    let object = health.as_object_mut().unwrap();
+    object.insert("binder_invalid_callers".into(), 1.into());
+    object.insert("status".into(), "incomplete".into());
+    object.insert("degraded".into(), true.into());
+    object.insert(
+        "incomplete_reasons".into(),
+        serde_json::json!(["Binder caller identity was unusable"]),
+    );
+    let capture = bounded_capture_with_health(
+        r#"{"type":"binder","ts_ns":2,"pid":1545,"to_proc":0,"debug_id":0,"code":0,"target_node":0}"#,
+        "probe_keystore_lookup",
+        "0000000000001234",
+        health.to_string(),
+    );
+
+    let md = report(&capture, ReportOptions::default());
+
+    assert!(md.contains("status is `incomplete`"));
+    assert!(!md.contains("status is `unknown`"));
+    assert!(!md.contains("malformed, invalid, or unknown NDJSON"));
+    assert!(!md.contains("pid=0 node=0"));
+}
+
+#[test]
+fn zero_identity_binder_with_complete_health_makes_report_unknown() {
+    for event in [
+        r#"{"type":"binder","ts_ns":2,"pid":1545,"to_proc":0,"debug_id":0,"code":0,"target_node":0}"#,
+        r#"{"type":"binder_received","ts_ns":2,"pid":536,"debug_id":0}"#,
+    ] {
+        let capture = bounded_capture_with_health(
+            event,
+            "probe_keystore_lookup",
+            "0000000000001234",
+            complete_health(),
+        );
+
+        let md = report(&capture, ReportOptions::default());
+
+        assert!(md.contains("status is `unknown`"), "{md}");
+        assert!(md.contains("unusable Binder identity"), "{md}");
+        assert!(md.contains("Absence of evidence is not conclusive"), "{md}");
+    }
+}
+
+#[test]
+fn malformed_synthetic_binder_call_makes_report_health_unknown() {
+    for event in [
+        r#"{"type":"binder_call","caller_pid":42,"callee_pid":536}"#,
+        r#"{"type":"binder_call","caller_pid":42,"callee_pid":536,"debug_id":"7"}"#,
+        r#"{"type":"binder_call","caller_pid":42,"callee_pid":536,"debug_id":0}"#,
+    ] {
+        let capture = bounded_capture(event, "scenario", "0000000000001234");
+        let md = report(&capture, ReportOptions::default());
+
+        assert!(md.contains("malformed, invalid, or unknown NDJSON"), "{md}");
+        assert!(md.contains("status is `unknown`"), "{md}");
+    }
+}
+
+#[test]
+fn malformed_marker_cannot_hide_unscoped_zero_binder_identity() {
+    let capture = [
+        r#"{"type":"binder","ts_ns":1,"pid":1545,"to_proc":0,"debug_id":0}"#.to_string(),
+        r#"{"type":"marker","name":"not-a-valid-boundary"}"#.to_string(),
+        complete_health(),
+    ]
+    .join("\n")
+        + "\n";
+
+    let md = report(&capture, ReportOptions::default());
+
+    assert!(md.contains("status is `unknown`"), "{md}");
+    assert!(md.contains("scenario marker lifecycle is invalid"), "{md}");
+}
+
+#[test]
+fn unscoped_zero_binder_warns_without_tainting_bounded_health() {
+    let capture = [
+        r#"{"type":"binder","ts_ns":1,"pid":1545,"to_proc":0,"debug_id":0}"#.to_string(),
+        r#"{"type":"marker","ts_ns":2,"name":"scenario","phase":"start","scenario_id":"scenario","trace_id":"0000000000001234","root_pid":10}"#.to_string(),
+        r#"{"type":"marker","ts_ns":3,"name":"scenario","phase":"end","scenario_id":"scenario","trace_id":"0000000000001234","root_pid":10}"#.to_string(),
+        complete_health(),
+    ]
+    .join("\n")
+        + "\n";
+
+    let md = report(&capture, ReportOptions::default());
+
+    assert!(md.contains("unusable Binder identity"));
+    assert!(!md.contains("status is `unknown`"));
+    assert!(md.contains("- `status`: complete"));
 }
 
 #[test]

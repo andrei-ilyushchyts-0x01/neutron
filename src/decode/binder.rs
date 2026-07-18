@@ -51,13 +51,8 @@ pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> Str
         None => String::new(),
     };
     let debug_id = { ev.ptr_hint } as u32 as i32;
-    let debug_id_json = if debug_id == 0 {
-        String::new()
-    } else {
-        format!(r#","debug_id":{}"#, debug_id)
-    };
     format!(
-        r#"{{"ts_ns":{},"pid":{},"tgid":{},"process_id":{},"thread_id":{},"uid":{},"type":"binder","phase":"enter","comm":{},"reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{}{}{}}}"#,
+        r#"{{"ts_ns":{},"pid":{},"tgid":{},"process_id":{},"thread_id":{},"uid":{},"type":"binder","phase":"enter","comm":{},"reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{},"debug_id":{}{}}}"#,
         { ev.timestamp_ns },
         { ev.pid },
         { ev.tgid },
@@ -71,7 +66,7 @@ pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> Str
         args[5] as u32,
         args[1] as u32,
         args[2],
-        debug_id_json,
+        debug_id,
         event_id_json,
     )
 }
@@ -183,6 +178,22 @@ mod tests {
         assert_eq!(obj.get("target_node").and_then(|v| v.as_u64()), Some(7));
         // event_id omitted when caller doesn't supply one.
         assert!(!obj.contains_key("event_id"));
+    }
+
+    #[test]
+    fn format_binder_event_json_preserves_zero_identity_fields() {
+        let ev = binder_event([0, 0, 0, 0, 0, 0]);
+        let value: serde_json::Value =
+            serde_json::from_str(&format_binder_event_json(&ev, None)).unwrap();
+
+        assert_eq!(
+            value.get("debug_id").and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            value.get("to_proc").and_then(|value| value.as_u64()),
+            Some(0)
+        );
     }
 
     #[test]

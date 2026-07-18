@@ -109,6 +109,8 @@ struct Snapshot {
     parsed_events: u64,
     health: Option<Value>,
     malformed_records: u64,
+    unusable_binder_identity_records: u64,
+    scenario_unusable_binder_identity_records: u64,
     health_records: u64,
     final_record_is_health: bool,
     pids: CountMap,
@@ -197,7 +199,9 @@ impl BinderAttribution {
                 |method| format!("{service}.{method}"),
             ));
         }
-        let callee_pid = u32_field(obj, "callee_pid").or_else(|| u32_field(obj, "to_proc"))?;
+        let callee_pid = u32_field(obj, "callee_pid")
+            .or_else(|| u32_field(obj, "to_proc"))
+            .filter(|pid| *pid > 0)?;
         let target_node = i32_field(obj, "target_node").unwrap_or_default();
         let code = u32_field(obj, "code");
         if let Some(service) = self
@@ -383,6 +387,15 @@ fn collect_snapshot<R: BufRead>(
             snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
             continue;
         }
+        if unusable_raw_binder_identity(kind, obj) {
+            snapshot.unusable_binder_identity_records =
+                snapshot.unusable_binder_identity_records.saturating_add(1);
+            if obj.contains_key("scenario_id") || obj.contains_key("trace_id") {
+                snapshot.scenario_unusable_binder_identity_records = snapshot
+                    .scenario_unusable_binder_identity_records
+                    .saturating_add(1);
+            }
+        }
         if kind == "marker" {
             snapshot.markers.push(crate::capture_normalize::Marker {
                 ts_ns: u64_field(obj, "ts_ns"),
@@ -427,8 +440,16 @@ fn recognized_event_valid(kind: &str, obj: &serde_json::Map<String, Value>) -> b
     let nonzero = |key| u64_field(obj, key).is_some_and(|value| value > 0);
     match kind {
         "syscall" => nonzero("pid") && syscall_name(obj).is_some(),
-        "binder" => nonzero("pid") && nonzero("to_proc") && i64_field(obj, "debug_id").is_some(),
-        "binder_call" => nonzero("caller_pid") && nonzero("callee_pid"),
+        "binder" => {
+            nonzero("pid")
+                && u32_field(obj, "to_proc").is_some()
+                && i64_field(obj, "debug_id").is_some()
+        }
+        "binder_call" => {
+            nonzero("caller_pid")
+                && nonzero("callee_pid")
+                && i64_field(obj, "debug_id").is_some_and(|value| value != 0)
+        }
         "binder_received" => nonzero("pid") && i64_field(obj, "debug_id").is_some(),
         "process_exit" | "selinux_denial" | "fd_snapshot" => nonzero("pid"),
         "finding" => str_field(obj, "rule_id").is_some_and(|value| !value.is_empty()),
@@ -444,6 +465,14 @@ fn recognized_event_valid(kind: &str, obj: &serde_json::Map<String, Value>) -> b
                 && str_field(obj, "status").is_some()
                 && str_field(obj, "reason").is_some()
         }
+        _ => false,
+    }
+}
+
+fn unusable_raw_binder_identity(kind: &str, obj: &serde_json::Map<String, Value>) -> bool {
+    match kind {
+        "binder" => i64_field(obj, "debug_id") == Some(0) || u32_field(obj, "to_proc") == Some(0),
+        "binder_received" => i64_field(obj, "debug_id") == Some(0),
         _ => false,
     }
 }
@@ -643,6 +672,8 @@ fn snapshot_capture_scope(snapshot: &Snapshot) -> Option<crate::health::CaptureS
 
 fn snapshot_health_is_complete(snapshot: &Snapshot) -> bool {
     snapshot.malformed_records == 0
+        && !invalid_scenario_marker_contract(snapshot)
+        && health_scoped_unusable_binder_identities(snapshot) == 0
         && snapshot.health_records == 1
         && snapshot.final_record_is_health
         && snapshot
@@ -650,6 +681,18 @@ fn snapshot_health_is_complete(snapshot: &Snapshot) -> bool {
             .as_ref()
             .and_then(Value::as_object)
             .is_some_and(crate::health::capture_health_is_complete)
+}
+
+fn health_scoped_unusable_binder_identities(snapshot: &Snapshot) -> u64 {
+    if snapshot_scenario_contract(snapshot).is_some() {
+        snapshot.scenario_unusable_binder_identity_records
+    } else {
+        snapshot.unusable_binder_identity_records
+    }
+}
+
+fn invalid_scenario_marker_contract(snapshot: &Snapshot) -> bool {
+    !snapshot.markers.is_empty() && snapshot_scenario_contract(snapshot).is_none()
 }
 
 fn render_health(out: &mut String, snapshot: &Snapshot) {
@@ -687,7 +730,15 @@ fn render_health(out: &mut String, snapshot: &Snapshot) {
             || (value != "complete" && bool_field(health, "degraded") == Some(false))
             || (cap_hit && !matches!(value, "incomplete" | "unknown"))
     });
-    if contradictory || snapshot.malformed_records > 0 || snapshot.health_records != 1 {
+    let binder_identity_contradiction =
+        health_scoped_unusable_binder_identities(snapshot) > 0 && parsed_status == Some("complete");
+    let marker_contract_invalid = invalid_scenario_marker_contract(snapshot);
+    if contradictory
+        || binder_identity_contradiction
+        || marker_contract_invalid
+        || snapshot.malformed_records > 0
+        || snapshot.health_records != 1
+    {
         status = "unknown";
     } else if !snapshot.final_record_is_health && status != "unknown" {
         status = "incomplete";
@@ -701,6 +752,20 @@ fn render_health(out: &mut String, snapshot: &Snapshot) {
         out.push_str(
             "**WARNING:** `capture_health` fields contradict each other; status is `unknown`.\n\n",
         );
+    }
+    if snapshot.unusable_binder_identity_records > 0 {
+        out.push_str(&format!(
+            "**WARNING:** capture contains {} raw Binder record(s) with an unusable Binder identity; those records are excluded from causal attribution.\n\n",
+            snapshot.unusable_binder_identity_records
+        ));
+        if binder_identity_contradiction {
+            out.push_str(
+                "**WARNING:** the raw Binder identity evidence contradicts a `complete` health status; status is `unknown`.\n\n",
+            );
+        }
+    }
+    if marker_contract_invalid {
+        out.push_str("**WARNING:** scenario marker lifecycle is invalid; status is `unknown`.\n\n");
     }
     if snapshot.health_records > 1 {
         out.push_str(&format!(
