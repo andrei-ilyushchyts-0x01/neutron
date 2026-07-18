@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.provenance-v1.schema.json",
+  "title": "Neutron release provenance v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "git_commit",
+    "git_dirty",
+    "build_timestamp",
+    "toolchain",
+    "build_environment",
+    "targets",
+    "binaries",
+    "bpf_abi",
+    "bpf_objects",
+    "probe",
+    "release_authentication",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": { "const": "neutron.provenance/v1" },
+    "version": { "type": "string", "minLength": 1 },
+    "git_commit": { "$ref": "#/$defs/buildId" },
+    "git_dirty": { "const": false },
+    "build_timestamp": { "type": "string", "minLength": 1 },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rustc",
+        "cargo",
+        "bpf_linker",
+        "java_runtime",
+        "java_vendor",
+        "gradle",
+        "gradle_distribution_sha256",
+        "android_gradle_plugin",
+        "android_compile_sdk",
+        "android_build_tools",
+        "aapt2",
+        "apksigner"
+      ],
+      "properties": {
+        "rustc": { "type": "string", "minLength": 1 },
+        "cargo": { "type": "string", "minLength": 1 },
+        "bpf_linker": { "type": "string", "minLength": 1 },
+        "java_runtime": { "type": "string", "minLength": 1 },
+        "java_vendor": { "type": "string", "minLength": 1 },
+        "gradle": { "type": "string", "minLength": 1 },
+        "gradle_distribution_sha256": { "$ref": "#/$defs/sha256" },
+        "android_gradle_plugin": { "type": "string", "minLength": 1 },
+        "android_compile_sdk": { "type": "integer", "minimum": 1 },
+        "android_build_tools": { "type": "string", "minLength": 1 },
+        "aapt2": { "type": "string", "minLength": 1 },
+        "apksigner": { "type": "string", "minLength": 1 }
+      }
+    },
+    "build_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runner_os",
+        "runner_image_version",
+        "runner_arch",
+        "runner_environment",
+        "identity_sha256"
+      ],
+      "properties": {
+        "runner_os": { "type": "string", "minLength": 1 },
+        "runner_image_version": { "type": "string", "minLength": 1 },
+        "runner_arch": { "type": "string", "minLength": 1 },
+        "runner_environment": { "type": "string", "minLength": 1 },
+        "identity_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "x86_64-unknown-linux-gnu" },
+        { "const": "aarch64-unknown-linux-musl" },
+        { "const": "bpfel-unknown-none" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "binaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "android_agent"],
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/binaryMeasurement"
+        },
+        "android_agent": {
+          "$ref": "#/$defs/binaryMeasurement"
+        }
+      }
+    },
+    "bpf_abi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor", "event_size"],
+      "properties": {
+        "major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "minor": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "event_size": { "const": 257 }
+      }
+    },
+    "bpf_objects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["neutron.bpf.elf", "neutron-stacks.bpf.elf"],
+      "properties": {
+        "neutron.bpf.elf": { "$ref": "#/$defs/bpfMeasurement" },
+        "neutron-stacks.bpf.elf": { "$ref": "#/$defs/bpfMeasurement" }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "version_code",
+        "version_name",
+        "target_sdk",
+        "build_type",
+        "debuggable",
+        "signing_certificate_sha256",
+        "signing_certificate_approved",
+        "attacker_model"
+      ],
+      "properties": {
+        "package": { "type": "string", "pattern": "^[A-Za-z0-9._]+$" },
+        "version_code": { "type": "integer", "minimum": 1 },
+        "version_name": { "type": "string", "minLength": 1 },
+        "target_sdk": { "type": "integer", "minimum": 1 },
+        "build_type": { "const": "debug" },
+        "debuggable": { "type": "boolean" },
+        "signing_certificate_sha256": { "$ref": "#/$defs/sha256" },
+        "signing_certificate_approved": { "type": "boolean" },
+        "attacker_model": {
+          "type": "string",
+          "pattern": "^ordinary_installed_app_target_sdk_[0-9]+_debuggable_(true|false)$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "debuggable": { "const": true } },
+            "required": ["debuggable"]
+          },
+          "then": {
+            "properties": { "attacker_model": { "pattern": "_debuggable_true$" } }
+          },
+          "else": {
+            "properties": { "attacker_model": { "pattern": "_debuggable_false$" } }
+          }
+        }
+      ]
+    },
+    "release_authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strict", "minisign_public_key_sha256"],
+      "properties": {
+        "strict": { "type": "boolean" },
+        "minisign_public_key_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "strict": { "const": true } },
+            "required": ["strict"]
+          },
+          "then": {
+            "properties": {
+              "minisign_public_key_sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      ]
+    },
+    "artifacts": {
+      "type": "object",
+      "minProperties": 8,
+      "required": [
+        "host/neutron",
+        "android/neutron-agent",
+        "neutron.bpf.elf",
+        "neutron-stacks.bpf.elf",
+        "neutron-probe.apk"
+      ],
+      "propertyNames": { "type": "string", "minLength": 1 },
+      "additionalProperties": { "$ref": "#/$defs/sha256" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "release_authentication": {
+            "properties": { "strict": { "const": true } },
+            "required": ["strict"]
+          }
+        },
+        "required": ["release_authentication"]
+      },
+      "then": {
+        "properties": {
+          "probe": {
+            "properties": { "signing_certificate_approved": { "const": true } }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "buildId": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "toolIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "git_commit",
+        "git_dirty",
+        "build_timestamp",
+        "rustc_version",
+        "target",
+        "feature_set"
+      ],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "git_commit": { "$ref": "#/$defs/buildId" },
+        "git_dirty": { "const": false },
+        "build_timestamp": { "type": "string", "minLength": 1 },
+        "rustc_version": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "feature_set": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "binaryMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "sha256", "self_info"],
+      "properties": {
+        "artifact": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "self_info": { "$ref": "#/$defs/toolIdentity" }
+      }
+    },
+    "bpfIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "object_sha256",
+        "section",
+        "magic",
+        "abi_major",
+        "abi_minor",
+        "syscall_event_size",
+        "feature_bits",
+        "build_id",
+        "build_id_present"
+      ],
+      "properties": {
+        "object_sha256": { "$ref": "#/$defs/sha256" },
+        "section": { "const": ".neutron_abi" },
+        "magic": { "const": "0x004e4f525455454e" },
+        "abi_major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "abi_minor": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "syscall_event_size": { "const": 257 },
+        "feature_bits": { "type": "integer", "minimum": 0 },
+        "build_id": { "$ref": "#/$defs/buildId" },
+        "build_id_present": { "const": true }
+      }
+    },
+    "bpfMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "identity"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "identity": { "$ref": "#/$defs/bpfIdentity" }
+      }
+    }
+  }
+}

@@ -1,13 +1,100 @@
 use clap::CommandFactory;
 use neutron::cli::Cli;
+use neutron::format::format_process_exit_json;
+use neutron::health::{
+    format_capture_health_json_with_metadata, CaptureHealth, CaptureMetadata, UserspaceHealth,
+};
 use neutron::report::{
     parse_service_list, render_binder_template_from_reader, render_report_from_reader,
-    render_service_catalog_from_reader, ReportOptions,
+    render_service_catalog_from_reader, run_report, ReportArgs, ReportOptions,
 };
+use neutron::sources::ProcessExitEvent;
+use neutron_common::{ExitSource, SIGSEGV};
 use std::io::Cursor;
 
 fn report(input: &str, opts: ReportOptions) -> String {
     render_report_from_reader(Cursor::new(input), opts).expect("render report")
+}
+
+fn complete_health() -> String {
+    let mut health = CaptureHealth::default();
+    health.slots[neutron_common::COUNTER_EVENTS_SUBMITTED as usize] = 4;
+    let capture_scope = neutron::health::CaptureScope::unfiltered_raw_ndjson();
+    format_capture_health_json_with_metadata(
+        &health,
+        &UserspaceHealth::default(),
+        4,
+        &CaptureMetadata {
+            max_depth: capture_scope.instrumentation.max_depth,
+            max_processes: capture_scope.instrumentation.max_processes,
+            capture_scope: Some(capture_scope),
+            attached_programs: vec![
+                "trace_sys_enter".into(),
+                "trace_sys_exit".into(),
+                "trace_sched_process_exit".into(),
+            ],
+            boot_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            bpf_object_sha256: Some("1".repeat(64)),
+            bpf_build_id: Some("2".repeat(40)),
+            bpf_abi_major: Some(neutron_common::BPF_ABI_MAJOR),
+            bpf_abi_minor: Some(neutron_common::BPF_ABI_MINOR),
+            bpf_event_size: Some(core::mem::size_of::<neutron_common::SyscallEvent>() as u32),
+            bpf_feature_bits: Some(
+                neutron_common::BPF_FEATURE_SYSCALL_TRACE
+                    | neutron_common::BPF_FEATURE_PROCESS_EXIT
+                    | neutron_common::BPF_FEATURE_PER_CPU_HEALTH,
+            ),
+            ring_size_bytes: Some(1 << 20),
+            ..CaptureMetadata::default()
+        },
+    )
+}
+
+fn bounded_capture_with_health(
+    events: &str,
+    scenario: &str,
+    trace_id: &str,
+    health: impl AsRef<str>,
+) -> String {
+    let mut lines = vec![serde_json::json!({
+        "type": "marker",
+        "ts_ns": 1,
+        "name": scenario,
+        "phase": "start",
+        "scenario_id": scenario,
+        "trace_id": trace_id,
+        "root_pid": 10,
+    })
+    .to_string()];
+    for line in events
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut value: serde_json::Value = serde_json::from_str(line).expect("event JSON");
+        let object = value.as_object_mut().expect("event object");
+        object.insert("scenario_id".into(), scenario.into());
+        object.insert("trace_id".into(), trace_id.into());
+        lines.push(value.to_string());
+    }
+    lines.push(
+        serde_json::json!({
+            "type": "marker",
+            "ts_ns": 3,
+            "name": scenario,
+            "phase": "end",
+            "scenario_id": scenario,
+            "trace_id": trace_id,
+            "root_pid": 10,
+        })
+        .to_string(),
+    );
+    lines.push(health.as_ref().to_string());
+    format!("{}\n", lines.join("\n"))
+}
+
+fn bounded_capture(events: &str, scenario: &str, trace_id: &str) -> String {
+    bounded_capture_with_health(events, scenario, trace_id, complete_health())
 }
 
 #[test]
@@ -61,6 +148,47 @@ fn degraded_health_and_output_cap_emit_warning() {
 }
 
 #[test]
+fn complete_transport_with_restricted_scope_warns_against_negative_claims() {
+    let mut health: serde_json::Value =
+        serde_json::from_str(&complete_health()).expect("health JSON");
+    health["capture_scope"]["output"]["event_mode"] = "findings_only".into();
+    health["capture_scope"]["claim_scope_complete"] = false.into();
+    health["capture_scope"]["claim_scope_reasons"] = serde_json::json!(["findings_only_output"]);
+
+    let md = report(&health.to_string(), ReportOptions::default());
+
+    assert!(md.contains("effective capture scope is restricted"));
+    assert!(md.contains("unfiltered negative claims are not supported"));
+}
+
+#[test]
+fn formatter_crash_classification_reaches_the_report() {
+    let exit = ProcessExitEvent {
+        ts_ns: 42,
+        pid: 1234,
+        uid: Some(10_341),
+        comm: "camera-hal".into(),
+        exit_code: 0,
+        exit_signal: SIGSEGV,
+        source: ExitSource::Tracepoint,
+    };
+    let capture = format!(
+        "{}\n{}\n",
+        format_process_exit_json(&exit, &[], Some(7)),
+        complete_health()
+    );
+
+    let md = report(&capture, ReportOptions::default());
+
+    assert!(md.contains("camera-hal"), "missing crash label:\n{md}");
+    assert!(md.contains("SIGSEGV"), "missing crash signal:\n{md}");
+    assert!(
+        md.contains("Crashes / Findings"),
+        "missing crash section:\n{md}"
+    );
+}
+
+#[test]
 fn binder_attribution_prefers_exact_service_then_map_then_catalog_then_raw() {
     let capture = r#"
 {"type":"binder_call","caller_pid":10,"caller_uid":10341,"caller_comm":"wallet","callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"android.hardware.security.keymint.IKeyMintDevice/default"}
@@ -89,22 +217,30 @@ fn binder_attribution_prefers_exact_service_then_map_then_catalog_then_raw() {
 
 #[test]
 fn baseline_diff_reports_new_and_removed_behavior() {
-    let base = r#"
-{"type":"syscall","name":"openat","fd_path":"/proc/version"}
-{"type":"syscall","name":"ioctl","ioctl_family":"binder","fd_path":"/dev/binder"}
-{"type":"binder_call","callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"activity"}
-"#;
-    let test = r#"
-{"type":"syscall","name":"openat","fd_path":"/proc/self/maps"}
-{"type":"syscall","name":"ioctl","ioctl_family":"kgsl","fd_path":"/dev/kgsl-3d0"}
-{"type":"binder_call","callee_pid":201,"target_node":2,"code":8,"status":"completed","service":"package"}
-{"type":"syscall","name":"socket","fd_path":"socket:[1]"}
-"#;
+    let base = bounded_capture(
+        r#"
+{"type":"syscall","pid":10,"name":"openat","fd_path":"/proc/version"}
+{"type":"syscall","pid":10,"name":"ioctl","ioctl_family":"binder","fd_path":"/dev/binder"}
+{"type":"binder_call","caller_pid":10,"callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"activity"}
+"#,
+        "procedure",
+        "trace-base",
+    );
+    let test = bounded_capture(
+        r#"
+{"type":"syscall","pid":10,"name":"openat","fd_path":"/proc/self/maps"}
+{"type":"syscall","pid":10,"name":"ioctl","ioctl_family":"kgsl","fd_path":"/dev/kgsl-3d0"}
+{"type":"binder_call","caller_pid":10,"callee_pid":201,"target_node":2,"code":8,"status":"completed","service":"package"}
+{"type":"syscall","pid":10,"name":"socket","fd_path":"socket:[1]"}
+"#,
+        "procedure",
+        "trace-test",
+    );
 
     let md = report(
-        test,
+        &test,
         ReportOptions {
-            baseline_capture: Some(base.into()),
+            baseline_capture: Some(base),
             ..ReportOptions::default()
         },
     );
@@ -119,14 +255,225 @@ fn baseline_diff_reports_new_and_removed_behavior() {
 }
 
 #[test]
+fn baseline_diff_rejects_different_effective_capture_scopes() {
+    let baseline = bounded_capture(
+        r#"{"type":"syscall","pid":10,"name":"openat"}"#,
+        "procedure",
+        "trace-base",
+    );
+    let mut test_health: serde_json::Value =
+        serde_json::from_str(&complete_health()).expect("health JSON");
+    test_health["capture_scope"]["observation"]["target_pid"] = 20.into();
+    let test = bounded_capture_with_health(
+        r#"{"type":"syscall","pid":20,"name":"socket"}"#,
+        "procedure",
+        "trace-test",
+        test_health.to_string(),
+    );
+
+    let md = report(
+        &test,
+        ReportOptions {
+            baseline_capture: Some(baseline),
+            ..ReportOptions::default()
+        },
+    );
+
+    assert!(md.contains("identical claim-complete effective capture scope"));
+    assert!(
+        !md.contains("- + socket"),
+        "nonconclusive diff leaked:\n{md}"
+    );
+}
+
+#[test]
+fn baseline_diff_requires_matching_completed_scenario_lifecycles() {
+    let event = r#"{"type":"syscall","pid":10,"name":"openat"}"#;
+    let bounded = bounded_capture(event, "procedure", "trace-base");
+    let unmarked = format!("{event}\n{}\n", complete_health());
+    let md = report(
+        &unmarked,
+        ReportOptions {
+            baseline_capture: Some(bounded.clone()),
+            ..ReportOptions::default()
+        },
+    );
+    assert!(md.contains("paired scenario lifecycle/root contract"));
+    assert!(!md.contains("- - openat"));
+
+    let different = bounded_capture(event, "different", "trace-test");
+    let md = report(
+        &different,
+        ReportOptions {
+            baseline_capture: Some(bounded.clone()),
+            ..ReportOptions::default()
+        },
+    );
+    assert!(md.contains("behavior diff is nonconclusive"));
+
+    let unfinished = bounded_capture(event, "procedure", "trace-test")
+        .lines()
+        .filter(|line| !line.contains(r#""phase":"end""#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let md = report(
+        &unfinished,
+        ReportOptions {
+            baseline_capture: Some(bounded),
+            ..ReportOptions::default()
+        },
+    );
+    assert!(md.contains("behavior diff is nonconclusive"));
+}
+
+#[test]
+fn baseline_diff_ignores_behavior_outside_the_scenario_boundary() {
+    let inside = r#"{"type":"syscall","pid":10,"name":"ioctl"}"#;
+    let baseline = format!(
+        "{}\n{}",
+        r#"{"type":"syscall","pid":10,"name":"outside_baseline"}"#,
+        bounded_capture(inside, "procedure", "trace-base")
+    );
+    let test = format!(
+        "{}\n{}",
+        r#"{"type":"syscall","pid":10,"name":"outside_test"}"#,
+        bounded_capture(inside, "procedure", "trace-test")
+    );
+    let md = report(
+        &test,
+        ReportOptions {
+            baseline_capture: Some(baseline),
+            ..ReportOptions::default()
+        },
+    );
+    assert!(md.contains("## New Behavior"));
+    assert!(!md.contains("- + outside_test"));
+    assert!(!md.contains("- - outside_baseline"));
+}
+
+#[test]
+fn report_rejects_hard_linked_capture_and_baseline() {
+    let directory = std::env::temp_dir().join(format!(
+        "neutron-report-hardlink-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let capture = directory.join("capture.ndjson");
+    let baseline = directory.join("baseline.ndjson");
+    std::fs::write(&capture, b"capture\n").unwrap();
+    std::fs::hard_link(&capture, &baseline).unwrap();
+
+    let error = run_report(ReportArgs {
+        capture: capture.to_string_lossy().into_owned(),
+        baseline: Some(baseline.to_string_lossy().into_owned()),
+        title: None,
+        package: None,
+        binder_services: None,
+        binder_catalog: None,
+        aidl_catalog: None,
+        top: 10,
+        output: None,
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("same file"));
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn malformed_and_blank_lines_are_skipped() {
     let md = report(
-        "not json\n\n{\"type\":\"syscall\",\"name\":\"openat\"}\n{bad",
+        "not json\n\n{\"type\":\"syscall\",\"name\":\"openat\",\"fd_path\":\"/proc/self/maps\",\"ioctl_family\":\"binder\"}\n{bad",
         ReportOptions::default(),
     );
 
-    assert!(md.contains("openat"));
+    assert!(!md.contains("| openat |"));
+    assert!(!md.contains("/proc/self/maps"));
+    assert!(!md.contains("| binder |"));
     assert!(md.contains("Parsed events: 1"));
+}
+
+#[test]
+fn recognized_record_missing_required_fields_makes_report_health_unknown() {
+    let capture = r#"
+{"type":"syscall"}
+{"type":"capture_health","status":"complete","degraded":false,"output_cap_hit":false}
+"#;
+    let md = report(capture, ReportOptions::default());
+
+    assert!(md.contains("malformed, invalid, or unknown NDJSON"));
+    assert!(md.contains("status is `unknown`"));
+    assert!(md.contains("Absence of evidence is not conclusive"));
+}
+
+#[test]
+fn unknown_record_type_makes_report_health_unknown() {
+    let capture = r#"
+{"type":"future_event","pid":42}
+{"type":"capture_health","status":"complete","degraded":false,"output_cap_hit":false}
+"#;
+    let md = report(capture, ReportOptions::default());
+
+    assert!(md.contains("malformed, invalid, or unknown NDJSON"));
+    assert!(md.contains("status is `unknown`"));
+}
+
+#[test]
+fn hostile_capture_strings_cannot_inject_markdown_structure_or_html() {
+    let records = [
+        serde_json::json!({
+            "type": "syscall",
+            "pid": 42,
+            "name": "openat`\n## Forged Event Heading",
+            "comm": "bad\n- forged-list-item",
+            "fd_path": "/proc/self/maps`\n<script>alert(1)</script>"
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "finding",
+            "rule_id": "R`\n## Forged Finding Heading",
+            "severity": "high",
+            "category": "[click](javascript:alert(1))"
+        })
+        .to_string(),
+        complete_health(),
+    ];
+    let md = report(
+        &records.join("\n"),
+        ReportOptions {
+            title: Some("Trusted\n## Forged Title <script>x</script> [x](javascript:y)".into()),
+            ..ReportOptions::default()
+        },
+    );
+
+    assert!(
+        !md.contains("\n## Forged"),
+        "forged heading rendered:\n{md}"
+    );
+    assert!(!md.contains("<script>"), "raw HTML rendered:\n{md}");
+    assert!(
+        !md.contains("[x](javascript:y)"),
+        "active title link rendered:\n{md}"
+    );
+    assert!(
+        md.contains("\\n"),
+        "control characters should remain visible"
+    );
+    assert!(md.contains("\\x60"), "backticks should remain visible");
+    assert!(md.contains("&lt;script&gt;"), "HTML should be escaped");
+}
+
+#[test]
+fn appended_clean_health_cannot_override_an_earlier_unknown_record() {
+    let capture = r#"
+{"type":"capture_health","status":"unknown","degraded":true,"output_cap_hit":false}
+{"type":"capture_health","status":"complete","degraded":false,"output_cap_hit":false}
+"#;
+    let md = report(capture, ReportOptions::default());
+
+    assert!(md.contains("2 `capture_health` records"));
+    assert!(md.contains("status is `unknown`"));
 }
 
 #[test]

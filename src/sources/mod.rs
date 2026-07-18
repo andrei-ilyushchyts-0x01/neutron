@@ -36,7 +36,10 @@ use neutron_common::{is_fatal_signal, signal_name, ExitSource};
 pub struct ProcessExitEvent {
     pub ts_ns: u64,
     pub pid: u32,
-    pub uid: u32,
+    /// Effective UID when the observing source reports it. Logcat native
+    /// crash records and older tombstones do not carry a UID; `None` must
+    /// never be interpreted as UID 0 (root).
+    pub uid: Option<u32>,
     pub comm: String,
     pub exit_code: u8,
     pub exit_signal: u32,

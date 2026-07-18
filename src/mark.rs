@@ -21,8 +21,9 @@
 //! Marker lines are well below that limit. Without `--output`, the
 //! line goes to stdout — the caller is responsible for redirection.
 
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -55,7 +56,7 @@ pub struct MarkArgs {
     /// legacy append-only path. Use `off` to skip live control.
     #[arg(
         long,
-        default_value = "/data/local/tmp/neutron.control.sock",
+        default_value = "/data/local/share/neutron/runtime/neutron.control.sock",
         value_name = "PATH|off"
     )]
     pub control_socket: String,
@@ -93,35 +94,35 @@ pub fn render_line(args: &MarkArgs) -> Result<String> {
             .as_nanos() as u64,
     };
 
-    // JSON-escape the name so quotes/backslashes round-trip.
-    let escaped_name = args.name.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut object = serde_json::Map::new();
+    object.insert("type".into(), serde_json::Value::String("marker".into()));
+    object.insert("ts_ns".into(), serde_json::Value::from(ts_ns));
+    object.insert("name".into(), serde_json::Value::String(args.name.clone()));
+    if let Some(p) = phase {
+        object.insert("phase".into(), serde_json::Value::String(p.into()));
+    }
 
-    let phase_field = match phase {
-        Some(p) => format!(r#","phase":"{p}""#),
-        None => String::new(),
-    };
-
-    let meta_field = if args.meta.is_empty() {
-        String::new()
-    } else {
-        let mut parts: Vec<String> = Vec::with_capacity(args.meta.len());
+    if !args.meta.is_empty() {
+        let mut meta = serde_json::Map::new();
         for kv in &args.meta {
             let (k, v) = kv
                 .split_once('=')
                 .ok_or_else(|| anyhow::anyhow!("--meta entry '{kv}' missing '=' separator"))?;
-            let k_esc = k.trim().replace('\\', "\\\\").replace('"', "\\\"");
-            let v_esc = v.replace('\\', "\\\\").replace('"', "\\\"");
-            if k_esc.is_empty() {
+            let key = k.trim();
+            if key.is_empty() {
                 bail!("--meta entry '{kv}' has empty key");
             }
-            parts.push(format!(r#""{k_esc}":"{v_esc}""#));
+            if meta
+                .insert(key.to_string(), serde_json::Value::String(v.to_string()))
+                .is_some()
+            {
+                bail!("duplicate --meta key '{key}'");
+            }
         }
-        format!(r#","meta":{{{}}}"#, parts.join(","))
-    };
+        object.insert("meta".into(), serde_json::Value::Object(meta));
+    }
 
-    Ok(format!(
-        r#"{{"type":"marker","ts_ns":{ts_ns},"name":"{escaped_name}"{phase_field}{meta_field}}}"#,
-    ))
+    serde_json::to_string(&serde_json::Value::Object(object)).context("serializing marker record")
 }
 
 /// Entry point — invoked from `main.rs` when the user runs
@@ -158,12 +159,10 @@ pub fn run(args: MarkArgs) -> Result<()> {
     let line = render_line(&args)?;
     match &args.output {
         Some(path) => {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .with_context(|| format!("opening {path} for append"))?;
+            let mut f = open_private_append(Path::new(path))?;
             writeln!(f, "{line}").with_context(|| format!("writing marker to {path}"))?;
+            f.sync_data()
+                .with_context(|| format!("syncing marker output {path}"))?;
         }
         None => {
             let mut stdout = io::stdout().lock();
@@ -173,10 +172,16 @@ pub fn run(args: MarkArgs) -> Result<()> {
     Ok(())
 }
 
+fn open_private_append(path: &Path) -> Result<File> {
+    crate::private_output::open_private_file(path, crate::private_output::PrivateFileMode::Append)
+        .with_context(|| format!("opening {} for secure append", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::os::unix::fs::PermissionsExt;
 
     fn args(name: &str) -> MarkArgs {
         MarkArgs {
@@ -279,11 +284,25 @@ mod tests {
     }
 
     #[test]
+    fn control_characters_round_trip_without_splitting_ndjson() {
+        let mut a = args("scenario\n{\"type\":\"finding\"}");
+        a.meta = vec!["note=line1\nline2\tvalue".into()];
+        let line = render_line(&a).unwrap();
+
+        assert_eq!(line.lines().count(), 1, "marker record was split: {line:?}");
+        let value: Value = serde_json::from_str(&line).expect("valid marker JSON");
+        assert_eq!(value["name"], "scenario\n{\"type\":\"finding\"}");
+        assert_eq!(value["meta"]["note"], "line1\nline2\tvalue");
+    }
+
+    #[test]
     fn run_writes_to_output_file() {
         use std::io::Read;
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("neutron-mark-test-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = std::env::temp_dir().join(format!("neutron-mark-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("markers.ndjson");
         let mut a = args("camera");
         a.phase = Some("start".into());
         a.output = Some(path.to_string_lossy().into_owned());
@@ -311,6 +330,29 @@ mod tests {
             .unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2, "second run appended, did not truncate");
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_rejects_symlink_without_modifying_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir =
+            std::env::temp_dir().join(format!("neutron-mark-symlink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("markers.ndjson");
+        std::fs::write(&target, b"preserve\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let mut a = args("camera");
+        a.output = Some(link.to_string_lossy().into_owned());
+        assert!(run(a).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve\n");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

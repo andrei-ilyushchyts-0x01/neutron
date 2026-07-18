@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.run-manifest-v1.schema.json",
+  "title": "Neutron run manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "run_id",
+    "run_kind",
+    "started_at",
+    "completed_at",
+    "tool",
+    "bpf",
+    "device",
+    "research_model",
+    "collection",
+    "health",
+    "bpf_loaded",
+    "stimulus_executed",
+    "configuration_changed",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": { "const": "neutron.run-manifest/v1" },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "run_kind": { "enum": ["surface_static", "trace_live"] },
+    "started_at": { "type": "string", "minLength": 1 },
+    "completed_at": { "type": "string", "minLength": 1 },
+    "tool": { "$ref": "#/$defs/tool" },
+    "bpf": { "$ref": "#/$defs/bpf" },
+    "device": { "$ref": "#/$defs/device" },
+    "research_model": { "$ref": "#/$defs/researchModel" },
+    "collection": { "$ref": "#/$defs/collection" },
+    "health": { "$ref": "#/$defs/health" },
+    "transport_health": { "$ref": "#/$defs/health" },
+    "capture_scope": {
+      "$ref": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.capture-health-v1.schema.json#/$defs/captureScope"
+    },
+    "bpf_loaded": { "type": "boolean" },
+    "stimulus_executed": { "const": false },
+    "configuration_changed": { "const": false },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "git_commit",
+        "git_dirty",
+        "binary_sha256",
+        "build_timestamp",
+        "rustc",
+        "target",
+        "feature_set"
+      ],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "git_commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "git_dirty": { "type": "boolean" },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "build_timestamp": { "type": "string", "minLength": 1 },
+        "rustc": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "feature_set": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "bpf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "object_sha256",
+        "abi_major",
+        "abi_minor",
+        "event_size",
+        "feature_bits",
+        "build_id"
+      ],
+      "properties": {
+        "used": { "type": "boolean" },
+        "object_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "abi_major": { "type": "integer", "minimum": 1 },
+        "abi_minor": { "type": "integer", "minimum": 0 },
+        "event_size": { "const": 257 },
+        "feature_bits": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "build_id": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serial_hash",
+        "model",
+        "product",
+        "build_id",
+        "fingerprint",
+        "api",
+        "spl",
+        "kernel",
+        "boot_id"
+      ],
+      "properties": {
+        "serial_hash": {
+          "oneOf": [
+            { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            { "type": "null" }
+          ]
+        },
+        "model": { "$ref": "#/$defs/nullableString" },
+        "product": { "$ref": "#/$defs/nullableString" },
+        "build_id": { "$ref": "#/$defs/nullableString" },
+        "fingerprint": { "$ref": "#/$defs/nullableString" },
+        "api": { "type": ["integer", "null"], "minimum": 1 },
+        "spl": { "$ref": "#/$defs/nullableString" },
+        "kernel": { "$ref": "#/$defs/nullableString" },
+        "boot_id": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "researchModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observer_privilege", "attacker_capability"],
+      "properties": {
+        "observer_privilege": { "type": "string", "minLength": 1 },
+        "attacker_capability": { "type": "string", "minLength": 1 }
+      }
+    },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_count", "minimal", "full_snapshot_retained", "repeat"],
+      "properties": {
+        "target_count": { "type": "integer", "minimum": 0, "maximum": 4096 },
+        "minimal": { "type": "boolean" },
+        "full_snapshot_retained": { "type": "boolean" },
+        "repeat": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reasons"],
+      "properties": {
+        "status": {
+          "enum": ["complete", "degraded", "incomplete", "unknown"]
+        },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^/\\\\\\u0000-\\u001f\\u007f]+$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "surfaceStaticRun": {
+      "type": "object",
+      "properties": {
+        "run_kind": { "const": "surface_static" },
+        "bpf_loaded": { "const": false },
+        "bpf": {
+          "type": "object",
+          "properties": {
+            "used": { "const": false },
+            "object_sha256": { "type": "null" },
+            "build_id": { "type": "null" }
+          }
+        },
+        "collection": {
+          "type": "object",
+          "properties": {
+            "target_count": { "type": "integer", "minimum": 1, "maximum": 4096 },
+            "minimal": { "const": true },
+            "full_snapshot_retained": { "const": false },
+            "repeat": { "type": "integer", "minimum": 1, "maximum": 32 }
+          }
+        }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["transport_health"] },
+          { "required": ["capture_scope"] }
+        ]
+      }
+    },
+    "traceLiveRun": {
+      "type": "object",
+      "required": ["transport_health", "capture_scope"],
+      "properties": {
+        "run_kind": { "const": "trace_live" },
+        "device": {
+          "type": "object",
+          "required": [
+            "serial_hash",
+            "model",
+            "product",
+            "build_id",
+            "fingerprint",
+            "api",
+            "spl",
+            "kernel",
+            "boot_id"
+          ],
+          "properties": {
+            "serial_hash": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "not": {
+                "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            },
+            "model": { "type": "string", "minLength": 1 },
+            "product": { "type": "string", "minLength": 1 },
+            "build_id": { "type": "string", "minLength": 1 },
+            "fingerprint": { "type": "string", "minLength": 1 },
+            "api": { "type": "integer", "minimum": 1, "maximum": 10000 },
+            "spl": { "type": "string", "minLength": 1 },
+            "kernel": { "type": "string", "minLength": 1 },
+            "boot_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        },
+        "bpf_loaded": { "const": true },
+        "bpf": {
+          "type": "object",
+          "properties": {
+            "used": { "const": true },
+            "object_sha256": { "$ref": "#/$defs/sha256" },
+            "build_id": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+          }
+        },
+        "collection": {
+          "type": "object",
+          "properties": {
+            "target_count": { "const": 0 },
+            "minimal": { "const": false },
+            "full_snapshot_retained": { "const": false },
+            "repeat": { "const": 1 }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/surfaceStaticRun" },
+    { "$ref": "#/$defs/traceLiveRun" }
+  ]
+}

@@ -115,7 +115,7 @@ neutron captures `ioctl(fd, cmd, arg)`'s `cmd` (4 bytes) and the first
 transactions and for most Android driver command structs, but a long
 DMA-heap allocation request or a driver-specific buffer deeper than 124
 bytes is truncated. The truncation is recorded in the BPF `COUNTERS` map
-under `path_truncated` (slot reserved; instrumentation TODO).
+under `ioctl_payload_truncated`, which makes capture health `degraded`.
 
 The built-in specialized decoders still ship for stable Binder, DMA-heap and
 LWIS output. `neutron ioctl generate` can add device/kernel-specific scalar
@@ -293,6 +293,6 @@ vulnerability, a feature, or a false positive is up to the analyst.
 | `--package` / `--root-uid` process discovery | v1.3 / v1.4 | Neither is retroactive. Package roots can miss sub-second processes between refreshes; explicit UID roots use first-event kernel admission. |
 | Cross-process causal tracing | v1.3–v1.4 | Observed Binder following with depth/PID/TTL/domain/special-process guardrails; incomplete branches are explicit |
 | Android surface mapper | v1.4 + Unreleased | Static/imported/live causal evidence, resource lifetimes, semantic diff, and explicit collector health |
-| `path_truncated` counter wired in BPF | v1.1 | Currently reserved in COUNTERS but not incremented |
+| Path and ioctl payload truncation counters wired in BPF | v1.5 | `path_truncated` and `ioctl_payload_truncated` are explicit degradation counters |
 
 See [docs/ROADMAP.md](ROADMAP.md) for the full multi-version plan.

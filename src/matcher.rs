@@ -741,6 +741,7 @@ pub struct SyscallEventLens<'a> {
     fd_path: Option<&'a str>,
     ioctl_cmd: Option<u32>,
     arg_payload: Option<[u8; 124]>,
+    arg_payload_len: usize,
     rwx_marker: Option<u8>,
     binder_args: Option<[u64; 6]>,
 }
@@ -766,13 +767,19 @@ impl<'a> SyscallEventLens<'a> {
         } else {
             None
         };
-        let arg_payload = if nr == 29 {
-            let mut buf = [0u8; 124];
-            buf.copy_from_slice(&data[4..128]);
-            Some(buf)
+        let arg_payload_len = if nr == 29 {
+            (neutron_common::ioctl_size(args[1] as u32) as usize).min(124)
         } else {
-            None
+            0
         };
+        let arg_payload =
+            if nr == 29 && arg_payload_len != 0 && neutron_common::event_payload_is_valid(ev) {
+                let mut buf = [0u8; 124];
+                buf.copy_from_slice(&data[4..128]);
+                Some(buf)
+            } else {
+                None
+            };
         let rwx_marker = if matches!(nr, 222 | 226) {
             match data[0] {
                 v @ (1 | 2) => Some(v),
@@ -794,6 +801,7 @@ impl<'a> SyscallEventLens<'a> {
             fd_path,
             ioctl_cmd,
             arg_payload,
+            arg_payload_len,
             rwx_marker,
             binder_args,
         }
@@ -829,7 +837,9 @@ impl<'a> EventLens for SyscallEventLens<'a> {
         self.ioctl_cmd
     }
     fn arg_payload(&self) -> Option<&[u8]> {
-        self.arg_payload.as_ref().map(|b| b.as_slice())
+        self.arg_payload
+            .as_ref()
+            .map(|bytes| &bytes[..self.arg_payload_len])
     }
     fn rwx_marker(&self) -> Option<u8> {
         self.rwx_marker
@@ -1278,6 +1288,42 @@ mod tests {
             ..TestEvent::default()
         };
         assert!(!evaluate(&s, &ev));
+    }
+
+    #[test]
+    fn syscall_lens_hides_failed_or_out_of_contract_ioctl_payload() {
+        let cmd = 0xc010_4c64_u32;
+        let mut data = [0u8; 128];
+        data[..4].copy_from_slice(&cmd.to_le_bytes());
+        data[4..8].copy_from_slice(&0x20200_u32.to_le_bytes());
+        let mut reserved = [0u8; 6];
+        reserved[0] = neutron_common::EVENT_FLAG_PAYLOAD_READ_FAILED;
+        let failed = SyscallEvent {
+            syscall_nr: 29,
+            args: [0, cmd as u64, 0, 0, 0, 0],
+            data,
+            _reserved: reserved,
+            ..SyscallEvent::default()
+        };
+        let failed_lens = SyscallEventLens::new(&failed, String::new(), None, None);
+        assert_eq!(failed_lens.ioctl_cmd(), Some(cmd));
+        assert!(failed_lens.arg_payload().is_none());
+
+        let mut unavailable_reserved = [0u8; 6];
+        unavailable_reserved[0] = neutron_common::EVENT_FLAG_PAYLOAD_UNAVAILABLE;
+        let unavailable = SyscallEvent {
+            _reserved: unavailable_reserved,
+            ..failed
+        };
+        let unavailable_lens = SyscallEventLens::new(&unavailable, String::new(), None, None);
+        assert!(unavailable_lens.arg_payload().is_none());
+
+        let valid = SyscallEvent {
+            _reserved: [0u8; 6],
+            ..failed
+        };
+        let valid_lens = SyscallEventLens::new(&valid, String::new(), None, None);
+        assert_eq!(valid_lens.arg_payload().map(<[u8]>::len), Some(16));
     }
 
     #[test]

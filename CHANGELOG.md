@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0-rc.1] — Unreleased
+
+- Reframed the supported core around evidence-grade Android boundary ownership
+  and bounded causal tracing, with explicit STABLE/PREVIEW/EXPERIMENTAL command
+  labels and a device/build support matrix.
+- Added verbose source/toolchain identity, a userspace/BPF ABI and build-ID
+  handshake, tracepoint-format validation, and a real syscall load/attach/event
+  smoke path in versioned `doctor --json --smoke` output.
+- Reworked capture health around per-CPU BPF counters, explicit read errors,
+  complete/degraded/incomplete/unknown status, bounded Binder-loss accounting,
+  and a versioned effective capture scope that prevents filtered or sampled
+  data from supporting unqualified negative claims.
+- Added target-scoped `surface coverage` collection, repeat/drift validation,
+  proof-chain explanations, private content-addressed run bundles, and typed
+  external behavioral-evidence import with explicit probe attribution.
+- Added host and Android release payloads containing both BPF variants,
+  schemas, packs, and a content-identified probe APK; deployment now requires
+  one explicit physical USB serial and verifies root-private candidate hashes
+  before publication.
+- Added signed-tag release automation with exact-tag tests, minisign manifests,
+  GitHub build-provenance attestations, deterministic archive metadata, and a
+  fixed secret-backed research-probe signing identity.
+- Hardened capture/report/evidence inputs with bounded parsing, cardinality and
+  file limits, non-following descriptor-relative I/O, Markdown/terminal
+  escaping, and conclusive diff gates over identical pinned capture scopes.
 - Added versioned `neutron.causal-graph/v1` JSON export and deterministic
   `--collapse-syscalls` grouping alongside the existing Mermaid graph.
 - Added semantic `surface diff` / `surface diff-device` reports using
@@ -24,9 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stimuli with private artifact locking and bounded permission cleanup.
 - Expanded CI to verify the full host workspace, AArch64 musl build, release
   eBPF object, and Android research-probe unit tests.
-- Seeded PIDs matching explicit `--follow-deny-domain` policy before Binder
-  tracepoints attach. Research runs now pre-deny `servicemanager` and
-  `system_server` to avoid coordinator-wide follower fanout.
+- Reserved SELinux domain follow-policy flags are rejected in 1.5 because
+  they cannot be enforced before first-event BPF admission.
 - Added the additive `causal_admission_boundary_exit` capture-health volume
   counter, including admitted sibling-worker boundary accounting, so expected
   first exits are distinguished from ordinary correlation misses.
@@ -330,8 +354,9 @@ new finding fields; rule pack grows from 22 to 26 detectors.
 - `Category` enum gains `ResourceExhaustion` and `Crash` variants;
   rule YAML files using exhaustive Rust matches must be updated.
 - The `binder_transaction_received` tracepoint requires a kernel where
-  it is upstreamed (Pixel 8 Pro at 6.1+ ships it). Attach failure is
-  logged and the userspace correlator silently never matches.
+  it is available. In the current 1.5 line doctor validates both Binder
+  layouts and attachment failures make capture health non-complete; older
+  releases did not enforce that gate.
 
 ## [1.0.0] — 2026-04-26
 
@@ -348,8 +373,9 @@ kernel 6.1.x using Aya 0.13, BTF + CO-RE, and BPF ring buffer.
   BTF + CO-RE relocation, map creation, program load, tracepoint /
   kprobe attach, and verifier log capture.
 - **BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`)** as the event output
-  channel. Single multi-producer ring, 1 MiB, lossless from the
-  producer's perspective.
+  channel. Single multi-producer ring, 1 MiB. This historical 1.0 entry
+  did not account for reserve failures; current releases explicitly count
+  them as dropped events and never describe the channel as lossless.
 - **Modern eBPF helpers** throughout: `bpf_probe_read_user_str_bytes`
   (114), `bpf_probe_read_user_buf` (112), `bpf_probe_read_kernel_buf`
   (113).

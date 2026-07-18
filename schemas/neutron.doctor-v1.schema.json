@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.doctor-v1.schema.json",
+  "title": "Neutron doctor report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "tool",
+    "compatible",
+    "checks",
+    "tracepoint_layouts",
+    "object"
+  ],
+  "properties": {
+    "schema": { "const": "neutron.doctor/v1" },
+    "tool": { "$ref": "#/$defs/selfInfo" },
+    "compatible": { "type": "boolean" },
+    "checks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "tracepoint_layouts": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/tracepointLayout" }
+    },
+    "object": { "$ref": "#/$defs/objectReport" },
+    "smoke": { "$ref": "#/$defs/smokeReport" }
+  },
+  "$defs": {
+    "status": { "enum": ["pass", "warn", "fail"] },
+    "compatibility": { "enum": ["compatible", "unsupported", "unknown"] },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "buildId": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "selfInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "tool", "bpf"],
+      "properties": {
+        "schema": { "const": "neutron.self-info/v1" },
+        "tool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "git_commit",
+            "git_dirty",
+            "build_timestamp",
+            "rustc_version",
+            "target",
+            "feature_set"
+          ],
+          "properties": {
+            "version": { "type": "string", "minLength": 1 },
+            "git_commit": { "$ref": "#/$defs/buildId" },
+            "git_dirty": { "type": "boolean" },
+            "build_timestamp": { "type": "string", "minLength": 1 },
+            "rustc_version": { "type": "string", "minLength": 1 },
+            "target": { "type": "string", "minLength": 1 },
+            "feature_set": {
+              "type": "array",
+              "items": { "type": "string" },
+              "uniqueItems": true
+            }
+          }
+        },
+        "bpf": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["abi_major", "event_size", "feature_bits"],
+          "properties": {
+            "abi_major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "event_size": { "const": 257 },
+            "feature_bits": {
+              "type": "array",
+              "items": { "type": "string" },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status", "reason"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "tracepointField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "field_type", "offset", "size", "signed"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "field_type": { "type": "string", "minLength": 1 },
+        "offset": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 1 },
+        "signed": { "type": "boolean" }
+      }
+    },
+    "tracepointLayout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "compatibility"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "raw_sys_enter",
+            "raw_sys_exit",
+            "binder_transaction",
+            "binder_transaction_received",
+            "sched_process_exit"
+          ]
+        },
+        "path": { "type": "string", "minLength": 1 },
+        "compatibility": { "$ref": "#/$defs/compatibility" },
+        "normalized_sha256": { "$ref": "#/$defs/sha256" },
+        "fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/tracepointField" }
+        },
+        "mismatches": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "error": { "type": "string", "minLength": 1 }
+      }
+    },
+    "bpfIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "object_sha256",
+        "section",
+        "magic",
+        "abi_major",
+        "abi_minor",
+        "syscall_event_size",
+        "feature_bits",
+        "build_id",
+        "build_id_present"
+      ],
+      "properties": {
+        "object_sha256": { "$ref": "#/$defs/sha256" },
+        "section": { "const": ".neutron_abi" },
+        "magic": { "type": "string", "pattern": "^0x[0-9a-f]{16}$" },
+        "abi_major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "abi_minor": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "syscall_event_size": { "const": 257 },
+        "feature_bits": { "type": "integer", "minimum": 0 },
+        "build_id": { "$ref": "#/$defs/buildId" },
+        "build_id_present": { "const": true }
+      }
+    },
+    "objectReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "compatibility"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "compatibility": { "$ref": "#/$defs/compatibility" },
+        "identity": { "$ref": "#/$defs/bpfIdentity" },
+        "error": { "type": "string", "minLength": 1 }
+      }
+    },
+    "smokeReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempted",
+        "tracepoint_layout_validated",
+        "object_abi_validated",
+        "bpf_load",
+        "syscall_attach",
+        "ringbuf_open",
+        "sentinel_syscall",
+        "exact_event",
+        "event_size",
+        "percpu_health_read",
+        "health_totals",
+        "cleanup",
+        "passed",
+        "temporary_side_effects",
+        "pinned_resources_created"
+      ],
+      "properties": {
+        "attempted": { "const": true },
+        "tracepoint_layout_validated": { "type": "boolean" },
+        "object_abi_validated": { "type": "boolean" },
+        "bpf_load": { "type": "boolean" },
+        "syscall_attach": { "type": "boolean" },
+        "ringbuf_open": { "type": "boolean" },
+        "sentinel_syscall": { "type": "boolean" },
+        "exact_event": { "type": "boolean" },
+        "event_size": { "const": 257 },
+        "percpu_health_read": { "type": "boolean" },
+        "health_totals": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "maxItems": 20
+        },
+        "cleanup": { "type": "boolean" },
+        "passed": { "type": "boolean" },
+        "temporary_side_effects": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "pinned_resources_created": { "type": "boolean" },
+        "object": { "$ref": "#/$defs/bpfIdentity" },
+        "error": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

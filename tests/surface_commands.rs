@@ -29,6 +29,8 @@ impl TestDir {
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&path).expect("create test directory");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make test directory private");
         Self(path)
     }
 
@@ -68,7 +70,7 @@ fn minimal_snapshot() -> SurfaceSnapshot {
         processes: vec![Process {
             id: process_id.into(),
             pid: 42,
-            uid: 10_123,
+            uid: Some(10_123),
             gid: 10_123,
             cmdline: vec!["/vendor/bin/example".into()],
             executable: Some("/vendor/bin/example".into()),
@@ -264,7 +266,10 @@ fn explain_accepts_coverage_and_emits_a_deterministic_chain_of_proof() {
         .expect("coverage explain should succeed");
     }
 
-    assert_eq!(fs::read(&first_output).unwrap(), fs::read(&second_output).unwrap());
+    assert_eq!(
+        fs::read(&first_output).unwrap(),
+        fs::read(&second_output).unwrap()
+    );
     let result = read_json(&first_output);
     assert_eq!(result["schema"], "neutron.surface/query/v1");
     assert_eq!(result["entity"]["kind"], "coverage");
@@ -396,7 +401,7 @@ fn uid_queries_and_selector_errors_are_reported_as_json_command_errors() {
 }
 
 #[test]
-fn capture_scan_degrades_mismatched_health_and_rejects_unsafe_outputs() {
+fn capture_scan_marks_invalid_health_unknown_and_rejects_unsafe_outputs() {
     let temp = TestDir::new("surface-capture-command");
     let capture = temp.path("capture.ndjson");
     fs::write(
@@ -417,35 +422,35 @@ fn capture_scan_degrades_mismatched_health_and_rejects_unsafe_outputs() {
     }))
     .unwrap();
     let snapshot: SurfaceSnapshot = serde_json::from_value(read_json(&output)).unwrap();
-    assert_eq!(snapshot.captures[0].health, "degraded");
-    assert_eq!(snapshot.health.status, "degraded");
+    assert_eq!(snapshot.captures[0].health, "unknown");
+    assert_eq!(snapshot.health.status, "unknown");
 
     let target = temp.path("target.json");
     let link = temp.path("output-link.json");
     fs::write(&target, b"untouched").unwrap();
     symlink(&target, &link).unwrap();
     let error = run(SurfaceCommand::Services(input_args(&output, &link))).unwrap_err();
-    assert!(format!("{error:#}").contains("secure output"));
+    assert!(format!("{error:#}").contains("secure overwrite target"));
     assert_eq!(fs::read(&target).unwrap(), b"untouched");
 
     let hardlink = temp.path("output-hardlink.json");
     fs::hard_link(&target, &hardlink).unwrap();
     let error = run(SurfaceCommand::Services(input_args(&output, &hardlink))).unwrap_err();
-    assert!(format!("{error:#}").contains("one link"));
+    assert!(format!("{error:#}").contains("single-link"));
     assert_eq!(fs::read(&target).unwrap(), b"untouched");
 
     let public = temp.path("public-output.json");
     fs::write(&public, b"private-after-validation").unwrap();
     fs::set_permissions(&public, fs::Permissions::from_mode(0o644)).unwrap();
     let error = run(SurfaceCommand::Services(input_args(&output, &public))).unwrap_err();
-    assert!(format!("{error:#}").contains("secure output"));
+    assert!(format!("{error:#}").contains("secure overwrite target"));
     assert_eq!(fs::read(&public).unwrap(), b"private-after-validation");
 
     let fifo = temp.path("output.fifo");
     let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
     let error = run(SurfaceCommand::Services(input_args(&output, &fifo))).unwrap_err();
-    assert!(format!("{error:#}").contains("secure output"));
+    assert!(format!("{error:#}").contains("secure overwrite target"));
 }
 
 #[test]

@@ -82,7 +82,9 @@ candidate services, but it normally cannot prove which service owns a specific
 Create a catalog:
 
 ```bash
-adb shell service list -p > service-list-p.txt
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+"${ADB[@]}" shell service list -p > service-list-p.txt
 
 neutron binder-map service-list \
   --input service-list-p.txt \

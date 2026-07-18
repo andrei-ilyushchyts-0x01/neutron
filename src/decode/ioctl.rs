@@ -459,6 +459,9 @@ fn decode_binder_write_read(payload: &[u8]) -> IoctlFields {
 }
 
 fn decode_driver_scalars(payload: &[u8]) -> IoctlFields {
+    if payload.len() < 32 {
+        return IoctlFields::None;
+    }
     IoctlFields::DriverScalars {
         arg0: read_u64_at(payload, 0),
         arg1: read_u64_at(payload, 8),
@@ -468,6 +471,9 @@ fn decode_driver_scalars(payload: &[u8]) -> IoctlFields {
 }
 
 fn decode_alsa(payload: &[u8], ret: i64) -> IoctlFields {
+    if payload.len() < 16 {
+        return IoctlFields::None;
+    }
     IoctlFields::Alsa {
         compat_candidate: ret < 0,
         arg0: read_u64_at(payload, 0),
@@ -515,6 +521,15 @@ fn fd_flags_as_str(flags: u32) -> String {
 /// caller can concatenate without further glue. Returns an empty string
 /// when the family is `Unknown` AND no name/fields are populated.
 pub fn render_decoded_ioctl_json(d: &DecodedIoctl) -> String {
+    let mut out = render_decoded_ioctl_identity_json(d);
+    render_decoded_ioctl_fields_json(d, &mut out);
+    out
+}
+
+/// Render only command-derived ioctl identity. This is safe when the BPF
+/// payload read failed: family and name come from the command/fd context,
+/// while all payload-derived scalar objects remain suppressed.
+pub fn render_decoded_ioctl_identity_json(d: &DecodedIoctl) -> String {
     let mut out = String::new();
     if d.family != IoctlFamily::Unknown {
         out.push_str(r#","ioctl_family":""#);
@@ -528,6 +543,10 @@ pub fn render_decoded_ioctl_json(d: &DecodedIoctl) -> String {
         out.push_str(r#","ioctl_name":"#);
         out.push_str(&serde_json::to_string(name).expect("serializing ioctl name"));
     }
+    out
+}
+
+fn render_decoded_ioctl_fields_json(d: &DecodedIoctl, out: &mut String) {
     match &d.fields {
         IoctlFields::DmaHeapAlloc {
             len,
@@ -599,7 +618,6 @@ pub fn render_decoded_ioctl_json(d: &DecodedIoctl) -> String {
             &serde_json::to_string(&generated.fields).expect("serializing generated ioctl fields"),
         );
     }
-    out
 }
 
 #[cfg(test)]
@@ -1024,5 +1042,35 @@ mod tests {
         let json = render_decoded_ioctl_json(&alsa);
         let v: serde_json::Value = serde_json::from_str(&format!("{{\"x\":1{json}}}")).unwrap();
         assert_eq!(v["alsa"]["compat_candidate"], true);
+    }
+
+    #[test]
+    fn fixed_scalar_schemas_do_not_fabricate_fields_from_short_payloads() {
+        let kgsl_cmd = (3u32 << 30) | (16u32 << 16) | (0x09u32 << 8) | 0x2f;
+        let kgsl = decode_ioctl_with_context(
+            kgsl_cmd,
+            &[0u8; 16],
+            -22,
+            Some(FdKind::Device),
+            Some("/dev/kgsl-3d0"),
+        );
+        assert_eq!(kgsl.family, IoctlFamily::Kgsl);
+        assert_eq!(kgsl.fields, IoctlFields::None);
+        let rendered = render_decoded_ioctl_json(&kgsl);
+        assert!(!rendered.contains("arg0"));
+
+        let alsa_cmd = (3u32 << 30) | (8u32 << 16) | (0x50u32 << 8) | 0x10;
+        let alsa = decode_ioctl_with_context(
+            alsa_cmd,
+            &[0u8; 8],
+            -25,
+            Some(FdKind::Device),
+            Some("/dev/snd/pcmC0D0p"),
+        );
+        assert_eq!(alsa.family, IoctlFamily::Alsa);
+        assert_eq!(alsa.fields, IoctlFields::None);
+        let rendered = render_decoded_ioctl_json(&alsa);
+        assert!(!rendered.contains("compat_candidate"));
+        assert!(!rendered.contains("arg0"));
     }
 }

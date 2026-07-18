@@ -13,10 +13,13 @@ pub use args::{
 };
 pub use binder::{format_binder_event, format_binder_event_json, format_binder_received_json};
 pub use ioctl::{
-    decode_ioctl, decode_ioctl_with_context, format_ioctl_deep, render_decoded_ioctl_json,
-    DecodedIoctl, IoctlFamily, IoctlFields,
+    decode_ioctl, decode_ioctl_with_context, format_ioctl_deep, render_decoded_ioctl_identity_json,
+    render_decoded_ioctl_json, DecodedIoctl, IoctlFamily, IoctlFields,
 };
-pub use sockaddr::{format_sockaddr, lookup_socket_by_inode, parse_net_addr, read_socket_inode};
+pub use sockaddr::{
+    format_sockaddr, format_sockaddr_bounded, lookup_socket_by_inode, parse_net_addr,
+    read_socket_inode,
+};
 pub use syscalls::{syscall_name, syscall_nr};
 
 /// True if `nr` carries a NUL-terminated path in `data[128]`.
@@ -28,10 +31,7 @@ pub use syscalls::{syscall_name, syscall_nr};
 /// Path at args[0]: execve(221), statfs(43), symlinkat(36 — target),
 ///                  chdir(49), mount(40 — source).
 pub fn is_path_syscall(nr: i32) -> bool {
-    matches!(
-        nr,
-        56 | 48 | 439 | 79 | 78 | 34 | 35 | 281 | 437 | 221 | 43 | 36 | 49 | 40
-    )
+    neutron_common::syscall_path_arg_index(nr).is_some()
 }
 
 /// Resolve a path via `/proc/<pid>/fd/<fd>` readlink. Used as a userspace
@@ -72,6 +72,9 @@ pub struct UnixMsgControl {
 /// Decode the sendmsg/recvmsg control metadata that the BPF program stores
 /// in `data[64..100]`. Returns `None` when no control buffer was present.
 pub fn decode_unix_msg_control(ev: &SyscallEvent) -> Option<UnixMsgControl> {
+    if !neutron_common::event_payload_is_valid(ev) {
+        return None;
+    }
     let nr = { ev.syscall_nr };
     if !matches!(nr, 211 | 212) {
         return None;
@@ -104,6 +107,11 @@ pub fn format_comm(raw: &[u8; 16]) -> String {
     String::from_utf8_lossy(&raw[..end]).to_string()
 }
 
+/// Render untrusted text as a single terminal-safe visible token.
+pub fn escape_text(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
 /// Interpret `data[128]` based on `syscall_nr` and return a display string.
 ///
 /// Dispatches:
@@ -113,17 +121,23 @@ pub fn format_comm(raw: &[u8; 16]) -> String {
 /// - ioctl(29) → `format_ioctl_deep`
 /// - mmap(222)/mprotect(226) → RWX/WX marker tag
 pub fn format_data_field(ev: &SyscallEvent) -> Option<String> {
+    if !neutron_common::event_payload_is_valid(ev) {
+        return None;
+    }
     let nr = { ev.syscall_nr };
     let data = { ev.data };
+    let args = { ev.args };
 
     match nr {
         // File path syscalls
-        56 | 48 | 79 | 78 | 43 | 36 | 35 | 221 | 281 => format_data_as_path(&data),
+        nr if neutron_common::syscall_path_arg_index(nr).is_some() => format_data_as_path(&data),
         // Network sockaddr (including device alias 294 for connect)
-        200 | 203 | 206 | 294 => format_sockaddr(&data),
+        200 | 203 | 294 => format_sockaddr_bounded(&data, args[2] as usize),
+        206 => format_sockaddr_bounded(&data, args[5] as usize),
         // sendmsg/recvmsg: sockaddr from msg_name + controllen at data[64..72]
         211 | 212 => {
-            let addr = format_sockaddr(&data);
+            let namelen = u32::from_le_bytes(data[72..76].try_into().unwrap_or([0u8; 4]));
+            let addr = format_sockaddr_bounded(&data, namelen as usize);
             let ctrl = decode_unix_msg_control(ev);
             let controllen = ctrl.map(|c| c.controllen).unwrap_or(0);
             let ctrl_suffix = ctrl
@@ -254,7 +268,7 @@ mod tests {
 
     #[test]
     fn format_data_field_decodes_all_file_path_syscalls() {
-        for nr in [56, 48, 79, 78, 43, 36, 35, 221, 281] {
+        for nr in [34, 35, 36, 40, 43, 48, 49, 56, 78, 79, 221, 281, 437, 439] {
             let ev = path_event(nr, b"/system/lib/libc.so\0");
             assert_eq!(
                 format_data_field(&ev),

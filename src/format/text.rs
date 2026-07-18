@@ -1,8 +1,9 @@
 //! Human-readable text rendering of `SyscallEvent`s.
 
 use crate::decode::{
-    compute_latency_us, format_binder_event, format_comm, format_data_field, format_enter_args,
-    lookup_socket_by_inode, read_socket_inode, resolve_path_from_fd, syscall_name,
+    compute_latency_us, escape_text, format_binder_event, format_comm, format_data_field,
+    format_enter_args, lookup_socket_by_inode, read_socket_inode, resolve_path_from_fd,
+    syscall_name,
 };
 use neutron_common::SyscallEvent;
 
@@ -26,7 +27,7 @@ pub fn format_event_text_with_stack(
     let mut line = format_event_text_inner(ev, resolve_paths);
     if let Some(s) = stack {
         line.push_str(" stack=<");
-        line.push_str(s);
+        line.push_str(&escape_text(s));
         line.push('>');
     }
     line
@@ -46,9 +47,16 @@ fn format_event_text_inner(ev: &SyscallEvent, resolve_paths: bool) -> String {
     let is_enter = { ev.is_enter };
     let ret = { ev.ret };
     let args = { ev.args };
-    let comm = format_comm(&{ ev.comm });
+    let comm = escape_text(&format_comm(&{ ev.comm }));
     let name = syscall_name(syscall_nr);
     let data_info = format_data_field(ev);
+    let payload_note = if neutron_common::event_payload_read_failed(ev) {
+        " [payload-read-failed]"
+    } else if neutron_common::event_payload_unavailable(ev) {
+        " [payload-unavailable]"
+    } else {
+        ""
+    };
 
     // RWX alert prefix
     let rwx_prefix = {
@@ -63,12 +71,14 @@ fn format_event_text_inner(ev: &SyscallEvent, resolve_paths: bool) -> String {
     if is_enter == 1 {
         let args_str = format_enter_args(syscall_nr, &args);
         let base = format!(
-            "[{:>10}] {:>6}/{:<6} {:<16} {}-> {}({})",
-            ts_ms, pid, tid, comm, rwx_prefix, name, args_str,
+            "[{:>10}] {:>6}/{:<6} {:<16} {}-> {}({}){}",
+            ts_ms, pid, tid, comm, rwx_prefix, name, args_str, payload_note,
         );
         // Append data field info (path, sockaddr, ioctl, etc.)
         match data_info {
-            Some(ref d) if !d.starts_with("[!") => format!("{} \"{}\"", base, d),
+            Some(ref d) if !d.starts_with("[!") => {
+                format!("{} \"{}\"", base, escape_text(d))
+            }
             _ => base,
         }
     } else {
@@ -78,15 +88,15 @@ fn format_event_text_inner(ev: &SyscallEvent, resolve_paths: bool) -> String {
             None => String::new(),
         };
         let base = format!(
-            "[{:>10}] {:>6}/{:<6} {:<16} {}<- {} = {}{}",
-            ts_ms, pid, tid, comm, rwx_prefix, name, ret, latency_str,
+            "[{:>10}] {:>6}/{:<6} {:<16} {}<- {} = {}{}{}",
+            ts_ms, pid, tid, comm, rwx_prefix, name, ret, latency_str, payload_note,
         );
         // Resolve paths on exit: openat readlink fallback, then /proc/net for connect
         if resolve_paths && data_info.is_none() {
             // Tertiary: readlink for openat
             if syscall_nr == 56 && ret >= 0 {
                 if let Some(resolved) = resolve_path_from_fd(pid, ret) {
-                    return format!("{} \"{}\"", base, resolved);
+                    return format!("{} \"{}\"", base, escape_text(&resolved));
                 }
             }
             // Quaternary: /proc/net for connect()
@@ -95,12 +105,14 @@ fn format_event_text_inner(ev: &SyscallEvent, resolve_paths: bool) -> String {
                 if let Some(resolved) = read_socket_inode(pid, sock_fd)
                     .and_then(|inode| lookup_socket_by_inode(pid, inode))
                 {
-                    return format!("{} \"{}\"", base, resolved);
+                    return format!("{} \"{}\"", base, escape_text(&resolved));
                 }
             }
         }
         match data_info {
-            Some(ref d) if !d.starts_with("[!") => format!("{} \"{}\"", base, d),
+            Some(ref d) if !d.starts_with("[!") => {
+                format!("{} \"{}\"", base, escape_text(d))
+            }
             _ => base,
         }
     }
@@ -215,6 +227,29 @@ mod tests {
     }
 
     #[test]
+    fn text_output_escapes_control_characters_from_comm_path_and_stack() {
+        let ev = SyscallEvent {
+            syscall_nr: 56,
+            is_enter: 1,
+            pid: 42,
+            tgid: 42,
+            comm: comm_bytes("bad\n\x1bcomm"),
+            data: data_path(b"/proc/bad\n\x1b[31m\0"),
+            ..SyscallEvent::default()
+        };
+        let rendered = format_event_text_with_stack(&ev, false, Some("sym\n\x1b[2J"));
+
+        assert_eq!(
+            rendered.lines().count(),
+            1,
+            "text record split: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "terminal escape leaked");
+        assert!(rendered.contains("\\n"), "newline should be visible");
+        assert!(rendered.contains("\\u{1b}"), "ESC should be visible");
+    }
+
+    #[test]
     fn format_event_text_includes_sockaddr_for_connect() {
         let mut data = [0u8; 128];
         data[..8].copy_from_slice(&[0x02, 0x00, 0x00, 0x50, 8, 8, 8, 8]);
@@ -222,6 +257,7 @@ mod tests {
             timestamp_ns: 0,
             syscall_nr: 203, // connect
             is_enter: 1,
+            args: [3, 0, 8, 0, 0, 0],
             comm: comm_bytes("net"),
             data,
             ..SyscallEvent::default()

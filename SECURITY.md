@@ -33,14 +33,10 @@ ADB targets, automatic exploit primitives, or unbounded replay loops.
 ## Reporting a vulnerability in neutron itself
 
 If you discover a vulnerability in `neutron`'s own code (the loader, the BPF
-programs, the rule engine, build scripts, or shipped artifacts), please
-report it privately rather than opening a public issue.
-
-A private contact channel will be added in a follow-up release. In the
-meantime, open a private security advisory via GitHub's "Report a
-vulnerability" feature on the project page, or open a regular issue marked
-`[security]` and we will move the discussion to a private channel before
-disclosing details.
+programs, the rule engine, build scripts, or shipped artifacts), submit a
+[private security advisory](https://github.com/andrei-ilyushchyts-0x01/neutron/security/advisories/new).
+Do not disclose technical details outside that advisory before coordinated
+disclosure.
 
 We aim to acknowledge reports within 7 days. Please include:
 
@@ -56,7 +52,8 @@ will credit the reporter (with consent) in `CHANGELOG.md`.
 
 | Version | Status | Notes |
 |---------|--------|-------|
-| `1.4.x` | Supported | Current line. Aya 0.13, kernel 6.1+ aarch64, BTF + CO-RE. |
+| `1.5.x` | Pre-release support | Release candidates receive fixes while the device matrix is completed. |
+| `1.4.x` | Supported | Maintenance line. Aya 0.13, kernel 6.1+ aarch64, BTF + CO-RE. |
 | `< 1.4` | Unsupported | Historical releases; reproduce against the current line. |
 
 ## Out of scope

@@ -15,13 +15,15 @@
 //! # Memory bound
 //!
 //! Bounded LRU keyed by `debug_id` with a default cap of 1024 in-flight
-//! entries. When inserting would exceed the cap, the least-recently-touched
-//! entry is silently dropped (its `binder_call` event is lost — see Q4 in
-//! the design doc; surfacing evicted entries as `Unmatched` is a follow-up).
+//! entries. Evictions, unmatched receive events, and discarded causal
+//! metadata are counted so final capture health cannot silently claim a
+//! complete causal view.
 
 use std::collections::HashMap;
 
 use neutron_common::BinderCallStatus;
+
+use crate::causal::CausalMetadata;
 
 /// Default in-flight cap. ~256 bytes per entry → ~256 KB worst case.
 const DEFAULT_MAX_INFLIGHT: usize = 1024;
@@ -49,6 +51,7 @@ pub struct BinderCallEvent {
     /// callee crashed before dequeueing the transaction.
     pub received_ts_ns: Option<u64>,
     pub status: BinderCallStatus,
+    pub causal_metadata: Option<CausalMetadata>,
 }
 
 impl BinderCallEvent {
@@ -72,8 +75,18 @@ struct Inflight {
     reply: bool,
     target_node: i32,
     sent_ts_ns: u64,
+    causal_metadata: Option<CausalMetadata>,
     /// LRU tick — bumped on every operation that touches this entry.
     lru: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BinderTrackerStats {
+    pub baseline_discarded: u64,
+    pub tracker_evictions: u64,
+    pub unmatched_receives: u64,
+    pub causal_metadata_discarded: u64,
+    pub invalid_callers: u64,
 }
 
 /// Bounded LRU map of in-flight binder transactions.
@@ -82,6 +95,7 @@ pub struct BinderTracker {
     max_inflight: usize,
     inflight: HashMap<i32, Inflight>,
     tick: u64,
+    stats: BinderTrackerStats,
 }
 
 impl Default for BinderTracker {
@@ -96,6 +110,7 @@ impl BinderTracker {
             max_inflight: max_inflight.max(1),
             inflight: HashMap::new(),
             tick: 0,
+            stats: BinderTrackerStats::default(),
         }
     }
 
@@ -107,11 +122,49 @@ impl BinderTracker {
         self.inflight.len()
     }
 
+    pub fn stats(&self) -> BinderTrackerStats {
+        self.stats
+    }
+
+    /// Clear caller halves collected before a scenario evidence boundary.
+    /// These records are outside the scenario by definition, so account them
+    /// separately without turning them into in-scenario correlation loss.
+    pub fn reset_baseline(&mut self) {
+        self.stats.baseline_discarded = self
+            .stats
+            .baseline_discarded
+            .saturating_add(self.inflight.len() as u64);
+        self.inflight.clear();
+    }
+
+    /// Drop every still-unpaired transaction at a scenario or shutdown
+    /// boundary and account for the lost pair and any attached metadata.
+    pub fn discard_inflight(&mut self) {
+        let evictions = self.inflight.len() as u64;
+        let causal = self
+            .inflight
+            .values()
+            .filter(|entry| entry.causal_metadata.is_some())
+            .count() as u64;
+        self.inflight.clear();
+        self.stats.tracker_evictions = self.stats.tracker_evictions.saturating_add(evictions);
+        self.stats.causal_metadata_discarded =
+            self.stats.causal_metadata_discarded.saturating_add(causal);
+    }
+
+    fn account_eviction(&mut self, entry: &Inflight) {
+        self.stats.tracker_evictions = self.stats.tracker_evictions.saturating_add(1);
+        if entry.causal_metadata.is_some() {
+            self.stats.causal_metadata_discarded =
+                self.stats.causal_metadata_discarded.saturating_add(1);
+        }
+    }
+
     /// Record a caller-side `binder_transaction` event. `callee_pid` is the
     /// `to_proc` field from the BPF-decoded args. `debug_id == 0` is treated
-    /// as "no usable id" and silently dropped (the kernel has been observed
-    /// to emit `0` on early-init paths before the binder driver assigned an
-    /// id; we cannot pair those).
+    /// as "no usable id" and counted as an invalid caller (the kernel has
+    /// been observed to emit `0` on early-init paths before the binder driver
+    /// assigned an id; we cannot pair those).
     #[allow(clippy::too_many_arguments)]
     pub fn record_caller(
         &mut self,
@@ -125,8 +178,14 @@ impl BinderTracker {
         reply: bool,
         target_node: i32,
         sent_ts_ns: u64,
+        causal_metadata: Option<CausalMetadata>,
     ) {
         if debug_id == 0 || caller_pid == 0 {
+            self.stats.invalid_callers = self.stats.invalid_callers.saturating_add(1);
+            if causal_metadata.is_some() {
+                self.stats.causal_metadata_discarded =
+                    self.stats.causal_metadata_discarded.saturating_add(1);
+            }
             return;
         }
         self.tick = self.tick.wrapping_add(1);
@@ -140,9 +199,12 @@ impl BinderTracker {
             reply,
             target_node,
             sent_ts_ns,
+            causal_metadata,
             lru: self.tick,
         };
-        self.inflight.insert(debug_id, entry);
+        if let Some(replaced) = self.inflight.insert(debug_id, entry) {
+            self.account_eviction(&replaced);
+        }
         // Evict LRU until within cap.
         while self.inflight.len() > self.max_inflight {
             if let Some(victim) = self
@@ -151,7 +213,9 @@ impl BinderTracker {
                 .min_by_key(|(_, v)| v.lru)
                 .map(|(k, _)| *k)
             {
-                self.inflight.remove(&victim);
+                if let Some(evicted) = self.inflight.remove(&victim) {
+                    self.account_eviction(&evicted);
+                }
             } else {
                 break;
             }
@@ -168,9 +232,13 @@ impl BinderTracker {
         received_ts_ns: u64,
     ) -> Option<BinderCallEvent> {
         if debug_id == 0 {
+            self.stats.unmatched_receives = self.stats.unmatched_receives.saturating_add(1);
             return None;
         }
-        let inflight = self.inflight.remove(&debug_id)?;
+        let Some(inflight) = self.inflight.remove(&debug_id) else {
+            self.stats.unmatched_receives = self.stats.unmatched_receives.saturating_add(1);
+            return None;
+        };
         Some(BinderCallEvent {
             debug_id,
             caller_pid: inflight.caller_pid,
@@ -184,6 +252,7 @@ impl BinderTracker {
             sent_ts_ns: inflight.sent_ts_ns,
             received_ts_ns: Some(received_ts_ns),
             status: BinderCallStatus::Completed,
+            causal_metadata: inflight.causal_metadata,
         })
     }
 
@@ -216,6 +285,7 @@ impl BinderTracker {
                     sent_ts_ns: entry.sent_ts_ns,
                     received_ts_ns: None,
                     status: BinderCallStatus::CalleeCrashed,
+                    causal_metadata: entry.causal_metadata,
                 });
             }
         }
@@ -228,7 +298,9 @@ mod tests {
     use super::*;
 
     fn record_call(t: &mut BinderTracker, debug_id: i32, caller: u32, callee: u32, ts: u64) {
-        t.record_caller(debug_id, caller, 1000, "caller", callee, 7, 0, false, 0, ts);
+        t.record_caller(
+            debug_id, caller, 1000, "caller", callee, 7, 0, false, 0, ts, None,
+        );
     }
 
     #[test]
@@ -250,14 +322,50 @@ mod tests {
         let mut t = BinderTracker::new(64);
         // Receive without a prior caller record (caller-side was filtered).
         assert!(t.record_received(99, 1_000_000).is_none());
+        assert_eq!(t.stats().unmatched_receives, 1);
     }
 
     #[test]
-    fn debug_id_zero_is_dropped_on_both_sides() {
+    fn invalid_caller_identifiers_and_zero_receive_are_counted() {
         let mut t = BinderTracker::new(64);
         record_call(&mut t, 0, 100, 200, 1_000_000);
+        record_call(&mut t, 1, 0, 200, 1_000_001);
         assert_eq!(t.inflight_count(), 0);
         assert!(t.record_received(0, 1_000_000).is_none());
+        assert_eq!(t.stats().invalid_callers, 2);
+        assert_eq!(t.stats().unmatched_receives, 1);
+    }
+
+    #[test]
+    fn completed_pair_carries_causal_metadata_without_discard() {
+        let metadata = crate::causal::CausalMetadata {
+            scenario_id: "scenario".into(),
+            trace_id: 1,
+            span_id: 2,
+            parent_span_id: 0,
+            depth: 0,
+            relation: crate::causal::CausalRelation::Exact,
+            root_package: Some("com.example".into()),
+            root_uid: Some(10123),
+        };
+        let mut t = BinderTracker::new(64);
+        t.record_caller(
+            7,
+            100,
+            10123,
+            "caller",
+            200,
+            8,
+            0,
+            false,
+            0,
+            1_000,
+            Some(metadata.clone()),
+        );
+
+        let pair = t.record_received(7, 2_000).expect("pair matches");
+        assert_eq!(pair.causal_metadata, Some(metadata));
+        assert_eq!(t.stats().causal_metadata_discarded, 0);
     }
 
     #[test]
@@ -290,6 +398,56 @@ mod tests {
         );
         assert!(t.record_received(2, 0).is_some());
         assert!(t.record_received(3, 0).is_some());
+        assert_eq!(t.stats().tracker_evictions, 1);
+    }
+
+    #[test]
+    fn evicted_causal_metadata_is_counted_and_tracker_clear_is_bounded() {
+        let metadata = crate::causal::CausalMetadata {
+            scenario_id: "scenario".into(),
+            trace_id: 1,
+            span_id: 2,
+            parent_span_id: 0,
+            depth: 0,
+            relation: crate::causal::CausalRelation::Exact,
+            root_package: Some("com.example".into()),
+            root_uid: Some(10123),
+        };
+        let mut t = BinderTracker::new(1);
+        t.record_caller(
+            1,
+            100,
+            10123,
+            "caller",
+            200,
+            7,
+            0,
+            false,
+            0,
+            1_000,
+            Some(metadata.clone()),
+        );
+        t.record_caller(
+            2,
+            100,
+            10123,
+            "caller",
+            200,
+            8,
+            0,
+            false,
+            0,
+            2_000,
+            Some(metadata),
+        );
+        assert_eq!(t.inflight_count(), 1);
+        assert_eq!(t.stats().tracker_evictions, 1);
+        assert_eq!(t.stats().causal_metadata_discarded, 1);
+
+        t.discard_inflight();
+        assert_eq!(t.inflight_count(), 0);
+        assert_eq!(t.stats().tracker_evictions, 2);
+        assert_eq!(t.stats().causal_metadata_discarded, 2);
     }
 
     #[test]
@@ -304,7 +462,7 @@ mod tests {
     #[test]
     fn crashed_pair_carries_caller_metadata() {
         let mut t = BinderTracker::new(64);
-        t.record_caller(7, 100, 1000, "myapp", 200, 13, 1, false, 5, 1_000_000);
+        t.record_caller(7, 100, 1000, "myapp", 200, 13, 1, false, 5, 1_000_000, None);
         let drained = t.on_callee_crash(200);
         assert_eq!(drained.len(), 1);
         let p = &drained[0];

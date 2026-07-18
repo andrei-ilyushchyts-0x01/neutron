@@ -13,8 +13,8 @@
 //! - BTF + CO-RE compatible (Aya performs runtime BTF relocation).
 //! - Optional stack traces via the `stacks` feature, `bpf_get_stackid`, and
 //!   `BPF_MAP_TYPE_STACK_TRACE`.
-//! - Output via BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`, kernel 5.8+) — single
-//!   multi-producer ring, lossless, no per-CPU juggling.
+//! - Output via a bounded BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`, kernel
+//!   5.8+) with explicit reserve-failure accounting.
 //!
 //! `SyscallEvent` is `#[repr(C, packed)]`, so all field accesses go through
 //! `addr_of!` / `addr_of_mut!` and `write_unaligned` / `read_unaligned`.
@@ -36,30 +36,64 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use neutron_common::{
-    causal_admission_boundary_exit, causal_pid_action, encode_causal_relation_depth,
-    is_state_tracking_nr, ret_matches_class, ExitSource, ProcessTraceContext, SyscallEvent,
-    TraceReason, CAUSAL_PID_ADMIT_ROOT, CAUSAL_PID_FALLTHROUGH, CAUSAL_PID_MATCH,
+    bpf_build_id_from_git_hex, causal_admission_boundary_exit, causal_pid_action,
+    encode_causal_relation_depth, is_state_tracking_nr, ret_matches_class, BpfAbiMetadata,
+    ExitSource, ProcessTraceContext, SyscallEvent, TraceReason, BPF_ABI_MAGIC, BPF_ABI_MAJOR,
+    BPF_ABI_MINOR, BPF_FEATURE_BINDER_TRACE, BPF_FEATURE_PER_CPU_HEALTH, BPF_FEATURE_PROCESS_EXIT,
+    BPF_FEATURE_SYSCALL_TRACE, CAUSAL_PID_ADMIT_ROOT, CAUSAL_PID_FALLTHROUGH, CAUSAL_PID_MATCH,
     CAUSAL_RELATION_EXACT, CAUSAL_RELATION_INFERRED, COUNTER_BINDER_DEPTH_LIMIT,
     COUNTER_BINDER_FOLLOW_FAILED, COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT, COUNTER_EVENTS_SUBMITTED,
-    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
-    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_THREAD_CONTEXT_UPDATE_FAILED,
-    COUNTER_TRACED_PROCESS_LIMIT, COUNTER_UNIX_MSG_CONTROL_NESTED,
-    COUNTER_UNIX_MSG_CONTROL_TRUNCATED, FILTER_KEY_ACTIVE, FILTER_KEY_ARG_U32_OFF,
-    FILTER_KEY_CAUSAL_MODE, FILTER_KEY_FOLLOW_BINDER, FILTER_KEY_IOCTL_DIR,
+    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED,
+    COUNTER_IOCTL_PAYLOAD_TRUNCATED, COUNTER_IOCTL_REFRESH_MISSED, COUNTER_PATH_READ_FAILED,
+    COUNTER_PATH_TRUNCATED, COUNTER_PAYLOAD_READ_FAILED, COUNTER_RINGBUF_RESERVE_FAILED,
+    COUNTER_SLOT_COUNT, COUNTER_THREAD_CONTEXT_UPDATE_FAILED, COUNTER_TRACED_PROCESS_LIMIT,
+    COUNTER_TRACEPOINT_READ_FAILED, COUNTER_UNIX_MSG_CONTROL_NESTED,
+    COUNTER_UNIX_MSG_CONTROL_TRUNCATED, EVENT_FLAG_IOCTL_EXIT_REFRESHED,
+    EVENT_FLAG_PAYLOAD_READ_FAILED, EVENT_FLAG_PAYLOAD_UNAVAILABLE, FILTER_KEY_ACTIVE,
+    FILTER_KEY_ARG_U32_OFF, FILTER_KEY_CAUSAL_MODE, FILTER_KEY_FOLLOW_BINDER, FILTER_KEY_IOCTL_DIR,
     FILTER_KEY_LATENCY_MIN_US, FILTER_KEY_MATCH_BITS, FILTER_KEY_MAX_DEPTH, FILTER_KEY_PID,
     FILTER_KEY_RET_CLASS, FILTER_KEY_ROOT_UID, FILTER_KEY_ROOT_UID_ACTIVE,
     FILTER_KEY_ROOT_UID_ADMIT, FILTER_KEY_STATE_EMIT_REQUIRED, FILTER_MAP_SLOT_COUNT,
     MATCH_BIT_ARG_U32, MATCH_BIT_IOCTL_CMD, MATCH_BIT_IOCTL_DIR, MATCH_BIT_IOCTL_NR,
     MATCH_BIT_IOCTL_TYPE, MATCH_BIT_LATENCY, MATCH_BIT_RET, MATCH_BIT_UID,
-    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT,
+    SYSCALL_NR_BINDER_RECEIVED, SYSCALL_NR_PROCESS_EXIT, TRACEPOINT_BINDER_CODE_OFFSET as BT_CODE,
+    TRACEPOINT_BINDER_DEBUG_ID_OFFSET as BT_DEBUG_ID, TRACEPOINT_BINDER_FLAGS_OFFSET as BT_FLAGS,
+    TRACEPOINT_BINDER_RECEIVED_DEBUG_ID_OFFSET as BTR_DEBUG_ID,
+    TRACEPOINT_BINDER_REPLY_OFFSET as BT_REPLY,
+    TRACEPOINT_BINDER_TARGET_NODE_OFFSET as BT_TARGET_NODE,
+    TRACEPOINT_BINDER_TO_PROC_OFFSET as BT_TO_PROC,
+    TRACEPOINT_BINDER_TO_THREAD_OFFSET as BT_TO_THREAD,
+    TRACEPOINT_SCHED_EXIT_COMM_OFFSET as SCHED_EXIT_COMM,
+    TRACEPOINT_SCHED_EXIT_PID_OFFSET as SCHED_EXIT_PID,
+    TRACEPOINT_SYS_ENTER_ARGS_OFFSET as SYS_ENTER_ARGS,
+    TRACEPOINT_SYS_ENTER_ID_OFFSET as SYS_ENTER_ID, TRACEPOINT_SYS_EXIT_ID_OFFSET as SYS_EXIT_ID,
+    TRACEPOINT_SYS_EXIT_RET_OFFSET as SYS_EXIT_RET,
 };
 #[cfg(feature = "stacks")]
-use neutron_common::{COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED};
+use neutron_common::{BPF_FEATURE_STACKS, COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED};
 
-// COUNTER_PATH_READ_FAILED and COUNTER_PATH_TRUNCATED slot indices are reserved
-// in neutron-common but not yet incremented here — wiring per-call-site error
-// inspection through `capture_syscall_data` adds branches to a verifier-hot
-// path and is deferred to a follow-up. Userspace already knows about the slots.
+const BASE_BPF_FEATURES: u64 = BPF_FEATURE_SYSCALL_TRACE
+    | BPF_FEATURE_BINDER_TRACE
+    | BPF_FEATURE_PER_CPU_HEALTH
+    | BPF_FEATURE_PROCESS_EXIT;
+#[cfg(feature = "stacks")]
+const BPF_FEATURES: u64 = BASE_BPF_FEATURES | BPF_FEATURE_STACKS;
+#[cfg(not(feature = "stacks"))]
+const BPF_FEATURES: u64 = BASE_BPF_FEATURES;
+
+/// Kept in an Aya-ignored custom ELF section so userspace can reject a stale
+/// or mismatched object before any map is created or program is attached.
+#[used]
+#[link_section = ".neutron_abi"]
+static NEUTRON_BPF_ABI: [u8; neutron_common::BPF_ABI_ENCODED_SIZE] = BpfAbiMetadata {
+    magic: BPF_ABI_MAGIC,
+    abi_major: BPF_ABI_MAJOR,
+    abi_minor: BPF_ABI_MINOR,
+    syscall_event_size: size_of::<SyscallEvent>() as u32,
+    feature_bits: BPF_FEATURES,
+    build_id: bpf_build_id_from_git_hex(option_env!("NEUTRON_GIT_COMMIT")),
+}
+.encode();
 
 // ── Maps ─────────────────────────────────────────────────────────────────────
 
@@ -103,13 +137,21 @@ static SYSCALL_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 #[map]
 static PID_WHITELIST: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
 
+/// Explicit target PIDs that have exited during this capture. The static
+/// CONFIG target is intentionally immutable, so this guard prevents a later
+/// PID reuse from being accepted even if the process-exit ring record itself
+/// cannot reach userspace.
+#[map]
+static EXITED_TARGET_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
+
 /// Dynamic causal set. Userspace overrides max_entries at load time from
 /// `--max-processes`; Binder propagation updates it before publishing events.
 #[map]
 static TRACED_PROCESSES: HashMap<u32, ProcessTraceContext> = HashMap::with_max_entries(64, 0);
 
-/// Process IDs that must not be admitted as Binder followers. Userspace seeds
-/// this from explicit `--follow-deny-domain` policy before tracepoints attach.
+/// Reserved pre-attachment follower deny set. The 1.5 CLI leaves this empty
+/// and rejects domain-policy flags because it cannot enforce them safely at
+/// first-event admission.
 #[map]
 static BINDER_FOLLOW_DENY_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 
@@ -207,26 +249,38 @@ static IOCTL_REFRESH_CMD_SET: HashMap<u32, u8> = HashMap::with_max_entries(64, 0
 #[map]
 static IOCTL_REFRESH_TYPE_SET: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 
-/// Capture-health counters. Slot indices are defined in `neutron_common::COUNTER_*`.
-/// Userspace polls this map periodically and prints a capture summary on exit.
-/// Values are u64 monotonic counters; the BPF programs increment them via the
-/// `bump_counter` helper (one helper call per degraded path).
+/// Capture-health counters. Each CPU owns its own monotonic `u64` slot, so the
+/// loss-accounting path cannot itself lose cross-CPU read/add/write updates.
+/// Userspace must aggregate every CPU for each `COUNTER_*` index.
 #[map]
-static COUNTERS: Array<u64> = Array::with_max_entries(COUNTER_SLOT_COUNT, 0);
+static COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(COUNTER_SLOT_COUNT, 0);
 
 #[inline(always)]
 fn bump_counter(idx: u32) {
     if let Some(slot) = COUNTERS.get_ptr_mut(idx) {
-        // SAFETY: `slot` points to a u64 inside the BPF array map. Concurrent
-        // writes from other CPUs are tolerated — counters are best-effort. We
-        // accept a non-atomic add: the verifier accepts read+add+write through
-        // a map pointer and the worst-case under contention is a lost update,
-        // not memory corruption.
+        // SAFETY: `slot` points to this CPU's u64 in the per-CPU array. A
+        // tracepoint program does not migrate CPUs while executing, so no
+        // cross-CPU writer aliases this value.
         unsafe {
             let cur = core::ptr::read_unaligned(slot);
             core::ptr::write_unaligned(slot, cur.wrapping_add(1));
         }
     }
+}
+
+/// Read one required field from a tracepoint context. Doctor validates the
+/// static layout before attach, but a runtime helper failure still invalidates
+/// the affected event and must be represented in capture health.
+macro_rules! required_tracepoint_field {
+    ($ctx:expr, $ty:ty, $offset:expr) => {
+        match unsafe { $ctx.read_at::<$ty>($offset) } {
+            Ok(value) => value,
+            Err(_) => {
+                bump_counter(COUNTER_TRACEPOINT_READ_FAILED);
+                return Err(());
+            }
+        }
+    };
 }
 
 #[inline(always)]
@@ -243,33 +297,6 @@ fn ioctl_refresh_enabled(cmd: u32) -> bool {
     }
     false
 }
-
-// ── Tracepoint field offsets (raw_syscalls/sys_*) ────────────────────────────
-
-// Common header is 8 bytes (type:2 + flags:1 + preempt:1 + pid:4).
-// raw_syscalls/sys_enter: id (long) at +8, args[6] (unsigned long) at +16..+64.
-// raw_syscalls/sys_exit:  id (long) at +8, ret (long) at +16.
-const SYS_ENTER_ID: usize = 8;
-const SYS_ENTER_ARGS: usize = 16;
-const SYS_EXIT_ID: usize = 8;
-const SYS_EXIT_RET: usize = 16;
-
-// binder/binder_transaction tracepoint:
-//   debug_id (s32)    @ +8     target_node (s32) @ +12
-//   to_proc (s32)     @ +16    to_thread (s32)   @ +20
-//   reply (s32)       @ +24    code (u32)        @ +28
-//   flags (u32)       @ +32
-const BT_DEBUG_ID: usize = 8;
-const BT_TARGET_NODE: usize = 12;
-const BT_TO_PROC: usize = 16;
-const BT_TO_THREAD: usize = 20;
-const BT_REPLY: usize = 24;
-const BT_CODE: usize = 28;
-const BT_FLAGS: usize = 32;
-
-// binder/binder_transaction_received tracepoint:
-//   debug_id (s32)    @ +8
-const BTR_DEBUG_ID: usize = 8;
 
 // ── Common filter helpers ────────────────────────────────────────────────────
 
@@ -377,7 +404,7 @@ fn pid_matches(userspace_pid: u32) -> bool {
         None => return false,
     };
     if target != 0 && target == userspace_pid {
-        return true;
+        return unsafe { EXITED_TARGET_PIDS.get(&userspace_pid).is_none() };
     }
     // SAFETY: `HashMap::get` borrows into kernel map memory; we discard the
     // borrow immediately, so no aliasing concern.
@@ -503,6 +530,9 @@ fn ioctl_matches_predicate(cmd: u32, payload_ptr: *const u8) -> bool {
         if off > 120 {
             return false;
         }
+        if off.saturating_add(4) > bounded_ioctl_payload_len(cmd) as u32 {
+            return false;
+        }
         let mut buf = [0u8; 4];
         // SAFETY: `payload_ptr` is the address of the captured `data[4..]`
         // window inside the on-stack `SyscallEvent`. `off + 4 <= 124` is
@@ -511,6 +541,7 @@ fn ioctl_matches_predicate(cmd: u32, payload_ptr: *const u8) -> bool {
         // `try_sys_enter` for the population path.
         let src = unsafe { payload_ptr.add(off as usize) };
         if unsafe { bpf_probe_read_kernel_buf(src, &mut buf) }.is_err() {
+            bump_counter(COUNTER_PAYLOAD_READ_FAILED);
             return false;
         }
         let v = u32::from_le_bytes(buf);
@@ -536,6 +567,12 @@ fn enter_predicate_match(nr: i32, uid: u32, ev: *const SyscallEvent) -> bool {
         // `capture_syscall_data`. `data` is a `[u8; 128]` inside that struct;
         // `data[4..]` is the captured arg snapshot.
         let cmd = unsafe { core::ptr::addr_of!((*ev).args).read_unaligned() }[1] as u32;
+        let reserved = unsafe { core::ptr::addr_of!((*ev)._reserved).read_unaligned() };
+        if match_active(MATCH_BIT_ARG_U32)
+            && reserved[0] & (EVENT_FLAG_PAYLOAD_READ_FAILED | EVENT_FLAG_PAYLOAD_UNAVAILABLE) != 0
+        {
+            return false;
+        }
         let payload_ptr = unsafe { (core::ptr::addr_of!((*ev).data) as *const u8).add(4) };
         if !ioctl_matches_predicate(cmd, payload_ptr) {
             return false;
@@ -727,6 +764,18 @@ unsafe fn reserved_write_u8(ev: *mut SyscallEvent, off: usize, v: u8) {
 }
 
 #[inline(always)]
+unsafe fn mark_payload_read_failed(ev: *mut SyscallEvent) {
+    let flags = reserved_ptr(ev, 0);
+    *flags |= EVENT_FLAG_PAYLOAD_READ_FAILED;
+}
+
+#[inline(always)]
+unsafe fn mark_payload_unavailable(ev: *mut SyscallEvent) {
+    let flags = reserved_ptr(ev, 0);
+    *flags |= EVENT_FLAG_PAYLOAD_UNAVAILABLE;
+}
+
+#[inline(always)]
 unsafe fn reserved_write_u32(ev: *mut SyscallEvent, off: usize, value: u32) {
     let bytes = value.to_le_bytes();
     reserved_write_u8(ev, off, bytes[0]);
@@ -878,6 +927,43 @@ unsafe fn data_slice(ev: *mut SyscallEvent, off: usize, len: usize) -> &'static 
     core::slice::from_raw_parts_mut(data_ptr(ev, off), len)
 }
 
+/// Capture a bounded user string and account for both unreadable and truncated
+/// values. Aya excludes the NUL from the returned slice, so a 127-byte result
+/// means the 128-byte destination was filled.
+#[inline(always)]
+unsafe fn capture_user_path(ev: *mut SyscallEvent, ptr: u64, dst: &mut [u8]) {
+    match bpf_probe_read_user_str_bytes(ptr as *const u8, dst) {
+        Ok(bytes) => {
+            if bytes.len().saturating_add(1) >= dst.len() {
+                bump_counter(COUNTER_PATH_TRUNCATED);
+            }
+        }
+        Err(_) => {
+            mark_payload_read_failed(ev);
+            bump_counter(COUNTER_PATH_READ_FAILED);
+        }
+    }
+}
+
+/// Read a bounded user payload and make any failure visible in final capture
+/// health. Callers must derive `dst.len()` from an ABI-declared bound rather
+/// than from Neutron's destination capacity alone.
+#[inline(always)]
+unsafe fn capture_user_bytes(ev: *mut SyscallEvent, ptr: u64, dst: &mut [u8]) -> bool {
+    if bpf_probe_read_user_buf(ptr as *const u8, dst).is_ok() {
+        true
+    } else {
+        mark_payload_read_failed(ev);
+        bump_counter(COUNTER_PAYLOAD_READ_FAILED);
+        false
+    }
+}
+
+#[inline(always)]
+fn bounded_ioctl_payload_len(cmd: u32) -> usize {
+    (neutron_common::ioctl_size(cmd) as usize).min(124)
+}
+
 // ── Per-syscall data capture ────────────────────────────────────────────────
 //
 // Mirrors `capture_syscall_data` in `bpf/syscall_tracer.bpf.c`. Operates on
@@ -886,42 +972,15 @@ unsafe fn data_slice(ev: *mut SyscallEvent, off: usize, len: usize) -> &'static 
 // kernel-space helper 113 is used for memory we know is in kernel space.
 #[inline(always)]
 unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) {
-    // File-path syscalls with path at args[1]:
-    //   openat(56), faccessat(48), faccessat2(439), fstatat(79), readlinkat(78),
-    //   mkdirat(34), unlinkat(35), execveat(281), openat2(437).
-    //
-    // Note: the v0.1.0-legacy table mistakenly believed 35=mkdirat / 36=unlinkat.
-    // Authoritative aarch64 numbers: mkdirat=34, unlinkat=35, symlinkat=36.
-    // symlinkat takes path at args[0] (target) — handled below.
-    if matches!(nr, 56 | 48 | 79 | 78 | 34 | 35 | 281 | 437 | 439) {
-        let ptr = args[1];
+    // The producer and userspace decoder share this aarch64 path table.
+    if let Some(arg_index) = neutron_common::syscall_path_arg_index(nr) {
+        let ptr = args[arg_index];
         addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
         if ptr != 0 {
             let dst = data_slice(ev, 0, 128);
-            let _ = bpf_probe_read_user_str_bytes(ptr as *const u8, dst);
-        }
-        return;
-    }
-
-    // File-path syscalls with path at args[0]:
-    //   execve(221), statfs(43), symlinkat(36 — target), chdir(49), mount(40 — source).
-    if matches!(nr, 221 | 43 | 36 | 49 | 40) {
-        let ptr = args[0];
-        addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
-        if ptr != 0 {
-            let dst = data_slice(ev, 0, 128);
-            let _ = bpf_probe_read_user_str_bytes(ptr as *const u8, dst);
-        }
-        return;
-    }
-
-    // execveat(281): filename in args[1]
-    if nr == 281 {
-        let ptr = args[1];
-        addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
-        if ptr != 0 {
-            let dst = data_slice(ev, 0, 128);
-            let _ = bpf_probe_read_user_str_bytes(ptr as *const u8, dst);
+            capture_user_path(ev, ptr, dst);
+        } else {
+            mark_payload_unavailable(ev);
         }
         return;
     }
@@ -930,15 +989,23 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
     // Pack: data[0..4] = cmd (u32 LE), data[4..128] = first 124 bytes of arg.
     if nr == 29 {
         let cmd = args[1] as u32;
+        if neutron_common::ioctl_size(cmd) > 124 {
+            bump_counter(COUNTER_IOCTL_PAYLOAD_TRUNCATED);
+        }
         let bytes = cmd.to_le_bytes();
         data_write_u8(ev, 0, bytes[0]);
         data_write_u8(ev, 1, bytes[1]);
         data_write_u8(ev, 2, bytes[2]);
         data_write_u8(ev, 3, bytes[3]);
         let ptr = args[2];
-        if ptr != 0 {
-            let dst = data_slice(ev, 4, 124);
-            let _ = bpf_probe_read_user_buf(ptr as *const u8, dst);
+        let len = bounded_ioctl_payload_len(cmd);
+        if len != 0 {
+            if ptr != 0 {
+                let dst = data_slice(ev, 4, len);
+                capture_user_bytes(ev, ptr, dst);
+            } else {
+                mark_payload_unavailable(ev);
+            }
         }
         return;
     }
@@ -947,9 +1014,14 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
     if matches!(nr, 203 | 200) {
         let ptr = args[1];
         addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
-        if ptr != 0 {
-            let dst = data_slice(ev, 0, 128);
-            let _ = bpf_probe_read_user_buf(ptr as *const u8, dst);
+        let len = (args[2] as usize).min(128);
+        if len != 0 {
+            if ptr != 0 {
+                let dst = data_slice(ev, 0, len);
+                capture_user_bytes(ev, ptr, dst);
+            } else {
+                mark_payload_unavailable(ev);
+            }
         }
         return;
     }
@@ -958,9 +1030,14 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
     if nr == 206 {
         let ptr = args[4];
         addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
-        if ptr != 0 {
-            let dst = data_slice(ev, 0, 128);
-            let _ = bpf_probe_read_user_buf(ptr as *const u8, dst);
+        let len = (args[5] as usize).min(128);
+        if len != 0 {
+            if ptr != 0 {
+                let dst = data_slice(ev, 0, len);
+                capture_user_bytes(ev, ptr, dst);
+            } else {
+                mark_payload_unavailable(ev);
+            }
         }
         return;
     }
@@ -983,13 +1060,14 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
         let ptr = args[1];
         addr_of_mut!((*ev).ptr_hint).write_unaligned(ptr);
         if ptr == 0 {
+            mark_payload_unavailable(ev);
             return;
         }
         // Read msg_name (8B pointer) + msg_namelen (4B) + 4B pad in one shot
         // into a stack scratch.
         let mut hdr_head_buf = MaybeUninit::<[u8; 16]>::uninit();
         let hdr_head = &mut *hdr_head_buf.as_mut_ptr();
-        if bpf_probe_read_user_buf(ptr as *const u8, hdr_head).is_err() {
+        if !capture_user_bytes(ev, ptr, hdr_head) {
             return;
         }
         let name_ptr = u64::from_le_bytes([
@@ -1003,15 +1081,19 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
             hdr_head[7],
         ]);
         let namelen = u32::from_le_bytes([hdr_head[8], hdr_head[9], hdr_head[10], hdr_head[11]]);
+        data_write_u32(ev, 72, namelen);
         if name_ptr != 0 && namelen >= 2 {
             // Constant 28 = max sockaddr_in6.
-            let dst = data_slice(ev, 0, 28);
-            let _ = bpf_probe_read_user_buf(name_ptr as *const u8, dst);
+            let len = (namelen as usize).min(28);
+            let dst = data_slice(ev, 0, len);
+            capture_user_bytes(ev, name_ptr, dst);
+        } else if name_ptr == 0 && namelen != 0 {
+            mark_payload_unavailable(ev);
         }
         // Read msg_control pointer + msg_controllen into stack scratch.
         let mut hdr_ctl_buf = MaybeUninit::<[u8; 16]>::uninit();
         let hdr_ctl = &mut *hdr_ctl_buf.as_mut_ptr();
-        if bpf_probe_read_user_buf((ptr + 32) as *const u8, hdr_ctl).is_err() {
+        if !capture_user_bytes(ev, ptr.saturating_add(32), hdr_ctl) {
             bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
             return;
         }
@@ -1034,12 +1116,13 @@ unsafe fn capture_syscall_data(ev: *mut SyscallEvent, nr: i32, args: &[u64; 6]) 
             return;
         }
         if control_ptr == 0 || controllen < 16 {
+            mark_payload_unavailable(ev);
             bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
             return;
         }
         let mut cmsg_buf = MaybeUninit::<[u8; 16]>::uninit();
         let cmsg = &mut *cmsg_buf.as_mut_ptr();
-        if bpf_probe_read_user_buf(control_ptr as *const u8, cmsg).is_err() {
+        if !capture_user_bytes(ev, control_ptr, cmsg) {
             bump_counter(COUNTER_UNIX_MSG_CONTROL_TRUNCATED);
             return;
         }
@@ -1156,10 +1239,8 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
     }
     mark_admitted_thread_enter(pid_tgid, userspace_pid);
 
-    let nr = match unsafe { ctx.read_at::<i64>(SYS_ENTER_ID) } {
-        Ok(v) => v as i32,
-        Err(_) => return Err(()),
-    };
+    let nr = required_tracepoint_field!(ctx, i64, SYS_ENTER_ID) as i32;
+    let args = required_tracepoint_field!(ctx, [u64; 6], SYS_ENTER_ARGS);
 
     // CRITICAL: do NOT return early on a failed syscall_allowed() here. The
     // INFLIGHT update below is the source of truth for exit-time predicates
@@ -1169,7 +1250,7 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
 
     // Build the event on stack first — we need to (a) insert it into INFLIGHT
     // for sys_exit correlation, and (b) submit a copy through the ring buffer.
-    // The redundant 241-byte memcpy into the ring entry is trivial.
+    // The redundant 257-byte copy into the ring entry is bounded and explicit.
     let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();
     let ev = unsafe { addr_of_mut!((*ev_buf.as_mut_ptr()).event) };
 
@@ -1189,7 +1270,6 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
 
         // Read the six syscall args from the tracepoint context and stamp
         // them into the event in one packed write.
-        let args = ctx.read_at::<[u64; 6]>(SYS_ENTER_ARGS).unwrap_or([0u64; 6]);
         addr_of_mut!((*ev).args).write_unaligned(args);
 
         // comm[16] — direct write from the helper-returned array.
@@ -1261,11 +1341,21 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
     }
 
     let nr = match unsafe { ctx.read_at::<i64>(SYS_EXIT_ID) } {
-        Ok(v) => v as i32,
-        Err(_) => return Err(()),
+        Ok(value) => value as i32,
+        Err(_) => {
+            bump_counter(COUNTER_TRACEPOINT_READ_FAILED);
+            let _ = INFLIGHT.remove(&pid_tgid);
+            return Err(());
+        }
     };
-
-    let ret = unsafe { ctx.read_at::<i64>(SYS_EXIT_RET) }.unwrap_or(0);
+    let ret = match unsafe { ctx.read_at::<i64>(SYS_EXIT_RET) } {
+        Ok(value) => value,
+        Err(_) => {
+            bump_counter(COUNTER_TRACEPOINT_READ_FAILED);
+            let _ = INFLIGHT.remove(&pid_tgid);
+            return Err(());
+        }
+    };
     let now = unsafe { bpf_ktime_get_ns() };
     let uid_now = bpf_get_current_uid_gid() as u32;
 
@@ -1332,7 +1422,10 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
             // kernel-space helper for a guaranteed bounded copy with EFAULT
             // handling.
             let dst = data_slice(ev, 0, 128);
-            let _ = bpf_probe_read_kernel_buf(addr_of!((*saved).data) as *const u8, dst);
+            if bpf_probe_read_kernel_buf(addr_of!((*saved).data) as *const u8, dst).is_err() {
+                mark_payload_read_failed(ev);
+                bump_counter(COUNTER_PAYLOAD_READ_FAILED);
+            }
 
             let _ = INFLIGHT.remove(&pid_tgid);
 
@@ -1356,10 +1449,22 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
                 // than re-reading data[0..4] so we avoid additional pointer
                 // arithmetic the verifier would have to track.
                 let cmd = saved_args[1] as u32;
+                let cmd_bytes = cmd.to_le_bytes();
+                data_write_u8(ev, 0, cmd_bytes[0]);
+                data_write_u8(ev, 1, cmd_bytes[1]);
+                data_write_u8(ev, 2, cmd_bytes[2]);
+                data_write_u8(ev, 3, cmd_bytes[3]);
                 if ioctl_refresh_enabled(cmd) {
-                    let dst = data_slice(ev, 4, 124);
-                    let _ = bpf_probe_read_user_buf(saved_ptr_hint as *const u8, dst);
-                    reserved_write_u8(ev, 0, 1);
+                    let len = bounded_ioctl_payload_len(cmd);
+                    if len != 0 {
+                        let dst = data_slice(ev, 4, len);
+                        if capture_user_bytes(ev, saved_ptr_hint, dst) {
+                            // Only advertise post-exit data after a successful
+                            // bounded re-read. Failed reads leave the enter
+                            // snapshot and globally degrade capture health.
+                            reserved_write_u8(ev, 0, EVENT_FLAG_IOCTL_EXIT_REFRESHED);
+                        }
+                    }
                 } else if neutron_common::ioctl_runtime_refresh_candidate(cmd) {
                     bump_counter(COUNTER_IOCTL_REFRESH_MISSED);
                 }
@@ -1410,16 +1515,15 @@ fn try_binder(ctx: &TracePointContext) -> Result<(), ()> {
         return Err(());
     }
 
-    // Tracepoint fields. Failures default to 0 (the C version did the same via
-    // `bpf_probe_read` into a zero-initialised local).
-    // SAFETY: tracepoint layout fixed by the kernel; offsets from event format.
-    let debug_id = unsafe { ctx.read_at::<i32>(BT_DEBUG_ID) }.unwrap_or(0);
-    let to_proc = unsafe { ctx.read_at::<i32>(BT_TO_PROC) }.unwrap_or(0);
-    let to_thread = unsafe { ctx.read_at::<i32>(BT_TO_THREAD) }.unwrap_or(0);
-    let reply = unsafe { ctx.read_at::<i32>(BT_REPLY) }.unwrap_or(0);
-    let code = unsafe { ctx.read_at::<u32>(BT_CODE) }.unwrap_or(0);
-    let flags = unsafe { ctx.read_at::<u32>(BT_FLAGS) }.unwrap_or(0);
-    let target_node = unsafe { ctx.read_at::<i32>(BT_TARGET_NODE) }.unwrap_or(0);
+    // SAFETY: doctor validates these offsets against tracefs `format` before
+    // attach. Runtime read failures discard the event and degrade health.
+    let debug_id = required_tracepoint_field!(ctx, i32, BT_DEBUG_ID);
+    let to_proc = required_tracepoint_field!(ctx, i32, BT_TO_PROC);
+    let to_thread = required_tracepoint_field!(ctx, i32, BT_TO_THREAD);
+    let reply = required_tracepoint_field!(ctx, i32, BT_REPLY);
+    let code = required_tracepoint_field!(ctx, u32, BT_CODE);
+    let flags = required_tracepoint_field!(ctx, u32, BT_FLAGS);
+    let target_node = required_tracepoint_field!(ctx, i32, BT_TARGET_NODE);
     let now = unsafe { bpf_ktime_get_ns() };
 
     let (context, parent_debug_id, relation) = causal_context(pid_tgid, userspace_pid);
@@ -1517,7 +1621,7 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
         return Err(());
     }
 
-    let debug_id = unsafe { ctx.read_at::<i32>(BTR_DEBUG_ID) }.unwrap_or(0);
+    let debug_id = required_tracepoint_field!(ctx, i32, BTR_DEBUG_ID);
     let now = unsafe { bpf_ktime_get_ns() };
     let transaction = if debug_id == 0 {
         None
@@ -1608,9 +1712,6 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
 // tracepoint event is the lookback synchronisation point: when userspace
 // sees `nr == -3` it knows to dump the per-PID ring buffer.
 
-const SCHED_EXIT_COMM: usize = 8;
-const SCHED_EXIT_PID: usize = 24;
-
 #[tracepoint]
 pub fn trace_sched_process_exit(ctx: TracePointContext) -> i32 {
     let _ = try_sched_process_exit(&ctx);
@@ -1625,7 +1726,7 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
     // returns the dying task — what we actually want for "who exited".
     let pid_tgid = bpf_get_current_pid_tgid();
     let userspace_pid = (pid_tgid >> 32) as u32;
-    let userspace_tid = pid_tgid as u32;
+    let userspace_tid = required_tracepoint_field!(ctx, i32, SCHED_EXIT_PID) as u32;
 
     // Same filter rules as the syscall path: respect `--pid` / whitelist so
     // we don't flood userspace with unrelated exits.
@@ -1635,12 +1736,19 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
 
     let now = unsafe { bpf_ktime_get_ns() };
     let causal = causal_context(pid_tgid, userspace_pid);
+    let _ = INFLIGHT.remove(&pid_tgid);
     let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
     let _ = ADMITTED_THREAD_ENTERS.remove(&pid_tgid);
     if userspace_tid != userspace_pid {
         return Ok(());
     }
+    if target_pid() == Some(userspace_pid)
+        && EXITED_TARGET_PIDS.insert(&userspace_pid, &1, 0).is_err()
+    {
+        bump_counter(COUNTER_INFLIGHT_UPDATE_FAILED);
+    }
     let _ = TRACED_PROCESSES.remove(&userspace_pid);
+    let _ = PID_WHITELIST.remove(&userspace_pid);
 
     let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();
     let ev = unsafe { addr_of_mut!((*ev_buf.as_mut_ptr()).event) };
@@ -1659,6 +1767,7 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
         if let Ok(comm) = ctx.read_at::<[u8; 16]>(SCHED_EXIT_COMM) {
             addr_of_mut!((*ev).comm).write_unaligned(comm);
         } else {
+            bump_counter(COUNTER_TRACEPOINT_READ_FAILED);
             write_current_comm(ev);
         }
 
@@ -1688,9 +1797,6 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
             bump_counter(COUNTER_RINGBUF_RESERVE_FAILED);
         }
     }
-
-    // Silence unused-import warning when this is the only consumer.
-    let _ = SCHED_EXIT_PID;
     Ok(())
 }
 

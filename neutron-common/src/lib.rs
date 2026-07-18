@@ -31,6 +31,9 @@
 ///
 /// `maps_generation` carries the live causal scenario generation in 1.3 and
 /// is copied from syscall enter to exit. Zero means no active scenario.
+/// `_reserved[0]` is a bit field: bit 0 marks a successful ioctl exit refresh
+/// and bit 1 marks an event whose bounded payload read failed. Bytes 1..4
+/// carry the causal parent Binder debug ID and byte 5 carries relation/depth.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct SyscallEvent {
@@ -50,6 +53,46 @@ pub struct SyscallEvent {
     pub enter_timestamp_ns: u64,
     pub maps_generation: u16,
     pub _reserved: [u8; 6],
+}
+
+pub const EVENT_FLAG_IOCTL_EXIT_REFRESHED: u8 = 1 << 0;
+pub const EVENT_FLAG_PAYLOAD_READ_FAILED: u8 = 1 << 1;
+pub const EVENT_FLAG_PAYLOAD_UNAVAILABLE: u8 = 1 << 2;
+
+/// Return the syscall argument index containing a pathname captured in
+/// [`SyscallEvent::data`]. Shared by the BPF producer and userspace decoder so
+/// positive path evidence cannot be captured and then silently discarded.
+pub const fn syscall_path_arg_index(syscall_nr: i32) -> Option<usize> {
+    match syscall_nr {
+        // aarch64: path in args[1]
+        34 | 35 | 48 | 56 | 78 | 79 | 281 | 437 | 439 => Some(1),
+        // aarch64: path in args[0]
+        36 | 40 | 43 | 49 | 221 => Some(0),
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn event_ioctl_exit_refreshed(event: &SyscallEvent) -> bool {
+    let reserved = event._reserved;
+    reserved[0] & EVENT_FLAG_IOCTL_EXIT_REFRESHED != 0
+}
+
+#[inline]
+pub fn event_payload_read_failed(event: &SyscallEvent) -> bool {
+    let reserved = event._reserved;
+    reserved[0] & EVENT_FLAG_PAYLOAD_READ_FAILED != 0
+}
+
+#[inline]
+pub fn event_payload_unavailable(event: &SyscallEvent) -> bool {
+    let reserved = event._reserved;
+    reserved[0] & EVENT_FLAG_PAYLOAD_UNAVAILABLE != 0
+}
+
+#[inline]
+pub fn event_payload_is_valid(event: &SyscallEvent) -> bool {
+    !event_payload_read_failed(event) && !event_payload_unavailable(event)
 }
 
 // ── Causal tracing (1.3) ───────────────────────────────────────────────────
@@ -118,6 +161,278 @@ impl Default for SyscallEvent {
         unsafe { core::mem::zeroed() }
     }
 }
+
+// ── Userspace/eBPF ABI metadata ─────────────────────────────────────────────
+
+/// ELF section containing the fixed-width [`BpfAbiMetadata`] encoding.
+pub const BPF_ABI_SECTION_NAME: &str = ".neutron_abi";
+
+/// Little-endian `NEUTRON\0`, used to reject unrelated or corrupt sections.
+pub const BPF_ABI_MAGIC: u64 = u64::from_le_bytes(*b"NEUTRON\0");
+/// Breaking ABI generation. A mismatch must be rejected before BPF load or
+/// tracepoint attachment.
+pub const BPF_ABI_MAJOR: u16 = 2;
+/// Backward-compatible ABI revision within [`BPF_ABI_MAJOR`].
+pub const BPF_ABI_MINOR: u16 = 0;
+
+/// The object contains the raw syscall enter/exit programs and event stream.
+pub const BPF_FEATURE_SYSCALL_TRACE: u64 = 1 << 0;
+/// The object contains both Binder transaction tracepoint programs.
+pub const BPF_FEATURE_BINDER_TRACE: u64 = 1 << 1;
+/// Capture-health counters use a per-CPU array and require aggregation.
+pub const BPF_FEATURE_PER_CPU_HEALTH: u64 = 1 << 2;
+/// The object contains the optional kernel/user stack trace map and helpers.
+pub const BPF_FEATURE_STACKS: u64 = 1 << 3;
+/// The object contains the sched_process_exit causal sentinel program.
+pub const BPF_FEATURE_PROCESS_EXIT: u64 = 1 << 4;
+
+/// Fixed wire size of the custom ELF metadata section. The encoding is
+/// deliberately independent of Rust struct padding and always little-endian.
+pub const BPF_ABI_ENCODED_SIZE: usize = 44;
+
+/// Metadata compiled into every supported Neutron BPF object.
+///
+/// The Rust representation is never copied directly into the object. Use
+/// [`BpfAbiMetadata::encode`] and [`BpfAbiMetadata::decode`] at object
+/// boundaries so compiler padding cannot become part of the wire contract.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BpfAbiMetadata {
+    pub magic: u64,
+    pub abi_major: u16,
+    pub abi_minor: u16,
+    pub syscall_event_size: u32,
+    pub feature_bits: u64,
+    pub build_id: [u8; 20],
+}
+
+impl BpfAbiMetadata {
+    /// Encode metadata for the `.neutron_abi` ELF section.
+    pub const fn encode(self) -> [u8; BPF_ABI_ENCODED_SIZE] {
+        let mut out = [0u8; BPF_ABI_ENCODED_SIZE];
+        copy_abi_bytes(&mut out, 0, self.magic.to_le_bytes());
+        copy_abi_bytes(&mut out, 8, self.abi_major.to_le_bytes());
+        copy_abi_bytes(&mut out, 10, self.abi_minor.to_le_bytes());
+        copy_abi_bytes(&mut out, 12, self.syscall_event_size.to_le_bytes());
+        copy_abi_bytes(&mut out, 16, self.feature_bits.to_le_bytes());
+        copy_abi_bytes(&mut out, 24, self.build_id);
+        out
+    }
+
+    /// Decode and authenticate the fixed-width little-endian metadata block.
+    pub fn decode(bytes: &[u8]) -> Result<Self, BpfAbiError> {
+        if bytes.is_empty() {
+            return Err(BpfAbiError::MissingMetadata);
+        }
+        if bytes.len() < BPF_ABI_ENCODED_SIZE {
+            return Err(BpfAbiError::TruncatedMetadata {
+                expected: BPF_ABI_ENCODED_SIZE,
+                actual: bytes.len(),
+            });
+        }
+
+        let magic = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        if magic != BPF_ABI_MAGIC {
+            return Err(BpfAbiError::InvalidMagic {
+                expected: BPF_ABI_MAGIC,
+                actual: magic,
+            });
+        }
+        let abi_major = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let abi_minor = u16::from_le_bytes([bytes[10], bytes[11]]);
+        let syscall_event_size = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let feature_bits = u64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ]);
+        let mut build_id = [0u8; 20];
+        build_id.copy_from_slice(&bytes[24..44]);
+        Ok(Self {
+            magic,
+            abi_major,
+            abi_minor,
+            syscall_event_size,
+            feature_bits,
+            build_id,
+        })
+    }
+}
+
+const fn copy_abi_bytes<const N: usize>(
+    output: &mut [u8; BPF_ABI_ENCODED_SIZE],
+    offset: usize,
+    input: [u8; N],
+) {
+    let mut index = 0;
+    while index < N {
+        output[offset + index] = input[index];
+        index += 1;
+    }
+}
+
+impl PartialEq for BpfAbiMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.magic == other.magic
+            && self.abi_major == other.abi_major
+            && self.abi_minor == other.abi_minor
+            && self.syscall_event_size == other.syscall_event_size
+            && self.feature_bits == other.feature_bits
+            && self.build_id == other.build_id
+    }
+}
+
+impl Eq for BpfAbiMetadata {}
+
+impl core::fmt::Debug for BpfAbiMetadata {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let magic = self.magic;
+        let abi_major = self.abi_major;
+        let abi_minor = self.abi_minor;
+        let syscall_event_size = self.syscall_event_size;
+        let feature_bits = self.feature_bits;
+        let build_id = self.build_id;
+        formatter
+            .debug_struct("BpfAbiMetadata")
+            .field("magic", &magic)
+            .field("abi_major", &abi_major)
+            .field("abi_minor", &abi_minor)
+            .field("syscall_event_size", &syscall_event_size)
+            .field("feature_bits", &feature_bits)
+            .field("build_id", &build_id)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BpfAbiError {
+    MissingMetadata,
+    TruncatedMetadata {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidMagic {
+        expected: u64,
+        actual: u64,
+    },
+    MajorMismatch {
+        expected: u16,
+        actual: u16,
+    },
+    EventSizeMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    MissingBuildId,
+    BuildIdMismatch {
+        expected: [u8; 20],
+        actual: [u8; 20],
+    },
+    MissingFeatures {
+        required: u64,
+        available: u64,
+        missing: u64,
+    },
+}
+
+impl core::fmt::Display for BpfAbiError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingMetadata => formatter.write_str("BPF ABI metadata is missing"),
+            Self::TruncatedMetadata { expected, actual } => write!(
+                formatter,
+                "BPF ABI metadata is truncated: expected at least {expected} bytes, found {actual}"
+            ),
+            Self::InvalidMagic { expected, actual } => write!(
+                formatter,
+                "BPF ABI magic mismatch: expected {expected:#018x}, found {actual:#018x}"
+            ),
+            Self::MajorMismatch { expected, actual } => write!(
+                formatter,
+                "BPF ABI major mismatch: userspace requires {expected}, object provides {actual}"
+            ),
+            Self::EventSizeMismatch { expected, actual } => write!(
+                formatter,
+                "SyscallEvent size mismatch: userspace requires {expected}, object provides {actual}"
+            ),
+            Self::MissingBuildId => formatter.write_str(
+                "BPF build ID is missing; rebuild the object through cargo xtask build-ebpf",
+            ),
+            Self::BuildIdMismatch { expected, actual } => {
+                formatter.write_str("BPF source commit mismatch: userspace=")?;
+                write_hex(formatter, expected)?;
+                formatter.write_str(" object=")?;
+                write_hex(formatter, actual)
+            }
+            Self::MissingFeatures {
+                required,
+                available,
+                missing,
+            } => write!(
+                formatter,
+                "BPF feature mismatch: required={required:#x} available={available:#x} missing={missing:#x}"
+            ),
+        }
+    }
+}
+
+fn write_hex(formatter: &mut core::fmt::Formatter<'_>, bytes: &[u8]) -> core::fmt::Result {
+    for byte in bytes {
+        write!(formatter, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
+/// Convert a 40-character Git object ID exposed by the build environment into
+/// the 20-byte ABI build ID. Invalid or absent values produce all zeroes; the
+/// userspace object inspector still reports the full object SHA-256.
+pub const fn bpf_build_id_from_git_hex(value: Option<&str>) -> [u8; 20] {
+    let Some(value) = value else {
+        return [0u8; 20];
+    };
+    let bytes = value.as_bytes();
+    if bytes.len() < 40 {
+        return [0u8; 20];
+    }
+    let mut output = [0u8; 20];
+    let mut index = 0;
+    while index < 20 {
+        let high = hex_nibble(bytes[index * 2]);
+        let low = hex_nibble(bytes[index * 2 + 1]);
+        if high > 15 || low > 15 {
+            return [0u8; 20];
+        }
+        output[index] = (high << 4) | low;
+        index += 1;
+    }
+    output
+}
+
+const fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => u8::MAX,
+    }
+}
+
+// ── Tracepoint field offsets covered by doctor compatibility checks ─────────
+
+pub const TRACEPOINT_SYS_ENTER_ID_OFFSET: usize = 8;
+pub const TRACEPOINT_SYS_ENTER_ARGS_OFFSET: usize = 16;
+pub const TRACEPOINT_SYS_EXIT_ID_OFFSET: usize = 8;
+pub const TRACEPOINT_SYS_EXIT_RET_OFFSET: usize = 16;
+pub const TRACEPOINT_BINDER_DEBUG_ID_OFFSET: usize = 8;
+pub const TRACEPOINT_BINDER_TARGET_NODE_OFFSET: usize = 12;
+pub const TRACEPOINT_BINDER_TO_PROC_OFFSET: usize = 16;
+pub const TRACEPOINT_BINDER_TO_THREAD_OFFSET: usize = 20;
+pub const TRACEPOINT_BINDER_REPLY_OFFSET: usize = 24;
+pub const TRACEPOINT_BINDER_CODE_OFFSET: usize = 28;
+pub const TRACEPOINT_BINDER_FLAGS_OFFSET: usize = 32;
+pub const TRACEPOINT_BINDER_RECEIVED_DEBUG_ID_OFFSET: usize = 8;
+pub const TRACEPOINT_SCHED_EXIT_COMM_OFFSET: usize = 8;
+pub const TRACEPOINT_SCHED_EXIT_PID_OFFSET: usize = 24;
 
 // ── filter_map (BPF_MAP_TYPE_ARRAY) ──────────────────────────────────────────
 //
@@ -303,7 +618,7 @@ pub const fn is_state_tracking_nr(nr: i32) -> bool {
 /// Maximum number of stack frames stored per stack trace
 pub const STACK_FRAMES: u32 = 127;
 
-// ── Counter indices (COUNTERS BPF_MAP_TYPE_ARRAY, 16 slots) ──────────────────
+// ── Counter indices (COUNTERS BPF_MAP_TYPE_PERCPU_ARRAY) ─────────────────────
 //
 // The loader and the BPF programs share these indices to surface degraded
 // paths to the user via the capture summary at exit. Slot indices are stable
@@ -350,11 +665,20 @@ pub const COUNTER_THREAD_CONTEXT_UPDATE_FAILED: u32 = 16;
 /// process was admitted, so no enter-side arguments were available yet.
 /// This is an explicit causal-boundary observation, not ring-buffer loss.
 pub const COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT: u32 = 17;
+/// A bounded user/kernel payload read failed. The event may still be emitted,
+/// but its payload must not be treated as complete evidence.
+pub const COUNTER_PAYLOAD_READ_FAILED: u32 = 18;
+/// A required tracepoint context field could not be read at its validated
+/// offset. The affected event is discarded and capture health is degraded.
+pub const COUNTER_TRACEPOINT_READ_FAILED: u32 = 19;
+/// An ioctl declared more payload bytes than fit in the 124-byte bounded
+/// capture region. The event is emitted, but its argument evidence is partial.
+pub const COUNTER_IOCTL_PAYLOAD_TRUNCATED: u32 = 20;
 
 /// Number of slots in the COUNTERS map. New counters extend the tail; bumping
-/// requires updating the `Array::with_max_entries(...)` size in BPF and the
+/// requires updating the `PerCpuArray::with_max_entries(...)` size in BPF and the
 /// label table in userspace.
-pub const COUNTER_SLOT_COUNT: u32 = 20;
+pub const COUNTER_SLOT_COUNT: u32 = 21;
 
 // ── ioctl post-exit refresh policy ───────────────────────────────────────────
 //
@@ -420,6 +744,16 @@ pub const fn ioctl_dir(cmd: u32) -> u32 {
 #[inline]
 pub const fn ioctl_type(cmd: u32) -> u32 {
     (cmd >> 8) & 0xff
+}
+
+/// Extracts the `_IOC_SIZE` field (bits 16..30) from an ioctl `cmd`.
+///
+/// Neutron uses this as the privacy and safety bound for user-buffer reads;
+/// zero-sized commands are never treated as carrying a generic pointer-sized
+/// payload.
+#[inline]
+pub const fn ioctl_size(cmd: u32) -> u32 {
+    (cmd >> 16) & 0x3fff
 }
 
 /// Returns `true` when a `sys_exit` event for this ioctl should overwrite

@@ -6,6 +6,11 @@ use std::io::BufRead;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
+use crate::capture_input::{read_capture_record, validate_capture_strings};
+
+const MAX_NORMALIZED_ITEMS: usize = 1_000_000;
+const MAX_NORMALIZED_STRING_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CausalRelation {
     #[default]
@@ -136,10 +141,30 @@ pub struct Marker {
     pub trace_id: Option<String>,
     pub root_package: Option<String>,
     pub root_uid: Option<u32>,
+    pub root_pid: Option<u32>,
+}
+
+/// Stable scenario identity used to decide whether two captures exercised
+/// the same bounded procedure. Trace IDs and timestamps are deliberately not
+/// part of the cross-run identity: they prove pairing inside a run, while the
+/// scenario name and root selector define what may be compared.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScenarioIdentity {
+    pub scenario_id: String,
+    pub root_package: Option<String>,
+    pub root_uid: Option<u32>,
+    pub root_pid: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScenarioContract {
+    pub scenarios: Vec<ScenarioIdentity>,
+    pub trace_ids: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct CaptureHealth {
+    pub status: String,
     pub degraded: bool,
     pub output_cap_hit: bool,
     pub root_package: Option<String>,
@@ -151,6 +176,13 @@ pub struct CaptureHealth {
     pub binder_follow_failed: u64,
     pub follow_policy_filtered: u64,
     pub follow_ttl_expired: u64,
+    pub binder_tracker_evictions: u64,
+    pub binder_unmatched_receives: u64,
+    pub binder_causal_metadata_discarded: u64,
+    pub binder_invalid_callers: u64,
+    pub binder_tracker_enabled: bool,
+    pub kprobe_attach_failures: Vec<String>,
+    pub capture_scope: Option<crate::health::CaptureScope>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -178,23 +210,72 @@ enum SyscallKey {
     Legacy(Option<String>, u32, u32, u64, i64),
 }
 
-pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
+pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture> {
     let mut binders = BTreeMap::<BinderKey, BinderSpan>::new();
     let mut syscalls = BTreeMap::<SyscallKey, SyscallSpan>::new();
     let mut capture = NormalizedCapture::default();
+    let mut malformed_lines = 0_u64;
+    let mut invalid_known_records = 0_u64;
+    let mut unknown_records = 0_u64;
+    let mut health_records = 0_u64;
+    let mut final_record_is_health = false;
+    let mut record = Vec::new();
+    let mut record_number = 1usize;
+    let mut normalized_items = 0usize;
+    let mut string_bytes = 0usize;
 
-    for line in reader.lines() {
-        let line = line.context("reading capture line")?;
-        let value: Value = match serde_json::from_str(line.trim()) {
+    while read_capture_record(&mut reader, &mut record, record_number)? {
+        let line = std::str::from_utf8(&record)
+            .with_context(|| format!("capture record {record_number} is not UTF-8"))?
+            .trim();
+        if line.is_empty() {
+            record_number += 1;
+            continue;
+        }
+        final_record_is_health = false;
+        let value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(_) => {
+                malformed_lines = malformed_lines.saturating_add(1);
+                record_number += 1;
+                continue;
+            }
         };
+        string_bytes = string_bytes
+            .checked_add(validate_capture_strings(&value, record_number)?)
+            .context("normalized capture string byte count overflow")?;
+        if string_bytes > MAX_NORMALIZED_STRING_BYTES {
+            anyhow::bail!("normalized capture strings exceed {MAX_NORMALIZED_STRING_BYTES} bytes");
+        }
         let Some(object) = value.as_object() else {
+            malformed_lines = malformed_lines.saturating_add(1);
+            record_number += 1;
             continue;
         };
         let Some(kind) = text(object, "type") else {
+            malformed_lines = malformed_lines.saturating_add(1);
+            record_number += 1;
             continue;
         };
+        let retained_items = match kind {
+            "binder" | "binder_call" | "binder_received" => object
+                .get("service_candidates")
+                .and_then(Value::as_array)
+                .map_or(1, |values| values.len().saturating_add(1)),
+            "selinux_denial" => object
+                .get("permissions")
+                .and_then(Value::as_array)
+                .map_or(1, |values| values.len().saturating_add(1)),
+            "syscall" | "process_exit" | "marker" | "capture_health" => 1,
+            _ => 0,
+        };
+        normalized_items = normalized_items
+            .checked_add(retained_items)
+            .context("normalized capture item count overflow")?;
+        if normalized_items > MAX_NORMALIZED_ITEMS {
+            anyhow::bail!("normalized capture exceeds {MAX_NORMALIZED_ITEMS} retained items");
+        }
+        final_record_is_health = kind == "capture_health";
 
         if let (Some(trace), Some(package)) =
             (text(object, "trace_id"), text(object, "root_package"))
@@ -207,32 +288,51 @@ pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
         match kind {
             "binder" | "binder_call" => {
                 capture.has_causal |= has_causal(object);
-                merge_binder(&mut binders, object);
+                if !merge_binder(&mut binders, object) {
+                    invalid_known_records = invalid_known_records.saturating_add(1);
+                }
             }
             "binder_received" => {
                 capture.has_causal |= has_causal(object);
-                merge_binder_received(&mut binders, object);
+                if !merge_binder_received(&mut binders, object) {
+                    invalid_known_records = invalid_known_records.saturating_add(1);
+                }
             }
             "syscall" => {
                 capture.has_causal |= has_causal(object);
-                merge_syscall(&mut syscalls, object);
+                if !merge_syscall(&mut syscalls, object) {
+                    invalid_known_records = invalid_known_records.saturating_add(1);
+                }
             }
             "process_exit" => {
                 capture.has_causal |= has_causal(object);
                 if let Some(exit) = parse_exit(object) {
                     capture.exits.push(exit);
+                } else {
+                    invalid_known_records = invalid_known_records.saturating_add(1);
                 }
             }
             "selinux_denial" => {
                 capture.has_causal |= has_causal(object);
                 if let Some(denial) = parse_selinux_denial(object) {
                     capture.denials.push(denial);
+                } else {
+                    invalid_known_records = invalid_known_records.saturating_add(1);
                 }
             }
             "marker" => capture.markers.push(parse_marker(object)),
-            "capture_health" => merge_health(&mut capture, object),
-            _ => {}
+            "capture_health" => {
+                health_records = health_records.saturating_add(1);
+                merge_health(&mut capture, object);
+            }
+            "fd_snapshot" | "finding" | "process_maps" | "stack_trace" | "follow_guardrail" => {
+                if !valid_ignorable_record(kind, object) {
+                    invalid_known_records = invalid_known_records.saturating_add(1);
+                }
+            }
+            _ => unknown_records = unknown_records.saturating_add(1),
         }
+        record_number += 1;
     }
 
     for binder in binders.into_values() {
@@ -253,12 +353,202 @@ pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
             capture.syscalls.push(syscall);
         }
     }
+    if malformed_lines > 0 {
+        capture.health_warnings.insert(format!(
+            "ignored {malformed_lines} malformed NDJSON record(s); run health is unknown"
+        ));
+        if let Some(health) = capture.health.as_mut() {
+            health.status = "unknown".into();
+            health.degraded = true;
+        }
+    }
+    if invalid_known_records > 0 {
+        capture.health_warnings.insert(format!(
+            "ignored {invalid_known_records} recognized record(s) with missing or invalid required fields; run health is unknown"
+        ));
+        if let Some(health) = capture.health.as_mut() {
+            health.status = "unknown".into();
+            health.degraded = true;
+        }
+    }
+    if unknown_records > 0 {
+        capture.health_warnings.insert(format!(
+            "ignored {unknown_records} unknown record type(s); run health is unknown"
+        ));
+        if let Some(health) = capture.health.as_mut() {
+            health.status = "unknown".into();
+            health.degraded = true;
+        }
+    }
+    if health_records > 1 {
+        capture.health_warnings.insert(format!(
+            "capture contains {health_records} capture_health records; run health is unknown"
+        ));
+        if let Some(health) = capture.health.as_mut() {
+            health.status = "unknown".into();
+            health.degraded = true;
+        }
+    }
+    if capture.health.is_none() || !final_record_is_health {
+        capture
+            .health_warnings
+            .insert("capture has no final capture_health record; run is incomplete".into());
+        if let Some(health) = capture.health.as_mut() {
+            if health.status != "unknown" {
+                health.status = "incomplete".into();
+            }
+            health.degraded = true;
+        }
+    }
     Ok(capture)
 }
 
-fn merge_binder(binders: &mut BTreeMap<BinderKey, BinderSpan>, object: &Map<String, Value>) {
+/// Validate that the capture has one or more non-overlapping, exactly paired
+/// scenario boundaries and that every causally tagged behavior belongs to a
+/// declared scenario. This is an additional gate for negative/diff claims;
+/// clean transport health alone cannot prove that the same stimulus ran.
+pub fn validated_scenario_contract(capture: &NormalizedCapture) -> Result<ScenarioContract> {
+    let contract = validated_marker_contract(&capture.markers)?;
+    for (scenario_id, trace_id) in capture
+        .binders
+        .iter()
+        .filter_map(|event| {
+            event
+                .scenario_id
+                .as_deref()
+                .map(|id| (id, event.trace_id.as_deref()))
+        })
+        .chain(capture.syscalls.iter().filter_map(|event| {
+            event
+                .scenario_id
+                .as_deref()
+                .map(|id| (id, event.trace_id.as_deref()))
+        }))
+        .chain(capture.exits.iter().filter_map(|event| {
+            event
+                .scenario_id
+                .as_deref()
+                .map(|id| (id, event.trace_id.as_deref()))
+        }))
+        .chain(capture.denials.iter().filter_map(|event| {
+            event
+                .scenario_id
+                .as_deref()
+                .map(|id| (id, event.trace_id.as_deref()))
+        }))
+    {
+        if contract.trace_ids.get(scenario_id).map(String::as_str) != trace_id {
+            anyhow::bail!("event scenario_id/trace_id does not match a completed scenario");
+        }
+    }
+    Ok(contract)
+}
+
+pub fn validated_marker_contract(markers: &[Marker]) -> Result<ScenarioContract> {
+    let mut active: Option<(&Marker, String)> = None;
+    let mut scenarios = Vec::new();
+    let mut trace_ids = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+
+    for marker in markers {
+        let phase = marker
+            .phase
+            .as_deref()
+            .context("scenario marker is missing phase")?;
+        let scenario_id = marker
+            .scenario_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .context("scenario marker is missing scenario_id")?;
+        if marker.name != scenario_id {
+            anyhow::bail!("scenario marker name and scenario_id differ");
+        }
+        let trace_id = marker
+            .trace_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .context("scenario marker is missing trace_id")?;
+        let timestamp = marker
+            .ts_ns
+            .filter(|value| *value > 0)
+            .context("scenario marker is missing a positive timestamp")?;
+        if marker.root_package.is_none() && marker.root_uid.is_none() && marker.root_pid.is_none() {
+            anyhow::bail!("scenario marker is missing a package, UID, or PID root selector");
+        }
+        match phase {
+            "start" => {
+                if active.is_some() {
+                    anyhow::bail!("scenario markers overlap or contain duplicate starts");
+                }
+                if !seen.insert(scenario_id.to_string()) {
+                    anyhow::bail!("scenario_id was reused in one capture");
+                }
+                active = Some((marker, trace_id.to_string()));
+            }
+            "end" => {
+                let (start, start_trace_id) = active
+                    .take()
+                    .context("scenario end marker has no matching start")?;
+                if start.scenario_id.as_deref() != Some(scenario_id)
+                    || start_trace_id != trace_id
+                    || start.root_package != marker.root_package
+                    || start.root_uid != marker.root_uid
+                    || start.root_pid != marker.root_pid
+                {
+                    anyhow::bail!("scenario start/end identity does not match");
+                }
+                if start.ts_ns.is_some_and(|start_ts| timestamp < start_ts) {
+                    anyhow::bail!("scenario end timestamp precedes its start");
+                }
+                scenarios.push(ScenarioIdentity {
+                    scenario_id: scenario_id.to_string(),
+                    root_package: marker.root_package.clone(),
+                    root_uid: marker.root_uid,
+                    root_pid: marker.root_pid,
+                });
+                trace_ids.insert(scenario_id.to_string(), trace_id.to_string());
+            }
+            _ => anyhow::bail!("scenario marker phase must be start or end"),
+        }
+    }
+    if active.is_some() {
+        anyhow::bail!("scenario start marker has no matching end");
+    }
+    if scenarios.is_empty() {
+        anyhow::bail!("capture has no paired scenario lifecycle markers");
+    }
+    Ok(ScenarioContract {
+        scenarios,
+        trace_ids,
+    })
+}
+
+fn valid_ignorable_record(kind: &str, object: &Map<String, Value>) -> bool {
+    let positive = |field| number_u64(object, field).is_some_and(|value| value > 0);
+    match kind {
+        "fd_snapshot" => positive("pid"),
+        "finding" => text(object, "rule_id").is_some_and(|value| !value.is_empty()),
+        "process_maps" => positive("pid") && object.get("mappings").is_some_and(Value::is_array),
+        "stack_trace" => {
+            positive("pid")
+                && text(object, "stack_trace_ref").is_some_and(|value| !value.is_empty())
+        }
+        "follow_guardrail" => {
+            positive("caller_pid")
+                && positive("callee_pid")
+                && text(object, "status").is_some()
+                && text(object, "reason").is_some()
+        }
+        _ => false,
+    }
+}
+
+fn merge_binder(
+    binders: &mut BTreeMap<BinderKey, BinderSpan>,
+    object: &Map<String, Value>,
+) -> bool {
     let Some(debug_id) = number_i64(object, "debug_id") else {
-        return;
+        return false;
     };
     let causal_key = causal_key(object).map(|(trace, span)| BinderKey::Causal(trace, span));
     let key = if let Some(key) = causal_key {
@@ -281,14 +571,15 @@ fn merge_binder(binders: &mut BTreeMap<BinderKey, BinderSpan>, object: &Map<Stri
         ..BinderSpan::default()
     });
     apply_binder_fields(node, object);
+    true
 }
 
 fn merge_binder_received(
     binders: &mut BTreeMap<BinderKey, BinderSpan>,
     object: &Map<String, Value>,
-) {
+) -> bool {
     let Some(debug_id) = number_i64(object, "debug_id") else {
-        return;
+        return false;
     };
     let key = causal_key(object)
         .map(|(trace, span)| BinderKey::Causal(trace, span))
@@ -312,6 +603,7 @@ fn merge_binder_received(
     if let Some(relation) = relation(object) {
         node.relation = relation;
     }
+    true
 }
 
 fn apply_binder_fields(node: &mut BinderSpan, object: &Map<String, Value>) {
@@ -364,9 +656,12 @@ fn apply_binder_fields(node: &mut BinderSpan, object: &Map<String, Value>) {
     }
 }
 
-fn merge_syscall(syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>, object: &Map<String, Value>) {
+fn merge_syscall(
+    syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>,
+    object: &Map<String, Value>,
+) -> bool {
     let Some(pid) = number_u32(object, "pid") else {
-        return;
+        return false;
     };
     let tid = number_u32(object, "tid")
         .or_else(|| number_u32(object, "tgid"))
@@ -393,8 +688,13 @@ fn merge_syscall(syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>, object: &Map<
                 nr,
             )
         });
-    let name = text(object, "name")
+    let explicit_name = text(object, "name")
         .or_else(|| text(object, "syscall"))
+        .filter(|value| !value.is_empty());
+    if explicit_name.is_none() && nr < 0 {
+        return false;
+    }
+    let name = explicit_name
         .map(str::to_string)
         .unwrap_or_else(|| format!("syscall {nr}"));
     let fd_path = text(object, "fd_path").or_else(|| {
@@ -438,6 +738,7 @@ fn merge_syscall(syscalls: &mut BTreeMap<SyscallKey, SyscallSpan>, object: &Map<
             syscalls.insert(key, candidate);
         }
     }
+    true
 }
 
 fn merge_syscall_fields(
@@ -542,19 +843,54 @@ fn parse_marker(object: &Map<String, Value>) -> Marker {
         trace_id: text(object, "trace_id").map(str::to_string),
         root_package: text(object, "root_package").map(str::to_string),
         root_uid: number_u32(object, "root_uid"),
+        root_pid: number_u32(object, "root_pid"),
     }
 }
 
 fn merge_health(capture: &mut NormalizedCapture, object: &Map<String, Value>) {
-    let health = CaptureHealth {
-        degraded: object
-            .get("degraded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        output_cap_hit: object
-            .get("output_cap_hit")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+    let contract_errors = crate::health::capture_health_contract_errors(object);
+    let legacy_degraded_field = object.get("degraded").and_then(Value::as_bool);
+    let legacy_degraded = legacy_degraded_field.unwrap_or(false);
+    let output_cap_hit = object
+        .get("output_cap_hit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let explicit_status = object.get("status");
+    let parsed_status = explicit_status
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "complete" | "degraded" | "incomplete" | "unknown"));
+    let mut status = parsed_status.map(str::to_string).unwrap_or_else(|| {
+        if explicit_status.is_some() {
+            "unknown".into()
+        } else {
+            if output_cap_hit {
+                "incomplete".into()
+            } else if legacy_degraded {
+                "degraded".into()
+            } else {
+                "complete".into()
+            }
+        }
+    });
+    let contradictory = parsed_status.is_some_and(|value| {
+        (value == "complete" && (legacy_degraded || output_cap_hit))
+            || (value != "complete" && legacy_degraded_field == Some(false))
+            || (output_cap_hit && !matches!(value, "incomplete" | "unknown"))
+    });
+    if contradictory {
+        status = "unknown".into();
+        capture
+            .health_warnings
+            .insert("capture_health fields are contradictory".into());
+    } else if explicit_status.is_some() && parsed_status.is_none() {
+        capture
+            .health_warnings
+            .insert("capture_health status is invalid".into());
+    }
+    let mut health = CaptureHealth {
+        degraded: legacy_degraded || status != "complete",
+        output_cap_hit,
+        status,
         root_package: text(object, "root_package").map(str::to_string),
         root_uid: number_u32(object, "root_uid"),
         boot_id: text(object, "boot_id").map(str::to_string),
@@ -564,11 +900,46 @@ fn merge_health(capture: &mut NormalizedCapture, object: &Map<String, Value>) {
         binder_follow_failed: number_u64(object, "binder_follow_failed").unwrap_or(0),
         follow_policy_filtered: number_u64(object, "follow_policy_filtered").unwrap_or(0),
         follow_ttl_expired: number_u64(object, "follow_ttl_expired").unwrap_or(0),
+        binder_tracker_evictions: number_u64(object, "binder_tracker_evictions").unwrap_or(0),
+        binder_unmatched_receives: number_u64(object, "binder_unmatched_receives").unwrap_or(0),
+        binder_causal_metadata_discarded: number_u64(object, "binder_causal_metadata_discarded")
+            .unwrap_or(0),
+        binder_invalid_callers: number_u64(object, "binder_invalid_callers").unwrap_or(0),
+        binder_tracker_enabled: object
+            .get("binder_tracker_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        kprobe_attach_failures: object
+            .get("kprobe_attach_failures")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        capture_scope: object
+            .get("capture_scope")
+            .and_then(|value| crate::health::CaptureScope::from_json_value(value).ok()),
     };
+    if !contract_errors.is_empty() {
+        health.status = "unknown".into();
+        health.degraded = true;
+        capture.health_warnings.insert(format!(
+            "capture_health contract is incomplete or invalid: {}",
+            contract_errors.join("; ")
+        ));
+    }
     for (value, label) in [
         (health.traced_process_limit, "traced process limit"),
         (health.binder_depth_limit, "Binder depth limit"),
         (health.binder_follow_failed, "Binder follow failure"),
+        (health.binder_tracker_evictions, "Binder tracker eviction"),
+        (health.binder_unmatched_receives, "Binder unmatched receive"),
+        (
+            health.binder_causal_metadata_discarded,
+            "Binder causal metadata discard",
+        ),
+        (health.binder_invalid_callers, "Binder invalid caller"),
         (
             number_u64(object, "ringbuf_reserve_failed").unwrap_or(0),
             "ring buffer event loss",
@@ -590,10 +961,28 @@ fn merge_health(capture: &mut NormalizedCapture, object: &Map<String, Value>) {
             capture.health_warnings.insert(label.to_string());
         }
     }
-    if health.degraded {
+    if !health.binder_tracker_enabled {
         capture
             .health_warnings
-            .insert("capture health is degraded".into());
+            .insert("Binder correlation tracker was disabled".into());
+    }
+    for failure in &health.kprobe_attach_failures {
+        capture.health_warnings.insert(format!(
+            "requested kprobe source was not attached: {failure}"
+        ));
+    }
+    if let Some(scope) = &health.capture_scope {
+        if !scope.claim_scope_complete {
+            capture.health_warnings.insert(format!(
+                "capture claim scope is restricted: {}",
+                scope.claim_scope_reasons.join(", ")
+            ));
+        }
+    }
+    if health.status != "complete" {
+        capture
+            .health_warnings
+            .insert(format!("capture health is {}", health.status));
     }
     if health.output_cap_hit {
         capture

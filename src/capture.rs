@@ -113,6 +113,16 @@ impl ContextRing {
         Vec::new()
     }
 
+    /// Reset buffered backward/forward context at an evidence boundary.
+    /// Returns the number of buffered records that were intentionally
+    /// discarded so capture health can make the boundary loss explicit.
+    pub fn reset_boundary(&mut self) -> usize {
+        let discarded = self.events.len();
+        self.events.clear();
+        self.forward_until_ns = 0;
+        discarded
+    }
+
     fn evict_old(&mut self, now_ns: u64) {
         let cutoff = now_ns.saturating_sub(self.duration_ns);
         while let Some((t, _)) = self.events.front() {
@@ -216,6 +226,20 @@ mod tests {
     fn matched_context_rejects_overflow() {
         let err = CaptureMode::from_cli(Some("matched+context=120s")).unwrap_err();
         assert!(format!("{err:#}").contains("cap"));
+    }
+
+    #[test]
+    fn evidence_boundary_discards_buffered_and_forward_context() {
+        let mut ring = ContextRing::new(1_000, 8);
+        assert!(ring.observe(10, false, "before").is_empty());
+        assert_eq!(ring.observe(20, true, "match"), ["before", "match"]);
+        assert!(ring.forward_until_ns() > 20);
+        assert!(ring.observe(21, false, "forward").len() == 1);
+        assert!(ring.observe(2_000, false, "buffered").is_empty());
+
+        assert_eq!(ring.reset_boundary(), 1);
+        assert!(ring.is_empty());
+        assert_eq!(ring.forward_until_ns(), 0);
     }
 
     #[test]

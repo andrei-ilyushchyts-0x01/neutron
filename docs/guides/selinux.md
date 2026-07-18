@@ -7,9 +7,15 @@ are not attributed to the new trace. It is disabled by `--no-logcat`.
 Capture NDJSON on an authorized device:
 
 ```bash
-adb shell su -c '/data/local/tmp/neutron trace \
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+NEUTRON=/data/local/share/neutron/neutron-agent
+RUN=/data/local/share/neutron/runs/selinux-$(date -u +%Y%m%dT%H%M%SZ)
+"${ADB[@]}" shell "su -c 'install -d -m 0700 ${RUN}'"
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --package com.example.app --follow-hal --json --raw \
-  --output /data/local/tmp/capture.ndjson'
+  --output ${RUN}/capture.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/capture.ndjson'" > capture.ndjson
 ```
 
 Each observed decision is written as `type:"selinux_denial"`. `permissions`

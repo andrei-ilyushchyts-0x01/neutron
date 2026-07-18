@@ -6,8 +6,10 @@
 //! field variants, so the post-processor stays tolerant and streaming.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -16,7 +18,12 @@ use serde_json::Value;
 
 use crate::aidl::{normalize_descriptor, AidlCatalog};
 use crate::binder_services::BinderServiceMap;
+use crate::capture_input::{read_capture_record, validate_capture_strings, MAX_CAPTURE_RECORDS};
 use crate::summarize::open_capture;
+
+const MAX_REPORT_GROUPS: usize = 100_000;
+const MAX_REPORT_STRING_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AUXILIARY_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 pub struct ReportArgs {
@@ -101,6 +108,9 @@ pub struct ReportOptions {
 struct Snapshot {
     parsed_events: u64,
     health: Option<Value>,
+    malformed_records: u64,
+    health_records: u64,
+    final_record_is_health: bool,
     pids: CountMap,
     uids: CountMap,
     comms: CountMap,
@@ -113,6 +123,16 @@ struct Snapshot {
     rwx: CountMap,
     findings: CountMap,
     crashes: CountMap,
+    markers: Vec<crate::capture_normalize::Marker>,
+    scenario_event_bindings: BTreeSet<(String, String)>,
+    scenario_syscalls: CountMap,
+    scenario_sensitive_paths: CountMap,
+    scenario_sockets: CountMap,
+    scenario_binder_targets: CountMap,
+    scenario_ioctl_families: CountMap,
+    scenario_rwx: CountMap,
+    scenario_findings: CountMap,
+    scenario_crashes: CountMap,
 }
 
 type CountMap = BTreeMap<String, u64>;
@@ -128,13 +148,22 @@ struct BinderAttribution {
 impl BinderAttribution {
     fn from_options(opts: &ReportOptions) -> Result<Self> {
         let services = match opts.binder_services_json.as_deref() {
-            Some(raw) => Some(BinderServiceMap::from_json(raw).context("parsing binder services")?),
+            Some(raw) => {
+                validate_auxiliary_input(raw, "binder services")?;
+                Some(BinderServiceMap::from_json(raw).context("parsing binder services")?)
+            }
             None => None,
         };
         let catalog = match opts.binder_catalog_json.as_deref() {
-            Some(raw) => parse_binder_catalog_json(raw).context("parsing binder catalog")?,
+            Some(raw) => {
+                validate_auxiliary_input(raw, "binder catalog")?;
+                parse_binder_catalog_json(raw).context("parsing binder catalog")?
+            }
             None => BinderCatalog::new(),
         };
+        if let Some(raw) = opts.aidl_catalog_json.as_deref() {
+            validate_auxiliary_input(raw, "AIDL catalog")?;
+        }
         let aidl = opts
             .aidl_catalog_json
             .as_deref()
@@ -196,11 +225,18 @@ impl BinderAttribution {
 }
 
 pub fn run_report(args: ReportArgs) -> Result<()> {
-    let baseline_capture = match args.baseline.as_deref() {
+    let (reader, capture_identity) = open_report_capture(&args.capture, "capture")?;
+    let baseline_reader = match args.baseline.as_deref() {
         Some("-") if args.capture == "-" => {
             bail!("only one of <capture>/--baseline can be '-' (stdin)");
         }
-        Some(path) => Some(read_input_to_string(path)?),
+        Some(path) => {
+            let (reader, identity) = open_report_capture(path, "baseline")?;
+            if capture_identity.is_some() && capture_identity == identity {
+                bail!("capture and baseline refer to the same file; refusing a self-comparison");
+            }
+            Some(reader)
+        }
         None => None,
     };
     let binder_services_json = args
@@ -224,12 +260,41 @@ pub fn run_report(args: ReportArgs) -> Result<()> {
         binder_services_json,
         binder_catalog_json,
         aidl_catalog_json,
-        baseline_capture,
+        baseline_capture: None,
         top: args.top,
     };
-    let reader = open_capture(&args.capture)?;
-    let markdown = render_report_from_reader(reader, opts)?;
+    let attribution = BinderAttribution::from_options(&opts)?;
+    let mut snapshot = collect_snapshot(reader, &attribution).context("reading capture")?;
+    if let Some(package) = opts.package.as_deref() {
+        snapshot.packages.insert(package.to_string());
+    }
+    ensure_snapshot_bounds(&snapshot)?;
+    let baseline = baseline_reader
+        .map(|reader| collect_snapshot(reader, &attribution).context("reading baseline capture"))
+        .transpose()?;
+    let markdown = render_markdown(&snapshot, baseline.as_ref(), &opts);
     write_output(args.output.as_deref(), markdown.as_bytes())
+}
+
+type ReportCaptureReader = (Box<dyn BufRead>, Option<(u64, u64)>);
+
+fn open_report_capture(path: &str, label: &str) -> Result<ReportCaptureReader> {
+    if path == "-" {
+        return Ok((open_capture(path)?, None));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {label} capture {path}"))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting {label} capture {path}"))?;
+    if !metadata.is_file() {
+        bail!("{label} capture must be a regular file: {path}");
+    }
+    let identity = (metadata.dev(), metadata.ino());
+    Ok((Box::new(BufReader::new(file)), Some(identity)))
 }
 
 pub fn run_binder_map(command: BinderMapCommand) -> Result<()> {
@@ -265,34 +330,130 @@ pub fn render_report_from_reader<R: BufRead>(reader: R, opts: ReportOptions) -> 
     Ok(render_markdown(&snapshot, baseline.as_ref(), &opts))
 }
 
-fn collect_snapshot<R: BufRead>(reader: R, attribution: &BinderAttribution) -> Result<Snapshot> {
+fn collect_snapshot<R: BufRead>(
+    mut reader: R,
+    attribution: &BinderAttribution,
+) -> Result<Snapshot> {
     let mut snapshot = Snapshot::default();
-    for line in reader.lines() {
-        let line = line.context("reading capture line")?;
-        let trimmed = line.trim();
+    let mut record = Vec::new();
+    let mut record_number = 1usize;
+    let mut string_bytes = 0usize;
+    while read_capture_record(&mut reader, &mut record, record_number)? {
+        if record_number > MAX_CAPTURE_RECORDS {
+            bail!("capture exceeds {MAX_CAPTURE_RECORDS} records");
+        }
+        let current_record = record_number;
+        record_number += 1;
+        let trimmed = std::str::from_utf8(&record)
+            .with_context(|| format!("capture record {current_record} is not UTF-8"))?
+            .trim();
         if trimmed.is_empty() {
             continue;
         }
+        snapshot.final_record_is_health = false;
         let value: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(_) => {
+                snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
+                continue;
+            }
         };
+        string_bytes = string_bytes
+            .checked_add(validate_capture_strings(&value, current_record)?)
+            .context("report capture string byte count overflow")?;
+        if string_bytes > MAX_REPORT_STRING_BYTES {
+            bail!("report capture strings exceed {MAX_REPORT_STRING_BYTES} bytes");
+        }
         let Some(obj) = value.as_object() else {
+            snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
             continue;
         };
-        if str_field(obj, "type") == Some("capture_health") {
+        let Some(kind) = str_field(obj, "type") else {
+            snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
+            continue;
+        };
+        if kind == "capture_health" {
             ingest_health(&mut snapshot, &value);
+            snapshot.final_record_is_health = true;
+            ensure_snapshot_bounds(&snapshot)?;
             continue;
         }
         snapshot.parsed_events = snapshot.parsed_events.saturating_add(1);
+        if !recognized_event_valid(kind, obj) {
+            snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
+            continue;
+        }
+        if kind == "marker" {
+            snapshot.markers.push(crate::capture_normalize::Marker {
+                ts_ns: u64_field(obj, "ts_ns"),
+                name: str_field(obj, "name").unwrap_or_default().to_string(),
+                phase: str_field(obj, "phase").map(str::to_string),
+                scenario_id: str_field(obj, "scenario_id").map(str::to_string),
+                trace_id: str_field(obj, "trace_id").map(str::to_string),
+                root_package: str_field(obj, "root_package").map(str::to_string),
+                root_uid: u32_field(obj, "root_uid"),
+                root_pid: u32_field(obj, "root_pid"),
+            });
+        }
         ingest_scope(&mut snapshot, obj);
         ingest_event(&mut snapshot, obj, attribution);
+        ensure_snapshot_bounds(&snapshot)?;
     }
     Ok(snapshot)
 }
 
+fn ensure_snapshot_bounds(snapshot: &Snapshot) -> Result<()> {
+    let groups = snapshot
+        .pids
+        .len()
+        .saturating_add(snapshot.uids.len())
+        .saturating_add(snapshot.comms.len())
+        .saturating_add(snapshot.packages.len())
+        .saturating_add(snapshot.syscalls.len())
+        .saturating_add(snapshot.sensitive_paths.len())
+        .saturating_add(snapshot.sockets.len())
+        .saturating_add(snapshot.binder_targets.len())
+        .saturating_add(snapshot.ioctl_families.len())
+        .saturating_add(snapshot.rwx.len())
+        .saturating_add(snapshot.findings.len())
+        .saturating_add(snapshot.crashes.len());
+    if groups > MAX_REPORT_GROUPS {
+        bail!("report capture exceeds {MAX_REPORT_GROUPS} aggregate groups");
+    }
+    Ok(())
+}
+
+fn recognized_event_valid(kind: &str, obj: &serde_json::Map<String, Value>) -> bool {
+    let nonzero = |key| u64_field(obj, key).is_some_and(|value| value > 0);
+    match kind {
+        "syscall" => nonzero("pid") && syscall_name(obj).is_some(),
+        "binder" => nonzero("pid") && nonzero("to_proc") && i64_field(obj, "debug_id").is_some(),
+        "binder_call" => nonzero("caller_pid") && nonzero("callee_pid"),
+        "binder_received" => nonzero("pid") && i64_field(obj, "debug_id").is_some(),
+        "process_exit" | "selinux_denial" | "fd_snapshot" => nonzero("pid"),
+        "finding" => str_field(obj, "rule_id").is_some_and(|value| !value.is_empty()),
+        "marker" => str_field(obj, "name").is_some_and(|value| !value.is_empty()),
+        "process_maps" => nonzero("pid") && obj.get("mappings").is_some_and(Value::is_array),
+        "stack_trace" => {
+            nonzero("pid")
+                && str_field(obj, "stack_trace_ref").is_some_and(|value| !value.is_empty())
+        }
+        "follow_guardrail" => {
+            nonzero("caller_pid")
+                && nonzero("callee_pid")
+                && str_field(obj, "status").is_some()
+                && str_field(obj, "reason").is_some()
+        }
+        _ => false,
+    }
+}
+
 fn ingest_health(snapshot: &mut Snapshot, value: &Value) {
     if let Some(obj) = value.as_object() {
+        snapshot.health_records = snapshot.health_records.saturating_add(1);
+        if !crate::health::capture_health_contract_errors(obj).is_empty() {
+            snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
+        }
         for pkg in string_array(obj.get("match_packages")) {
             snapshot.packages.insert(pkg);
         }
@@ -351,8 +512,50 @@ fn ingest_event(
     if ty == "finding" {
         increment(&mut snapshot.findings, finding_label(obj));
     }
-    if ty == "process_exit" && bool_field(obj, "crashed").unwrap_or(false) {
+    if ty == "process_exit"
+        && (str_field(obj, "classification") == Some("crash")
+            || bool_field(obj, "crashed").unwrap_or(false))
+    {
         increment(&mut snapshot.crashes, crash_label(obj));
+    }
+    let Some(scenario_id) = str_field(obj, "scenario_id").filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if ty == "marker" {
+        return;
+    }
+    snapshot.scenario_event_bindings.insert((
+        scenario_id.to_string(),
+        str_field(obj, "trace_id").unwrap_or_default().to_string(),
+    ));
+    if let Some(name) = syscall.as_deref() {
+        increment(&mut snapshot.scenario_syscalls, name.to_string());
+    }
+    if let Some(path) = event_path(obj).filter(|path| is_sensitive_path(path)) {
+        increment(&mut snapshot.scenario_sensitive_paths, path.to_string());
+    }
+    if is_socket_event(obj, syscall.as_deref()) {
+        increment(&mut snapshot.scenario_sockets, socket_label(obj));
+    }
+    if matches!(ty, "binder_call" | "binder") {
+        if let Some(label) = attribution.label_for(obj) {
+            increment(&mut snapshot.scenario_binder_targets, label);
+        }
+    }
+    if let Some(label) = ioctl_label(obj) {
+        increment(&mut snapshot.scenario_ioctl_families, label);
+    }
+    if let Some(label) = rwx_label(obj, syscall.as_deref()) {
+        increment(&mut snapshot.scenario_rwx, label);
+    }
+    if ty == "finding" {
+        increment(&mut snapshot.scenario_findings, finding_label(obj));
+    }
+    if ty == "process_exit"
+        && (str_field(obj, "classification") == Some("crash")
+            || bool_field(obj, "crashed").unwrap_or(false))
+    {
+        increment(&mut snapshot.scenario_crashes, crash_label(obj));
     }
 }
 
@@ -363,7 +566,9 @@ fn render_markdown(
 ) -> String {
     let mut out = String::new();
     out.push_str("# ");
-    out.push_str(opts.title.as_deref().unwrap_or("Neutron Boundary Report"));
+    out.push_str(&markdown_text(
+        opts.title.as_deref().unwrap_or("Neutron Boundary Report"),
+    ));
     out.push_str("\n\n");
     render_health(&mut out, snapshot);
     render_scope(&mut out, snapshot);
@@ -390,29 +595,139 @@ fn render_markdown(
     render_count_section(&mut out, "mmap / RWX", &snapshot.rwx, opts.top);
     render_findings(&mut out, snapshot, opts.top);
     if let Some(baseline) = baseline {
-        render_diff_section(&mut out, baseline, snapshot, opts.top);
+        let scopes_match = snapshot_capture_scope(snapshot)
+            .zip(snapshot_capture_scope(baseline))
+            .is_some_and(|(current, baseline)| {
+                current.claim_scope_complete && baseline.claim_scope_complete && current == baseline
+            });
+        let scenarios_match = snapshot_scenario_contract(snapshot)
+            .zip(snapshot_scenario_contract(baseline))
+            .is_some_and(|(current, baseline)| current.scenarios == baseline.scenarios);
+        if snapshot_health_is_complete(snapshot)
+            && snapshot_health_is_complete(baseline)
+            && scopes_match
+            && scenarios_match
+        {
+            render_diff_section(&mut out, baseline, snapshot, opts.top);
+        } else {
+            out.push_str("## New Behavior\n\n");
+            out.push_str(
+                "**WARNING:** behavior diff is nonconclusive because the current capture or baseline lacks exactly one final, structurally valid `complete` health record, an identical claim-complete effective capture scope, or an identical paired scenario lifecycle/root contract.\n\n",
+            );
+        }
     }
     out
+}
+
+fn snapshot_scenario_contract(
+    snapshot: &Snapshot,
+) -> Option<crate::capture_normalize::ScenarioContract> {
+    let contract = crate::capture_normalize::validated_marker_contract(&snapshot.markers).ok()?;
+    snapshot
+        .scenario_event_bindings
+        .iter()
+        .all(|(scenario_id, trace_id)| {
+            contract.trace_ids.get(scenario_id).map(String::as_str) == Some(trace_id.as_str())
+        })
+        .then_some(contract)
+}
+
+fn snapshot_capture_scope(snapshot: &Snapshot) -> Option<crate::health::CaptureScope> {
+    let value = snapshot
+        .health
+        .as_ref()?
+        .as_object()?
+        .get("capture_scope")?;
+    crate::health::CaptureScope::from_json_value(value).ok()
+}
+
+fn snapshot_health_is_complete(snapshot: &Snapshot) -> bool {
+    snapshot.malformed_records == 0
+        && snapshot.health_records == 1
+        && snapshot.final_record_is_health
+        && snapshot
+            .health
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(crate::health::capture_health_is_complete)
 }
 
 fn render_health(out: &mut String, snapshot: &Snapshot) {
     out.push_str("## Capture Health\n\n");
     out.push_str(&format!("Parsed events: {}\n\n", snapshot.parsed_events));
+    if snapshot.malformed_records > 0 {
+        out.push_str(&format!(
+            "**WARNING:** {} malformed, invalid, or unknown NDJSON record(s) were encountered; capture health is `unknown`. Absence of evidence is not conclusive.\n\n",
+            snapshot.malformed_records
+        ));
+    }
     let Some(health) = snapshot.health.as_ref().and_then(Value::as_object) else {
-        out.push_str("- No `capture_health` event was present.\n\n");
+        out.push_str(
+            "**WARNING:** no final `capture_health` event was present; the run is incomplete and absence of evidence is not conclusive.\n\n",
+        );
         return;
     };
     let degraded = bool_field(health, "degraded").unwrap_or(false);
     let cap_hit = bool_field(health, "output_cap_hit").unwrap_or(false);
-    if degraded || cap_hit {
+    let explicit_status = health.get("status");
+    let parsed_status = explicit_status
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "complete" | "degraded" | "incomplete" | "unknown"));
+    let mut status = parsed_status.unwrap_or(if explicit_status.is_some() {
+        "unknown"
+    } else if cap_hit {
+        "incomplete"
+    } else if degraded {
+        "degraded"
+    } else {
+        "complete"
+    });
+    let contradictory = parsed_status.is_some_and(|value| {
+        (value == "complete" && (degraded || cap_hit))
+            || (value != "complete" && bool_field(health, "degraded") == Some(false))
+            || (cap_hit && !matches!(value, "incomplete" | "unknown"))
+    });
+    if contradictory || snapshot.malformed_records > 0 || snapshot.health_records != 1 {
+        status = "unknown";
+    } else if !snapshot.final_record_is_health && status != "unknown" {
+        status = "incomplete";
+    }
+    if !snapshot.final_record_is_health {
+        out.push_str(
+            "**WARNING:** `capture_health` was not the final non-empty record; the run is incomplete.\n\n",
+        );
+    }
+    if contradictory {
+        out.push_str(
+            "**WARNING:** `capture_health` fields contradict each other; status is `unknown`.\n\n",
+        );
+    }
+    if snapshot.health_records > 1 {
+        out.push_str(&format!(
+            "**WARNING:** capture contains {} `capture_health` records; status is `unknown`.\n\n",
+            snapshot.health_records
+        ));
+    }
+    if status != "complete" {
         out.push_str("**WARNING:** capture health is not clean");
-        if degraded {
-            out.push_str("; degraded paths were reported");
-        }
-        if cap_hit {
-            out.push_str("; output cap was hit");
-        }
+        out.push_str(&format!("; status is `{status}`"));
         out.push_str(". Absence of evidence is not conclusive.\n\n");
+    }
+    if let Some(scope) = health
+        .get("capture_scope")
+        .and_then(|value| crate::health::CaptureScope::from_json_value(value).ok())
+        .filter(|scope| !scope.claim_scope_complete)
+    {
+        out.push_str(
+            "**WARNING:** transport health may be complete, but the effective capture scope is restricted; unfiltered negative claims are not supported. Reasons: ",
+        );
+        out.push_str(&markdown_text(&scope.claim_scope_reasons.join(", ")));
+        out.push_str(".\n\n");
+    }
+    if cap_hit {
+        out.push_str(
+            "**WARNING:** the output cap truncated this capture; required evidence may be missing.\n\n",
+        );
     }
     for key in [
         "events_userspace",
@@ -423,6 +738,7 @@ fn render_health(out: &mut String, snapshot: &Snapshot) {
         "ringbuf_reserve_failed",
         "fd_graph_miss",
         "fd_graph_backfilled",
+        "status",
         "degraded",
         "output_cap_hit",
     ] {
@@ -451,7 +767,7 @@ fn render_count_section(out: &mut String, title: &str, counts: &CountMap, top: u
         return;
     }
     for (key, count) in sorted_counts(counts, top) {
-        out.push_str(&format!("- `{key}`: {count}\n"));
+        out.push_str(&format!("- `{}`: {count}\n", markdown_code(key)));
     }
     if top > 0 && counts.len() > top {
         out.push_str(&format!(
@@ -469,36 +785,42 @@ fn render_findings(out: &mut String, snapshot: &Snapshot, top: usize) {
         return;
     }
     for (key, count) in sorted_counts(&snapshot.findings, top) {
-        out.push_str(&format!("- finding `{key}`: {count}\n"));
+        out.push_str(&format!("- finding `{}`: {count}\n", markdown_code(key)));
     }
     for (key, count) in sorted_counts(&snapshot.crashes, top) {
-        out.push_str(&format!("- crash `{key}`: {count}\n"));
+        out.push_str(&format!("- crash `{}`: {count}\n", markdown_code(key)));
     }
     out.push('\n');
 }
 
 fn render_diff_section(out: &mut String, baseline: &Snapshot, test: &Snapshot, top: usize) {
     out.push_str("## New Behavior\n\n");
-    render_count_diff(out, "syscalls", &baseline.syscalls, &test.syscalls, top);
+    render_count_diff(
+        out,
+        "syscalls",
+        &baseline.scenario_syscalls,
+        &test.scenario_syscalls,
+        top,
+    );
     render_count_diff(
         out,
         "sensitive paths",
-        &baseline.sensitive_paths,
-        &test.sensitive_paths,
+        &baseline.scenario_sensitive_paths,
+        &test.scenario_sensitive_paths,
         top,
     );
     render_count_diff(
         out,
         "ioctl families",
-        &baseline.ioctl_families,
-        &test.ioctl_families,
+        &baseline.scenario_ioctl_families,
+        &test.scenario_ioctl_families,
         top,
     );
     render_count_diff(
         out,
         "binder targets",
-        &baseline.binder_targets,
-        &test.binder_targets,
+        &baseline.scenario_binder_targets,
+        &test.scenario_binder_targets,
         top,
     );
 }
@@ -540,6 +862,7 @@ fn render_count_diff(
         return;
     }
     for (key, b, t) in rows {
+        let key = markdown_text(&key);
         match (b, t) {
             (0, _) => out.push_str(&format!("- + {key} ({t})\n")),
             (_, 0) => out.push_str(&format!("- - {key} ({b})\n")),
@@ -556,11 +879,20 @@ struct BinderTemplateEntry {
     status_counts: BTreeMap<String, u64>,
 }
 
-pub fn render_binder_template_from_reader<R: BufRead>(reader: R) -> Result<String> {
+pub fn render_binder_template_from_reader<R: BufRead>(mut reader: R) -> Result<String> {
     let mut out: BTreeMap<String, BTreeMap<String, BinderTemplateEntry>> = BTreeMap::new();
-    for line in reader.lines() {
-        let line = line.context("reading capture line")?;
-        let trimmed = line.trim();
+    let mut record = Vec::new();
+    let mut record_number = 1usize;
+    let mut string_bytes = 0usize;
+    while read_capture_record(&mut reader, &mut record, record_number)? {
+        if record_number > MAX_CAPTURE_RECORDS {
+            bail!("capture exceeds {MAX_CAPTURE_RECORDS} records");
+        }
+        let current_record = record_number;
+        record_number += 1;
+        let trimmed = std::str::from_utf8(&record)
+            .with_context(|| format!("capture record {current_record} is not UTF-8"))?
+            .trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -568,6 +900,12 @@ pub fn render_binder_template_from_reader<R: BufRead>(reader: R) -> Result<Strin
             Ok(value) => value,
             Err(_) => continue,
         };
+        string_bytes = string_bytes
+            .checked_add(validate_capture_strings(&value, current_record)?)
+            .context("binder template string byte count overflow")?;
+        if string_bytes > MAX_REPORT_STRING_BYTES {
+            bail!("binder template strings exceed {MAX_REPORT_STRING_BYTES} bytes");
+        }
         let Some(obj) = value.as_object() else {
             continue;
         };
@@ -591,6 +929,22 @@ pub fn render_binder_template_from_reader<R: BufRead>(reader: R) -> Result<Strin
         if let Some(status) = str_field(obj, "status") {
             *entry.status_counts.entry(status.to_string()).or_insert(0) += 1;
         }
+        let groups = out
+            .values()
+            .map(|nodes| {
+                nodes
+                    .values()
+                    .map(|entry| {
+                        1usize
+                            .saturating_add(entry.observed_codes.len())
+                            .saturating_add(entry.status_counts.len())
+                    })
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        if groups > MAX_REPORT_GROUPS {
+            bail!("binder template exceeds {MAX_REPORT_GROUPS} aggregate groups");
+        }
     }
     let mut json = serde_json::to_string_pretty(&out).context("serializing binder template")?;
     json.push('\n');
@@ -606,8 +960,11 @@ struct ServiceCatalogEntry {
 pub fn render_service_catalog_from_reader<R: BufRead>(mut reader: R) -> Result<String> {
     let mut input = String::new();
     reader
+        .by_ref()
+        .take(MAX_AUXILIARY_INPUT_BYTES + 1)
         .read_to_string(&mut input)
         .context("reading service list input")?;
+    validate_auxiliary_input(&input, "service list")?;
     let parsed = parse_service_list(&input)?;
     let catalog: BTreeMap<String, ServiceCatalogEntry> = parsed
         .into_iter()
@@ -627,6 +984,7 @@ pub fn render_service_catalog_from_reader<R: BufRead>(mut reader: R) -> Result<S
 }
 
 pub fn parse_service_list(input: &str) -> Result<BTreeMap<u32, Vec<String>>> {
+    validate_auxiliary_input(input, "service list")?;
     let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     for raw in input.lines() {
         let line = raw.trim();
@@ -642,6 +1000,10 @@ pub fn parse_service_list(input: &str) -> Result<BTreeMap<u32, Vec<String>>> {
         let services = out.entry(pid).or_default();
         if !services.iter().any(|s| s == &service) {
             services.push(service);
+            let entries = out.values().map(Vec::len).sum::<usize>();
+            if entries > MAX_REPORT_GROUPS {
+                bail!("service list exceeds {MAX_REPORT_GROUPS} entries");
+            }
         }
     }
     for services in out.values_mut() {
@@ -651,7 +1013,9 @@ pub fn parse_service_list(input: &str) -> Result<BTreeMap<u32, Vec<String>>> {
 }
 
 fn parse_binder_catalog_json(raw: &str) -> Result<BinderCatalog> {
+    validate_auxiliary_input(raw, "binder catalog")?;
     let value: Value = serde_json::from_str(raw).context("expected PID -> services object")?;
+    validate_capture_strings(&value, 1).context("validating binder catalog strings")?;
     let Some(obj) = value.as_object() else {
         bail!("expected PID -> services object");
     };
@@ -671,20 +1035,40 @@ fn parse_binder_catalog_json(raw: &str) -> Result<BinderCatalog> {
             _ => Vec::new(),
         };
         out.insert(pid, services);
+        let entries = out
+            .values()
+            .map(|services| services.len().saturating_add(1))
+            .sum::<usize>();
+        if entries > MAX_REPORT_GROUPS {
+            bail!("binder catalog exceeds {MAX_REPORT_GROUPS} entries");
+        }
     }
     Ok(out)
 }
 
 fn read_input_to_string(path: &str) -> Result<String> {
+    let mut s = String::new();
     if path == "-" {
-        let mut s = String::new();
         io::stdin()
+            .take(MAX_AUXILIARY_INPUT_BYTES + 1)
             .read_to_string(&mut s)
             .context("reading stdin argument")?;
-        Ok(s)
     } else {
-        fs::read_to_string(path).with_context(|| format!("reading {path}"))
+        fs::File::open(path)
+            .with_context(|| format!("opening {path}"))?
+            .take(MAX_AUXILIARY_INPUT_BYTES + 1)
+            .read_to_string(&mut s)
+            .with_context(|| format!("reading {path}"))?;
     }
+    validate_auxiliary_input(&s, path)?;
+    Ok(s)
+}
+
+fn validate_auxiliary_input(value: &str, label: &str) -> Result<()> {
+    if value.len() as u64 > MAX_AUXILIARY_INPUT_BYTES {
+        bail!("{label} exceeds {MAX_AUXILIARY_INPUT_BYTES} bytes");
+    }
+    Ok(())
 }
 
 fn open_text_input(path: &str) -> Result<Box<dyn BufRead>> {
@@ -698,7 +1082,8 @@ fn open_text_input(path: &str) -> Result<Box<dyn BufRead>> {
 
 fn write_output(path: Option<&str>, bytes: &[u8]) -> Result<()> {
     if let Some(path) = path {
-        fs::write(path, bytes).with_context(|| format!("writing {path}"))?;
+        crate::private_output::write(Path::new(path), bytes, true)
+            .with_context(|| format!("writing {path}"))?;
     } else {
         io::stdout()
             .lock()
@@ -729,7 +1114,7 @@ fn render_inline_set(out: &mut String, label: &str, values: &BTreeSet<String>) {
             "- {label}: {}\n",
             values
                 .iter()
-                .map(|v| format!("`{v}`"))
+                .map(|v| format!("`{}`", markdown_code(v)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -743,7 +1128,7 @@ fn render_inline_counts(out: &mut String, label: &str, counts: &CountMap, top: u
     }
     let values = sorted_counts(counts, top)
         .into_iter()
-        .map(|(value, count)| format!("`{value}` ({count})"))
+        .map(|(value, count)| format!("`{}` ({count})", markdown_code(value)))
         .collect::<Vec<_>>()
         .join(", ");
     out.push_str(&format!("- {label}: {values}\n"));
@@ -752,10 +1137,12 @@ fn render_inline_counts(out: &mut String, label: &str, counts: &CountMap, top: u
 fn syscall_name(obj: &serde_json::Map<String, Value>) -> Option<String> {
     str_field(obj, "name")
         .or_else(|| str_field(obj, "syscall"))
+        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| {
             i64_field(obj, "nr")
                 .or_else(|| i64_field(obj, "syscall_nr"))
+                .filter(|value| *value >= 0)
                 .map(|n| n.to_string())
         })
 }
@@ -848,7 +1235,10 @@ fn crash_label(obj: &serde_json::Map<String, Value>) -> String {
         .map(|n| n.to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
     let comm = str_field(obj, "comm").unwrap_or("<unknown>");
-    let signal = str_or_num(obj, "signal").unwrap_or_else(|| "unknown".to_string());
+    let signal = str_or_num(obj, "signal_name")
+        .or_else(|| str_or_num(obj, "exit_signal"))
+        .or_else(|| str_or_num(obj, "signal"))
+        .unwrap_or_else(|| "unknown".to_string());
     format!("pid={pid} comm={comm} signal={signal}")
 }
 
@@ -900,9 +1290,60 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
 
 fn scalar_to_string(value: &Value) -> String {
     match value {
-        Value::String(s) => s.clone(),
+        Value::String(s) => markdown_text(s),
         other => other.to_string(),
     }
+}
+
+/// Render attacker-controlled text without allowing it to introduce Markdown
+/// structure, links, or raw HTML. Capture files and service catalogs can come
+/// from a hostile device, so report rendering must treat every string as data.
+fn markdown_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '.'
+            | '!' | '|' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            control if control.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{{{:04x}}}", control as u32);
+            }
+            printable => out.push(printable),
+        }
+    }
+    out
+}
+
+/// Escape data placed inside an inline-code span. Backticks are rendered as a
+/// visible escape so they cannot terminate the span.
+fn markdown_code(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '`' => out.push_str("\\x60"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            control if control.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{{{:04x}}}", control as u32);
+            }
+            printable => out.push(printable),
+        }
+    }
+    out
 }
 
 fn str_or_num(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {

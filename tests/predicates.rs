@@ -216,6 +216,7 @@ fn syscall_event_lens_renders_arg_payload_for_ioctl() {
         pid: 970,
         uid: 1047,
         syscall_nr: 29,
+        args: [0, 0xc010_4c64, 0, 0, 0, 0],
         is_enter: 0,
         ret: 0,
         data,

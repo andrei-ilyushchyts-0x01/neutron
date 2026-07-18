@@ -2,36 +2,12 @@
 
 use std::fs;
 use std::io;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use anyhow::{bail, Context, Result};
 
-pub(crate) fn run_platform_command(program: &str, args: &[&str]) -> io::Result<Output> {
-    let candidates: &[&str] = match program {
-        "cmd" => &["/system/bin/cmd"],
-        "pm" => &["/system/bin/pm"],
-        "service" => &["/system/bin/service"],
-        "dumpsys" => &["/system/bin/dumpsys"],
-        "getprop" => &["/system/bin/getprop"],
-        "lshal" => &["/system/bin/lshal", "/vendor/bin/lshal"],
-        "vndservice" => &["/vendor/bin/vndservice", "/system/bin/vndservice"],
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsupported Android platform command: {program}"),
-            ))
-        }
-    };
-    let mut last_not_found = None;
-    for candidate in candidates {
-        match Command::new(candidate).args(args).output() {
-            Ok(output) => return Ok(output),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => last_not_found = Some(error),
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_not_found
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "platform command not found")))
+pub fn run_platform_command(program: &str, args: &[&str]) -> io::Result<Output> {
+    crate::surface::platform::run_platform_command_bounded(program, args)
 }
 
 fn validate_package_name(package: &str) -> Result<&str> {
@@ -274,8 +250,13 @@ fn parse_status_uid(status: &str) -> Option<u32> {
 
 /// Find every live process whose real UID matches `uid`.
 pub fn find_uid_processes(uid: u32) -> Result<Vec<u32>> {
+    const MAX_PROC_ENTRIES: usize = 32 * 1024;
+    const MAX_STATUS_BYTES: usize = 1024 * 1024;
     let mut pids = Vec::new();
-    for entry in fs::read_dir("/proc").context("reading /proc")? {
+    for (index, entry) in fs::read_dir("/proc").context("reading /proc")?.enumerate() {
+        if index >= MAX_PROC_ENTRIES {
+            bail!("/proc exceeds the {MAX_PROC_ENTRIES}-entry discovery limit");
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -288,8 +269,12 @@ pub fn find_uid_processes(uid: u32) -> Result<Vec<u32>> {
         else {
             continue;
         };
-        let status = match fs::read_to_string(entry.path().join("status")) {
-            Ok(status) => status,
+        let status = match crate::surface::platform::read_regular_file_bounded(
+            &entry.path().join("status"),
+            MAX_STATUS_BYTES,
+        ) {
+            Ok(status) => String::from_utf8(status)
+                .with_context(|| format!("decoding /proc/{pid}/status for UID discovery"))?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(error)
@@ -309,10 +294,14 @@ pub fn find_uid_processes(uid: u32) -> Result<Vec<u32>> {
 /// Find every live process belonging to the package UID whose cmdline is the
 /// package or one of its colon-suffixed Android child process names.
 pub fn find_package_processes(package: &str, uid: u32) -> Result<Vec<u32>> {
+    const MAX_CMDLINE_BYTES: usize = 64 * 1024;
     let package = validate_package_name(package)?;
     let mut pids = Vec::new();
     for pid in find_uid_processes(uid)? {
-        let cmdline = match fs::read(format!("/proc/{pid}/cmdline")) {
+        let cmdline = match crate::surface::platform::read_regular_file_bounded(
+            std::path::Path::new(&format!("/proc/{pid}/cmdline")),
+            MAX_CMDLINE_BYTES,
+        ) {
             Ok(cmdline) => cmdline,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {

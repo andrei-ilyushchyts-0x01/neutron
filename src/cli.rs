@@ -4,15 +4,21 @@
 //! cover diagnostic, indexing, causal-analysis, surface, research, and
 //! capture-to-regression workflows.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
     name = "neutron",
-    version,
+    disable_version_flag = true,
     about = "Android kernel-boundary and cross-service causal tracer for authorized security assessment"
 )]
 pub struct Cli {
+    /// Print build identity. Combine with --verbose for provenance details.
+    #[arg(short = 'V', long)]
+    pub version: bool,
+
     /// Optional subcommand. When omitted, neutron runs in trace mode using
     /// the flags in [`Args`].
     #[command(subcommand)]
@@ -26,105 +32,208 @@ pub struct Cli {
 /// Subcommand registry. Add new subcommands here.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Trace syscalls and optional causal Binder/service/HAL descendants.
+    /// [PREVIEW] Trace syscalls and optional causal Binder/service/HAL descendants.
     /// The same flags remain accepted without this explicit subcommand.
+    /// PREVIEW: This command contract may change before it becomes stable.
     Trace(Box<Args>),
 
-    /// Preflight environment checks. Verifies that the device kernel,
+    /// [PREVIEW] Preflight environment checks. Verifies that the device kernel,
     /// privileges, and BPF subsystem are in a state where neutron can attach.
     /// Prints PASS/WARN/FAIL per check and exits non-zero on any FAIL.
-    Doctor,
+    /// PREVIEW: This command contract may change before it becomes stable.
+    Doctor(crate::doctor::DoctorArgs),
 
-    /// Host-side post-processor: cut a window of events around an anchor
+    /// [STABLE] Print source, compiler, target, feature, and userspace/BPF ABI identity.
+    SelfInfo(SelfInfoArgs),
+
+    /// [STABLE] Verify run bundles and import separately attributed external evidence.
+    #[command(subcommand)]
+    Evidence(crate::evidence::EvidenceCommand),
+
+    /// [STABLE] Host-side post-processor: cut a window of events around an anchor
     /// (finding, crash, pid, etc.) from a previously-captured NDJSON file.
     /// Sprint-2 PR 3.
     Window(WindowArgs),
 
-    /// Aggregate an NDJSON capture by a user-chosen group key. Emits a
+    /// [STABLE] Aggregate an NDJSON capture by a user-chosen group key. Emits a
     /// sorted table of `count + group fields`, optionally with raw
     /// exemplars per group. Phase 2.
     Summarize(crate::summarize::SummarizeArgs),
 
-    /// Compare two NDJSON captures aggregated on a shared key. Useful
+    /// [STABLE] Compare two NDJSON captures aggregated on a shared key. Useful
     /// for negative-evidence workflows ("scenario A and scenario B
     /// both ran, what's different?"). Phase 2.
     Diff(crate::diff::DiffArgs),
 
-    /// Render a Markdown kernel-boundary report from an NDJSON capture.
+    /// [STABLE] Render a Markdown kernel-boundary report from an NDJSON capture.
     Report(crate::report::ReportArgs),
 
-    /// Build Binder attribution helper JSON files from captures and
+    /// [PREVIEW] Build Binder attribution helper JSON files from captures and
     /// Android `service list -p` output.
+    ///
+    /// PREVIEW: This command contract may change before it becomes stable.
     #[command(subcommand)]
     BinderMap(crate::report::BinderMapCommand),
 
-    /// Append a `type:"marker"` NDJSON line to an output file (or
+    /// [PREVIEW] Append a `type:"marker"` NDJSON line to an output file (or
     /// stdout). Used to correlate external scenarios with the live
     /// trace; downstream `neutron window --anchor marker:<name>` cuts
     /// a window around the marker. Phase 5a.
+    ///
+    /// PREVIEW: This command contract may change before it becomes stable.
     Mark(crate::mark::MarkArgs),
 
-    /// Render a causal capture as Mermaid or versioned JSON.
+    /// [STABLE] Render a causal capture as Mermaid or versioned JSON.
     Graph(crate::graph::GraphArgs),
 
-    /// Build, query, and semantically diff Android surface snapshots.
+    /// [PREVIEW] Build, query, and semantically diff Android surface snapshots.
+    ///
+    /// PREVIEW: This command contract may change before it becomes stable.
     #[command(subcommand)]
     Surface(crate::surface::SurfaceCommand),
 
-    /// Print built-in workflow recipes for common Android security
+    /// [PREVIEW] Print built-in workflow recipes for common Android security
     /// research tasks.
+    ///
+    /// PREVIEW: This command contract may change before it becomes stable.
     #[command(subcommand)]
     Recipes(crate::recipes::RecipesCommand),
 
-    /// Generate and inspect data-only ioctl ABI schema packs.
+    /// [EXPERIMENTAL] Generate and inspect data-only ioctl ABI schema packs.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     #[command(subcommand)]
     Ioctl(IoctlCommand),
 
-    /// Capture, build, minimize, and replay authorized regression testcases.
+    /// [EXPERIMENTAL] Capture, build, minimize, and replay authorized regression testcases.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     #[command(subcommand)]
     Harness(HarnessCommand),
 
-    /// Index AIDL interfaces and selectively decode complete harness testcases.
+    /// [EXPERIMENTAL] Index AIDL interfaces and selectively decode complete harness testcases.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     #[command(subcommand)]
     Aidl(AidlCommand),
 
-    /// Run a validated, bounded on-device security research scenario.
+    /// [EXPERIMENTAL] Run a validated, bounded on-device security research scenario.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Research(crate::research::ResearchArgs),
 
-    /// Resolve captured raw userspace IPs against ELF/APK/symbol artifacts.
+    /// [EXPERIMENTAL] Resolve captured raw userspace IPs against ELF/APK/symbol artifacts.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     NativeMap(crate::native::NativeMapArgs),
 
-    /// Aggregate resolved native frames into neutral Ghidra bookmark JSON.
+    /// [EXPERIMENTAL] Aggregate resolved native frames into neutral Ghidra bookmark JSON.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     GhidraExport(crate::native::GhidraExportArgs),
 
-    /// Explain captured SELinux AVC decisions and observed delegation.
+    /// [PREVIEW] Explain captured SELinux AVC decisions and observed delegation.
+    ///
+    /// PREVIEW: This command contract may change before it becomes stable.
     #[command(subcommand)]
     Selinux(crate::selinux::SelinuxCommand),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandMaturity {
+    Stable,
+    Preview,
+    Experimental,
+}
+
+impl CommandMaturity {
+    pub const fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Stable => None,
+            Self::Preview => Some("PREVIEW command contract may change before it becomes stable"),
+            Self::Experimental => {
+                Some("EXPERIMENTAL lab command is not part of the stable 1.5 contract")
+            }
+        }
+    }
+}
+
+impl Command {
+    pub const fn maturity(&self) -> CommandMaturity {
+        match self {
+            Self::SelfInfo(_)
+            | Self::Evidence(_)
+            | Self::Window(_)
+            | Self::Summarize(_)
+            | Self::Diff(_)
+            | Self::Report(_)
+            | Self::Graph(_) => CommandMaturity::Stable,
+            Self::Trace(_)
+            | Self::Doctor(_)
+            | Self::BinderMap(_)
+            | Self::Mark(_)
+            | Self::Surface(_)
+            | Self::Recipes(_)
+            | Self::Selinux(_) => CommandMaturity::Preview,
+            Self::Ioctl(_)
+            | Self::Harness(_)
+            | Self::Aidl(_)
+            | Self::Research(_)
+            | Self::NativeMap(_)
+            | Self::GhidraExport(_) => CommandMaturity::Experimental,
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SelfInfoArgs {
+    /// Emit the versioned neutron.self-info/v1 JSON contract.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Inspect one BPF object and include its measured ABI identity. May be
+    /// repeated; validation is read-only and creates no kernel state.
+    #[arg(long = "bpf-object", value_name = "PATH", requires = "json")]
+    pub bpf_objects: Vec<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum AidlCommand {
-    /// Build a deterministic descriptor and transaction catalog.
+    /// [EXPERIMENTAL] Build a deterministic descriptor and transaction catalog.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Index(crate::aidl::IndexArgs),
-    /// Decode a complete offline Binder harness testcase with a static plugin.
+    /// [EXPERIMENTAL] Decode a complete offline Binder harness testcase with a static plugin.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Decode(crate::aidl::DecodeArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub enum HarnessCommand {
-    /// Extract one captured event and its dependencies into a testcase directory.
+    /// [EXPERIMENTAL] Extract one captured event and its dependencies into a testcase directory.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Extract(crate::harness::ExtractArgs),
-    /// Cross-build the generated replay for a physical Android device.
+    /// [EXPERIMENTAL] Cross-build the generated replay for a physical Android device.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Build(crate::harness::BuildArgs),
-    /// Minimize a testcase without synthesizing new values.
+    /// [EXPERIMENTAL] Minimize a testcase without synthesizing new values.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Minimize(crate::harness::MinimizeArgs),
-    /// Replay a testcase on one explicitly selected physical USB device.
+    /// [EXPERIMENTAL] Replay a testcase on one explicitly selected physical USB device.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Replay(crate::harness::ReplayArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub enum IoctlCommand {
-    /// Extract ioctl constants and record layouts from kernel headers with clang.
+    /// [EXPERIMENTAL] Extract ioctl constants and record layouts from kernel headers with clang.
+    ///
+    /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Generate(crate::ioctl_schema::GenerateArgs),
 }
 
@@ -225,18 +334,18 @@ pub struct Args {
     #[arg(long, default_value = "30s", value_name = "DURATION")]
     pub follow_ttl: String,
 
-    /// Follow only callees in these SELinux domains. Repeat or comma-separate.
+    /// Reserved compatibility flag; rejected in 1.5 because pre-admission enforcement is unsafe.
     #[arg(long, value_delimiter = ',', num_args = 1.., value_name = "DOMAIN")]
     pub follow_allow_domain: Vec<String>,
 
-    /// Never follow callees in these SELinux domains. Repeat or comma-separate.
+    /// Reserved compatibility flag; rejected in 1.5 because pre-admission enforcement is unsafe.
     #[arg(long, value_delimiter = ',', num_args = 1.., value_name = "DOMAIN")]
     pub follow_deny_domain: Vec<String>,
 
     /// Live marker control socket path. Use `off` to disable it.
     #[arg(
         long,
-        default_value = "/data/local/tmp/neutron.control.sock",
+        default_value = "/data/local/share/neutron/runtime/neutron.control.sock",
         value_name = "PATH|off"
     )]
     pub control_socket: String,
@@ -246,7 +355,7 @@ pub struct Args {
     pub pid: u32,
 
     /// Path to compiled Aya BPF ELF object
-    #[arg(long, default_value = "/data/local/tmp/neutron.bpf.elf")]
+    #[arg(long, default_value = "/data/local/share/neutron/neutron.bpf.elf")]
     pub object: String,
 
     /// (Deprecated as of CORE V1 — kept for backward compatibility. The
@@ -267,6 +376,22 @@ pub struct Args {
     #[arg(long)]
     pub output: Option<String>,
 
+    /// Create a private, self-verifying live-capture run bundle. The bundle
+    /// owns capture.ndjson and capture.health.json, so standalone output paths
+    /// and rotation cannot be combined with this option. Captures are bounded
+    /// to 1 GiB so the shipped verifier can always read the artifact.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["output", "health_output", "rotate_output_size"]
+    )]
+    pub run_dir: Option<PathBuf>,
+
+    /// Attacker capability exercised by an external stimulus. Neutron does
+    /// not infer ordinary-app reachability from the capture configuration.
+    #[arg(long, default_value = "not_tested", requires = "run_dir")]
+    pub attacker_capability: String,
+
     /// Stop capture after writing this many bytes to the output stream.
     /// Accepts bare bytes or binary suffixes like `500mb`, `1gb`.
     #[arg(long, value_name = "SIZE")]
@@ -283,9 +408,9 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub health_output: Option<String>,
 
-    /// Inter-process capture lock path. "auto" uses /data/local/tmp on Android
-    /// when present, otherwise the host temp directory. "off" disables the
-    /// lock for advanced debugging.
+    /// Inter-process capture lock path. "auto" uses the root-owned Neutron
+    /// runtime directory on Android, otherwise the host temp directory.
+    /// "off" disables the lock for advanced debugging.
     #[arg(long, default_value = "auto", value_name = "PATH|auto|off")]
     pub capture_lock: String,
 
@@ -317,7 +442,7 @@ pub struct Args {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub kprobe_pack: Vec<String>,
 
-    /// Enable binder transaction tracing via kprobe
+    /// Enable Binder transaction tracing via tracepoints.
     #[arg(long)]
     pub binder: bool,
 
@@ -337,7 +462,8 @@ pub struct Args {
     #[arg(long)]
     pub follow_children: bool,
 
-    /// Capture content of read() calls on watched FDs (/proc/*, /sys/*)
+    /// Track read/write calls on watched /proc/* and /sys/* FDs. Buffer
+    /// content capture is not implemented in the 1.5 ABI.
     #[arg(long)]
     pub capture_reads: bool,
 
@@ -372,7 +498,7 @@ pub struct Args {
     /// `traced` = `--pid` target + followed children + (under `--pid 0`)
     /// PIDs that already produced fd-bearing events.
     /// `active` (default) = same as `traced` but excludes followed children.
-    /// `uid` = sprint-2 stub; falls back to `active` with a stderr warning.
+    /// `uid` is rejected in 1.5 because UID-class polling is not implemented.
     /// `all` = scan all PIDs in `/proc` (heavy; use only for one-off audits).
     #[arg(long, default_value = "active")]
     pub fdgraph_pids: String,
@@ -418,8 +544,10 @@ pub struct Args {
     // ── Binder causality (sprint-2 PR 2) ───────────────────────────────────
     /// Maximum in-flight binder transactions tracked by the userspace
     /// correlator. When the cap is exceeded the least-recently-touched
-    /// entry is silently dropped. `0` disables the correlator entirely
-    /// (raw `binder` / `binder_received` events still flow). Default 1024.
+    /// entry is dropped and capture health records the causal loss.
+    /// `0` disables the correlator entirely and marks capture health
+    /// incomplete (raw `binder` / `binder_received` events still flow).
+    /// Default 1024.
     #[arg(long, default_value_t = 1024)]
     pub binder_inflight: usize,
 
@@ -686,6 +814,150 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_labels_every_command_family_by_maturity() {
+        let cmd = Cli::command();
+        let expected = [
+            ("trace", "PREVIEW"),
+            ("doctor", "PREVIEW"),
+            ("self-info", "STABLE"),
+            ("evidence", "STABLE"),
+            ("window", "STABLE"),
+            ("summarize", "STABLE"),
+            ("diff", "STABLE"),
+            ("report", "STABLE"),
+            ("binder-map", "PREVIEW"),
+            ("mark", "PREVIEW"),
+            ("graph", "STABLE"),
+            ("surface", "PREVIEW"),
+            ("recipes", "PREVIEW"),
+            ("ioctl", "EXPERIMENTAL"),
+            ("harness", "EXPERIMENTAL"),
+            ("aidl", "EXPERIMENTAL"),
+            ("research", "EXPERIMENTAL"),
+            ("native-map", "EXPERIMENTAL"),
+            ("ghidra-export", "EXPERIMENTAL"),
+            ("selinux", "PREVIEW"),
+        ];
+
+        for (name, maturity) in expected {
+            let subcommand = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing {name} subcommand"));
+            let about = subcommand
+                .get_about()
+                .unwrap_or_else(|| panic!("missing {name} help"))
+                .to_string();
+            assert!(
+                about.starts_with(&format!("[{maturity}]")),
+                "{name} help does not start with [{maturity}]: {about}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_stable_subcommand_help_repeats_contract_warning() {
+        let cmd = Cli::command();
+        for (name, maturity) in [
+            ("trace", "PREVIEW"),
+            ("doctor", "PREVIEW"),
+            ("binder-map", "PREVIEW"),
+            ("mark", "PREVIEW"),
+            ("surface", "PREVIEW"),
+            ("recipes", "PREVIEW"),
+            ("selinux", "PREVIEW"),
+            ("ioctl", "EXPERIMENTAL"),
+            ("harness", "EXPERIMENTAL"),
+            ("aidl", "EXPERIMENTAL"),
+            ("research", "EXPERIMENTAL"),
+            ("native-map", "EXPERIMENTAL"),
+            ("ghidra-export", "EXPERIMENTAL"),
+        ] {
+            let mut subcommand = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing {name} subcommand"))
+                .clone();
+            let mut help = Vec::new();
+            subcommand.write_long_help(&mut help).unwrap();
+            let help = String::from_utf8(help).unwrap();
+            let warning = match maturity {
+                "PREVIEW" => "PREVIEW: This command contract may change before it becomes stable",
+                "EXPERIMENTAL" => {
+                    "EXPERIMENTAL: This lab command is not part of the stable 1.5 contract."
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                help.contains(warning),
+                "{name} help does not repeat its non-stable warning:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_lab_leaf_help_repeats_contract_warning() {
+        let cmd = Cli::command();
+        for (family, leaf) in [
+            ("ioctl", "generate"),
+            ("harness", "extract"),
+            ("harness", "build"),
+            ("harness", "minimize"),
+            ("harness", "replay"),
+            ("aidl", "index"),
+            ("aidl", "decode"),
+        ] {
+            let mut leaf_command = cmd
+                .find_subcommand(family)
+                .unwrap_or_else(|| panic!("missing {family} family"))
+                .find_subcommand(leaf)
+                .unwrap_or_else(|| panic!("missing {family} {leaf} command"))
+                .clone();
+            let mut help = Vec::new();
+            leaf_command.write_long_help(&mut help).unwrap();
+            let help = String::from_utf8(help).unwrap();
+            assert!(
+                help.starts_with("[EXPERIMENTAL]")
+                    && help.contains(
+                        "EXPERIMENTAL: This lab command is not part of the stable 1.5 contract."
+                    ),
+                "{family} {leaf} help lacks its maturity warning:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_maturity_keeps_legacy_alias_while_trace_is_preview() {
+        let legacy = Cli::try_parse_from(["neutron"]).expect("legacy trace alias");
+        assert!(legacy.command.is_none());
+
+        let trace = Cli::try_parse_from(["neutron", "trace"]).expect("explicit trace");
+        assert_eq!(
+            trace.command.as_ref().map(Command::maturity),
+            Some(CommandMaturity::Preview)
+        );
+
+        let preview =
+            Cli::try_parse_from(["neutron", "surface", "services", "--input", "surface.json"])
+                .expect("preview surface command");
+        assert_eq!(
+            preview.command.as_ref().map(Command::maturity),
+            Some(CommandMaturity::Preview)
+        );
+
+        let experimental = Cli::try_parse_from([
+            "neutron",
+            "native-map",
+            "capture.ndjson",
+            "--symbols",
+            "symbols",
+        ])
+        .expect("experimental native-map command");
+        assert_eq!(
+            experimental.command.as_ref().map(Command::maturity),
+            Some(CommandMaturity::Experimental)
+        );
+    }
+
+    #[test]
     fn driver_and_kprobe_packs_accept_comma_lists() {
         let cli = Cli::try_parse_from([
             "neutron",
@@ -722,5 +994,49 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(export.command, Some(Command::GhidraExport(_))));
+    }
+
+    #[test]
+    fn trace_run_directory_owns_capture_outputs() {
+        let cli = Cli::try_parse_from([
+            "neutron",
+            "trace",
+            "--run-dir",
+            "/data/local/share/neutron/runs/test-run",
+        ])
+        .expect("parse trace run bundle");
+        let Some(Command::Trace(args)) = cli.command else {
+            panic!("expected trace command");
+        };
+        assert_eq!(
+            args.run_dir.as_deref(),
+            Some(std::path::Path::new(
+                "/data/local/share/neutron/runs/test-run"
+            ))
+        );
+        assert_eq!(args.attacker_capability, "not_tested");
+    }
+
+    #[test]
+    fn trace_run_directory_rejects_conflicting_output_paths_and_rotation() {
+        for conflicting in [
+            ["--output", "capture.ndjson"],
+            ["--health-output", "capture.health.json"],
+            ["--rotate-output-size", "1mb"],
+        ] {
+            let result = Cli::try_parse_from([
+                "neutron",
+                "trace",
+                "--run-dir",
+                "run",
+                conflicting[0],
+                conflicting[1],
+            ]);
+            assert!(
+                result.is_err(),
+                "--run-dir unexpectedly accepted {}",
+                conflicting[0]
+            );
+        }
     }
 }

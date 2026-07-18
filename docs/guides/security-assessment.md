@@ -3,7 +3,8 @@
 End-to-end workflow for authorized security assessment of Android
 applications using neutron. This guide covers root detection analysis,
 network traffic enumeration, file probing, and IPC analysis on Pixel 8
-Pro / Android 14+ / kernel 6.1+.
+Pro on the explicitly validated build lines in the support matrix. Other
+Android/GKI combinations remain experimental even when they expose kernel 6.1+.
 
 > **Authorization required.** Only use this tool on devices and
 > applications you own or have explicit written authorization to test.
@@ -11,32 +12,36 @@ Pro / Android 14+ / kernel 6.1+.
 ## Environment Setup
 
 ```bash
-# 1. Build and deploy the tracer (Aya BPF + userspace).
+# 1. Select exactly one physical device, then build and deploy.
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
 ./build.sh
 
-# 2. Find the target PID (launch the app first).
-adb shell pidof com.target.app
-# or
-adb shell 'ps -A | grep com.target'
+# 2. Find one target PID (launch the app first) and reject unexpected output.
+TARGET_PID="$("${ADB[@]}" shell pidof -s com.target.app | tr -d '\r')"
+[[ "$TARGET_PID" =~ ^[0-9]+$ ]] || { echo "invalid target PID" >&2; exit 1; }
 
-# 3. Set convenience variables.
-export TARGET_PID=$(adb shell pidof com.target.app)
-export TRACER='adb shell su -c'
+# 3. Create one root-private run directory.
+NEUTRON=/data/local/share/neutron/neutron-agent
+RUN=/data/local/share/neutron/runs/security-$(date -u +%Y%m%dT%H%M%SZ)
+"${ADB[@]}" shell "su -c 'install -d -m 0700 ${RUN}'"
 ```
 
-The default `--object` is `/data/local/tmp/neutron.bpf.elf` — `build.sh`
-pushes it there. No need to pass it explicitly.
+The installed default object is
+`/data/local/share/neutron/neutron.bpf.elf`; no explicit `--object` is needed.
+Retrieve private output with `adb -s "$ANDROID_SERIAL" exec-out "su -c
+'cat ...'"`; do not make evidence world-readable for `adb pull`.
 
 ## Default workflow: rule-engine findings
 
 For most assessments, start with the bundled detector pack:
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --profile security \
   --resolve-paths \
-  --stacks"
+  --stacks'"
 ```
 
 Findings emit to stdout. Rules T001..T015 are path/syscall-pattern based;
@@ -54,12 +59,12 @@ Examples:
 To export findings as NDJSON for tooling:
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --profile security \
   --resolve-paths --stacks \
-  --json --output /data/local/tmp/findings.ndjson"
-adb pull /data/local/tmp/findings.ndjson
+  --json --output ${RUN}/findings.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/findings.ndjson'" > findings.ndjson
 ```
 
 For raw events alongside findings, add `--raw`. To suppress findings
@@ -77,13 +82,13 @@ Root detection typically involves:
 ### Capture command (raw events for ad-hoc analysis)
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --profile security \
   --resolve-paths \
   --raw --no-findings --json \
-  --output /data/local/tmp/raw.ndjson"
-adb pull /data/local/tmp/raw.ndjson
+  --output ${RUN}/raw.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/raw.ndjson'" > raw.ndjson
 ```
 
 ### What to Look For
@@ -110,12 +115,12 @@ jq -c 'select(.nr == 56 and (.data // "") | startswith("/proc"))' raw.ndjson
 Capture all outbound connections and DNS-like activity.
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --profile security \
   --raw --no-findings --json \
-  --output /data/local/tmp/net_trace.ndjson"
-adb pull /data/local/tmp/net_trace.ndjson
+  --output ${RUN}/net_trace.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/net_trace.ndjson'" > net_trace.ndjson
 
 # All connect() calls with destination
 jq -r 'select(.nr == 203 and .enter == false) | "\(.comm) connect -> \(.data) ret=\(.ret)"' net_trace.ndjson
@@ -130,13 +135,13 @@ jq -r 'select(.nr == 203 and (.data // "") | contains(":443")) | .data' net_trac
 ## File System Probing Analysis
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --profile security \
   --resolve-paths \
   --raw --no-findings --json \
-  --output /data/local/tmp/fs_trace.ndjson"
-adb pull /data/local/tmp/fs_trace.ndjson
+  --output ${RUN}/fs_trace.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/fs_trace.ndjson'" > fs_trace.ndjson
 
 # All opened files (successful)
 jq -r 'select(.nr == 56 and .enter == false and .ret > 0) | .data' fs_trace.ndjson \
@@ -150,12 +155,12 @@ jq -r 'select(.nr == 56 or .nr == 48) | .data' fs_trace.ndjson \
 ## IPC and Binder Analysis
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --binder \
   --raw --no-findings --json \
-  --output /data/local/tmp/binder_trace.ndjson"
-adb pull /data/local/tmp/binder_trace.ndjson
+  --output ${RUN}/binder_trace.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/binder_trace.ndjson'" > binder_trace.ndjson
 
 # Summary of destination processes
 jq -r 'select(.type == "binder") | .to_proc' binder_trace.ndjson \
@@ -187,12 +192,12 @@ workflow:
 ```bash
 # Capture with all sources enabled (binder + crash + fdgraph all on by
 # default in 1.1.0).
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid 0 \
   --binder \
   --json \
-  --output /data/local/tmp/full_trace.ndjson"
-adb pull /data/local/tmp/full_trace.ndjson
+  --output ${RUN}/full_trace.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/full_trace.ndjson'" > full_trace.ndjson
 
 # Every crash with its in-flight binder context (R004 finding).
 jq -c 'select(.type == "finding" and .rule_id == "R004_binder_callee_crash")' \
@@ -220,10 +225,10 @@ For the full anchor + window reference see
 ## Memory Integrity Analysis
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --alert-rwx \
-  --raw --no-findings --json" \
+  --raw --no-findings --json'" \
   | jq -r 'select(.rwx_alert != null) |
     "\(.comm) \(.rwx_alert): mmap addr=\(.args[0]) size=\(.args[1]) prot=\(.args[2])"'
 ```
@@ -237,11 +242,11 @@ When the call origin matters (which native function or JIT region
 triggered a syscall):
 
 ```bash
-$TRACER "/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid $TARGET_PID \
   --profile security \
   --stacks \
-  --raw --no-findings --json" \
+  --raw --no-findings --json'" \
   | jq -r 'select(.stack and (.stack | contains("su"))) | "\(.name) \(.data) | \(.stack)"'
 ```
 
@@ -254,22 +259,22 @@ A typical 10-minute session against a hardened banking app on Pixel 8 Pro:
 
 ```bash
 # Terminal 1: rule-engine findings live + capture full raw stream
-adb shell su -c '/data/local/tmp/neutron \
-  --pid '$TARGET_PID' \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
+  --pid ${TARGET_PID} \
   --profile security \
   --resolve-paths \
   --follow-children \
   --binder \
   --stacks \
   --raw --json \
-  --output /data/local/tmp/full_trace.ndjson'
+  --output ${RUN}/full_trace.ndjson'"
 
 # Terminal 2: drive the app — login, biometric prompt, payment flow.
 # Watch findings stream in Terminal 1. Each [FINDING] block is one
 # triggered detector with evidence and process context.
 
-# After session: pull and summarise.
-adb pull /data/local/tmp/full_trace.ndjson
+# After session: retrieve the private file through the selected device.
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/full_trace.ndjson'" > full_trace.ndjson
 
 echo "Total raw events:"
 wc -l full_trace.ndjson
@@ -287,23 +292,24 @@ jq -r 'select(.nr == 203 and .enter == false and .ret == 0) | .data' full_trace.
   | sort | uniq
 ```
 
-A typical hardened fintech app trips T001 (proc/self/maps polling), T003
-(TracerPid scrape), T004 or T016 (su binary checks), T013 (SELinux
-status), T014 (property service), and frequently T017 (JIT-cache
-syscalls — typical of integrity SDKs that do their work in dynamically
-loaded code). T011 fires once at startup for the ART JIT itself.
+Depending on the behavior actually observed, relevant rules may include T001
+(proc/self/maps polling), T003 (TracerPid scrape), T004 or T016 (su binary
+checks), T013 (SELinux status), T014 (property service), T017 (JIT-cache
+syscalls), and T011 (RWX/W^X events). A rule firing is a review lead, not a
+vulnerability finding or proof of intent.
 
 ## Output Enrichment with Python
 
 ```python
 #!/usr/bin/env python3
 """Enrich trace with process names and flag suspicious patterns."""
-import json, subprocess
+import json, os, subprocess
 
 # Build PID → app name map
 pid_map = {}
-result = subprocess.run(['adb', 'shell', 'ps', '-A'],
-                        capture_output=True, text=True)
+serial = os.environ['ANDROID_SERIAL']
+result = subprocess.run(['adb', '-s', serial, 'shell', 'ps', '-A'],
+                        capture_output=True, text=True, check=True)
 for line in result.stdout.splitlines()[1:]:
     parts = line.split()
     if len(parts) >= 9:

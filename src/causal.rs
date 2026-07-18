@@ -3,9 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -18,7 +17,7 @@ use neutron_common::{
     CAUSAL_RELATION_EXACT, CAUSAL_RELATION_INFERRED, PROCESS_TRACE_CONTEXT_SIZE,
 };
 
-pub const DEFAULT_CONTROL_SOCKET: &str = "/data/local/tmp/neutron.control.sock";
+pub const DEFAULT_CONTROL_SOCKET: &str = "/data/local/share/neutron/runtime/neutron.control.sock";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CausalRelation {
@@ -89,6 +88,11 @@ impl FollowPolicy {
 
     pub fn decide(&self, candidate: FollowCandidate<'_>) -> FollowDecision {
         let callee_domain = candidate.callee_domain.and_then(normalize_domain_lossy);
+        if (!self.allow_domains.is_empty() || !self.deny_domains.is_empty())
+            && callee_domain.is_none()
+        {
+            return FollowDecision::Block("domain_unavailable");
+        }
         if callee_domain
             .as_ref()
             .is_some_and(|domain| self.deny_domains.contains(domain))
@@ -291,11 +295,9 @@ impl ScenarioState {
         self.by_generation.get(&generation)
     }
 
-    pub fn start(&mut self, name: &str) -> Result<ScenarioInfo> {
-        self.start_with_trace_id(name, random_nonzero_u64()?)
-    }
-
-    pub fn start_with_trace_id(&mut self, name: &str, trace_id: u64) -> Result<ScenarioInfo> {
+    /// Validate a start request without mutating scenario state. Callers use
+    /// this before draining external-source baselines or changing BPF maps.
+    pub fn validate_start(&self, name: &str) -> Result<()> {
         validate_marker_name(name)?;
         if self.active.is_some() {
             bail!("cannot start scenario '{name}': another scenario is active");
@@ -303,11 +305,20 @@ impl ScenarioState {
         if self.used_names.contains(name) {
             bail!("scenario '{name}' was already used in this capture");
         }
-        if trace_id == 0 {
-            bail!("trace_id must be non-zero");
-        }
         if self.next_generation == u16::MAX {
             bail!("scenario generation space exhausted for this capture");
+        }
+        Ok(())
+    }
+
+    pub fn start(&mut self, name: &str) -> Result<ScenarioInfo> {
+        self.start_with_trace_id(name, random_nonzero_u64()?)
+    }
+
+    pub fn start_with_trace_id(&mut self, name: &str, trace_id: u64) -> Result<ScenarioInfo> {
+        self.validate_start(name)?;
+        if trace_id == 0 {
+            bail!("trace_id must be non-zero");
         }
         self.next_generation += 1;
         let info = ScenarioInfo {
@@ -321,7 +332,8 @@ impl ScenarioState {
         Ok(info)
     }
 
-    pub fn end(&mut self, name: &str) -> Result<ScenarioInfo> {
+    /// Validate an end request without closing the active scenario.
+    pub fn validate_end(&self, name: &str) -> Result<ScenarioInfo> {
         validate_marker_name(name)?;
         let active = self
             .active
@@ -333,11 +345,16 @@ impl ScenarioState {
                 active.scenario_id
             );
         }
+        Ok(active.clone())
+    }
+
+    pub fn end(&mut self, name: &str) -> Result<ScenarioInfo> {
+        self.validate_end(name)?;
         Ok(self.active.take().expect("active checked above"))
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CausalMetadata {
     pub scenario_id: String,
     pub trace_id: u64,
@@ -542,31 +559,68 @@ impl PendingMark {
 
 pub struct ControlServer {
     listener: UnixListener,
-    path: PathBuf,
+    pinned_path: crate::private_output::PinnedPrivatePath,
+    device: u64,
+    inode: u64,
 }
 
 impl ControlServer {
     pub fn bind(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("creating control socket directory {}", parent.display())
-            })?;
+        let pinned_path = crate::private_output::PinnedPrivatePath::new(path)?;
+        let bound_path = pinned_path.proc_path();
+        if let Some(stat) = pinned_path.stat()? {
+            if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+                || stat.st_uid != unsafe { libc::geteuid() }
+            {
+                bail!(
+                    "refusing to replace non-socket or foreign control path: {}",
+                    path.display()
+                );
+            }
+            match UnixStream::connect(&bound_path) {
+                Ok(_) => bail!(
+                    "control socket already has a live listener: {}",
+                    path.display()
+                ),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    pinned_path.unlink().with_context(|| {
+                        format!("removing owned stale control socket {}", path.display())
+                    })?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("checking existing control socket {}", path.display())
+                    });
+                }
+            }
         }
-        if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("removing stale control socket {}", path.display()))?;
-        }
-        let listener = UnixListener::bind(path)
+        let listener = UnixListener::bind(&bound_path)
             .with_context(|| format!("binding control socket {}", path.display()))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        pinned_path.chmod(0o600)?;
         listener
             .set_nonblocking(true)
             .context("setting control socket nonblocking")?;
+        let metadata = pinned_path
+            .stat()?
+            .context("bound control socket disappeared before verification")?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFSOCK
+            || metadata.st_uid != unsafe { libc::geteuid() }
+            || metadata.st_mode & 0o077 != 0
+        {
+            let _ = pinned_path.unlink();
+            bail!("bound control socket failed ownership/mode verification");
+        }
         Ok(Self {
             listener,
-            path: path.to_path_buf(),
+            pinned_path,
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
         })
     }
 
@@ -633,14 +687,31 @@ impl ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if self.pinned_path.stat().is_ok_and(|metadata| {
+            metadata.is_some_and(|metadata| {
+                metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                    && metadata.st_dev == self.device
+                    && metadata.st_ino == self.inode
+            })
+        }) {
+            let _ = self.pinned_path.unlink();
+        }
     }
 }
 
 pub fn send_mark_request(path: impl AsRef<Path>, request: &MarkRequest) -> Result<MarkResponse> {
     request.validate()?;
     let path = path.as_ref();
-    let mut stream = UnixStream::connect(path)
+    let pinned_path = crate::private_output::PinnedPrivatePath::new(path)?;
+    let metadata = pinned_path
+        .stat()?
+        .context("control socket does not exist")?;
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFSOCK
+        || metadata.st_uid != unsafe { libc::geteuid() }
+    {
+        bail!("control path is not an owned socket: {}", path.display());
+    }
+    let mut stream = UnixStream::connect(pinned_path.proc_path())
         .with_context(|| format!("connecting to control socket {}", path.display()))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -706,5 +777,23 @@ mod tests {
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["root_uid"], 10123);
         assert!(value.get("root_package").is_none());
+    }
+
+    #[test]
+    fn scenario_validation_never_mutates_an_active_boundary() {
+        let mut scenarios = ScenarioState::default();
+        scenarios.validate_start("first").unwrap();
+        let first = scenarios.start_with_trace_id("first", 0x1234).unwrap();
+
+        assert!(scenarios.validate_start("nested").is_err());
+        assert_eq!(scenarios.active(), Some(&first));
+        assert!(scenarios.validate_end("wrong").is_err());
+        assert_eq!(scenarios.active(), Some(&first));
+        assert_eq!(scenarios.validate_end("first").unwrap(), first);
+        assert_eq!(scenarios.active(), Some(&first));
+
+        assert_eq!(scenarios.end("first").unwrap(), first);
+        assert!(scenarios.active().is_none());
+        assert!(scenarios.validate_start("first").is_err());
     }
 }

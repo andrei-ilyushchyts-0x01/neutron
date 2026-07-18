@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::causal::CausalRelation;
+use crate::sources::logcat::{set_nonblocking, stop_child, StreamTerminalState};
 
 const MAX_AVC_LINE_BYTES: usize = 16 * 1024;
 const MAX_CAPTURE_LINE_BYTES: usize = 1024 * 1024;
@@ -479,9 +480,23 @@ pub fn resolve_process_identity(denial: &mut SelinuxDenial) {
 }
 
 fn read_bounded_file(path: &str, limit: usize) -> io::Result<Vec<u8>> {
-    let file = fs::File::open(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input must be a single-link regular file",
+        ));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+    }
     let mut bytes = Vec::with_capacity(limit.min(4096));
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    file.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
     }
@@ -498,19 +513,28 @@ fn status_value<'a>(status: &'a str, key: &str) -> Option<&'a str> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SelinuxSourceStats {
+    pub baseline_drains: u64,
+    pub baseline_records_discarded: u64,
+    pub baseline_pending_discarded: u64,
+    pub baseline_errors: u64,
+    pub unprimed_drains: u64,
     pub parsed: u64,
     pub malformed: u64,
     pub deduplicated: u64,
     pub out_of_scope: u64,
+    pub eof: u64,
+    pub read_errors: u64,
 }
 
 pub struct SelinuxLogcatReader {
     child: Option<Child>,
-    reader: BufReader<std::process::ChildStdout>,
+    reader: Box<dyn BufRead + Send>,
     pending_line: Vec<u8>,
     pending_overflow: bool,
     deduper: DenialDeduper,
     stats: SelinuxSourceStats,
+    terminal_state: Option<StreamTerminalState>,
+    primed: bool,
 }
 
 fn selinux_logcat_args() -> &'static [&'static str] {
@@ -523,8 +547,6 @@ fn selinux_logcat_args() -> &'static [&'static str] {
         "kernel",
         "-b",
         "system",
-        "-b",
-        "main",
         "auditd:V",
         "kernel:V",
         "avc:V",
@@ -541,29 +563,91 @@ impl SelinuxLogcatReader {
             .stderr(Stdio::null())
             .stdin(Stdio::null())
             .spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("SELinux logcat stdout missing"))?;
-        crate::sources::logcat::set_nonblocking(stdout.as_raw_fd())?;
-        Ok(Self {
-            child: Some(child),
-            reader: BufReader::new(stdout),
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                stop_child(&mut child);
+                return Err(io::Error::other("SELinux logcat stdout missing"));
+            }
+        };
+        if let Err(error) = set_nonblocking(stdout.as_raw_fd()) {
+            stop_child(&mut child);
+            return Err(error);
+        }
+        Ok(Self::from_reader(Some(child), BufReader::new(stdout)))
+    }
+
+    fn from_reader<R>(child: Option<Child>, reader: R) -> Self
+    where
+        R: BufRead + Send + 'static,
+    {
+        Self {
+            child,
+            reader: Box::new(reader),
             pending_line: Vec::with_capacity(4096),
             pending_overflow: false,
             deduper: DenialDeduper::new(4096),
             stats: SelinuxSourceStats::default(),
-        })
+            terminal_state: None,
+            primed: false,
+        }
     }
 
-    pub fn drain(&mut self, now_ns: u64) -> Vec<SelinuxDenial> {
+    #[cfg(test)]
+    fn from_reader_for_test<R>(reader: R) -> Self
+    where
+        R: BufRead + Send + 'static,
+    {
+        let mut source = Self::from_reader(None, reader);
+        source.primed = true;
+        source
+    }
+
+    fn finish_pending_line(&mut self, now_ns: u64, denials: &mut Vec<SelinuxDenial>) {
+        if self.pending_overflow {
+            self.stats.malformed = self.stats.malformed.saturating_add(1);
+        } else if !self.pending_line.is_empty() {
+            let line = String::from_utf8_lossy(&self.pending_line);
+            match parse_avc_line(&line) {
+                Ok(Some(denial)) => {
+                    self.stats.parsed = self.stats.parsed.saturating_add(1);
+                    if self.deduper.is_duplicate(&denial, now_ns) {
+                        self.stats.deduplicated = self.stats.deduplicated.saturating_add(1);
+                    } else {
+                        denials.push(denial);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => self.stats.malformed = self.stats.malformed.saturating_add(1),
+            }
+        }
+        self.pending_line.clear();
+        self.pending_overflow = false;
+    }
+
+    fn drain_impl(&mut self, now_ns: u64) -> Vec<SelinuxDenial> {
         let mut denials = Vec::new();
+        if self.terminal_state.is_some() {
+            return denials;
+        }
         loop {
             let available = match self.reader.fill_buf() {
-                Ok([]) => break,
+                Ok([]) => {
+                    self.finish_pending_line(now_ns, &mut denials);
+                    self.stats.eof = self.stats.eof.saturating_add(1);
+                    self.terminal_state = Some(StreamTerminalState::EndOfStream);
+                    break;
+                }
                 Ok(available) => available,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Err(error) => {
+                    self.stats.read_errors = self.stats.read_errors.saturating_add(1);
+                    self.terminal_state = Some(StreamTerminalState::ReadError {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    });
+                    break;
+                }
             };
             let newline = available.iter().position(|byte| *byte == b'\n');
             let consume = newline.map_or(available.len(), |index| index + 1);
@@ -578,27 +662,47 @@ impl SelinuxLogcatReader {
             if newline.is_none() {
                 continue;
             }
-            if self.pending_overflow {
-                self.stats.malformed = self.stats.malformed.saturating_add(1);
-            } else {
-                let line = String::from_utf8_lossy(&self.pending_line);
-                match parse_avc_line(&line) {
-                    Ok(Some(denial)) => {
-                        self.stats.parsed = self.stats.parsed.saturating_add(1);
-                        if self.deduper.is_duplicate(&denial, now_ns) {
-                            self.stats.deduplicated = self.stats.deduplicated.saturating_add(1);
-                        } else {
-                            denials.push(denial);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(_) => self.stats.malformed = self.stats.malformed.saturating_add(1),
-                }
-            }
-            self.pending_line.clear();
-            self.pending_overflow = false;
+            self.finish_pending_line(now_ns, &mut denials);
         }
         denials
+    }
+
+    /// Drain buffered records without admitting them as evidence, then reset
+    /// partial-record and deduplication state at the capture boundary.
+    pub fn prime(&mut self, now_ns: u64) -> io::Result<()> {
+        self.primed = false;
+        self.stats.baseline_drains = self.stats.baseline_drains.saturating_add(1);
+        let parsed_before = self.stats.parsed;
+        let _ = self.drain_impl(now_ns);
+        self.stats.baseline_records_discarded = self
+            .stats
+            .baseline_records_discarded
+            .saturating_add(self.stats.parsed.saturating_sub(parsed_before));
+        self.stats.baseline_pending_discarded = self
+            .stats
+            .baseline_pending_discarded
+            .saturating_add(u64::from(
+                !self.pending_line.is_empty() || self.pending_overflow,
+            ));
+        self.pending_line.clear();
+        self.pending_overflow = false;
+        self.deduper = DenialDeduper::new(self.deduper.capacity);
+        if let Some(terminal) = self.terminal_state.as_ref() {
+            self.stats.baseline_errors = self.stats.baseline_errors.saturating_add(1);
+            return Err(io::Error::other(format!(
+                "SELinux logcat terminated during baseline drain: {terminal:?}"
+            )));
+        }
+        self.primed = true;
+        Ok(())
+    }
+
+    pub fn drain(&mut self, now_ns: u64) -> Vec<SelinuxDenial> {
+        if !self.primed {
+            self.stats.unprimed_drains = self.stats.unprimed_drains.saturating_add(1);
+            return Vec::new();
+        }
+        self.drain_impl(now_ns)
     }
 
     pub fn record_out_of_scope(&mut self) {
@@ -609,18 +713,40 @@ impl SelinuxLogcatReader {
         self.stats
     }
 
+    pub fn terminal_state(&self) -> Option<&StreamTerminalState> {
+        self.terminal_state.as_ref()
+    }
+
     pub fn is_available(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .is_some_and(|child| child.try_wait().ok().flatten().is_none())
+        if self.terminal_state.is_some() {
+            return false;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                self.terminal_state = Some(StreamTerminalState::ChildExited {
+                    status: status.to_string(),
+                });
+                false
+            }
+            Err(error) => {
+                self.terminal_state = Some(StreamTerminalState::ChildWaitError {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                });
+                false
+            }
+        }
     }
 }
 
 impl Drop for SelinuxLogcatReader {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child);
         }
     }
 }
@@ -940,12 +1066,146 @@ pub fn render_explanation_text(explanation: &SelinuxExplanation) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::selinux_logcat_args;
+    use super::{selinux_logcat_args, SelinuxLogcatReader, MAX_AVC_LINE_BYTES};
+    use crate::sources::logcat::{set_nonblocking, StreamTerminalState};
+    use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    const AVC_LINE: &[u8] = b"kernel: audit(1.000:7): avc: denied { getattr } for pid=77 comm=\"worker\" scontext=u:r:vendor_hal:s0 tcontext=u:object_r:sysfs:s0 tclass=file permissive=0\n";
+
+    struct ErrorReader(io::ErrorKind);
+
+    impl Read for ErrorReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "injected SELinux read failure"))
+        }
+    }
+
+    impl BufRead for ErrorReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::new(self.0, "injected SELinux read failure"))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
 
     #[test]
     fn logcat_starts_at_the_capture_boundary() {
         assert!(selinux_logcat_args()
             .windows(2)
             .any(|args| args == ["-T", "0"]));
+        assert!(!selinux_logcat_args()
+            .windows(2)
+            .any(|args| args == ["-b", "main"]));
+    }
+
+    #[test]
+    fn unprimed_reader_never_admits_buffered_denials() {
+        let mut reader = SelinuxLogcatReader::from_reader(None, Cursor::new(AVC_LINE));
+
+        assert!(reader.drain(10).is_empty());
+        assert_eq!(reader.stats().unprimed_drains, 1);
+        assert_eq!(reader.stats().parsed, 0);
+        assert!(reader.terminal_state().is_none());
+    }
+
+    #[test]
+    fn explicit_baseline_discards_records_and_resets_partial_and_dedup_state() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        set_nonblocking(stream.as_raw_fd()).unwrap();
+        peer.write_all(AVC_LINE).unwrap();
+        peer.write_all(b"kernel: partial AVC").unwrap();
+        let mut reader = SelinuxLogcatReader::from_reader(None, BufReader::new(stream));
+
+        reader.prime(10).unwrap();
+        let baseline = reader.stats();
+        assert_eq!(baseline.baseline_drains, 1);
+        assert_eq!(baseline.baseline_records_discarded, 1);
+        assert_eq!(baseline.baseline_pending_discarded, 1);
+        assert_eq!(baseline.baseline_errors, 0);
+        assert!(reader.pending_line.is_empty());
+        assert!(reader.deduper.is_empty());
+
+        peer.write_all(AVC_LINE).unwrap();
+        let denials = reader.drain(20);
+        assert_eq!(
+            denials.len(),
+            1,
+            "baseline audit IDs must not suppress live evidence"
+        );
+        assert_eq!(denials[0].audit_id.as_deref(), Some("1.000:7"));
+    }
+
+    #[test]
+    fn terminal_baseline_fails_and_keeps_reader_unprimed() {
+        let mut reader = SelinuxLogcatReader::from_reader(None, Cursor::new(Vec::<u8>::new()));
+
+        let error = reader.prime(10).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("terminated during baseline drain"));
+        assert_eq!(reader.stats().baseline_drains, 1);
+        assert_eq!(reader.stats().baseline_errors, 1);
+        assert!(!reader.primed);
+        assert!(reader.drain(20).is_empty());
+        assert_eq!(reader.stats().unprimed_drains, 1);
+    }
+
+    #[test]
+    fn runtime_eof_is_explicit_and_counted_once() {
+        let mut reader = SelinuxLogcatReader::from_reader_for_test(Cursor::new(Vec::<u8>::new()));
+
+        assert!(reader.drain(10).is_empty());
+        assert_eq!(reader.stats().eof, 1);
+        assert_eq!(
+            reader.terminal_state(),
+            Some(&StreamTerminalState::EndOfStream)
+        );
+        assert!(!reader.is_available());
+        reader.drain(20);
+        assert_eq!(reader.stats().eof, 1);
+    }
+
+    #[test]
+    fn would_block_does_not_make_selinux_source_terminal() {
+        let mut reader =
+            SelinuxLogcatReader::from_reader_for_test(ErrorReader(io::ErrorKind::WouldBlock));
+
+        assert!(reader.drain(10).is_empty());
+        assert_eq!(reader.stats().read_errors, 0);
+        assert!(reader.terminal_state().is_none());
+        assert!(reader.is_available());
+    }
+
+    #[test]
+    fn non_would_block_error_is_terminal_and_counted_once() {
+        let mut reader =
+            SelinuxLogcatReader::from_reader_for_test(ErrorReader(io::ErrorKind::BrokenPipe));
+
+        assert!(reader.drain(10).is_empty());
+        assert_eq!(reader.stats().read_errors, 1);
+        assert!(matches!(
+            reader.terminal_state(),
+            Some(StreamTerminalState::ReadError {
+                kind: io::ErrorKind::BrokenPipe,
+                ..
+            })
+        ));
+        assert!(!reader.is_available());
+        reader.drain(20);
+        assert_eq!(reader.stats().read_errors, 1);
+    }
+
+    #[test]
+    fn oversized_avc_line_is_bounded_and_counted() {
+        let mut input = vec![b'x'; MAX_AVC_LINE_BYTES + 128];
+        input.push(b'\n');
+        let mut reader = SelinuxLogcatReader::from_reader_for_test(Cursor::new(input));
+
+        assert!(reader.drain(10).is_empty());
+        assert_eq!(reader.stats().malformed, 1);
+        assert!(reader.pending_line.capacity() <= (MAX_AVC_LINE_BYTES + 1).next_power_of_two());
     }
 }

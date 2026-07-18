@@ -1,8 +1,14 @@
 plugins { id "com.android.application" }
 
+def probeKeystore = System.getenv("NEUTRON_PROBE_KEYSTORE")
+def probeStorePassword = System.getenv("NEUTRON_PROBE_STORE_PASSWORD")
+def probeKeyAlias = System.getenv("NEUTRON_PROBE_KEY_ALIAS")
+def probeKeyPassword = System.getenv("NEUTRON_PROBE_KEY_PASSWORD")
+
 android {
     namespace "dev.neutron.probe"
     compileSdk 35
+    buildToolsVersion "35.0.0"
 
     defaultConfig {
         applicationId "dev.neutron.probe"
@@ -11,6 +17,25 @@ android {
         versionCode 1
         versionName "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (probeKeystore) {
+            research {
+                storeFile file(probeKeystore)
+                storePassword probeStorePassword
+                keyAlias probeKeyAlias
+                keyPassword probeKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (probeKeystore) {
+                signingConfig signingConfigs.research
+            }
+        }
     }
 }
 

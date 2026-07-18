@@ -1,8 +1,9 @@
 # neutron Documentation
 
-Aya-based Android kernel-boundary and cross-service causal tracing platform for
-authorized security assessment. The reference target is kernel 6.1+ on Pixel
-8 Pro/Android GKI; host analysis commands also operate on saved captures.
+Evidence-grade Android boundary mapping and bounded causal tracing for
+authorized security assessment. Support claims are limited to the exact device,
+build, and capture rows in [PRODUCT.md](../PRODUCT.md); host analysis commands
+also operate on saved captures.
 
 ## Contents
 
@@ -34,28 +35,35 @@ authorized security assessment. The reference target is kernel 6.1+ on Pixel
 ## Quick Reference
 
 ```bash
-# Build BPF + userspace and adb push
+# Select one physical device; build.sh refuses an implicit/default device.
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+
+# Build BPF + userspace and deploy to that device.
 ./build.sh
 
-# Default mode (rule-engine findings only)
-adb shell su -c '/data/local/tmp/neutron --pid <PID>'
+# Use one private run directory for this example.
+NEUTRON=/data/local/share/neutron/neutron-agent
+RUN=/data/local/share/neutron/runs/quick-reference
+"${ADB[@]}" shell "su -c 'install -d -m 0700 ${RUN}'"
 
-# Security profile + binder + stacks
-adb shell su -c '/data/local/tmp/neutron \
-    --pid <PID> --profile security --binder --stacks'
+# Security profile + Binder + stacks.
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
+    --pid <PID> --profile security --binder --stacks'"
 
-# Raw NDJSON capture for offline analysis
-adb shell su -c '/data/local/tmp/neutron \
+# Raw NDJSON capture for offline analysis.
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
     --pid <PID> --raw --no-findings --json \
-    --output /data/local/tmp/trace.ndjson'
+    --output ${RUN}/trace.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/trace.ndjson'" > trace.ndjson
 ```
 
 ## Requirements
 
 | Component | Requirement |
 |-----------|-------------|
-| Device | Pixel 8 Pro (`husky`) or any Android 14+ GKI device with kernel 6.1+ and BTF |
+| Device | Pixel 8 Pro (`husky`) on a validated support-matrix build; other GKI devices are experimental |
 | Kernel | 6.1+ aarch64 (verified: 6.1.145-android14-11) |
 | Host build | rust nightly + `bpfel-unknown-none` target + `bpf-linker` + `aarch64-linux-gnu-gcc` |
-| Runtime | Root shell (`adb shell su`) — KernelSU or Magisk |
+| Runtime | Root shell (`adb -s SERIAL shell su`) — KernelSU or Magisk |
 | BPF caps | Effective `CAP_BPF` + `CAP_SYS_ADMIN` in the `su` domain |

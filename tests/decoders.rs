@@ -65,6 +65,7 @@ fn connect_event_text_includes_decoded_sockaddr() {
         tgid: 99,
         syscall_nr: 203, // connect
         is_enter: 1,
+        args: [3, 0, 8, 0, 0, 0],
         comm: comm_bytes("net"),
         data,
         ..SyscallEvent::default()

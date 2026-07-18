@@ -711,9 +711,7 @@ fn resolve_pack(value: &str) -> Result<(PathBuf, bool)> {
     }
     let mut roots = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(prefix) = exe.parent().and_then(Path::parent) {
-            roots.push((prefix.join("share/neutron/packs"), true));
-        }
+        roots.extend(pack_roots_for_executable(&exe));
     }
     roots.extend([
         (PathBuf::from("/system/etc/neutron/packs"), true),
@@ -730,6 +728,21 @@ fn resolve_pack(value: &str) -> Result<(PathBuf, bool)> {
         }
     }
     bail!("research pack '{value}' was not found");
+}
+
+fn pack_roots_for_executable(executable: &Path) -> Vec<(PathBuf, bool)> {
+    let mut roots = Vec::new();
+    if let Some(parent) = executable.parent() {
+        // Self-contained Android archive layout:
+        // /data/local/share/neutron/{neutron-agent,packs/}
+        roots.push((parent.join("packs"), true));
+        // Conventional host FHS layout: /usr/bin/neutron plus
+        // /usr/share/neutron/packs/.
+        if let Some(prefix) = parent.parent() {
+            roots.push((prefix.join("share/neutron/packs"), true));
+        }
+    }
+    roots
 }
 
 pub fn run(args: ResearchArgs) -> i32 {
@@ -1605,6 +1618,20 @@ mod tests {
         state.transition(Phase::Postflight).unwrap();
         state.transition(Phase::Reported).unwrap();
         assert_eq!(state.history.last(), Some(&"reported"));
+    }
+
+    #[test]
+    fn packaged_android_agent_resolves_sibling_pack_directory() {
+        let roots = pack_roots_for_executable(Path::new("/data/local/share/neutron/neutron-agent"));
+        assert_eq!(
+            roots
+                .first()
+                .map(|(path, trusted)| (path.as_path(), *trusted)),
+            Some((Path::new("/data/local/share/neutron/packs"), true))
+        );
+        assert!(roots.iter().any(
+            |(path, trusted)| *trusted && path == Path::new("/data/local/share/neutron/packs")
+        ));
     }
 
     #[test]

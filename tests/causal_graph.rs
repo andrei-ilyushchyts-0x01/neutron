@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
@@ -164,12 +165,15 @@ fn service_and_lshal_catalogs_keep_ambiguous_candidates_honest() {
 
 #[test]
 fn control_socket_round_trips_one_validated_marker_request() {
-    let path = std::env::temp_dir().join(format!(
-        "neutron-control-{}-{}.sock",
+    let directory = std::env::temp_dir().join(format!(
+        "neutron-control-{}-{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
     ));
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("control.sock");
     let server = ControlServer::bind(&path).expect("bind control socket");
     let server_thread = thread::spawn(move || {
         for _ in 0..100 {
@@ -196,14 +200,17 @@ fn control_socket_round_trips_one_validated_marker_request() {
     assert!(response.ok);
     assert_eq!(response.ts_ns, Some(99));
     server_thread.join().unwrap();
-    let _ = std::fs::remove_file(&path);
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]
 fn stalled_control_client_is_rejected_without_failing_server() {
-    let path =
-        std::env::temp_dir().join(format!("neutron-control-stall-{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let directory =
+        std::env::temp_dir().join(format!("neutron-control-stall-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("control.sock");
     let server = ControlServer::bind(&path).expect("bind control socket");
     let _stalled = UnixStream::connect(&path).expect("connect stalled client");
     assert!(
@@ -214,7 +221,7 @@ fn stalled_control_client_is_rejected_without_failing_server() {
         "an incomplete request must not become a marker"
     );
     drop(server);
-    let _ = std::fs::remove_file(&path);
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]

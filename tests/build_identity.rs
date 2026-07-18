@@ -22,9 +22,7 @@ fn text_field<'a>(text: &'a str, name: &str) -> &'a str {
     text.lines()
         .find_map(|line| {
             let rest = line.trim().strip_prefix(name)?;
-            let value = rest
-                .trim_start_matches(|character: char| character == ':' || character == '=')
-                .trim();
+            let value = rest.trim_start_matches([':', '=']).trim();
             (!value.is_empty()).then_some(value)
         })
         .unwrap_or_else(|| panic!("missing or empty {name} field in:\n{text}"))
@@ -83,4 +81,21 @@ fn self_info_json_matches_neutron_self_info_v1() {
     assert!(value["bpf"]["abi_major"].is_u64());
     assert_eq!(value["bpf"]["event_size"], 257);
     assert!(value["bpf"]["feature_bits"].is_array());
+}
+
+#[test]
+fn self_info_bpf_measurement_reports_object_read_failures() {
+    let output = neutron(&[
+        "self-info",
+        "--json",
+        "--bpf-object",
+        "/definitely/missing/neutron.bpf.elf",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot read BPF object"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

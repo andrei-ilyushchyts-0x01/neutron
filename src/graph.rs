@@ -313,7 +313,7 @@ fn build_graph_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Res
     let mut warnings: Vec<_> = capture
         .health_warnings
         .into_iter()
-        .map(|warning| format!("{warning} recorded in capture_health."))
+        .map(|warning| format!("{warning}."))
         .collect();
     if !has_causal {
         warnings

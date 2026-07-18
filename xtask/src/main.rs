@@ -5,8 +5,8 @@
 //!   cargo xtask build-ebpf release  # release build
 //!   cargo xtask build-ebpf --stacks # stackful object for --stacks captures
 //!   cargo xtask build               # build everything (ebpf + userspace aarch64-musl)
-//!   cargo xtask deploy              # build + adb push to device
-//!   cargo xtask demo                # build + push demo target; print run instructions
+//!   cargo xtask deploy --serial ID  # build + adb push to one explicit device
+//!   cargo xtask demo --serial ID    # build + push demo target; print run instructions
 //!   cargo xtask demo-hal            # host-only ioctl decoder fixture; prints
 //!                                   # synthetic NDJSON and diffs it against
 //!                                   # examples/expected/dma-heap.ndjson
@@ -18,12 +18,30 @@
 //!                                   # examples/expected/findings.txt
 
 use anyhow::{bail, Context, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const EBPF_OBJ_NAME: &str = "neutron.bpf.elf";
 const EBPF_STACKS_OBJ_NAME: &str = "neutron-stacks.bpf.elf";
 const DEMO_BIN: &str = "demo-target";
+const DEVICE_INSTALL_DIR: &str = "/data/local/share/neutron";
+const DEVICE_RUNTIME_DIR: &str = "/data/local/share/neutron/runtime";
+const DEVICE_RUNS_DIR: &str = "/data/local/share/neutron/runs";
+const DEVICE_AGENT_PATH: &str = "/data/local/share/neutron/neutron-agent";
+const DEVICE_EBPF_PATH: &str = "/data/local/share/neutron/neutron.bpf.elf";
+const DEVICE_EBPF_STACKS_PATH: &str = "/data/local/share/neutron/neutron-stacks.bpf.elf";
+const DEVICE_DEMO_PATH: &str = "/data/local/tmp/demo-target";
+const DEVICE_STAGE_PREFIX: &str = "/data/local/tmp/neutron-install";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeployArtifact {
+    source: PathBuf,
+    stage_name: &'static str,
+    destination: &'static str,
+    mode: &'static str,
+}
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -41,11 +59,18 @@ fn main() -> Result<()> {
             build_userspace()
         }
         Some("deploy") => {
+            let serial = parse_serial(args, "cargo xtask deploy --serial SERIAL")?;
+            require_physical_usb_device(&serial)?;
             build_ebpf(true)?;
+            build_ebpf_plan(EbpfBuildPlan::new(true, EbpfStackMode::Stacks))?;
             build_userspace()?;
-            deploy()
+            deploy(&serial)
         }
-        Some("demo") => demo(),
+        Some("demo") => {
+            let serial = parse_serial(args, "cargo xtask demo --serial SERIAL")?;
+            require_physical_usb_device(&serial)?;
+            demo(&serial)
+        }
         Some("demo-hal") => demo_hal(),
         Some("demo-window") => demo_window(),
         Some("check-findings") => {
@@ -71,10 +96,326 @@ fn main() -> Result<()> {
         Some(cmd) => bail!("unknown command: {cmd}"),
         None => {
             println!(
-                "Usage: cargo xtask <build-ebpf [--stacks] [release] | build-ebpf-stacks [release] | build | deploy \
-                | demo | demo-hal | check-findings <file>>"
+                "Usage: cargo xtask <build-ebpf [--stacks] [release] | build-ebpf-stacks [release] | build \
+                | deploy --serial SERIAL | demo --serial SERIAL | demo-hal | check-findings <file>>"
             );
             Ok(())
+        }
+    }
+}
+
+fn parse_serial(mut args: impl Iterator<Item = String>, usage: &str) -> Result<String> {
+    match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(serial), None)
+            if flag == "--serial"
+                && !serial.starts_with("emulator-")
+                && !serial.is_empty()
+                && serial.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                }) =>
+        {
+            Ok(serial)
+        }
+        _ => bail!("usage: {usage}"),
+    }
+}
+
+fn adb_host() -> Command {
+    Command::new("adb")
+}
+
+fn adb(serial: &str) -> Command {
+    let mut command = adb_host();
+    command.args(["-s", serial]);
+    command
+}
+
+fn checked_command_output(mut command: Command, args: &[&str], action: &str) -> Result<String> {
+    let output = command
+        .args(args)
+        .output()
+        .with_context(|| format!("{action}: adb not found"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{action} failed with {}{}",
+            output.status,
+            if detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", detail.trim())
+            }
+        );
+    }
+    String::from_utf8(output.stdout).with_context(|| format!("{action}: adb output is not UTF-8"))
+}
+
+fn checked_adb_output(serial: &str, args: &[&str], action: &str) -> Result<String> {
+    checked_command_output(adb(serial), args, action)
+}
+
+fn checked_su_output(serial: &str, command: &str, action: &str) -> Result<String> {
+    checked_adb_output(serial, &["shell", "su", "-c", command], action)
+}
+
+fn device_list_has_physical_usb_serial(output: &str, serial: &str) -> bool {
+    output.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(serial)
+            && fields.next() == Some("device")
+            && fields.any(|field| field.starts_with("usb:"))
+    })
+}
+
+fn require_physical_usb_device(serial: &str) -> Result<()> {
+    let output = checked_command_output(
+        adb_host(),
+        &["devices", "-l"],
+        "enumerating authorized ADB devices",
+    )?;
+    if !device_list_has_physical_usb_serial(&output, serial) {
+        bail!("serial {serial} is not an attached authorized physical USB device");
+    }
+    Ok(())
+}
+
+fn parse_sha256_output(output: &str) -> Result<String> {
+    let digest = output
+        .split_whitespace()
+        .next()
+        .context("sha256sum returned no digest")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("sha256sum returned an invalid digest");
+    }
+    Ok(digest.to_ascii_lowercase())
+}
+
+fn local_sha256(path: &Path) -> Result<String> {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .with_context(|| format!("hashing {}: sha256sum not found", path.display()))?;
+    if !output.status.success() {
+        bail!("sha256sum failed for {}", path.display());
+    }
+    parse_sha256_output(&String::from_utf8_lossy(&output.stdout))
+        .with_context(|| format!("parsing SHA-256 for {}", path.display()))
+}
+
+fn device_sha256(serial: &str, path: &str) -> Result<String> {
+    let command = format!("sha256sum {path}");
+    let output = checked_su_output(serial, &command, &format!("hashing installed {path}"))?;
+    parse_sha256_output(&output).with_context(|| format!("parsing device SHA-256 for {path}"))
+}
+
+fn neutron_deploy_artifacts(root: &Path) -> [DeployArtifact; 3] {
+    [
+        DeployArtifact {
+            source: root.join(EBPF_OBJ_NAME),
+            stage_name: EBPF_OBJ_NAME,
+            destination: DEVICE_EBPF_PATH,
+            mode: "0600",
+        },
+        DeployArtifact {
+            source: root.join(EBPF_STACKS_OBJ_NAME),
+            stage_name: EBPF_STACKS_OBJ_NAME,
+            destination: DEVICE_EBPF_STACKS_PATH,
+            mode: "0600",
+        },
+        DeployArtifact {
+            source: root.join("target/aarch64-unknown-linux-musl/release/neutron"),
+            stage_name: "neutron-agent",
+            destination: DEVICE_AGENT_PATH,
+            mode: "0700",
+        },
+    ]
+}
+
+fn device_staging_dir() -> Result<String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock predates Unix epoch")?
+        .as_nanos();
+    Ok(format!(
+        "{DEVICE_STAGE_PREFIX}-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+fn transactional_publish_command(
+    artifacts: &[DeployArtifact],
+    candidate_suffix: &str,
+    backup_root: &str,
+) -> String {
+    let mut restore = String::from("restore_backup() {\n");
+    let mut rollback = String::from("rollback_publish() {\n  rm -f");
+    let mut preflight = Vec::with_capacity(artifacts.len());
+    let mut backup = Vec::with_capacity(artifacts.len());
+    let mut publish = Vec::with_capacity(artifacts.len());
+
+    for artifact in artifacts {
+        let previous = format!("{backup_root}/{}", artifact.stage_name);
+        restore.push_str(&format!(
+            "  if [ -e {previous} ] || [ -L {previous} ]; then rm -f {destination} && mv {previous} {destination} || return 1; fi\n",
+            destination = artifact.destination,
+        ));
+        rollback.push_str(&format!(" {}", artifact.destination));
+        preflight.push(format!(
+            "test -f {destination}{candidate_suffix} && test ! -L {destination}{candidate_suffix}",
+            destination = artifact.destination,
+        ));
+        backup.push(format!(
+            "{{ {{ [ ! -e {destination} ] && [ ! -L {destination} ]; }} || mv {destination} {previous}; }}",
+            destination = artifact.destination,
+        ));
+        publish.push(format!(
+            "mv {destination}{candidate_suffix} {destination}",
+            destination = artifact.destination,
+        ));
+    }
+
+    restore.push_str(&format!("  rmdir {backup_root}\n}}\n"));
+    rollback.push_str(" && restore_backup\n}\n");
+
+    format!(
+        "set -u\nrm -rf {backup_root} && mkdir -m 0700 {backup_root} || exit 1\n\
+{restore}{rollback}\
+if\n  {preflight}\nthen\n  :\nelse\n  rmdir {backup_root}\n  exit 1\nfi\n\
+trap 'restore_backup; exit 1' 1 2 15\n\
+if\n  {backup}\nthen\n  :\nelse\n  restore_backup\n  exit 1\nfi\n\
+trap 'rollback_publish; exit 1' 1 2 15\n\
+if\n  {publish}\nthen\n  trap - 1 2 15\n  rm -rf {backup_root}\nelse\n  rollback_publish\n  exit 1\nfi",
+        preflight = preflight.join(" &&\n  "),
+        backup = backup.join(" &&\n  "),
+        publish = publish.join(" &&\n  "),
+    )
+}
+
+fn install_neutron_artifacts(serial: &str, artifacts: &[DeployArtifact]) -> Result<()> {
+    for artifact in artifacts {
+        let metadata = std::fs::metadata(&artifact.source)
+            .with_context(|| format!("reading {}", artifact.source.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "deployment source is not a file: {}",
+                artifact.source.display()
+            );
+        }
+    }
+
+    let staging_dir = device_staging_dir()?;
+    let deployment_id = staging_dir
+        .rsplit('/')
+        .next()
+        .context("device staging directory has no basename")?;
+    let candidate_suffix = format!(".new.{deployment_id}");
+    let backup_root = format!("{DEVICE_INSTALL_DIR}/previous.{deployment_id}");
+    checked_adb_output(
+        serial,
+        &["shell", "mkdir", "-m", "0700", &staging_dir],
+        "creating private device staging directory",
+    )?;
+
+    let install_result = (|| -> Result<()> {
+        let mut expected_hashes = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            let local_hash = local_sha256(&artifact.source)?;
+            let stage_path = format!("{staging_dir}/{}", artifact.stage_name);
+            println!("  stage {} -> {stage_path}", artifact.source.display());
+            checked_adb_output(
+                serial,
+                &[
+                    "push",
+                    artifact
+                        .source
+                        .to_str()
+                        .context("deployment source path is not UTF-8")?,
+                    &stage_path,
+                ],
+                &format!("staging {}", artifact.source.display()),
+            )?;
+            expected_hashes.push((artifact, stage_path, local_hash));
+        }
+
+        let prepare = format!(
+            "test ! -L {DEVICE_INSTALL_DIR} && test ! -L {DEVICE_RUNTIME_DIR} && \
+             test ! -L {DEVICE_RUNS_DIR} && \
+             mkdir -p {DEVICE_INSTALL_DIR} {DEVICE_RUNTIME_DIR} {DEVICE_RUNS_DIR} && \
+             chown 0:0 {DEVICE_INSTALL_DIR} {DEVICE_RUNTIME_DIR} {DEVICE_RUNS_DIR} && \
+             chmod 0700 {DEVICE_INSTALL_DIR} {DEVICE_RUNTIME_DIR} {DEVICE_RUNS_DIR}"
+        );
+        checked_su_output(serial, &prepare, "preparing root-owned Neutron directories")?;
+
+        for (artifact, stage_path, expected_hash) in expected_hashes {
+            let candidate = format!("{}{candidate_suffix}", artifact.destination);
+            let install = format!(
+                "rm -f {candidate} && test -f {stage_path} && test ! -L {stage_path} && \
+                 install -m {mode} {stage_path} {candidate} && \
+                 chown 0:0 {candidate} && chmod {mode} {candidate}",
+                mode = artifact.mode,
+            );
+            checked_su_output(
+                serial,
+                &install,
+                &format!("preparing candidate for {}", artifact.destination),
+            )?;
+
+            let actual_hash = device_sha256(serial, &candidate)?;
+            if actual_hash != expected_hash {
+                bail!(
+                    "candidate SHA-256 mismatch for {}: local={}, device={}",
+                    artifact.destination,
+                    expected_hash,
+                    actual_hash
+                );
+            }
+            println!(
+                "  verified candidate {} mode={} sha256={}",
+                artifact.destination, artifact.mode, actual_hash
+            );
+        }
+
+        checked_su_output(
+            serial,
+            &transactional_publish_command(artifacts, &candidate_suffix, &backup_root),
+            "publishing the Neutron artifact set transactionally",
+        )?;
+        Ok(())
+    })();
+
+    let candidate_cleanup_result = if install_result.is_err() {
+        let candidates = artifacts
+            .iter()
+            .map(|artifact| format!("{}{}", artifact.destination, candidate_suffix))
+            .collect::<Vec<_>>()
+            .join(" ");
+        checked_su_output(
+            serial,
+            &format!("rm -f {candidates}"),
+            "cleaning unpublished Neutron candidates",
+        )
+        .map(|_| ())
+    } else {
+        Ok(())
+    };
+    let install_result = match (install_result, candidate_cleanup_result) {
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("candidate cleanup also failed: {cleanup:#}")))
+        }
+        (result, _) => result,
+    };
+
+    let cleanup_result = checked_adb_output(
+        serial,
+        &["shell", "rm", "-rf", &staging_dir],
+        "cleaning device staging directory",
+    );
+    match (install_result, cleanup_result) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("device staging cleanup also failed: {cleanup:#}")))
         }
     }
 }
@@ -147,6 +488,30 @@ fn workspace_root() -> PathBuf {
         .to_owned()
 }
 
+fn source_commit(root: &Path) -> Result<String> {
+    let value = match std::env::var("NEUTRON_BUILD_GIT_COMMIT") {
+        Ok(value) => value,
+        Err(_) => {
+            let output = Command::new("git")
+                .current_dir(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .context("reading source commit for BPF build ID")?;
+            if !output.status.success() {
+                bail!("git rev-parse HEAD failed while deriving BPF build ID");
+            }
+            String::from_utf8(output.stdout)
+                .context("git commit is not UTF-8")?
+                .trim()
+                .to_string()
+        }
+    };
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("BPF build ID requires a full 40-hex source commit");
+    }
+    Ok(value)
+}
+
 fn command_ok(program: &str, args: &[&str]) -> std::result::Result<(), String> {
     let output = Command::new(program)
         .args(args)
@@ -176,14 +541,14 @@ fn command_ok(program: &str, args: &[&str]) -> std::result::Result<(), String> {
 }
 
 fn format_ebpf_preflight_error(
-    cargo_nightly: std::result::Result<(), String>,
+    cargo_toolchain: std::result::Result<(), String>,
     bpf_linker: std::result::Result<(), String>,
 ) -> Option<String> {
     let mut lines = Vec::new();
-    if let Err(detail) = cargo_nightly {
+    if let Err(detail) = cargo_toolchain {
         lines.push(format!(
-            "- cargo +nightly is unavailable or unusable ({detail}). \
-             Install it with: rustup toolchain install nightly"
+            "- the pinned Cargo toolchain is unavailable or unusable ({detail}). \
+             Install it with: rustup toolchain install nightly-2026-07-15"
         ));
     }
     if let Err(detail) = bpf_linker {
@@ -197,7 +562,8 @@ fn format_ebpf_preflight_error(
     } else {
         Some(format!(
             "BPF build preflight failed:\n{}\n\n\
-             neutron builds eBPF with `cargo +nightly -Z build-std=core` \
+             neutron builds eBPF with the workspace-pinned nightly and \
+             `-Z build-std=core` \
              for target bpfel-unknown-none.",
             lines.join("\n")
         ))
@@ -205,12 +571,19 @@ fn format_ebpf_preflight_error(
 }
 
 fn preflight_ebpf_build() -> Result<()> {
-    let cargo_nightly = command_ok("cargo", &["+nightly", "--version"]);
+    let cargo_toolchain = command_ok("cargo", &["--version"]);
     let bpf_linker = command_ok("bpf-linker", &["--version"]);
-    if let Some(msg) = format_ebpf_preflight_error(cargo_nightly, bpf_linker) {
+    if let Some(msg) = format_ebpf_preflight_error(cargo_toolchain, bpf_linker) {
         bail!("{msg}");
     }
     Ok(())
+}
+
+fn copy_bpf_artifact(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::copy(source, destination)
+        .with_context(|| format!("copy {} -> {}", source.display(), destination.display()))?;
+    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("setting safe BPF object mode on {}", destination.display()))
 }
 
 fn build_ebpf(release: bool) -> Result<()> {
@@ -220,6 +593,7 @@ fn build_ebpf(release: bool) -> Result<()> {
 fn build_ebpf_plan(plan: EbpfBuildPlan) -> Result<()> {
     let root = workspace_root();
     let ebpf_dir = root.join("neutron-ebpf");
+    let commit = source_commit(&root)?;
 
     println!(
         "=== Building BPF programs ({} {}) ===",
@@ -230,7 +604,7 @@ fn build_ebpf_plan(plan: EbpfBuildPlan) -> Result<()> {
 
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
-        .args(["+nightly", "build"])
+        .arg("build")
         .args(["-Z", "build-std=core"])
         .args(["--target", "bpfel-unknown-none"])
         // Fat LTO + a single codegen unit produce a smaller BPF object and
@@ -241,7 +615,8 @@ fn build_ebpf_plan(plan: EbpfBuildPlan) -> Result<()> {
         .env("CARGO_PROFILE_RELEASE_LTO", "fat")
         .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1")
         .env("CARGO_PROFILE_DEV_LTO", "fat")
-        .env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1");
+        .env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1")
+        .env("NEUTRON_GIT_COMMIT", commit);
 
     cmd.args(plan.cargo_feature_args());
 
@@ -263,8 +638,7 @@ fn build_ebpf_plan(plan: EbpfBuildPlan) -> Result<()> {
     println!("  BPF object: {}", obj.display());
 
     let dest = root.join(plan.output_name());
-    std::fs::copy(&obj, &dest)
-        .with_context(|| format!("copy {} -> {}", obj.display(), dest.display()))?;
+    copy_bpf_artifact(&obj, &dest)?;
     println!("  Copied to: {}", dest.display());
 
     Ok(())
@@ -323,17 +697,18 @@ fn build_demo_target() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn demo() -> Result<()> {
+fn demo(serial: &str) -> Result<()> {
     let root = workspace_root();
 
     // Always build the BPF object + userspace binary so the device has a
     // matching neutron and BPF ELF.
     build_ebpf(true)?;
+    build_ebpf_plan(EbpfBuildPlan::new(true, EbpfStackMode::Stacks))?;
     build_userspace()?;
     let demo_bin = build_demo_target()?;
 
-    println!("\n=== Pushing demo-target to /data/local/tmp ===");
-    let state = Command::new("adb")
+    println!("\n=== Installing Neutron and demo-target ===");
+    let state = adb(serial)
         .args(["get-state"])
         .output()
         .context("adb not found")?;
@@ -341,43 +716,33 @@ fn demo() -> Result<()> {
         bail!("no adb device connected — connect a Pixel and re-run");
     }
 
-    // Push everything together.
-    for (src, dst) in &[
-        (root.join(EBPF_OBJ_NAME), "/data/local/tmp/neutron.bpf.elf"),
-        (
-            root.join("target/aarch64-unknown-linux-musl/release/neutron"),
-            "/data/local/tmp/neutron",
-        ),
-        (demo_bin.clone(), "/data/local/tmp/demo-target"),
-    ] {
-        println!("  push {} -> {}", src.display(), dst);
-        let status = Command::new("adb")
-            .args(["push", src.to_str().unwrap(), dst])
-            .status()
-            .context("adb push failed")?;
-        if !status.success() {
-            bail!("adb push failed for {}", src.display());
-        }
-    }
-    let _ = Command::new("adb")
-        .args([
-            "shell",
-            "chmod",
-            "+x",
-            "/data/local/tmp/neutron",
-            "/data/local/tmp/demo-target",
-        ])
-        .status();
+    install_neutron_artifacts(serial, &neutron_deploy_artifacts(&root))?;
+
+    println!("  push {} -> {DEVICE_DEMO_PATH}", demo_bin.display());
+    checked_adb_output(
+        serial,
+        &[
+            "push",
+            demo_bin.to_str().context("demo-target path is not UTF-8")?,
+            DEVICE_DEMO_PATH,
+        ],
+        "pushing demo-target",
+    )?;
+    checked_adb_output(
+        serial,
+        &["shell", "chmod", "0700", DEVICE_DEMO_PATH],
+        "setting demo-target permissions",
+    )?;
 
     println!("\n=== How to run on-device ===");
     println!("Two terminals:");
     println!();
     println!("  # Terminal A — start neutron in the background, capture JSON.");
-    println!("  adb shell su -c '/data/local/tmp/neutron --pid 0 --json' \\");
+    println!("  adb -s {serial} shell su -c '{DEVICE_AGENT_PATH} --pid 0 --json' \\");
     println!("      > demo-trace.ndjson");
     println!();
     println!("  # Terminal B — once neutron is attached, run the demo.");
-    println!("  adb shell '/data/local/tmp/demo-target'");
+    println!("  adb -s {serial} shell '{DEVICE_DEMO_PATH}'");
     println!();
     println!("  # Stop neutron with Ctrl-C; verify findings:");
     println!("  cargo xtask check-findings demo-trace.ndjson");
@@ -573,7 +938,7 @@ fn bench(secs: u64) -> Result<()> {
     println!("then parse events_submitted / drops / fd-graph misses out of it.\n");
 
     println!("Step 1 — push artifacts:");
-    println!("  cargo xtask demo            # builds + pushes neutron + demo-target\n");
+    println!("  cargo xtask demo --serial SERIAL  # builds + installs neutron + demo-target\n");
 
     println!("Step 2 — run each profile on-device. Use adb shell. Repeat for each:");
     println!("  PROFILE=security_no_stacks");
@@ -594,7 +959,7 @@ fn bench(secs: u64) -> Result<()> {
     println!("  esac");
     println!("  /data/local/tmp/demo-target --loop {secs} > /dev/null 2>&1 &");
     println!("  TARGET=$!");
-    println!("  /data/local/tmp/neutron --pid $TARGET --json $FLAGS \\");
+    println!("  {DEVICE_AGENT_PATH} --pid $TARGET --json $FLAGS \\");
     println!("      > /data/local/tmp/bench-$PROFILE.ndjson \\");
     println!("      2> /data/local/tmp/bench-$PROFILE.stderr &");
     println!("  NEUTRON=$!");
@@ -610,7 +975,7 @@ fn bench(secs: u64) -> Result<()> {
 
     println!("Step 3 — pull and parse:\n");
     println!("  for PROFILE in security_no_stacks security_with_stacks raw binder; do");
-    println!("    adb pull /data/local/tmp/bench-$PROFILE.stderr /tmp/");
+    println!("    adb -s SERIAL pull /data/local/tmp/bench-$PROFILE.stderr /tmp/");
     println!("    cargo xtask bench-parse $PROFILE {secs} \\");
     println!("        < /tmp/bench-$PROFILE.stderr");
     println!("  done\n");
@@ -673,11 +1038,11 @@ fn bench_parse_stdin(profile: &str, secs: u64) -> Result<()> {
     Ok(())
 }
 
-fn deploy() -> Result<()> {
+fn deploy(serial: &str) -> Result<()> {
     let root = workspace_root();
     println!("=== Deploying to device ===");
 
-    let state = Command::new("adb")
+    let state = adb(serial)
         .args(["get-state"])
         .output()
         .context("adb not found")?;
@@ -685,31 +1050,12 @@ fn deploy() -> Result<()> {
         bail!("no adb device connected");
     }
 
-    for (src, dst) in &[
-        (EBPF_OBJ_NAME, "/data/local/tmp/neutron.bpf.elf"),
-        (
-            "target/aarch64-unknown-linux-musl/release/neutron",
-            "/data/local/tmp/neutron",
-        ),
-    ] {
-        let src_path = root.join(src);
-        println!("  push {} -> {}", src_path.display(), dst);
-        let status = Command::new("adb")
-            .args(["push", src_path.to_str().unwrap(), dst])
-            .status()
-            .context("adb push failed")?;
-        if !status.success() {
-            bail!("adb push failed for {}", src);
-        }
-    }
-
-    Command::new("adb")
-        .args(["shell", "chmod", "+x", "/data/local/tmp/neutron"])
-        .status()?;
+    install_neutron_artifacts(serial, &neutron_deploy_artifacts(&root))?;
 
     println!("\n=== Done. On device run: ===");
-    println!("  adb shell su -c '/data/local/tmp/neutron --pid <PID>'");
-    println!("  # default --object is /data/local/tmp/neutron.bpf.elf");
+    println!("  adb -s {serial} shell su -c '{DEVICE_AGENT_PATH} --pid <PID>'");
+    println!("  # default --object is {DEVICE_EBPF_PATH}");
+    println!("  # runtime state: {DEVICE_RUNTIME_DIR}; run bundles: {DEVICE_RUNS_DIR}");
     Ok(())
 }
 
@@ -718,15 +1064,232 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ebpf_preflight_mentions_nightly_install_when_missing() {
-        let err = format_ebpf_preflight_error(
-            Err("cargo +nightly --version exited with status 1".into()),
-            Ok(()),
+    fn deploy_serial_parser_requires_explicit_serial() {
+        assert!(parse_serial(Vec::<String>::new().into_iter(), "deploy").is_err());
+        assert!(parse_serial(["USB123".into()].into_iter(), "deploy").is_err());
+        assert!(parse_serial(
+            ["--serial".into(), "emulator-5554".into()].into_iter(),
+            "deploy"
         )
-        .expect("missing nightly should produce an error");
+        .is_err());
+        assert!(parse_serial(["--serial".into(), "USB 123".into()].into_iter(), "deploy").is_err());
+        assert_eq!(
+            parse_serial(["--serial".into(), "USB123".into()].into_iter(), "deploy").unwrap(),
+            "USB123"
+        );
+    }
 
-        assert!(err.contains("cargo +nightly"));
-        assert!(err.contains("rustup toolchain install nightly"));
+    #[test]
+    fn physical_device_selection_requires_the_exact_authorized_usb_row() {
+        let devices = "List of devices attached\nUSB123 device usb:1-2 product:husky\nUSB124 unauthorized usb:1-3\nemulator-5554 device product:sdk\n";
+
+        assert!(device_list_has_physical_usb_serial(devices, "USB123"));
+        assert!(!device_list_has_physical_usb_serial(devices, "USB124"));
+        assert!(!device_list_has_physical_usb_serial(
+            devices,
+            "emulator-5554"
+        ));
+        assert!(!device_list_has_physical_usb_serial(devices, "USB12"));
+    }
+
+    #[test]
+    fn adb_command_contains_explicit_serial() {
+        let command = adb("USB123");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_str().unwrap())
+            .collect();
+        assert_eq!(args.as_slice(), ["-s", "USB123"]);
+    }
+
+    #[test]
+    fn deploy_plan_uses_private_root_owned_paths_and_modes() {
+        let artifacts = neutron_deploy_artifacts(Path::new("/workspace"));
+
+        assert_eq!(DEVICE_RUNTIME_DIR, "/data/local/share/neutron/runtime");
+        assert_eq!(DEVICE_RUNS_DIR, "/data/local/share/neutron/runs");
+        assert_eq!(artifacts[0].destination, DEVICE_EBPF_PATH);
+        assert_eq!(artifacts[0].mode, "0600");
+        assert_eq!(artifacts[1].destination, DEVICE_EBPF_STACKS_PATH);
+        assert_eq!(artifacts[1].mode, "0600");
+        assert_eq!(artifacts[2].destination, DEVICE_AGENT_PATH);
+        assert_eq!(artifacts[2].mode, "0700");
+        assert!(artifacts
+            .iter()
+            .all(|artifact| artifact.destination.starts_with(DEVICE_INSTALL_DIR)));
+        assert!(artifacts
+            .iter()
+            .all(|artifact| !artifact.destination.starts_with("/data/local/tmp/")));
+    }
+
+    #[test]
+    fn publish_command_restores_the_previous_artifact_set_on_failure() {
+        let artifacts = neutron_deploy_artifacts(Path::new("/workspace"));
+        let command = transactional_publish_command(
+            &artifacts,
+            ".new.test",
+            "/data/local/share/neutron/previous.test",
+        );
+
+        assert!(command.contains("rollback_publish"));
+        assert!(command.contains("restore_backup"));
+        for artifact in &artifacts {
+            let name = Path::new(artifact.destination)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(command.contains(&format!(
+                "mv {} /data/local/share/neutron/previous.test/{name}",
+                artifact.destination
+            )));
+            assert!(command.contains(&format!(
+                "mv {}.new.test {}",
+                artifact.destination, artifact.destination
+            )));
+            assert!(command.contains(&format!(
+                "mv /data/local/share/neutron/previous.test/{name} {}",
+                artifact.destination
+            )));
+        }
+    }
+
+    #[test]
+    fn publish_command_does_not_mask_an_early_move_failure() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "neutron-xtask-publish-{}-{nonce}",
+            std::process::id()
+        ));
+        let destinations = [root.join("one"), root.join("two"), root.join("three")];
+        let backup = root.join("backup");
+        std::fs::create_dir_all(&root).unwrap();
+        for destination in &destinations {
+            std::fs::write(destination, b"old").unwrap();
+            std::fs::write(format!("{}.new.test", destination.display()), b"new").unwrap();
+        }
+        let destination_strings: Vec<&'static str> = destinations
+            .iter()
+            .map(|path| Box::leak(path.to_string_lossy().into_owned().into_boxed_str()) as &str)
+            .collect();
+        let artifacts = [
+            DeployArtifact {
+                source: PathBuf::new(),
+                stage_name: "one",
+                destination: destination_strings[0],
+                mode: "0600",
+            },
+            DeployArtifact {
+                source: PathBuf::new(),
+                stage_name: "two",
+                destination: destination_strings[1],
+                mode: "0600",
+            },
+            DeployArtifact {
+                source: PathBuf::new(),
+                stage_name: "three",
+                destination: destination_strings[2],
+                mode: "0600",
+            },
+        ];
+        let command =
+            transactional_publish_command(&artifacts, ".new.test", backup.to_str().unwrap());
+
+        let fake_bin = root.join("bin");
+        let fake_mv = fake_bin.join("mv");
+        let fake_state = root.join("failed-first-publish");
+        std::fs::create_dir(&fake_bin).unwrap();
+        std::fs::write(
+            &fake_mv,
+            b"#!/bin/sh\ncase \"$1\" in\n  *.new.test)\n    if [ ! -e \"$NEUTRON_FAKE_MV_STATE\" ]; then\n      : > \"$NEUTRON_FAKE_MV_STATE\"\n      exit 71\n    fi\n    ;;\nesac\nexec /bin/mv \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_mv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("PATH", path)
+            .env("NEUTRON_FAKE_MV_STATE", &fake_state)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        assert!(!status.success());
+        assert!(fake_state.exists());
+        for destination in &destinations {
+            assert_eq!(std::fs::read(destination).unwrap(), b"old");
+        }
+        assert!(!backup.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sha256_parser_rejects_missing_or_malformed_digests() {
+        let upper = "A".repeat(64);
+        assert_eq!(
+            parse_sha256_output(&format!("{upper}  file\n")).unwrap(),
+            "a".repeat(64)
+        );
+        assert!(parse_sha256_output("").is_err());
+        assert!(parse_sha256_output("abc  file").is_err());
+        assert!(parse_sha256_output(&format!("{}g  file", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn staging_directory_is_bounded_under_data_local_tmp() {
+        let path = device_staging_dir().unwrap();
+        assert!(path.starts_with(&format!("{DEVICE_STAGE_PREFIX}-")));
+        assert!(!path.contains(".."));
+        assert!(path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-')));
+    }
+
+    #[test]
+    fn copied_bpf_artifact_is_never_group_or_other_writable() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "neutron-xtask-bpf-mode-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::write(&source, b"bpf").unwrap();
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        copy_bpf_artifact(&source, &destination).unwrap();
+
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"bpf");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ebpf_preflight_mentions_pinned_nightly_install_when_missing() {
+        let err =
+            format_ebpf_preflight_error(Err("cargo --version exited with status 1".into()), Ok(()))
+                .expect("missing pinned toolchain should produce an error");
+
+        assert!(err.contains("pinned Cargo toolchain"));
+        assert!(err.contains("rustup toolchain install nightly-2026-07-15"));
     }
 
     #[test]

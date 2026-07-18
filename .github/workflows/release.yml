@@ -1,0 +1,139 @@
+name: Signed release assets
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing signed tag to rebuild
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-assets-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-07-15
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Import the configured release tag verifier
+        env:
+          RELEASE_GPG_PUBLIC_KEY_B64: ${{ secrets.RELEASE_GPG_PUBLIC_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_GPG_PUBLIC_KEY_B64"
+          printf '%s' "$RELEASE_GPG_PUBLIC_KEY_B64" | base64 --decode > "$RUNNER_TEMP/release-signing-key.asc"
+          gpg --batch --import "$RUNNER_TEMP/release-signing-key.asc"
+          rm -f "$RUNNER_TEMP/release-signing-key.asc"
+          git verify-tag "$RELEASE_TAG"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+          echo "RELEASE_COMMIT=$(git rev-list -n 1 "$RELEASE_TAG")" >> "$GITHUB_ENV"
+
+      - name: Verify tag and package versions agree
+        run: |
+          set -euo pipefail
+          version=$(awk -F '"' '/^version =/ { print $2; exit }' Cargo.toml)
+          test "$RELEASE_TAG" = "v$version"
+
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly-2026-07-15
+          components: rust-src,rustfmt,clippy
+          targets: aarch64-unknown-linux-musl
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Install pinned release dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu minisign qemu-user zstd
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          cargo install bpf-linker --version 0.10.3 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Gate the exact signed tag source
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          bash tests/release_contract.sh
+          bash tests/package_release.sh
+          bash tests/release_identity.sh
+          bash tests/provenance_generation.sh
+          cargo audit
+          cargo check --workspace --exclude neutron-ebpf
+          cargo test --workspace --exclude neutron-ebpf
+          cargo clippy --workspace --exclude neutron-ebpf --all-targets -- -D warnings
+          cargo xtask build-ebpf release
+          cargo xtask build-ebpf --stacks release
+          (cd probe-app && ./gradlew --no-daemon testDebugUnitTest assembleDebug)
+
+      - name: Build and sign local release assets
+        env:
+          MINISIGN_SECRET_KEY_B64: ${{ secrets.MINISIGN_SECRET_KEY_B64 }}
+          PROBE_KEYSTORE_B64: ${{ secrets.PROBE_KEYSTORE_B64 }}
+          NEUTRON_PROBE_STORE_PASSWORD: ${{ secrets.PROBE_STORE_PASSWORD }}
+          NEUTRON_PROBE_KEY_ALIAS: ${{ secrets.PROBE_KEY_ALIAS }}
+          NEUTRON_PROBE_KEY_PASSWORD: ${{ secrets.PROBE_KEY_PASSWORD }}
+          NEUTRON_APPROVED_PROBE_CERT_SHA256: ${{ vars.NEUTRON_APPROVED_PROBE_CERT_SHA256 }}
+          NEUTRON_APPROVED_MINISIGN_PUBLIC_KEY: ${{ vars.NEUTRON_APPROVED_MINISIGN_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$MINISIGN_SECRET_KEY_B64"
+          test -n "$PROBE_KEYSTORE_B64"
+          test -n "$NEUTRON_PROBE_STORE_PASSWORD"
+          test -n "$NEUTRON_PROBE_KEY_ALIAS"
+          test -n "$NEUTRON_PROBE_KEY_PASSWORD"
+          test -n "$NEUTRON_APPROVED_PROBE_CERT_SHA256"
+          test -n "$NEUTRON_APPROVED_MINISIGN_PUBLIC_KEY"
+          trap 'rm -f "$RUNNER_TEMP/minisign.key" "$RUNNER_TEMP/neutron-probe.keystore"' EXIT
+          printf '%s' "$MINISIGN_SECRET_KEY_B64" | base64 --decode > "$RUNNER_TEMP/minisign.key"
+          chmod 0600 "$RUNNER_TEMP/minisign.key"
+          printf '%s' "$PROBE_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/neutron-probe.keystore"
+          chmod 0600 "$RUNNER_TEMP/neutron-probe.keystore"
+          export NEUTRON_PROBE_KEYSTORE="$RUNNER_TEMP/neutron-probe.keystore"
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_TAG^{commit}")"
+          REQUIRE_SIGNATURES=1 SIGNING_KEY="$RUNNER_TEMP/minisign.key" scripts/package-release.sh
+          rm -f "$RUNNER_TEMP/minisign.key" "$RUNNER_TEMP/neutron-probe.keystore"
+          trap - EXIT
+          cd "dist/$RELEASE_TAG"
+          sha256sum --check --strict SHA256SUMS
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/${{ env.RELEASE_TAG }}/*.tar.*
+            dist/${{ env.RELEASE_TAG }}/SHA256SUMS
+            dist/${{ env.RELEASE_TAG }}/SBOM.spdx.json
+            dist/${{ env.RELEASE_TAG }}/provenance.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: neutron-${{ env.RELEASE_TAG }}-${{ env.RELEASE_COMMIT }}
+          path: dist/${{ env.RELEASE_TAG }}/
+          if-no-files-found: error
+          retention-days: 30

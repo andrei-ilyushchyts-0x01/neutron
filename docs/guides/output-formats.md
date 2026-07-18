@@ -248,36 +248,38 @@ stimuli; `surface scan --observe` uses the name `surface-observe`.
 `scenario_id`, `trace_id`, and `generation`, plus optional `root_package` or
 `root_uid`.
 
-### Capture Health Event (`type == "capture_health"`, 1.2.0)
+### Capture Health Event (`type == "capture_health"`, `neutron.capture-health/v1`)
 
 Emitted as the final NDJSON line on shutdown when `--json` is on.
-Same counter set as the stderr capture-summary block, plus a
-`degraded:bool` flag mirroring the WARNING banner predicate.
+The versioned contract is shipped as
+`schemas/neutron.capture-health-v1.schema.json`. The abridged example below
+shows the transport-loss fields; the schema defines the complete required
+record.
 
 ```json
 { "type":"capture_health", "events_userspace":99999,
   "events_submitted":99999, "ringbuf_reserve_failed":0,
   "inflight_lookup_missed":0, "user_stack_failed":0,
   "kernel_stack_failed":0, "path_truncated":0,
-  "fd_lookup_missed":0, "ioctl_refresh_missed":0,
+  "ioctl_payload_truncated":0, "ioctl_refresh_missed":0,
   "unix_msg_control_truncated":0, "unix_msg_control_nested":0,
   "fd_graph_miss":0, "fd_graph_backfilled":0,
   "follow_policy_filtered":0, "follow_ttl_expired":0,
   "causal_admission_boundary_exit":0,
-  "degraded":false, "driver_packs":["kgsl"],
+  "status":"complete", "degraded":false, "driver_packs":["kgsl"],
   "attached_programs":["trace_sys_enter","trace_sys_exit"],
   "ioctl_refresh_types":["0x9"], "root_uid":10123,
   "boot_id":"8b2d6c98-20a1-4e7e-944f-53f61b52d5ef",
   "fingerprint":"google/husky/husky:16/..." }
 ```
 
-A downstream pipeline gating on "absence of finding is conclusive"
-should require `degraded:false`.
+A downstream pipeline gating on "absence of finding is conclusive" must
+validate the full schema and require `status:"complete"` and
+`degraded:false`.
 
 `follow_policy_filtered` and `follow_ttl_expired` count intentionally
-incomplete causal branches. They do not by themselves set `degraded:true`,
-but graph and surface consumers surface them as completeness warnings. Each
-individual boundary is also emitted as `type:"follow_guardrail"` with
+incomplete causal branches and make status `incomplete`. Each individual
+boundary is also emitted as `type:"follow_guardrail"` with
 `causal_branch_complete:false`.
 
 `causal_admission_boundary_exit` is a 1.4 additive volume counter. It marks
@@ -320,6 +322,7 @@ collapses the typical fan-out.
 | Field            | JSON type | Notes                                                                  |
 |------------------|-----------|------------------------------------------------------------------------|
 | `type`           | string    | Always `"process_exit"`.                                               |
+| `uid`            | u32/null  | Effective UID when observed. `null` for logcat and tombstones without a `uid:` header; unknown is never UID 0. |
 | `source`         | string    | `"tracepoint"` (BPF), `"logcat"`, or `"tombstone"`.                    |
 | `classification` | string    | `"crash"`, `"signal_exit"`, `"abnormal_exit"`, or `"normal_exit"`.     |
 | `exit_signal`    | u32       | POSIX signal number. Omitted when 0.                                   |

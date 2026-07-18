@@ -34,20 +34,50 @@ pub fn build_rule_engine(args: &Args) -> Result<Option<neutron_rules::RuleEngine
     Ok(Some(engine))
 }
 
+/// Build the rule engine from bytes that the caller has already pinned and
+/// identified. Capture provenance must describe the exact rules that were
+/// parsed, so the live tracer uses this entry point instead of hashing a path
+/// and reopening it later.
+pub fn build_rule_engine_from_yaml(
+    args: &Args,
+    custom: Option<(&str, &str)>,
+) -> Result<Option<neutron_rules::RuleEngine>> {
+    if args.no_findings {
+        return Ok(None);
+    }
+    let mut engine = match custom {
+        Some((path, yaml)) => {
+            let rules = neutron_rules::load_rules_yaml_str(yaml)
+                .with_context(|| format!("loading rules from {path}"))?;
+            eprintln!("  loaded {} custom rules from {path}", rules.len());
+            neutron_rules::RuleEngine::new(rules)?
+        }
+        None => {
+            let engine = neutron_rules::RuleEngine::with_default_rules()
+                .context("loading bundled default rules")?;
+            eprintln!("  loaded {} default rules", engine.rule_count());
+            engine
+        }
+    };
+    engine.set_raw_window_cap(args.finding_raw_window);
+    Ok(Some(engine))
+}
+
 /// Format a finding for human-readable text output.
 pub fn format_finding_text(f: &neutron_rules::Finding) -> String {
     use std::fmt::Write as _;
+    let safe = crate::decode::escape_text;
     let mut s = String::with_capacity(256);
     let span_ms = (f.last_seen_ns.saturating_sub(f.first_seen_ns)) as f64 / 1_000_000.0;
     let _ = writeln!(
         s,
         "[FINDING] {} {} {}",
-        f.rule_id,
+        safe(&f.rule_id),
         format!("{:?}", f.category).to_lowercase(),
         f.severity.as_str().to_uppercase()
     );
-    let _ = writeln!(s, "  rule:    {}", f.rule_name);
-    let _ = writeln!(s, "  process: {} (pid {})", f.comm, f.pid);
+    let _ = writeln!(s, "  rule:    {}", safe(&f.rule_name));
+    let _ = writeln!(s, "  process: {} (pid {})", safe(&f.comm), f.pid);
     if let Some(period) = f.period_ms {
         let _ = writeln!(
             s,
@@ -58,7 +88,7 @@ pub fn format_finding_text(f: &neutron_rules::Finding) -> String {
         let _ = writeln!(s, "  events:  {} over {:.1}ms", f.event_count, span_ms);
     }
     if let Some(t) = &f.target {
-        let _ = writeln!(s, "  target:  {}", t);
+        let _ = writeln!(s, "  target:  {}", safe(t));
     }
     if !f.evidence.is_empty() {
         let _ = writeln!(s, "  evidence:");
@@ -68,7 +98,11 @@ pub fn format_finding_text(f: &neutron_rules::Finding) -> String {
             let _ = writeln!(
                 s,
                 "    [{}] {} {}({}) ret={}",
-                e.ts_ns, arrow, e.name, data, e.ret
+                e.ts_ns,
+                arrow,
+                safe(&e.name),
+                safe(data),
+                e.ret
             );
         }
     }
@@ -203,6 +237,26 @@ mod tests {
         }]);
         // No ioctl in evidence → no fdinfo lookup attempted, returns None.
         assert!(build_fdinfo_map(&f).is_none());
+    }
+
+    #[test]
+    fn finding_text_escapes_device_control_characters() {
+        let mut finding = make_finding(vec![EventSnapshot {
+            ts_ns: 1,
+            name: "openat\n\x1b[2J".into(),
+            is_enter: true,
+            ret: 0,
+            data: Some("/proc/bad\n\x1b[31m".into()),
+            raw: None,
+        }]);
+        finding.comm = "evil\n\x1b[2J".into();
+        finding.target = Some("target\nforged".into());
+        let rendered = format_finding_text(&finding);
+
+        assert!(!rendered.contains('\u{1b}'), "terminal escape leaked");
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{1b}"));
+        assert_eq!(rendered.matches("[FINDING]").count(), 1);
     }
 
     #[test]

@@ -1,6 +1,10 @@
 use std::io::Cursor;
 
 use neutron::capture_normalize::{normalize_capture, CausalRelation};
+use neutron::health::{
+    format_capture_health_json_with_metadata, CaptureHealth as RuntimeHealth, CaptureMetadata,
+    CaptureScope, UserspaceHealth,
+};
 
 #[test]
 fn syscall_enter_and_exit_merge_into_one_exit_span() {
@@ -82,7 +86,7 @@ fn repeated_binder_debug_and_span_ids_stay_separate_across_traces() {
 }
 
 #[test]
-fn malformed_unknown_and_non_object_lines_are_ignored() {
+fn malformed_unknown_and_non_object_lines_taint_health_without_hiding_valid_records() {
     let input = r#"
 not-json
 42
@@ -96,6 +100,22 @@ not-json
     assert_eq!(capture.syscalls.len(), 1);
     assert!(capture.binders.is_empty());
     assert!(capture.exits.is_empty());
+    assert!(capture
+        .health_warnings
+        .iter()
+        .any(|warning| warning.contains("unknown record type")));
+}
+
+#[test]
+fn unknown_record_type_overrides_claimed_complete_health() {
+    let input = r#"
+{"type":"future_event","span_id":"not-understood"}
+{"type":"capture_health","status":"complete","degraded":false,"output_cap_hit":false}
+"#;
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+    let health = capture.health.unwrap();
+    assert_eq!(health.status, "unknown");
+    assert!(health.degraded);
 }
 
 #[test]
@@ -217,4 +237,138 @@ fn syscall_uid_is_retained_and_pid_zero_is_rejected() {
     assert!(capture
         .health_warnings
         .contains("ignored syscall span with a missing process endpoint"));
+}
+
+#[test]
+fn process_exit_unknown_uid_is_not_normalized_as_root() {
+    let input =
+        r#"{"type":"process_exit","pid":42,"uid":null,"comm":"native","classification":"crash"}"#;
+
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+    assert_eq!(capture.exits.len(), 1);
+    assert_eq!(capture.exits[0].uid, None);
+}
+
+#[test]
+fn recognized_records_missing_required_fields_taint_health_unknown() {
+    let input = r#"
+{"type":"syscall"}
+{"type":"binder","pid":10,"to_proc":20}
+{"type":"process_exit"}
+{"type":"selinux_denial"}
+{"type":"capture_health","status":"complete","degraded":false,"output_cap_hit":false}
+"#;
+
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+    let health = capture.health.expect("final health record");
+    assert_eq!(health.status, "unknown");
+    assert!(health.degraded);
+    assert!(capture.health_warnings.iter().any(|warning| warning
+        .contains("ignored 4 recognized record(s) with missing or invalid required fields")));
+}
+
+#[test]
+fn duplicate_health_records_cannot_restore_complete_status() {
+    let input = r#"
+{"type":"capture_health","status":"unknown","degraded":true,"output_cap_hit":false}
+{"type":"capture_health","status":"complete","degraded":false,"output_cap_hit":false}
+"#;
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+    assert_eq!(capture.health.unwrap().status, "unknown");
+    assert!(capture
+        .health_warnings
+        .iter()
+        .any(|warning| warning.contains("2 capture_health records")));
+}
+
+#[test]
+fn oversized_capture_record_is_rejected_before_json_allocation() {
+    let input = format!(
+        r#"{{"type":"marker","name":"{}"}}"#,
+        "x".repeat(4 * 1024 * 1024 + 1)
+    );
+
+    let error = normalize_capture(Cursor::new(input)).unwrap_err();
+    assert!(format!("{error:#}").contains("capture record 1 exceeds"));
+}
+
+#[test]
+fn excessive_nested_cardinality_is_rejected_before_retention() {
+    let candidates = vec![r#""""#; 1_000_000].join(",");
+    let input = format!(
+        r#"{{"type":"binder","pid":10,"to_proc":20,"debug_id":1,"service_candidates":[{candidates}]}}"#
+    );
+
+    let error = normalize_capture(Cursor::new(input)).unwrap_err();
+    assert!(format!("{error:#}").contains("exceeds 1000000 retained items"));
+}
+
+#[test]
+fn binder_correlation_loss_survives_normalization_and_taints_health() {
+    let input = r#"{"type":"capture_health","binder_tracker_evictions":2,"binder_unmatched_receives":3,"binder_causal_metadata_discarded":1,"binder_invalid_callers":4,"binder_tracker_enabled":false}"#;
+    let capture = normalize_capture(Cursor::new(input)).unwrap();
+    let health = capture.health.unwrap();
+
+    assert_eq!(health.binder_tracker_evictions, 2);
+    assert_eq!(health.binder_unmatched_receives, 3);
+    assert_eq!(health.binder_causal_metadata_discarded, 1);
+    assert_eq!(health.binder_invalid_callers, 4);
+    assert!(!health.binder_tracker_enabled);
+    assert_eq!(health.status, "unknown");
+    assert!(capture
+        .health_warnings
+        .iter()
+        .any(|warning| warning.contains("Binder tracker eviction")));
+    assert!(capture
+        .health_warnings
+        .iter()
+        .any(|warning| warning.contains("Binder correlation tracker was disabled")));
+}
+
+#[test]
+fn normalized_health_exposes_restricted_claim_scope_without_degrading_transport() {
+    let mut scope = CaptureScope::unfiltered_raw_ndjson();
+    scope.filters.userspace = vec!["fd_path glob {/dev/kgsl*}".into()];
+    let scope = scope.recompute_claim_scope();
+    let metadata = CaptureMetadata {
+        max_depth: scope.instrumentation.max_depth,
+        max_processes: scope.instrumentation.max_processes,
+        capture_scope: Some(scope),
+        attached_programs: vec![
+            "trace_sys_enter".into(),
+            "trace_sys_exit".into(),
+            "trace_sched_process_exit".into(),
+        ],
+        boot_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        bpf_object_sha256: Some("1".repeat(64)),
+        bpf_build_id: Some("2".repeat(40)),
+        bpf_abi_major: Some(neutron_common::BPF_ABI_MAJOR),
+        bpf_abi_minor: Some(neutron_common::BPF_ABI_MINOR),
+        bpf_event_size: Some(core::mem::size_of::<neutron_common::SyscallEvent>() as u32),
+        bpf_feature_bits: Some(
+            neutron_common::BPF_FEATURE_SYSCALL_TRACE
+                | neutron_common::BPF_FEATURE_PROCESS_EXIT
+                | neutron_common::BPF_FEATURE_PER_CPU_HEALTH,
+        ),
+        ring_size_bytes: Some(1 << 20),
+        ..CaptureMetadata::default()
+    };
+    let line = format_capture_health_json_with_metadata(
+        &RuntimeHealth::default(),
+        &UserspaceHealth::default(),
+        0,
+        &metadata,
+    );
+    let capture = normalize_capture(Cursor::new(line)).unwrap();
+    let health = capture.health.unwrap();
+
+    assert_eq!(health.status, "complete");
+    assert!(!health.degraded);
+    let scope = health.capture_scope.unwrap();
+    assert!(!scope.claim_scope_complete);
+    assert_eq!(scope.claim_scope_reasons, ["userspace_filters"]);
+    assert!(capture
+        .health_warnings
+        .iter()
+        .any(|warning| warning.contains("claim scope is restricted")));
 }

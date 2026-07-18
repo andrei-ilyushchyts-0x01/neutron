@@ -1,7 +1,4 @@
 [toolchain]
-channel = "nightly"
-targets = [
-    "bpfel-unknown-none",
-    "aarch64-unknown-linux-musl",
-]
+channel = "nightly-2026-07-15"
+targets = ["aarch64-unknown-linux-musl"]
 components = ["rust-src", "rustfmt", "clippy"]

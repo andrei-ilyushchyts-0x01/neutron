@@ -87,9 +87,13 @@ domain. The generated `runner.json` uses `transport:"adb"`: Neutron validates a
 fixed set of regular assets, stages them below a generated
 `/data/local/tmp/neutron-harness-*` directory, applies a device-side timeout,
 executes argv without `sh -c`, and removes the staging directory. ADB runners do
-not accept prepare/recover hooks; old or custom `transport:"host"` runners keep
-direct host argv semantics. The default timeout is 30 seconds and the hard cap
-is 1000 runs. Every attempt overwrites `run-result.json` with a distinct
+not retain evidence or install Neutron there; the path is disposable replay
+staging only. ADB runners do not accept prepare/recover hooks; old or custom
+`transport:"host"` runners keep
+direct host argv semantics. Every command runs in a dedicated process group;
+timeout or output overflow kills the group, including descendants. Standard
+output and error are capped at 1 MiB each. The default timeout is 30 seconds and
+the hard cap is 1000 runs. Every attempt overwrites `run-result.json` with a distinct
 completed, crash, non-zero, reboot, transport-loss, timeout, hook-failure,
 identity-drift, recovery-failure, or oracle-error result. `signal` is present
 when the host can recover the terminating signal. A normal exit status such as

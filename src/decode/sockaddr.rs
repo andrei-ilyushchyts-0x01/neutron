@@ -64,6 +64,29 @@ pub fn format_sockaddr(raw: &[u8; 128]) -> Option<String> {
     }
 }
 
+/// Decode only fields covered by the syscall-declared sockaddr length. This
+/// prevents zero-filled bytes beyond a short user buffer from becoming
+/// fabricated address/port evidence.
+pub fn format_sockaddr_bounded(raw: &[u8; 128], declared_len: usize) -> Option<String> {
+    let captured_len = declared_len.min(raw.len());
+    if captured_len < 2 {
+        return None;
+    }
+    let family = u16::from_le_bytes([raw[0], raw[1]]);
+    let required = match family {
+        1 => 2,   // AF_UNIX has a variable-length name after sa_family.
+        2 => 8,   // family + port + IPv4 address are the rendered fields.
+        10 => 28, // canonical sockaddr_in6, including scope-id boundary.
+        _ => 6,   // unknown-family preview renders four bytes after family.
+    };
+    if captured_len < required {
+        return None;
+    }
+    let mut bounded = *raw;
+    bounded[captured_len..].fill(0);
+    format_sockaddr(&bounded)
+}
+
 /// Read the socket inode from `/proc/<pid>/fd/<fd>`. Symlink target format:
 /// `socket:[<inode>]`.
 pub fn read_socket_inode(pid: u32, fd: i64) -> Option<u64> {
@@ -211,6 +234,16 @@ mod tests {
         let buf = buf_from(&[99, 0, 0xde, 0xad, 0xbe, 0xef]);
         let out = format_sockaddr(&buf).expect("some output for unknown family");
         assert!(out.starts_with("AF_?(99)"), "got {}", out);
+    }
+
+    #[test]
+    fn bounded_sockaddr_rejects_zero_filled_fields_past_declared_length() {
+        let buf = buf_from(&[2, 0, 0x01, 0xbb, 127, 0, 0, 1]);
+        assert_eq!(format_sockaddr_bounded(&buf, 2), None);
+        assert_eq!(
+            format_sockaddr_bounded(&buf, 8),
+            Some("AF_INET 127.0.0.1:443".into())
+        );
     }
 
     #[test]

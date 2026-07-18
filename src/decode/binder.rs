@@ -1,6 +1,6 @@
 //! Binder transaction event formatters (synthetic `syscall_nr == -1`).
 
-use crate::decode::format_comm;
+use crate::decode::{escape_text, format_comm};
 use neutron_common::SyscallEvent;
 
 /// Format a binder transaction event for human-readable text output.
@@ -12,7 +12,7 @@ pub fn format_binder_event(ev: &SyscallEvent) -> String {
     let to_thread = args[3] as u32;
     let reply = args[4] != 0;
     let target_node = args[5] as u32;
-    let comm = format_comm(&{ ev.comm });
+    let comm = escape_text(&format_comm(&{ ev.comm }));
     let ts_ms = { ev.timestamp_ns } / 1_000_000;
     let pid = { ev.pid };
     let tid = { ev.tgid };
@@ -45,6 +45,7 @@ pub fn format_binder_event(ev: &SyscallEvent) -> String {
 pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> String {
     let args = { ev.args };
     let comm = format_comm(&{ ev.comm });
+    let comm_json = serde_json::to_string(&comm).expect("serializing binder comm cannot fail");
     let event_id_json = match event_id {
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
@@ -56,12 +57,14 @@ pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> Str
         format!(r#","debug_id":{}"#, debug_id)
     };
     format!(
-        r#"{{"ts_ns":{},"pid":{},"tgid":{},"uid":{},"type":"binder","phase":"enter","comm":"{}","reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{}{}{}}}"#,
+        r#"{{"ts_ns":{},"pid":{},"tgid":{},"process_id":{},"thread_id":{},"uid":{},"type":"binder","phase":"enter","comm":{},"reply":{},"to_proc":{},"to_thread":{},"target_node":{},"code":{},"flags":{}{}{}}}"#,
         { ev.timestamp_ns },
         { ev.pid },
         { ev.tgid },
+        { ev.pid },
+        { ev.tgid },
         { ev.uid },
-        comm,
+        comm_json,
         args[4] != 0,
         args[0] as u32,
         args[3] as u32,
@@ -79,18 +82,21 @@ pub fn format_binder_event_json(ev: &SyscallEvent, event_id: Option<u64>) -> Str
 /// Sprint-2 PR 2.
 pub fn format_binder_received_json(ev: &SyscallEvent, event_id: Option<u64>) -> String {
     let comm = format_comm(&{ ev.comm });
+    let comm_json = serde_json::to_string(&comm).expect("serializing binder comm cannot fail");
     let debug_id = { ev.ptr_hint } as u32 as i32;
     let event_id_json = match event_id {
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
     };
     format!(
-        r#"{{"ts_ns":{},"pid":{},"tgid":{},"uid":{},"type":"binder_received","comm":"{}","debug_id":{}{}}}"#,
+        r#"{{"ts_ns":{},"pid":{},"tgid":{},"process_id":{},"thread_id":{},"uid":{},"type":"binder_received","comm":{},"debug_id":{}{}}}"#,
         { ev.timestamp_ns },
         { ev.pid },
         { ev.tgid },
+        { ev.pid },
+        { ev.tgid },
         { ev.uid },
-        comm,
+        comm_json,
         debug_id,
         event_id_json,
     )
@@ -177,6 +183,33 @@ mod tests {
         assert_eq!(obj.get("target_node").and_then(|v| v.as_u64()), Some(7));
         // event_id omitted when caller doesn't supply one.
         assert!(!obj.contains_key("event_id"));
+    }
+
+    #[test]
+    fn binder_comm_control_characters_cannot_split_ndjson() {
+        let mut ev = binder_event([42, 1, 0, 0, 0, 7]);
+        ev.comm = comm_bytes("evil\n\tcomm");
+
+        for line in [
+            format_binder_event_json(&ev, Some(1)),
+            format_binder_received_json(&ev, Some(2)),
+        ] {
+            assert_eq!(line.lines().count(), 1, "binder record was split: {line:?}");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+            assert_eq!(value["comm"], "evil\n\tcomm");
+        }
+    }
+
+    #[test]
+    fn binder_text_comm_cannot_split_or_escape_the_terminal() {
+        let mut ev = binder_event([42, 1, 0, 0, 0, 7]);
+        ev.comm = comm_bytes("evil\n\x1b[2J");
+
+        let text = format_binder_event(&ev);
+        assert_eq!(text.lines().count(), 1, "binder text split: {text:?}");
+        assert!(!text.contains('\u{1b}'), "terminal escape leaked");
+        assert!(text.contains("\\n"));
+        assert!(text.contains("\\u{1b}"));
     }
 
     #[test]

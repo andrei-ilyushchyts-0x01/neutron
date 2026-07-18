@@ -2,75 +2,107 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev, "release/**"]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # The repo's rust-toolchain.toml pins nightly and lists `bpfel-unknown-none`
-  # as a required target. That target has no prebuilt rust-std and breaks
-  # rustup auto-install. Each job installs only the targets it needs, so set
-  # RUSTUP_TOOLCHAIN per Rust job and let the eBPF job build core explicitly.
+  RUSTUP_TOOLCHAIN: nightly-2026-07-15
 
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
-    env:
-      # Match the nightly rustfmt the project develops against.
-      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
         with:
+          toolchain: nightly-2026-07-15
           components: rustfmt
       - run: cargo fmt --all -- --check
 
   host:
     name: host workspace
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
         with:
+          toolchain: nightly-2026-07-15
           components: clippy
           targets: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: bash tests/release_contract.sh
+      - run: bash tests/package_release.sh
+      - run: bash tests/release_identity.sh
+      - run: bash tests/provenance_generation.sh
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user zstd
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
       - run: cargo check --workspace --exclude neutron-ebpf
       - run: cargo test --workspace --exclude neutron-ebpf
       - run: cargo clippy --workspace --exclude neutron-ebpf --all-targets -- -D warnings
-      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-gnu --bin neutron
+      - run: cargo build --release --target aarch64-unknown-linux-musl --bin neutron
 
   ebpf:
     name: release eBPF object
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
         with:
+          toolchain: nightly-2026-07-15
           components: rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo install bpf-linker --version 0.10.3 --locked
       - run: cargo xtask build-ebpf release
+      - run: cargo xtask build-ebpf --stacks release
 
   probe:
     name: research probe unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
         with:
           gradle-version: "8.10.2"
-      - run: gradle --no-daemon testDebugUnitTest
+      - run: gradle --no-daemon testDebugUnitTest assembleDebug
         working-directory: probe-app
+
+  release-assets:
+    name: unpublished release assets
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly-2026-07-15
+          components: rust-src
+          targets: aarch64-unknown-linux-musl
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: "8.10.2"
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user zstd
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - run: cargo install bpf-linker --version 0.10.3 --locked
+      - run: scripts/package-release.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: neutron-${{ github.sha }}
+          path: dist/v*/
+          if-no-files-found: error

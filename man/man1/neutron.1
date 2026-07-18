@@ -5,10 +5,10 @@
 .\"   sudo install -m 0644 man/man1/neutron.1 /usr/local/share/man/man1/
 .\"   sudo mandb        # rebuild the man index
 .\"
-.TH NEUTRON 1 "2026-07-11" "neutron 1.4.0" "User Commands"
+.TH NEUTRON 1 "2026-07-17" "neutron 1.5.0-rc.1" "User Commands"
 .\" -----------------------------------------------------------------
 .SH NAME
-neutron \- Android kernel-boundary and cross-service causal tracer for authorized security assessment
+neutron \- evidence-grade Android boundary mapper and bounded causal tracer
 .\" -----------------------------------------------------------------
 .SH SYNOPSIS
 .B neutron
@@ -843,12 +843,11 @@ events. Typically populated from
 .BI \-\-object " PATH"
 Path to the compiled BPF ELF object.
 Default
-.IR /data/local/tmp/neutron.bpf.elf
-\(em the location
+.IR /data/local/share/neutron/neutron.bpf.elf
+\(em the root-private installed location used by
 .B "build.sh"
 and
-.B "cargo xtask deploy"
-push to.
+.BR install-android.sh .
 .TP
 .BI \-\-pages " N"
 .B Deprecated
@@ -1461,7 +1460,7 @@ Treat findings derived from a degraded run as suggestive, not conclusive.
 and
 .B \-\-match-comm
 take glob patterns. When they're invoked through
-.BR "adb shell su -c """ ,
+.BR "adb -s SERIAL shell su -c """ ,
 two shells stand between your keystrokes and neutron: the local shell
 that runs
 .B adb ,
@@ -1489,24 +1488,25 @@ sharing a prefix, no glob characters), but the easiest fix is to escape
 the wildcard so it survives both shells:
 .PP
 .EX
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+NEUTRON=/data/local/share/neutron/neutron-agent
+
 \&# DOES NOT WORK in a typical adb-over-bash setup:
-adb shell su -c "/data/local/tmp/neutron --pid 0 --match-fd '/dev/lwis*'"
+"${ADB[@]}" shell "su -c '${NEUTRON} trace --pid 0 --match-fd=/dev/lwis*'"
 
 \&# WORKS — the backslash survives the local bash and reaches the
 \&# device shell where it correctly suppresses globbing:
-adb shell su -c "/data/local/tmp/neutron --pid 0 --match-fd=/dev/lwis\\\\*"
-
-\&# Equivalent — heredoc keeps argv literal:
-adb shell su -c <<'CMD'
-/data/local/tmp/neutron --pid 0 --match-fd=/dev/lwis*
-CMD
+"${ADB[@]}" shell \
+  "su -c '${NEUTRON} trace --pid 0 --match-fd=/dev/lwis\\\\*'"
 .EE
 .PP
 The same caveat applies to
 .B \-\-match-comm
 patterns and to fd-path globs inside
 .BR "\-\-match '...'" .
-Use the heredoc form when in doubt — it transports argv literally.
+Pass the pattern as one validated argument and inspect Neutron's startup
+warning if a shell may have expanded it.
 .\" -----------------------------------------------------------------
 .SH MARKER WORKFLOW
 .B neutron mark
@@ -1634,7 +1634,7 @@ Affects only userspace; BPF programs are unaffected.
 .\" -----------------------------------------------------------------
 .SH FILES
 .TP
-.I /data/local/tmp/neutron.bpf.elf
+.I /data/local/share/neutron/neutron.bpf.elf
 Default location for the compiled BPF object.
 Override with
 .BR \-\-object .
@@ -1687,73 +1687,52 @@ is non-empty (default). Missing on hosts without Android crash reporting;
 the watcher silently no-ops.
 .\" -----------------------------------------------------------------
 .SH EXAMPLES
-.SS Quick start (one rooted Pixel)
+.SS Device setup and quick start
+.PP
+All device examples require one explicit physical-device serial and reuse a
+root-private run directory:
 .PP
 .EX
-# Build BPF + userspace, push to /data/local/tmp.
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+NEUTRON=/data/local/share/neutron/neutron-agent
+RUN=/data/local/share/neutron/runs/man-example
+
 \&./build.sh
-PID=$(adb shell pidof com.example.app)
+"${ADB[@]}" shell "su -c 'install -d -m 0700 ${RUN}'"
+PID="$("${ADB[@]}" shell pidof -s com.example.app | tr -d '\\r')"
+[[ "$PID" =~ ^[0-9]+$ ]] || exit 1
+
+# Prove the installed capture path before tracing.
+"${ADB[@]}" exec-out \
+  "su -c '${NEUTRON} doctor --json --smoke'" > doctor.json
 
 # Run with stack-aware rules and procfs fallback path resolution.
-adb shell su -c "/data/local/tmp/neutron \\
-    --pid $PID \\
-    --profile security \\
-    --stacks \\
-    --resolve-paths"
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \\
+    --pid ${PID} --profile security --stacks --resolve-paths'"
 .EE
 .SS Capture NDJSON for offline analysis
 .PP
 .EX
-adb shell su -c "/data/local/tmp/neutron --pid $PID --json --binder" \\
+"${ADB[@]}" shell "su -c '${NEUTRON} trace --pid ${PID} \\
+    --json --binder --output ${RUN}/app-trace.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/app-trace.ndjson'" \\
     > app-trace.ndjson
-# Cut a 5-second window around every crash:
 neutron window app-trace.ndjson --anchor crash --around 5s
-.EE
-.SS Investigate a HAL crash triggered by a specific app
-.PP
-.EX
-adb shell su -c "/data/local/tmp/neutron --pid 0 --json --binder \\
-    --profile security" > capture.ndjson
-# After a crash, find the binder transactions in flight when it fired:
-neutron window capture.ndjson \\
-    --anchor finding:R004_binder_callee_crash \\
-    --around 2s
-.EE
-.SS Self-test on the demo target
-.PP
-.EX
-cargo xtask demo                          # builds + pushes neutron + demo-target
-adb shell su -c '/data/local/tmp/neutron --pid 0 --json' > demo-trace.ndjson &
-adb shell '/data/local/tmp/demo-target'   # 18 phases, ~2s
-# Ctrl-C neutron, then verify:
-cargo xtask check-findings demo-trace.ndjson
-.EE
-.SS Verify the device is supported
-.PP
-.EX
-adb shell su -c '/data/local/tmp/neutron doctor'
 .EE
 .SS Trace one app and follow its child processes
 .PP
 .EX
-adb shell su -c "/data/local/tmp/neutron \\
-    --pid $(adb shell pidof com.example.app) \\
-    --follow-children \\
-    --json"
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \\
+    --pid ${PID} --follow-children --json'"
 .EE
-.SS Highlight only RWX memory operations
+.SS Predicate-driven LWIS capture (preview)
 .PP
 .EX
-adb shell su -c "/data/local/tmp/neutron --pid $PID --alert-rwx --raw"
-.EE
-.SS Predicate-driven LWIS capture (1.2.0)
-.PP
-.EX
-\&# Match LWIS command-packet ioctls only; expression form.
-adb shell su -c "/data/local/tmp/neutron --pid 0 --json \\
-    --match 'syscall = 29 AND ioctl.cmd = 0xc0104c64 \\
-             AND fd_path GLOB \(dq/dev/lwis*\(dq \\
-             AND arg.u32@0 IN (0x10100, 0x10200, 0x20300, 0x20400)'"
+\&# Match one LWIS ioctl shape; keep the wildcard literal.
+"${ADB[@]}" shell "su -c '${NEUTRON} trace --pid 0 --json \\
+    --match-syscall 29 --match-ioctl-cmd 0xc0104c64 \\
+    --match-fd=/dev/lwis\\\\*'"
 .EE
 .SS Summarise an existing capture
 .PP
@@ -1768,18 +1747,18 @@ neutron diff baseline.ndjson test.ndjson \\
 .SS Bracket a scenario with markers (1.2.0)
 .PP
 .EX
-adb shell su -c "/data/local/tmp/neutron --json \\
-    --output /data/local/tmp/trace.ndjson" &
+"${ADB[@]}" shell "su -c '${NEUTRON} trace --json \\
+    --output ${RUN}/trace.ndjson'" &
 
-adb shell su -c "/data/local/tmp/neutron mark scenario \\
-    --phase start --output /data/local/tmp/trace.ndjson"
-adb shell './trigger-camera-night'
-adb shell su -c "/data/local/tmp/neutron mark scenario \\
-    --phase end --output /data/local/tmp/trace.ndjson"
+"${ADB[@]}" shell "su -c '${NEUTRON} mark scenario \\
+    --phase start --output ${RUN}/trace.ndjson'"
+"${ADB[@]}" shell './trigger-camera-night'
+"${ADB[@]}" shell "su -c '${NEUTRON} mark scenario \\
+    --phase end --output ${RUN}/trace.ndjson'"
 
 kill %1
 wait %1
-adb pull /data/local/tmp/trace.ndjson .
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/trace.ndjson'" > trace.ndjson
 neutron window trace.ndjson --anchor marker:scenario --around 5s
 .EE
 .SS Build and query a surface snapshot (1.4.0)

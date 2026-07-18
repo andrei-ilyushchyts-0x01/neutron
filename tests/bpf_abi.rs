@@ -1,7 +1,10 @@
 use neutron::bpf_abi::{
-    validate_bpf_abi, BpfAbiError, BpfAbiMetadata, BpfAbiRequirements, BPF_ABI_MAGIC, BPF_ABI_MAJOR,
+    read_bpf_object_path, validate_bpf_abi, BpfAbiError, BpfAbiMetadata, BpfAbiRequirements,
+    BpfObjectError, BPF_ABI_MAGIC, BPF_ABI_MAJOR,
 };
 use neutron::SyscallEvent;
+use std::fs;
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 const REQUIRED_FEATURES: u64 = 0b0101;
 
@@ -21,6 +24,7 @@ fn requirements() -> BpfAbiRequirements {
         abi_major: BPF_ABI_MAJOR,
         syscall_event_size: std::mem::size_of::<SyscallEvent>() as u32,
         required_feature_bits: REQUIRED_FEATURES,
+        expected_build_id: Some([0x11; 20]),
     }
 }
 
@@ -83,4 +87,53 @@ fn missing_required_bpf_features_are_rejected() {
         validate_bpf_abi(&metadata, &requirements()),
         Err(BpfAbiError::MissingFeatures { .. })
     ));
+}
+
+#[test]
+fn missing_source_build_id_is_rejected() {
+    let mut metadata = matching_metadata();
+    metadata.build_id = [0; 20];
+
+    assert!(matches!(
+        validate_bpf_abi(&metadata, &requirements()),
+        Err(BpfAbiError::MissingBuildId)
+    ));
+}
+
+#[test]
+fn object_from_another_source_commit_is_rejected() {
+    let mut metadata = matching_metadata();
+    metadata.build_id = [0x22; 20];
+
+    assert!(matches!(
+        validate_bpf_abi(&metadata, &requirements()),
+        Err(BpfAbiError::BuildIdMismatch { .. })
+    ));
+}
+
+#[test]
+fn bpf_object_reader_rejects_shared_write_modes_and_symlinks() {
+    let directory = std::env::temp_dir().join(format!(
+        "neutron-bpf-reader-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let object = directory.join("object.elf");
+    fs::write(&object, b"object").unwrap();
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(matches!(
+        read_bpf_object_path(&object),
+        Err(BpfObjectError::UnsafeObject { .. })
+    ));
+
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+    let link = directory.join("object-link.elf");
+    symlink(&object, &link).unwrap();
+    assert!(read_bpf_object_path(&link).is_err());
+
+    fs::remove_dir_all(directory).unwrap();
 }

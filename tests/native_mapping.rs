@@ -2,7 +2,12 @@ use neutron::native::{
     aggregate_bookmarks, elf_map_metadata, translate_ip, CapturedMapping, GhidraBookmarkInput,
     NativeConfidence,
 };
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+
+fn make_private(path: &std::path::Path) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
 
 #[test]
 fn translates_non_zero_pt_load_offsets_exactly() {
@@ -69,6 +74,7 @@ fn cli_writes_versioned_native_and_ghidra_documents() {
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
+    make_private(&root);
     let capture = root.join("capture.ndjson");
     std::fs::write(
         &capture,
@@ -113,6 +119,7 @@ fn native_output_rejects_hardlink_without_truncating_source() {
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).unwrap();
+    make_private(&root);
     let capture = root.join("capture.ndjson");
     std::fs::write(&capture, "").unwrap();
     let source = root.join("source.json");
@@ -140,6 +147,7 @@ fn native_map_bounds_recursive_symbol_inputs() {
     let _ = std::fs::remove_dir_all(&root);
     let symbols = root.join("symbols");
     std::fs::create_dir_all(&symbols).unwrap();
+    make_private(&root);
     let capture = root.join("capture.ndjson");
     std::fs::write(&capture, "").unwrap();
     for index in 0..=256 {

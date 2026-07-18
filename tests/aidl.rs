@@ -141,6 +141,7 @@ fn exact_descriptor_resolves_catalog_but_candidates_never_guess_method() {
             sent_ts_ns: 1,
             received_ts_ns: Some(2),
             status: BinderCallStatus::Completed,
+            causal_metadata: None,
         },
         None,
         &verified,
@@ -190,8 +191,8 @@ fn conflicting_legacy_method_is_rejected() {
 
 #[test]
 fn report_catalog_resolves_only_exact_service_fields() {
-    let exact = r#"{"type":"binder_call","callee_pid":300,"target_node":7,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default"}"#;
-    let candidate = r#"{"type":"binder_call","callee_pid":300,"target_node":8,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default","attribution_confidence":"candidate"}"#;
+    let exact = r#"{"type":"binder_call","caller_pid":100,"callee_pid":300,"target_node":7,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default"}"#;
+    let candidate = r#"{"type":"binder_call","caller_pid":100,"callee_pid":300,"target_node":8,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default","attribution_confidence":"candidate"}"#;
     let report = render_report_from_reader(
         Cursor::new(format!("{exact}\n{candidate}\n")),
         ReportOptions {

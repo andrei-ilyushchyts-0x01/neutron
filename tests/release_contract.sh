@@ -238,6 +238,8 @@ current_abi_docs_match_257_byte_contract() {
 evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
     local architecture="$root/docs/ARCHITECTURE.md"
     local reference="$root/docs/REFERENCE.md"
+    local output_formats="$root/docs/guides/output-formats.md"
+    local limitations="$root/docs/LIMITATIONS.md"
     local cli="$root/src/cli.rs"
     local changelog="$root/CHANGELOG.md"
 
@@ -247,6 +249,10 @@ evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
         ! rg -qi 'uid.*falls back to.*active' "$reference" "$cli" &&
         contains "$reference" '`uid` is rejected in 1.5' &&
         contains "$cli" '`uid` is rejected in 1.5' &&
+        contains "$reference" '"ioctl_payload_truncated"' &&
+        contains "$output_formats" '"ioctl_payload_truncated"' &&
+        contains "$limitations" '`ioctl_payload_truncated`' &&
+        ! rg -q '"(fd_lookup_missed|symbolization_failed)"' "$reference" "$output_formats" &&
         ! contains "$changelog" 'Seeded PIDs matching explicit `--follow-deny-domain`' &&
         contains "$changelog" 'domain follow-policy flags are rejected in 1.5'
 }

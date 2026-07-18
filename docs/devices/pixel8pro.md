@@ -1,8 +1,9 @@
 # Pixel 8 Pro — Device Profile
 
-This is the documented target profile for neutron 1.4. Any Android
-14+ device with kernel 6.1+, BTF, and root access should work, but the
-verified baseline below is what we test against.
+This is the documented Android 16 baseline profile. It does not imply
+support for every Android 14+, GKI 6.1, BTF, or rooted device. Runtime
+support is limited to rows explicitly qualified in `PRODUCT.md`; other
+Pixel/GKI devices are best-effort and vendor devices remain unverified.
 
 ## Build identity
 
@@ -127,9 +128,10 @@ adb -s "$SERIAL" shell "su -c 'cat $RUN/run.json; cat $RUN/stimulus.json; tail -
 counter: it marks an exit whose matching enter predated dynamic causal
 admission, including an already-active sibling Binder thread. Ordinary
 `inflight_lookup_missed` values still make a capture degraded.
-`follow_policy_filtered` is expected for research runs because they pre-deny
-`servicemanager` and `system_server` before tracepoint attachment to avoid
-system-wide coordinator fanout.
+Research runs rely on the causal follower's built-in coordinator transit
+limits. They do not pre-deny `servicemanager` or `system_server`: domain policy
+flags are rejected in 1.5 because first-event BPF admission cannot enforce
+them safely.
 
 ## Helper inventory (kernel 6.1+)
 

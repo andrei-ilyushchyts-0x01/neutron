@@ -24,14 +24,20 @@ Prefer package names for the app under test and provider authorities for
 the content provider:
 
 ```bash
-adb shell su -c '/data/local/tmp/neutron \
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+NEUTRON=/data/local/share/neutron/neutron-agent
+RUN=/data/local/share/neutron/runs/provider-$(date -u +%Y%m%dT%H%M%SZ)
+"${ADB[@]}" shell "su -c 'install -d -m 0700 ${RUN}'"
+
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid 0 \
   --json --raw --no-findings \
   --no-logcat --fdgraph-interval off --lookback-events 0 \
   --match-package com.example.probe \
   --match-android-provider content://com.android.contacts/contacts \
   --max-output-size 250mb \
-  --output /data/local/tmp/provider_probe.ndjson'
+  --output ${RUN}/provider_probe.ndjson'"
 ```
 
 `--match-package` runs on-device and resolves the package to its UID via
@@ -52,7 +58,7 @@ For platform or shared providers where authority resolution is blocked or
 ambiguous, add their UID explicitly:
 
 ```bash
-adb shell su -c '/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid 0 \
   --json --raw --no-findings \
   --no-logcat --fdgraph-interval off --lookback-events 0 \
@@ -60,7 +66,7 @@ adb shell su -c '/data/local/tmp/neutron \
   --match-uid 10094 \
   --rate-limit 1000 \
   --max-output-size 250mb \
-  --output /data/local/tmp/provider_probe.ndjson'
+  --output ${RUN}/provider_probe.ndjson'"
 ```
 
 Use `cmd package list packages -U | grep <name>` or
@@ -72,25 +78,25 @@ manually.
 Run the tracer in one shell, then add markers around each stimulus:
 
 ```bash
-adb shell su -c '/data/local/tmp/neutron mark direct_avatar \
-  --phase start --output /data/local/tmp/provider_probe.ndjson'
+"${ADB[@]}" shell "su -c '${NEUTRON} mark direct_avatar \
+  --phase start --output ${RUN}/provider_probe.ndjson'"
 
 # Trigger direct provider read in the app.
 
-adb shell su -c '/data/local/tmp/neutron mark direct_avatar \
-  --phase end --output /data/local/tmp/provider_probe.ndjson'
+"${ADB[@]}" shell "su -c '${NEUTRON} mark direct_avatar \
+  --phase end --output ${RUN}/provider_probe.ndjson'"
 ```
 
 Repeat with a second marker name for the wrapped or mediated path:
 
 ```bash
-adb shell su -c '/data/local/tmp/neutron mark wrapped_avatar \
-  --phase start --output /data/local/tmp/provider_probe.ndjson'
+"${ADB[@]}" shell "su -c '${NEUTRON} mark wrapped_avatar \
+  --phase start --output ${RUN}/provider_probe.ndjson'"
 
 # Trigger wrapped provider read.
 
-adb shell su -c '/data/local/tmp/neutron mark wrapped_avatar \
-  --phase end --output /data/local/tmp/provider_probe.ndjson'
+"${ADB[@]}" shell "su -c '${NEUTRON} mark wrapped_avatar \
+  --phase end --output ${RUN}/provider_probe.ndjson'"
 ```
 
 The tracer writes output with append-safe semantics, so marker lines are
@@ -98,24 +104,28 @@ safe to append to the live capture file.
 
 ## Review
 
-Summarize high-level syscall shape:
+Retrieve the private capture through root, then perform all analysis with the
+host binary:
 
 ```bash
-adb shell /data/local/tmp/neutron summarize \
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/provider_probe.ndjson'" \
+  > provider_probe.ndjson
+
+./neutron summarize \
   --by comm,syscall,ret_class \
-  --top 30 /data/local/tmp/provider_probe.ndjson
+  --top 30 provider_probe.ndjson
 ```
 
 Cut windows around each scenario:
 
 ```bash
-adb shell /data/local/tmp/neutron window \
-  /data/local/tmp/provider_probe.ndjson \
+./neutron window \
+  provider_probe.ndjson \
   --anchor marker:direct_avatar --around 3s \
   > direct_avatar_windows.ndjson
 
-adb shell /data/local/tmp/neutron window \
-  /data/local/tmp/provider_probe.ndjson \
+./neutron window \
+  provider_probe.ndjson \
   --anchor marker:wrapped_avatar --around 3s \
   > wrapped_avatar_windows.ndjson
 ```
@@ -123,14 +133,14 @@ adb shell /data/local/tmp/neutron window \
 Compare direct vs wrapped windows:
 
 ```bash
-adb shell /data/local/tmp/neutron diff \
+./neutron diff \
   --by comm,syscall,ret_class \
   --top 40 \
   direct_avatar_windows.ndjson wrapped_avatar_windows.ndjson
 ```
 
-For quick host-side review, pull the capture and run the same
-post-processors locally.
+The host-side diff is conclusive only when both inputs contain a structurally
+valid final `capture_health` record with `status:"complete"`.
 
 ## Binder Context
 
@@ -140,14 +150,14 @@ but it is high-volume under `--pid 0`.
 Use Binder only when you need transaction metadata:
 
 ```bash
-adb shell su -c '/data/local/tmp/neutron \
+"${ADB[@]}" shell "su -c '${NEUTRON} trace \
   --pid 0 --binder \
   --json --raw --no-findings \
   --match-package com.example.probe \
   --match-android-provider com.android.contacts \
   --rate-limit 1000 \
   --max-output-size 250mb \
-  --output /data/local/tmp/provider_binder.ndjson'
+  --output ${RUN}/provider_binder.ndjson'"
 ```
 
 `type:"binder_call"` lines are synthesized by the global Binder

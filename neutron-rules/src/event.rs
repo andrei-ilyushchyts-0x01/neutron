@@ -37,7 +37,9 @@ pub struct Event<'a> {
     pub ts_ns: u64,
     pub pid: u32,
     pub tid: u32,
-    pub uid: u32,
+    /// Effective UID when supplied by the event producer. In particular,
+    /// userspace crash sources may not know it; absence is not UID 0.
+    pub uid: Option<u32>,
     /// Syscall number. `-1` for binder events.
     pub syscall_nr: i32,
     pub name: &'a str,
@@ -168,7 +170,10 @@ impl<'a> Event<'a> {
             obj.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32
         };
         let tid = obj.get("tid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let uid = obj.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let uid = obj
+            .get("uid")
+            .and_then(|v| v.as_u64())
+            .and_then(|value| u32::try_from(value).ok());
         // Schema cleanup (sprint 1): prefer the explicit `phase` field when
         // present, fall back to the legacy `enter` boolean. Defaults to `true`
         // (treat as enter) when neither is supplied — matches prior behaviour
@@ -374,6 +379,13 @@ mod tests {
         let ev = owned.view().unwrap();
         assert_eq!(ev.kind, EventKind::Binder);
         assert_eq!(ev.syscall_nr, -1);
+    }
+
+    #[test]
+    fn process_exit_without_uid_does_not_become_root() {
+        let line = r#"{"type":"process_exit","pid":42,"uid":null,"classification":"crash"}"#;
+        let owned = Event::parse_line(line).unwrap();
+        assert_eq!(owned.view().unwrap().uid, None);
     }
 
     #[test]

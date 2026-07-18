@@ -6,7 +6,7 @@ This guide describes the planned bidirectional integration between neutron and F
 
 | Capability | BPF (neutron) | Frida |
 |------------|-------------------|-------|
-| Syscall arguments | Yes (kernel 6.1+; user reads via `bpf_probe_read_user_*`) | Via Interceptor on libc wrappers |
+| Syscall arguments | Supported syscall set with bounded payload snippets | Via Interceptor on libc wrappers |
 | Java method calls | No | Yes (Java.use) |
 | Return values at Java layer | No | Yes |
 | Java stack traces | No | Yes |
@@ -17,7 +17,10 @@ This guide describes the planned bidirectional integration between neutron and F
 | Works without source code | Yes | Yes |
 | Works without repackaging | Yes | Yes (with frida-server) |
 
-The combination: BPF captures the full syscall surface with kernel-level accuracy; Frida hooks the Java/native layer and recovers context that lives only inside the process (Java method calls, SSL plaintext, ART method names for JIT frames).
+The combination: Neutron records its configured kernel-boundary event set;
+Frida hooks the Java/native layer and can recover context that lives only
+inside the process. Neither source proves method authorization merely because
+an event was observed.
 
 ## Architecture
 
@@ -64,7 +67,8 @@ The following sections cover:
 
 When `--frida` is passed, neutron will:
 
-1. Bind a Unix domain socket at `--frida-socket PATH` (default: `/data/local/tmp/neutron.sock`)
+1. Bind a Unix domain socket at `--frida-socket PATH` (planned default:
+   `/data/local/share/neutron/runtime/neutron.frida.sock`)
 2. Accept multiple Frida agent connections
 3. Broadcast every BPF event as JSON to all connected agents
 4. Accept JSON lines from agents (synthetic events and resolve responses)
@@ -74,7 +78,7 @@ When `--frida` is passed, neutron will:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--frida` | off | Enable Frida bidirectional bridge |
-| `--frida-socket PATH` | `/data/local/tmp/neutron.sock` | Unix socket path |
+| `--frida-socket PATH` | `/data/local/share/neutron/runtime/neutron.frida.sock` | Unix socket path |
 
 ### Protocol
 
@@ -113,7 +117,7 @@ When `data` is empty and `ptr_hint != 0`, the agent should resolve the pointer. 
 ```javascript
 // Connect to neutron Unix socket
 const sock = new Socket('unix');
-sock.connect({ path: '/data/local/tmp/neutron.sock' });
+sock.connect({ path: '/data/local/share/neutron/runtime/neutron.frida.sock' });
 
 function sendEvent(obj) {
     sock.write(JSON.stringify(obj) + '\n');
@@ -227,10 +231,16 @@ Even before the socket bridge is implemented, you can combine neutron and Frida 
 Run neutron in one terminal, Frida in another. Merge and sort by timestamp in post-processing.
 
 ```bash
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+NEUTRON=/data/local/share/neutron/neutron-agent
+RUN=/data/local/share/neutron/runs/frida-$(date -u +%Y%m%dT%H%M%SZ)
+"${ADB[@]}" shell "su -c 'install -d -m 0700 ${RUN}'"
+
 # Terminal 1: BPF trace
-adb shell su -c '/data/local/tmp/neutron --pid <PID> --profile security \
-  --json --output /data/local/tmp/bpf.ndjson \
-  --object /data/local/tmp/neutron.bpf.elf'
+"${ADB[@]}" shell "su -c '${NEUTRON} trace --pid <PID> --profile security \
+  --json --output ${RUN}/bpf.ndjson'"
+"${ADB[@]}" exec-out "su -c 'cat ${RUN}/bpf.ndjson'" > bpf.ndjson
 
 # Terminal 2: Frida trace (stdout)
 frida -U -f com.target.app -l frida_standalone.js --no-pause > frida.ndjson
@@ -305,9 +315,15 @@ jq -r 'select(.nr == 48 or .nr == 79) | .data' bpf.ndjson | sort | uniq -c | sor
 # Download frida-server for arm64 (match your Frida version)
 # https://github.com/frida/frida/releases
 
-adb push frida-server-XX.X.X-android-arm64 /data/local/tmp/frida-server
-adb shell su -c 'chmod +x /data/local/tmp/frida-server'
-adb shell su -c '/data/local/tmp/frida-server &'
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+FRIDA_DIR=/data/local/share/frida
+"${ADB[@]}" shell "su -c 'install -d -m 0700 ${FRIDA_DIR}'"
+"${ADB[@]}" exec-in "su -c 'umask 077; \
+  cat > ${FRIDA_DIR}/frida-server'" \
+  < frida-server-XX.X.X-android-arm64
+"${ADB[@]}" shell "su -c 'chmod 0700 ${FRIDA_DIR}/frida-server; \
+  ${FRIDA_DIR}/frida-server >/dev/null 2>&1 &'"
 ```
 
 ### Connect from Host
@@ -328,7 +344,10 @@ frida -U -f com.target.app -l agent.js --no-pause
 ### Verify Frida Can Read Process Memory
 
 ```bash
-frida -U -p <PID> -e "Memory.readUtf8String(ptr(0x$(adb shell cat /proc/<PID>/maps | head -1 | cut -d- -f1)))"
+MAP_BASE="$("${ADB[@]}" shell \
+  "su -c 'sed -n \"1s/-.*//p\" /proc/<PID>/maps'" | tr -d '\r')"
+[[ "$MAP_BASE" =~ ^[0-9a-fA-F]+$ ]] || { echo "invalid map base" >&2; exit 1; }
+frida -U -p <PID> -e "Memory.readUtf8String(ptr(0x${MAP_BASE}))"
 ```
 
 If this fails, check for anti-Frida protections (the app is likely the one you are assessing — neutron can help identify the exact syscalls used for the check).

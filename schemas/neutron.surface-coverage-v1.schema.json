@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.surface-coverage-v1.schema.json",
+  "title": "Neutron target-scoped surface coverage v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "neutron_version",
+    "collected_at",
+    "device",
+    "collection",
+    "repeat",
+    "health",
+    "summary",
+    "rows"
+  ],
+  "properties": {
+    "schema": { "const": "neutron.surface-coverage/v1" },
+    "neutron_version": { "type": "string", "minLength": 1 },
+    "collected_at": { "type": "string", "minLength": 1 },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fingerprint", "boot_id"],
+      "properties": {
+        "fingerprint": { "type": "string" },
+        "boot_id": { "type": "string" }
+      }
+    },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_count", "minimal", "full_snapshot_retained"],
+      "properties": {
+        "target_count": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "minimal": { "const": true },
+        "full_snapshot_retained": { "const": false }
+      }
+    },
+    "repeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "semantic_drift"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "semantic_drift": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["baseline_pass", "current_pass", "endpoints"],
+            "properties": {
+              "baseline_pass": { "type": "integer", "minimum": 1 },
+              "current_pass": { "type": "integer", "minimum": 1 },
+              "endpoints": {
+                "type": "array",
+                "items": { "type": "string" },
+                "uniqueItems": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "warnings"],
+      "properties": {
+        "status": { "enum": ["complete", "degraded", "incomplete", "unknown"] },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exact", "unresolved", "ambiguous"],
+      "properties": {
+        "exact": { "type": "integer", "minimum": 0 },
+        "unresolved": { "type": "integer", "minimum": 0 },
+        "ambiguous": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "rows": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/row" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measured_by", "collector", "source", "evidence", "evidence_sha256"],
+      "properties": {
+        "measured_by": { "const": "neutron" },
+        "collector": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string" },
+        "evidence_sha256": { "$ref": "#/$defs/sha256" },
+        "source_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "uid",
+        "gid",
+        "starttime",
+        "boot_id",
+        "selinux_domain",
+        "executable"
+      ],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 1 },
+        "uid": { "type": "integer", "minimum": 0 },
+        "gid": { "type": "integer", "minimum": 0 },
+        "starttime": { "type": "integer", "minimum": 0 },
+        "boot_id": { "type": "string", "minLength": 1 },
+        "selinux_domain": { "type": "string", "minLength": 1 },
+        "executable": { "type": "string", "minLength": 1 }
+      }
+    },
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "declared", "live", "transport", "attribution"],
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[!-~]+$"
+        },
+        "declared": { "type": "boolean" },
+        "live": { "type": "boolean" },
+        "transport": { "type": "string" },
+        "owner": { "$ref": "#/$defs/owner" },
+        "attribution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["confidence", "sources"],
+          "properties": {
+            "confidence": { "enum": ["exact", "unresolved", "ambiguous"] },
+            "sources": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/source" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

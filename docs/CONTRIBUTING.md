@@ -10,13 +10,13 @@
 | `bpf-linker`                             | Link Aya BPF programs                    | `cargo install bpf-linker`                   |
 | `aarch64-linux-gnu-gcc`                  | Cross-linker for the musl userspace      | `apt install gcc-aarch64-linux-gnu` (or distro equivalent) |
 | `adb`                                    | Deploy + run on device                   | Android SDK platform-tools                   |
-| `rustup target add bpfel-unknown-none`   | BPF target                               | automatic via `rust-toolchain.toml`          |
+| `bpfel-unknown-none`                     | BPF target specification                 | built from `rust-src` by `cargo xtask`; no prebuilt rustup target exists |
 | `rustup target add aarch64-unknown-linux-musl` | musl cross-compile target          | automatic via `rust-toolchain.toml`          |
 | `rustup component add rust-src`          | BPF build-std                            | automatic via `rust-toolchain.toml`          |
 
-The `rust-toolchain.toml` at the workspace root pins nightly and adds the
-two required targets and `rust-src` automatically. You still need to
-install `bpf-linker` manually.
+The `rust-toolchain.toml` at the workspace root pins a dated nightly, adds the
+AArch64 userspace target, and installs `rust-src`. The BPF target is built from
+that source with `-Z build-std=core`; install `bpf-linker` separately.
 
 There is no `clang` / `llvm-objdump` requirement — BPF programs are 100%
 Rust in V1.
@@ -63,7 +63,7 @@ cargo xtask deploy
 
 ### `SyscallEvent`
 
-`neutron_common::SyscallEvent` (`#[repr(C, packed)]`, **241 bytes**) is the
+`neutron_common::SyscallEvent` (`#[repr(C, packed)]`, **257 bytes**) is the
 single source of truth for the wire format. See
 `neutron-common/src/lib.rs`. Both `neutron-ebpf` and the userspace loader
 pull this type directly — there is no parallel C struct.
@@ -145,7 +145,7 @@ emit the verifier log to stderr. Common causes on kernel 6.1.x:
 - **Variable-size reads**: `bpf_probe_read_user_buf` length must be a
   constant or proven by the verifier.
 - **Stack overflow**: BPF stack limit is still 512 bytes. `SyscallEvent`
-  is 241 bytes — keep additional locals slim.
+  is 257 bytes — keep additional locals slim.
 - **Pointer leaks**: pointers from `bpf_probe_read_user` cannot be passed
   back to other helpers without a bounds check.
 

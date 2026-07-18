@@ -16,10 +16,11 @@ use std::collections::BTreeSet;
 use neutron_common::{
     COUNTER_BINDER_DEPTH_LIMIT, COUNTER_BINDER_FOLLOW_FAILED,
     COUNTER_CAUSAL_ADMISSION_BOUNDARY_EXIT, COUNTER_EVENTS_SUBMITTED,
-    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED, COUNTER_IOCTL_REFRESH_MISSED,
-    COUNTER_PATH_READ_FAILED, COUNTER_PATH_TRUNCATED, COUNTER_PAYLOAD_READ_FAILED,
-    COUNTER_RINGBUF_RESERVE_FAILED, COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED,
-    COUNTER_STACK_USER_FAILED, COUNTER_THREAD_CONTEXT_UPDATE_FAILED, COUNTER_TRACED_PROCESS_LIMIT,
+    COUNTER_INFLIGHT_LOOKUP_MISSED, COUNTER_INFLIGHT_UPDATE_FAILED,
+    COUNTER_IOCTL_PAYLOAD_TRUNCATED, COUNTER_IOCTL_REFRESH_MISSED, COUNTER_PATH_READ_FAILED,
+    COUNTER_PATH_TRUNCATED, COUNTER_PAYLOAD_READ_FAILED, COUNTER_RINGBUF_RESERVE_FAILED,
+    COUNTER_SLOT_COUNT, COUNTER_STACK_KERNEL_FAILED, COUNTER_STACK_USER_FAILED,
+    COUNTER_THREAD_CONTEXT_UPDATE_FAILED, COUNTER_TRACED_PROCESS_LIMIT,
     COUNTER_TRACEPOINT_READ_FAILED, COUNTER_UNIX_MSG_CONTROL_NESTED,
     COUNTER_UNIX_MSG_CONTROL_TRUNCATED,
 };
@@ -121,6 +122,11 @@ pub const COUNTER_LABELS: &[(u32, &str, CounterKind)] = &[
         "tracepoint read failed",
         CounterKind::Degradation,
     ),
+    (
+        COUNTER_IOCTL_PAYLOAD_TRUNCATED,
+        "ioctl payload truncated",
+        CounterKind::Degradation,
+    ),
 ];
 
 /// Severity tagging for summary rendering.
@@ -183,6 +189,7 @@ pub fn capture_health_contract_errors(object: &Map<String, Value>) -> Vec<String
         "causal_admission_boundary_exit",
         "payload_read_failed",
         "tracepoint_read_failed",
+        "ioctl_payload_truncated",
     ];
     const COUNTS: &[&str] = &[
         "events_userspace",
@@ -591,6 +598,7 @@ fn health_record_has_loss(object: &Map<String, Value>) -> bool {
         "thread_context_update_failed",
         "payload_read_failed",
         "tracepoint_read_failed",
+        "ioctl_payload_truncated",
         "events_sampled_out",
         "follow_policy_filtered",
         "follow_ttl_expired",

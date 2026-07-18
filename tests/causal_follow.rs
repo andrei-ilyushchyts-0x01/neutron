@@ -54,6 +54,30 @@ fn domain_policy_denies_before_allowing_and_rejects_unknown_allowlist_members() 
 }
 
 #[test]
+fn configured_domain_policy_blocks_missing_or_invalid_callee_identity() {
+    let policy = FollowPolicy::new(std::iter::empty::<&str>(), ["vendor_bad"]).unwrap();
+
+    for callee_domain in [None, Some("u:r::s0"), Some("not a domain")] {
+        assert_eq!(
+            policy.decide(candidate(
+                Some("untrusted_app"),
+                callee_domain,
+                CausalRelation::Exact,
+            )),
+            FollowDecision::Block("domain_unavailable")
+        );
+    }
+    assert_eq!(
+        policy.decide(candidate(
+            Some("untrusted_app"),
+            Some("hal_camera_default"),
+            CausalRelation::Exact,
+        )),
+        FollowDecision::Allow
+    );
+}
+
+#[test]
 fn special_process_transit_is_bounded() {
     let policy = FollowPolicy::new(std::iter::empty::<&str>(), std::iter::empty::<&str>()).unwrap();
     let mut through_manager = candidate(

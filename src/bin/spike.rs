@@ -187,7 +187,7 @@ fn run(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             };
             saw_any = true;
             // SAFETY: SyscallEvent is #[repr(C, packed)] of plain integers;
-            // any 241-byte payload is a valid instance.
+            // any 257-byte payload is a valid instance.
             let ev: SyscallEvent =
                 unsafe { std::ptr::read_unaligned(bytes_owned.as_ptr() as *const _) };
             count += 1;

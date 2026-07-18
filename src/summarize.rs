@@ -17,6 +17,14 @@ use std::io::{self, BufRead, BufReader, Write};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use crate::capture_input::{
+    read_capture_record, validate_capture_strings, MAX_CAPTURE_STRING_BYTES,
+};
+
+const MAX_AGGREGATION_GROUPS: usize = 100_000;
+const MAX_AGGREGATION_KEY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AGGREGATION_EXEMPLAR_BYTES: usize = 64 * 1024 * 1024;
+
 /// One column of the group-by key. Each variant maps to a specific JSON
 /// field on the event line. Unknown fields → an explicit string sentinel
 /// (`<none>`) instead of being skipped, so groups don't collapse silently.
@@ -199,30 +207,110 @@ pub fn summarize<R: BufRead>(
     keys: &[KeyField],
     samples_cap: usize,
 ) -> Result<Aggregation> {
+    summarize_impl(reader, keys, samples_cap, None)
+}
+
+/// Aggregate only behavior records causally tagged with one of the validated
+/// scenario IDs. Marker and health records define the evidence boundary but
+/// are never counted as behavior.
+pub fn summarize_scenarios<R: BufRead>(
+    reader: R,
+    keys: &[KeyField],
+    samples_cap: usize,
+    scenario_traces: &BTreeMap<String, String>,
+) -> Result<Aggregation> {
+    summarize_impl(reader, keys, samples_cap, Some(scenario_traces))
+}
+
+fn summarize_impl<R: BufRead>(
+    mut reader: R,
+    keys: &[KeyField],
+    samples_cap: usize,
+    scenario_traces: Option<&BTreeMap<String, String>>,
+) -> Result<Aggregation> {
     if keys.is_empty() {
         bail!("at least one --by field is required");
     }
     let mut out = Aggregation::new();
-    for line in reader.lines() {
-        let line = line.context("reading capture line")?;
-        let trimmed = line.trim();
+    let mut line = Vec::new();
+    let mut record_number = 1usize;
+    let mut key_bytes = 0usize;
+    let mut exemplar_bytes = 0usize;
+    while read_capture_record(&mut reader, &mut line, record_number)? {
+        let text = std::str::from_utf8(&line)
+            .with_context(|| format!("capture record {record_number} is not UTF-8"))?;
+        let trimmed = text.trim();
         if trimmed.is_empty() {
+            record_number += 1;
             continue;
         }
         let v: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
-            Err(_) => continue, // keep behaviour parallel to window.rs
+            Err(_) => {
+                record_number += 1;
+                continue; // keep behaviour parallel to window.rs
+            }
         };
+        validate_capture_strings(&v, record_number)?;
         let obj = match v.as_object() {
             Some(o) => o,
-            None => continue,
+            None => {
+                record_number += 1;
+                continue;
+            }
         };
+        if let Some(scenario_traces) = scenario_traces {
+            let kind = obj.get("type").and_then(Value::as_str);
+            let scenario_id = obj.get("scenario_id").and_then(Value::as_str);
+            let trace_id = obj.get("trace_id").and_then(Value::as_str);
+            if matches!(kind, Some("marker" | "capture_health"))
+                || !scenario_id.is_some_and(|scenario| {
+                    scenario_traces.get(scenario).map(String::as_str) == trace_id
+                })
+            {
+                record_number += 1;
+                continue;
+            }
+        }
         let key: Vec<String> = keys.iter().map(|k| k.extract(obj)).collect();
+        if key
+            .iter()
+            .any(|value| value.len() > MAX_CAPTURE_STRING_BYTES)
+        {
+            bail!(
+                "capture record {record_number} group key exceeds {MAX_CAPTURE_STRING_BYTES} bytes"
+            );
+        }
+        if !out.contains_key(&key) {
+            if out.len() >= MAX_AGGREGATION_GROUPS {
+                bail!("capture aggregation exceeds {MAX_AGGREGATION_GROUPS} groups");
+            }
+            let added = key.iter().try_fold(0usize, |total, value| {
+                total
+                    .checked_add(value.len())
+                    .context("aggregation key byte count overflow")
+            })?;
+            key_bytes = key_bytes
+                .checked_add(added)
+                .context("aggregation key byte count overflow")?;
+            if key_bytes > MAX_AGGREGATION_KEY_BYTES {
+                bail!("capture aggregation keys exceed {MAX_AGGREGATION_KEY_BYTES} bytes");
+            }
+        }
         let entry = out.entry(key).or_default();
         entry.count = entry.count.saturating_add(1);
         if entry.exemplars.len() < samples_cap {
+            exemplar_bytes = exemplar_bytes
+                .checked_add(trimmed.len())
+                .context("aggregation exemplar byte count overflow")?;
+            if exemplar_bytes > MAX_AGGREGATION_EXEMPLAR_BYTES {
+                bail!(
+                    "capture aggregation exemplars exceed {MAX_AGGREGATION_EXEMPLAR_BYTES} bytes"
+                );
+            }
             entry.exemplars.push(trimmed.to_string());
         }
+        record_number += 1;
     }
     Ok(out)
 }
@@ -247,9 +335,20 @@ pub fn render_table(agg: &Aggregation, keys: &[KeyField], top: usize, samples: u
             .max()
             .unwrap_or(5),
     );
-    for (key, _) in &rows {
+    let escaped_rows: Vec<(Vec<String>, &Aggregate)> = rows
+        .iter()
+        .map(|(key, aggregate)| {
+            (
+                key.iter()
+                    .map(|value| crate::decode::escape_text(value))
+                    .collect(),
+                *aggregate,
+            )
+        })
+        .collect();
+    for (key, _) in &escaped_rows {
         for (i, v) in key.iter().enumerate() {
-            widths[i] = widths[i].max(v.len());
+            widths[i] = widths[i].max(v.chars().count());
         }
     }
     let mut out = String::new();
@@ -263,7 +362,7 @@ pub fn render_table(agg: &Aggregation, keys: &[KeyField], top: usize, samples: u
     out.push('\n');
     out.push_str(&"─".repeat(header.chars().count()));
     out.push('\n');
-    for (key, agg) in &rows {
+    for (key, agg) in &escaped_rows {
         let mut row = format!("{:>w$}", agg.count, w = count_w);
         for (i, v) in key.iter().enumerate() {
             row.push_str("  ");
@@ -274,7 +373,7 @@ pub fn render_table(agg: &Aggregation, keys: &[KeyField], top: usize, samples: u
         if samples > 0 {
             for ex in agg.exemplars.iter().take(samples) {
                 out.push_str("    ");
-                out.push_str(ex);
+                out.push_str(&crate::decode::escape_text(ex));
                 out.push('\n');
             }
         }
@@ -535,13 +634,55 @@ mod tests {
         let keys = parse_by("syscall").unwrap();
         let agg = summarize(s(lines), &keys, 5).unwrap();
         let table = render_table(&agg, &keys, 0, 5);
-        assert!(table.contains("\"note\":\"first\""));
-        assert!(table.contains("\"note\":\"second\""));
+        assert!(table.contains("\\\"note\\\":\\\"first\\\""));
+        assert!(table.contains("\\\"note\\\":\\\"second\\\""));
+    }
+
+    #[test]
+    fn render_table_escapes_untrusted_values_and_exemplars() {
+        let lines = "{\"comm\":\"bad\\u001b[2J\\nrow\"}";
+        let keys = parse_by("comm").unwrap();
+        let agg = summarize(s(lines), &keys, 1).unwrap();
+        let table = render_table(&agg, &keys, 0, 1);
+
+        assert!(!table.contains('\u{1b}'));
+        assert!(!table.contains("\nrow"));
+        assert!(table.contains("\\u{1b}[2J\\nrow"));
     }
 
     #[test]
     fn summarize_requires_at_least_one_key() {
         let agg = summarize(s("{}\n"), &[], 0);
         assert!(agg.is_err());
+    }
+
+    #[test]
+    fn oversized_capture_record_is_rejected() {
+        let input = format!(r#"{{"comm":"{}"}}"#, "x".repeat(4 * 1024 * 1024 + 1));
+        let keys = parse_by("comm").unwrap();
+        let error = summarize(Cursor::new(input), &keys, 0).unwrap_err();
+
+        assert!(format!("{error:#}").contains("capture record 1 exceeds"));
+    }
+
+    #[test]
+    fn oversized_json_string_is_rejected() {
+        let input = format!(r#"{{"comm":"{}"}}"#, "x".repeat(64 * 1024 + 1));
+        let keys = parse_by("comm").unwrap();
+        let error = summarize(Cursor::new(input), &keys, 0).unwrap_err();
+
+        assert!(format!("{error:#}").contains("contains a string exceeding"));
+    }
+
+    #[test]
+    fn excessive_group_cardinality_is_rejected() {
+        let mut input = String::new();
+        for index in 0..=100_000 {
+            input.push_str(&format!("{{\"comm\":\"group-{index}\"}}\n"));
+        }
+        let keys = parse_by("comm").unwrap();
+        let error = summarize(Cursor::new(input), &keys, 0).unwrap_err();
+
+        assert!(format!("{error:#}").contains("aggregation exceeds 100000 groups"));
     }
 }

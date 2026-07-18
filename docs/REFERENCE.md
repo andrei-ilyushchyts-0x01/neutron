@@ -42,11 +42,11 @@ the **Marker workflow** section below. For Android provider work, use
 | `--max-depth N` / `--follow-depth N` | u8            | `4`                                      | Maximum causal Binder expansion depth. |
 | `--max-processes N` / `--follow-max-pids N` | 1..=1024 | `64`                                  | Dynamic `TRACED_PROCESSES` map capacity. A package/UID root exceeding the limit fails the trace. |
 | `--follow-ttl DURATION`           | duration         | `30s`                                    | Remove a non-root follower when no later causal Binder hop refreshes it. Accepts `ms`, `s`, or `m`. |
-| `--follow-allow-domain LIST`      | repeatable/comma-separated | empty                           | If non-empty, follow only callees whose current SELinux domain is listed. Unknown domains are rejected. |
-| `--follow-deny-domain LIST`       | repeatable/comma-separated | empty                           | Never follow callees in these SELinux domains. Deny takes precedence over allow; matching current PIDs are seeded before tracepoints attach. |
-| `--control-socket PATH|off`       | String           | `/data/local/tmp/neutron.control.sock`   | Live scenario marker socket; `off` disables it. |
+| `--follow-allow-domain LIST`      | repeatable/comma-separated | empty                           | Reserved compatibility flag; rejected in 1.5 because the policy cannot be enforced before first-event BPF admission. |
+| `--follow-deny-domain LIST`       | repeatable/comma-separated | empty                           | Reserved compatibility flag; rejected in 1.5 because the policy cannot be enforced before first-event BPF admission. |
+| `--control-socket PATH|off`       | String           | `/data/local/share/neutron/runtime/neutron.control.sock` | Live scenario marker socket; `off` disables it. |
 | `--pid N`                         | u32              | `0`                                      | Target process ID. `0` traces all processes. |
-| `--object PATH`                   | String           | `/data/local/tmp/neutron.bpf.elf`        | Path to the compiled Aya BPF ELF object on the device. |
+| `--object PATH`                   | String           | `/data/local/share/neutron/neutron.bpf.elf` | Path to the compiled Aya BPF ELF object on the device. |
 | `--pages N`                       | usize            | `64`                                     | **Deprecated.** Accepted for backward compatibility; ignored. The kernel `RingBuf` size is fixed in the BPF object. |
 | `-v, --verbose`                   | flag             | off                                      | Print diagnostic information to stderr: attached programs, kallsyms status, follow-children / capture-reads decisions, Aya verifier log on a failed `prog.load()`. |
 | `--exclude-comm LIST`             | comma-separated  | empty                                    | Exclude events whose `comm` field contains any of the listed substrings. Applied in userspace after reading from the ring buffer. |
@@ -67,7 +67,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--raw`                           | flag             | off                                      | Output raw syscall events in addition to (or instead of, with `--no-findings`) findings. Without this flag, neutron emits only rule-engine findings. |
 | `--no-findings`                   | flag             | off                                      | Suppress findings output. Useful with `--raw` for the legacy per-event-only behavior of pre-rule-engine versions. |
 | `--findings-drain-interval N`     | u64              | `256`                                    | Drain pending findings every N events. |
-| `--fdgraph-pids POLICY`           | String           | `active`                                 | Periodic FD-poller scope: `traced` (target + followed children), `active` (PIDs with at least one traced event), `uid` (sprint-2 stub → falls back to `active`), `all` (every `/proc/<NUM>` — heavy). |
+| `--fdgraph-pids POLICY`           | String           | `active`                                 | Periodic FD-poller scope: `traced` (target + followed children), `active` (PIDs with at least one traced event), or `all` (every `/proc/<NUM>` — heavy). `uid` is rejected in 1.5 because UID-class polling is not implemented. |
 | `--fdgraph-interval DURATION`     | String           | `1s`                                     | Poller interval. Accepts `1s`, `500ms`, or `off` to disable polling. |
 | `--fdgraph-thresholds TIERS`      | String           | `1024,8192,90%`                          | Comma-separated FD-count alert tiers. Parsed for forward-compat; rules carry their own thresholds today. |
 | `--fdgraph-top-paths-n N`         | usize            | `0`                                      | Top-N `/proc/<pid>/fd/<fd>` readlink aggregation per snapshot. `0` disables. |
@@ -148,7 +148,7 @@ argument order; explicit paths override selectors but never ABI, hash, or
 structural validation. With no explicit pack, auto-selection considers matching ABI,
 fingerprint, device and kernel-release selectors in these directories:
 `$prefix/share/neutron/schemas`, `/system/etc/neutron/schemas`,
-`/vendor/etc/neutron/schemas`, and `/data/local/tmp/neutron/schemas`. Auto mode
+`/vendor/etc/neutron/schemas`, and `/data/local/share/neutron/schemas`. Auto mode
 accepts only root-owned directories and files with no group/world write bits.
 Packs are applied from general to specific. ABI/hash/limit failures, descriptor
 conflicts without `replaces`, and BPF refresh-map overflow are fatal before
@@ -550,6 +550,7 @@ The rule engine maps `caller_pid` → the standard `pid` field for
 
 | Field            | Type   | Description                                                                  |
 |------------------|--------|------------------------------------------------------------------------------|
+| `uid`            | u32/null | Effective UID when observed. `null` for logcat and tombstones without a `uid:` header; unknown is never UID 0. |
 | `source`         | string | `"tracepoint"` (BPF), `"logcat"`, or `"tombstone"`.                          |
 | `classification` | string | `"crash"`, `"signal_exit"`, `"abnormal_exit"`, or `"normal_exit"`.           |
 | `exit_signal`    | u32    | POSIX signal number (omitted when 0). `11` = SIGSEGV, `6` = SIGABRT, etc.    |
@@ -592,12 +593,14 @@ bracket its `surface-observe` scenario.
 `neutron window --anchor marker:<name>` cuts a window around every
 matching marker. See **Marker workflow** below.
 
-### Capture Health Event (`type == "capture_health"`, 1.2.0)
+### Capture Health Event (`type == "capture_health"`, `neutron.capture-health/v1`)
 
 Emitted once on shutdown in `--json` mode as the last NDJSON line of
 the trace. Mirrors the stderr capture-summary block in
 machine-readable form so downstream pipelines can gate "absence of
-finding is conclusive" on a single field instead of grepping prose.
+finding is conclusive" on a validated record instead of grepping prose. The
+full required shape is shipped in
+`schemas/neutron.capture-health-v1.schema.json`; this example is abridged.
 
 ```json
 {
@@ -611,8 +614,7 @@ finding is conclusive" on a single field instead of grepping prose.
   "kernel_stack_failed":     0,
   "path_read_failed":        0,
   "path_truncated":          0,
-  "fd_lookup_missed":        0,
-  "symbolization_failed":    0,
+  "ioctl_payload_truncated": 0,
   "ioctl_refresh_missed":    0,
   "unix_msg_control_truncated": 0,
   "unix_msg_control_nested": 0,
@@ -621,6 +623,7 @@ finding is conclusive" on a single field instead of grepping prose.
   "follow_policy_filtered":  0,
   "follow_ttl_expired":      0,
   "causal_admission_boundary_exit": 0,
+  "status":                  "complete",
   "degraded":                false,
   "driver_packs":            ["kgsl"],
   "kprobe_packs":            [],
@@ -644,7 +647,8 @@ finding is conclusive" on a single field instead of grepping prose.
 | `follow_policy_filtered` | u64 | Causal branches intentionally stopped by domain/special-process policy. |
 | `follow_ttl_expired` | u64 | Non-root followers removed after the configured PID TTL. |
 | `causal_admission_boundary_exit` | u64 | Informational 1.4 volume count for an exit whose entry predates dynamic causal admission, including a sibling Binder thread; it does not set `degraded`. |
-| `degraded`         | bool | `true` when any drop or degradation counter is non-zero. Mirrors the stderr WARNING banner predicate. |
+| `status`           | string | `complete`, `degraded`, `incomplete`, or `unknown`; only `complete` supports bounded negative evidence. |
+| `degraded`         | bool | Legacy fail-closed companion: `false` only when `status` is `complete`. |
 | `driver_packs` / `kprobe_packs` | string[] | Active BPF-oriented decoder/kprobe packs requested for the capture. |
 | `attached_programs` | string[] | BPF programs successfully attached in this session. |
 | `ioctl_refresh_cmds` / `ioctl_refresh_types` | string[] | Runtime ioctl post-exit refresh coverage, rendered as hex strings. |
@@ -865,6 +869,12 @@ wait %1
 neutron graph trace.ndjson --root-package com.example.app \
   --format mermaid --output flow.md
 ```
+
+For behavior diffs, both captures must have the same completed scenario
+name/root contract. Neutron compares only records bound to each run's exact
+`scenario_id`/`trace_id`; records outside the interval are excluded. Markers
+prove the bounded observation interval, not successful execution of the
+external stimulus and not runtime unreachability.
 
 Pass an explicit `mark --output trace.ndjson` to retain the 1.2 append-only
 behavior without switching the live scenario. That path uses `O_APPEND`,

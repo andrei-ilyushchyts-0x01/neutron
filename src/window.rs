@@ -37,7 +37,10 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
+use crate::capture_input::read_capture_record;
 use crate::cli::WindowArgs;
+
+const MAX_WINDOW_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Parsed minimal view of one NDJSON line — only the fields anchors care
 /// about. Holds the original raw line so output is byte-exact.
@@ -398,13 +401,29 @@ fn load_capture(path: &str) -> Result<Vec<ParsedLine>> {
             File::open(path).with_context(|| format!("opening capture file {path}"))?,
         ))
     };
+    load_capture_reader(reader)
+}
+
+fn load_capture_reader<R: BufRead>(mut reader: R) -> Result<Vec<ParsedLine>> {
     let mut out = Vec::new();
-    for line in reader.lines() {
-        let line = line.context("reading capture line")?;
+    let mut line = Vec::new();
+    let mut record_number = 1usize;
+    let mut capture_bytes = 0usize;
+    while read_capture_record(&mut reader, &mut line, record_number)? {
+        capture_bytes = capture_bytes
+            .checked_add(line.len())
+            .context("window capture byte count overflow")?;
+        if capture_bytes > MAX_WINDOW_CAPTURE_BYTES {
+            bail!("window capture exceeds {MAX_WINDOW_CAPTURE_BYTES} bytes");
+        }
+        let line = std::str::from_utf8(&line)
+            .with_context(|| format!("capture record {record_number} is not UTF-8"))?;
         if line.trim().is_empty() {
+            record_number += 1;
             continue;
         }
-        out.push(ParsedLine::from_line(line));
+        out.push(ParsedLine::from_line(line.to_string()));
+        record_number += 1;
     }
     Ok(out)
 }
@@ -751,5 +770,12 @@ mod tests {
             summary: false,
         };
         assert!(WindowSpec::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn oversized_capture_record_is_rejected() {
+        let input = format!(r#"{{"comm":"{}"}}"#, "x".repeat(4 * 1024 * 1024 + 1));
+        let error = load_capture_reader(std::io::Cursor::new(input)).unwrap_err();
+        assert!(format!("{error:#}").contains("capture record 1 exceeds"));
     }
 }

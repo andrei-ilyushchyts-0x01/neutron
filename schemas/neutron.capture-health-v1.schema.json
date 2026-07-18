@@ -1,0 +1,620 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.capture-health-v1.schema.json",
+  "title": "Neutron capture health v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "events_userspace",
+    "events_submitted",
+    "ringbuf_reserve_failed",
+    "inflight_update_failed",
+    "inflight_lookup_missed",
+    "user_stack_failed",
+    "kernel_stack_failed",
+    "path_read_failed",
+    "path_truncated",
+    "ioctl_refresh_missed",
+    "unix_msg_control_truncated",
+    "unix_msg_control_nested",
+    "traced_process_limit",
+    "binder_depth_limit",
+    "binder_follow_failed",
+    "thread_context_update_failed",
+    "causal_admission_boundary_exit",
+    "payload_read_failed",
+    "tracepoint_read_failed",
+    "ioctl_payload_truncated",
+    "fd_graph_miss",
+    "fd_graph_backfilled",
+    "fd_poller_samples_dropped",
+    "fd_poller_shutdown_samples_discarded",
+    "fd_poller_sample_channel_errors",
+    "fd_poller_active_updates_dropped",
+    "fd_poller_active_channel_errors",
+    "fd_poller_proc_disappeared",
+    "fd_poller_proc_permission_errors",
+    "fd_poller_proc_io_errors",
+    "fd_poller_proc_parse_errors",
+    "fd_poller_proc_truncations",
+    "fd_poller_proc_races",
+    "fd_poller_pid_reuse",
+    "fd_poller_samples_suppressed_read_errors",
+    "fd_poller_target_unreadable_polls",
+    "fd_poller_scope_read_errors",
+    "scenario_inflight_discarded",
+    "scenario_context_discarded",
+    "scenario_context_baseline_discarded",
+    "events_matched",
+    "events_sampled_out",
+    "events_emitted",
+    "output_cap_hit",
+    "follow_policy_filtered",
+    "follow_ttl_expired",
+    "binder_tracker_evictions",
+    "binder_unmatched_receives",
+    "binder_causal_metadata_discarded",
+    "binder_invalid_callers",
+    "binder_baseline_discarded",
+    "binder_tracker_enabled",
+    "native_maps_truncated",
+    "native_stacks_truncated",
+    "native_refresh_failed",
+    "logcat_source",
+    "logcat_baseline_drains",
+    "logcat_baseline_lines_discarded",
+    "logcat_baseline_events_discarded",
+    "logcat_baseline_pending_discarded",
+    "logcat_baseline_errors",
+    "logcat_unprimed_drains",
+    "logcat_lines_read",
+    "logcat_oversized_lines",
+    "logcat_eof",
+    "logcat_read_errors",
+    "logcat_incomplete_correlations",
+    "logcat_malformed_correlations",
+    "logcat_unsupported_java_fatal",
+    "logcat_unsupported_anr",
+    "logcat_untrusted_native_exits",
+    "selinux_avc_source",
+    "selinux_baseline_drains",
+    "selinux_baseline_records_discarded",
+    "selinux_baseline_pending_discarded",
+    "selinux_baseline_errors",
+    "selinux_unprimed_drains",
+    "selinux_parsed",
+    "selinux_malformed",
+    "selinux_deduplicated",
+    "selinux_out_of_scope",
+    "selinux_eof",
+    "selinux_read_errors",
+    "tombstone_source",
+    "tombstone_baseline_primes",
+    "tombstone_baseline_errors",
+    "tombstone_baseline_files",
+    "tombstone_unprimed_polls",
+    "tombstone_directory_errors",
+    "tombstone_directory_entry_errors",
+    "tombstone_directory_overflows",
+    "tombstone_file_read_errors",
+    "tombstone_oversized_files",
+    "tombstone_file_identity_races",
+    "tombstone_malformed_files",
+    "tombstone_unmatched_in_scope",
+    "tombstone_out_of_scope",
+    "shutdown_events_discarded",
+    "status",
+    "degraded",
+    "read_errors",
+    "incomplete_reasons",
+    "unknown_reasons",
+    "unsupported_counters",
+    "capture_scope",
+    "driver_packs",
+    "kprobe_packs",
+    "attached_programs",
+    "ioctl_refresh_cmds",
+    "ioctl_refresh_types",
+    "match_packages",
+    "match_uids",
+    "match_pids",
+    "kprobe_attach_failures",
+    "boot_id",
+    "bpf_object_sha256",
+    "bpf_build_id",
+    "bpf_abi_major",
+    "bpf_abi_minor",
+    "bpf_event_size",
+    "bpf_feature_bits",
+    "ring_size_bytes",
+    "max_depth",
+    "max_processes"
+  ],
+  "properties": {
+    "type": { "const": "capture_health" },
+    "events_userspace": { "$ref": "#/$defs/count" },
+    "events_submitted": { "$ref": "#/$defs/readableCount" },
+    "ringbuf_reserve_failed": { "$ref": "#/$defs/readableCount" },
+    "inflight_update_failed": { "$ref": "#/$defs/readableCount" },
+    "inflight_lookup_missed": { "$ref": "#/$defs/readableCount" },
+    "user_stack_failed": { "$ref": "#/$defs/readableCount" },
+    "kernel_stack_failed": { "$ref": "#/$defs/readableCount" },
+    "path_read_failed": { "$ref": "#/$defs/readableCount" },
+    "path_truncated": { "$ref": "#/$defs/readableCount" },
+    "ioctl_refresh_missed": { "$ref": "#/$defs/readableCount" },
+    "unix_msg_control_truncated": { "$ref": "#/$defs/readableCount" },
+    "unix_msg_control_nested": { "$ref": "#/$defs/readableCount" },
+    "traced_process_limit": { "$ref": "#/$defs/readableCount" },
+    "binder_depth_limit": { "$ref": "#/$defs/readableCount" },
+    "binder_follow_failed": { "$ref": "#/$defs/readableCount" },
+    "thread_context_update_failed": { "$ref": "#/$defs/readableCount" },
+    "causal_admission_boundary_exit": { "$ref": "#/$defs/readableCount" },
+    "payload_read_failed": { "$ref": "#/$defs/readableCount" },
+    "tracepoint_read_failed": { "$ref": "#/$defs/readableCount" },
+    "ioctl_payload_truncated": { "$ref": "#/$defs/readableCount" },
+    "fd_graph_miss": { "$ref": "#/$defs/count" },
+    "fd_graph_backfilled": { "$ref": "#/$defs/count" },
+    "fd_poller_samples_dropped": { "$ref": "#/$defs/count" },
+    "fd_poller_shutdown_samples_discarded": { "$ref": "#/$defs/count" },
+    "fd_poller_sample_channel_errors": { "$ref": "#/$defs/count" },
+    "fd_poller_active_updates_dropped": { "$ref": "#/$defs/count" },
+    "fd_poller_active_channel_errors": { "$ref": "#/$defs/count" },
+    "fd_poller_proc_disappeared": { "$ref": "#/$defs/count" },
+    "fd_poller_proc_permission_errors": { "$ref": "#/$defs/count" },
+    "fd_poller_proc_io_errors": { "$ref": "#/$defs/count" },
+    "fd_poller_proc_parse_errors": { "$ref": "#/$defs/count" },
+    "fd_poller_proc_truncations": { "$ref": "#/$defs/count" },
+    "fd_poller_proc_races": { "$ref": "#/$defs/count" },
+    "fd_poller_pid_reuse": { "$ref": "#/$defs/count" },
+    "fd_poller_samples_suppressed_read_errors": { "$ref": "#/$defs/count" },
+    "fd_poller_target_unreadable_polls": { "$ref": "#/$defs/count" },
+    "fd_poller_scope_read_errors": { "$ref": "#/$defs/count" },
+    "scenario_inflight_discarded": { "$ref": "#/$defs/count" },
+    "scenario_context_discarded": { "$ref": "#/$defs/count" },
+    "scenario_context_baseline_discarded": { "$ref": "#/$defs/count" },
+    "events_matched": { "$ref": "#/$defs/count" },
+    "events_sampled_out": { "$ref": "#/$defs/count" },
+    "events_emitted": { "$ref": "#/$defs/count" },
+    "output_cap_hit": { "type": "boolean" },
+    "follow_policy_filtered": { "$ref": "#/$defs/count" },
+    "follow_ttl_expired": { "$ref": "#/$defs/count" },
+    "binder_tracker_evictions": { "$ref": "#/$defs/count" },
+    "binder_unmatched_receives": { "$ref": "#/$defs/count" },
+    "binder_causal_metadata_discarded": { "$ref": "#/$defs/count" },
+    "binder_invalid_callers": { "$ref": "#/$defs/count" },
+    "binder_baseline_discarded": { "$ref": "#/$defs/count" },
+    "binder_tracker_enabled": { "type": "boolean" },
+    "native_maps_truncated": { "$ref": "#/$defs/count" },
+    "native_stacks_truncated": { "$ref": "#/$defs/count" },
+    "native_refresh_failed": { "$ref": "#/$defs/count" },
+    "logcat_source": { "enum": ["disabled", "available", "unavailable"] },
+    "logcat_baseline_drains": { "$ref": "#/$defs/count" },
+    "logcat_baseline_lines_discarded": { "$ref": "#/$defs/count" },
+    "logcat_baseline_events_discarded": { "$ref": "#/$defs/count" },
+    "logcat_baseline_pending_discarded": { "$ref": "#/$defs/count" },
+    "logcat_baseline_errors": { "$ref": "#/$defs/count" },
+    "logcat_unprimed_drains": { "$ref": "#/$defs/count" },
+    "logcat_lines_read": { "$ref": "#/$defs/count" },
+    "logcat_oversized_lines": { "$ref": "#/$defs/count" },
+    "logcat_eof": { "$ref": "#/$defs/count" },
+    "logcat_read_errors": { "$ref": "#/$defs/count" },
+    "logcat_incomplete_correlations": { "$ref": "#/$defs/count" },
+    "logcat_malformed_correlations": { "$ref": "#/$defs/count" },
+    "logcat_unsupported_java_fatal": { "$ref": "#/$defs/count" },
+    "logcat_unsupported_anr": { "$ref": "#/$defs/count" },
+    "logcat_untrusted_native_exits": { "$ref": "#/$defs/count" },
+    "selinux_avc_source": { "enum": ["disabled", "available", "unavailable"] },
+    "selinux_baseline_drains": { "$ref": "#/$defs/count" },
+    "selinux_baseline_records_discarded": { "$ref": "#/$defs/count" },
+    "selinux_baseline_pending_discarded": { "$ref": "#/$defs/count" },
+    "selinux_baseline_errors": { "$ref": "#/$defs/count" },
+    "selinux_unprimed_drains": { "$ref": "#/$defs/count" },
+    "selinux_parsed": { "$ref": "#/$defs/count" },
+    "selinux_malformed": { "$ref": "#/$defs/count" },
+    "selinux_deduplicated": { "$ref": "#/$defs/count" },
+    "selinux_out_of_scope": { "$ref": "#/$defs/count" },
+    "selinux_eof": { "$ref": "#/$defs/count" },
+    "selinux_read_errors": { "$ref": "#/$defs/count" },
+    "tombstone_source": { "enum": ["disabled", "available", "unavailable"] },
+    "tombstone_baseline_primes": { "$ref": "#/$defs/count" },
+    "tombstone_baseline_errors": { "$ref": "#/$defs/count" },
+    "tombstone_baseline_files": { "$ref": "#/$defs/count" },
+    "tombstone_unprimed_polls": { "$ref": "#/$defs/count" },
+    "tombstone_directory_errors": { "$ref": "#/$defs/count" },
+    "tombstone_directory_entry_errors": { "$ref": "#/$defs/count" },
+    "tombstone_directory_overflows": { "$ref": "#/$defs/count" },
+    "tombstone_file_read_errors": { "$ref": "#/$defs/count" },
+    "tombstone_oversized_files": { "$ref": "#/$defs/count" },
+    "tombstone_file_identity_races": { "$ref": "#/$defs/count" },
+    "tombstone_malformed_files": { "$ref": "#/$defs/count" },
+    "tombstone_unmatched_in_scope": { "$ref": "#/$defs/count" },
+    "tombstone_out_of_scope": { "$ref": "#/$defs/count" },
+    "shutdown_events_discarded": { "$ref": "#/$defs/count" },
+    "status": { "enum": ["complete", "degraded", "incomplete", "unknown"] },
+    "degraded": { "type": "boolean" },
+    "read_errors": { "$ref": "#/$defs/strings" },
+    "incomplete_reasons": { "$ref": "#/$defs/strings" },
+    "unknown_reasons": { "$ref": "#/$defs/strings" },
+    "unsupported_counters": { "$ref": "#/$defs/strings" },
+    "capture_scope": { "$ref": "#/$defs/captureScope" },
+    "driver_packs": { "$ref": "#/$defs/strings" },
+    "kprobe_packs": { "$ref": "#/$defs/strings" },
+    "attached_programs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 3,
+      "allOf": [
+        { "contains": { "const": "trace_sys_enter" } },
+        { "contains": { "const": "trace_sys_exit" } },
+        { "contains": { "const": "trace_sched_process_exit" } }
+      ]
+    },
+    "ioctl_refresh_cmds": { "$ref": "#/$defs/strings" },
+    "ioctl_refresh_types": { "$ref": "#/$defs/strings" },
+    "match_packages": { "$ref": "#/$defs/strings" },
+    "match_uids": { "$ref": "#/$defs/strings" },
+    "match_pids": { "$ref": "#/$defs/strings" },
+    "kprobe_attach_failures": { "$ref": "#/$defs/strings" },
+    "root_package": { "type": "string" },
+    "root_uid": { "type": "integer", "minimum": 0 },
+    "boot_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "fingerprint": { "type": "string" },
+    "bpf_object_sha256": { "$ref": "#/$defs/sha256" },
+    "bpf_build_id": { "type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$" },
+    "bpf_abi_major": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "bpf_abi_minor": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "bpf_event_size": { "const": 257 },
+    "bpf_feature_bits": { "type": "integer", "minimum": 0 },
+    "ring_size_bytes": { "type": "integer", "minimum": 1 },
+    "max_depth": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "max_processes": { "type": "integer", "minimum": 1 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          { "properties": { "binder_tracker_evictions": { "minimum": 1 } }, "required": ["binder_tracker_evictions"] },
+          { "properties": { "binder_unmatched_receives": { "minimum": 1 } }, "required": ["binder_unmatched_receives"] },
+          { "properties": { "binder_causal_metadata_discarded": { "minimum": 1 } }, "required": ["binder_causal_metadata_discarded"] },
+          { "properties": { "binder_invalid_callers": { "minimum": 1 } }, "required": ["binder_invalid_callers"] },
+          { "properties": { "binder_tracker_enabled": { "const": false } }, "required": ["binder_tracker_enabled"] }
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": { "not": { "const": "complete" } },
+          "degraded": { "const": true },
+          "incomplete_reasons": { "minItems": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kprobe_attach_failures": { "minItems": 1 } },
+        "required": ["kprobe_attach_failures"]
+      },
+      "then": {
+        "properties": {
+          "status": { "not": { "const": "complete" } },
+          "degraded": { "const": true },
+          "incomplete_reasons": { "minItems": 1 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0 },
+    "readableCount": { "type": ["integer", "null"], "minimum": 0 },
+    "sha256": { "type": "string", "pattern": "^(?!0{64}$)[0-9a-f]{64}$" },
+    "strings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "captureScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "output",
+        "observation",
+        "filters",
+        "sampling",
+        "instrumentation",
+        "packs",
+        "sources",
+        "findings",
+        "enrichment",
+        "producer",
+        "claim_scope_complete",
+        "claim_scope_reasons"
+      ],
+      "properties": {
+        "schema": { "const": "neutron.capture-scope/v1" },
+        "output": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event_mode",
+            "serialization",
+            "capture_mode",
+            "context_duration_ns",
+            "destination",
+            "max_output_bytes",
+            "rotate_output_bytes"
+          ],
+          "properties": {
+            "event_mode": { "enum": ["raw_only", "raw_and_findings", "findings_only"] },
+            "serialization": { "enum": ["ndjson", "text"] },
+            "capture_mode": { "enum": ["matched", "matched_with_context"] },
+            "context_duration_ns": { "type": ["integer", "null"], "minimum": 1 },
+            "destination": { "enum": ["stdout", "file"] },
+            "max_output_bytes": { "type": ["integer", "null"], "minimum": 1 },
+            "rotate_output_bytes": { "type": ["integer", "null"], "minimum": 1 }
+          }
+        },
+        "observation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_pid", "root_package", "root_uid", "follow_children"],
+          "properties": {
+            "target_pid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "root_package": { "type": ["string", "null"] },
+            "root_uid": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
+            "follow_children": { "type": "boolean" }
+          }
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "bpf",
+            "userspace",
+            "exclude_comm",
+            "match_expression",
+            "match_packages",
+            "match_android_providers",
+            "alert_rwx_only"
+          ],
+          "properties": {
+            "bpf": { "$ref": "#/$defs/strings" },
+            "userspace": { "$ref": "#/$defs/strings" },
+            "exclude_comm": { "$ref": "#/$defs/strings" },
+            "match_expression": { "type": ["string", "null"] },
+            "match_packages": { "$ref": "#/$defs/strings" },
+            "match_android_providers": { "$ref": "#/$defs/strings" },
+            "alert_rwx_only": { "type": "boolean" }
+          }
+        },
+        "sampling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["probability", "rate_limit_per_second"],
+          "properties": {
+            "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+            "rate_limit_per_second": { "type": ["integer", "null"], "minimum": 1 }
+          }
+        },
+        "instrumentation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "binder_tracepoints",
+            "binder_correlation",
+            "causal_follow",
+            "follow_services",
+            "follow_hal",
+            "stacks",
+            "capture_reads",
+            "resolve_paths",
+            "max_depth",
+            "max_processes",
+            "follow_ttl_ns",
+            "follow_allow_domains",
+            "follow_deny_domains"
+          ],
+          "properties": {
+            "binder_tracepoints": { "type": "boolean" },
+            "binder_correlation": { "type": "boolean" },
+            "causal_follow": { "type": "boolean" },
+            "follow_services": { "type": "boolean" },
+            "follow_hal": { "type": "boolean" },
+            "stacks": { "type": "boolean" },
+            "capture_reads": { "type": "boolean" },
+            "resolve_paths": { "type": "boolean" },
+            "max_depth": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "max_processes": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+            "follow_ttl_ns": { "type": "integer", "minimum": 0 },
+            "follow_allow_domains": { "$ref": "#/$defs/strings" },
+            "follow_deny_domains": { "$ref": "#/$defs/strings" }
+          }
+        },
+        "packs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["driver", "kprobe", "schema", "schema_identities"],
+          "properties": {
+            "driver": { "$ref": "#/$defs/strings" },
+            "kprobe": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "requested_sources", "attached_sources", "failures"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "requested_sources": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "minLength": 1 }
+                  },
+                  "attached_sources": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 }
+                  },
+                  "failures": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 }
+                  }
+                }
+              }
+            },
+            "schema": { "$ref": "#/$defs/strings" },
+            "schema_identities": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "sha256"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "sha256": { "$ref": "#/$defs/sha256" }
+                }
+              }
+            }
+          }
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fdgraph_enabled",
+            "fdgraph_interval",
+            "fdgraph_pid_scope",
+            "fdgraph_thresholds",
+            "fdgraph_top_paths_n",
+            "logcat_requested",
+            "logcat_available",
+            "selinux_logcat_requested",
+            "selinux_logcat_available",
+            "tombstone_requested",
+            "tombstone_available",
+            "tombstone_dir",
+            "lookback_events",
+            "binder_inflight_capacity"
+          ],
+          "properties": {
+            "fdgraph_enabled": { "type": "boolean" },
+            "fdgraph_interval": { "type": "string", "minLength": 1 },
+            "fdgraph_pid_scope": { "type": "string", "minLength": 1 },
+            "fdgraph_thresholds": { "type": "string", "minLength": 1 },
+            "fdgraph_top_paths_n": { "type": "integer", "minimum": 0 },
+            "logcat_requested": { "type": "boolean" },
+            "logcat_available": { "type": "boolean" },
+            "selinux_logcat_requested": { "type": "boolean" },
+            "selinux_logcat_available": { "type": "boolean" },
+            "tombstone_requested": { "type": "boolean" },
+            "tombstone_available": { "type": "boolean" },
+            "tombstone_dir": { "type": ["string", "null"] },
+            "lookback_events": { "type": "integer", "minimum": 0 },
+            "binder_inflight_capacity": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "findings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "rules_sha256",
+            "drain_interval",
+            "raw_window",
+            "fd_snapshot_on_finding"
+          ],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "rules_sha256": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/sha256" }
+              ]
+            },
+            "drain_interval": { "type": "integer", "minimum": 1 },
+            "raw_window": { "type": "integer", "minimum": 0 },
+            "fd_snapshot_on_finding": { "type": "boolean" }
+          }
+        },
+        "enrichment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "binder_services_sha256",
+            "binder_methods_sha256",
+            "aidl_catalog_sha256",
+            "dynamic_service_inventory_sha256",
+            "dynamic_hal_inventory_sha256"
+          ],
+          "properties": {
+            "binder_services_sha256": {
+              "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+            },
+            "binder_methods_sha256": {
+              "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+            },
+            "aidl_catalog_sha256": {
+              "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+            },
+            "dynamic_service_inventory_sha256": {
+              "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+            },
+            "dynamic_hal_inventory_sha256": {
+              "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+            }
+          }
+        },
+        "producer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "bpf_object_sha256",
+            "bpf_build_id",
+            "bpf_feature_bits",
+            "userspace_binary_sha256",
+            "userspace_version",
+            "userspace_git_commit",
+            "userspace_git_dirty"
+          ],
+          "properties": {
+            "bpf_object_sha256": { "$ref": "#/$defs/sha256" },
+            "bpf_build_id": { "type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$" },
+            "bpf_feature_bits": { "type": "integer", "minimum": 1 },
+            "userspace_binary_sha256": { "$ref": "#/$defs/sha256" },
+            "userspace_version": { "type": "string", "minLength": 1 },
+            "userspace_git_commit": { "type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$" },
+            "userspace_git_dirty": { "type": "boolean" }
+          }
+        },
+        "claim_scope_complete": { "type": "boolean" },
+        "claim_scope_reasons": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "findings_only_output",
+              "non_ndjson_event_output",
+              "bpf_filters",
+              "userspace_filters",
+              "excluded_commands",
+              "match_expression",
+              "alert_rwx_filter",
+              "read_content_capture_unsupported",
+              "fdgraph_source_disabled",
+              "logcat_source_disabled",
+              "logcat_source_unavailable",
+              "selinux_source_disabled",
+              "selinux_source_unavailable",
+              "tombstone_source_disabled",
+              "tombstone_source_unavailable",
+              "userspace_source_dirty",
+              "probabilistic_sampling",
+              "rate_limit",
+              "kprobe_attachment_failure"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

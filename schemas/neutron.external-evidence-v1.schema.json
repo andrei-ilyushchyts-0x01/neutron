@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.external-evidence-v1.schema.json",
+  "title": "Neutron imported external evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "subject_id",
+    "measured_by",
+    "claim_type",
+    "imported_from",
+    "artifact_path",
+    "artifact_sha256",
+    "health_status",
+    "claim_scope",
+    "probe_identity"
+  ],
+  "properties": {
+    "schema": { "const": "neutron.external-evidence/v1" },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "subject_id": {
+      "type": "string",
+      "minLength": 9,
+      "maxLength": 4096,
+      "pattern": "^service:[!-~]+$"
+    },
+    "measured_by": { "const": "external_probe" },
+    "claim_type": {
+      "enum": [
+        "declared",
+        "live_mapped",
+        "observed_edge",
+        "not_observed_clean",
+        "lookup_unavailable",
+        "call_denied",
+        "call_succeeded"
+      ]
+    },
+    "imported_from": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "artifact_path": {
+      "type": "string",
+      "pattern": "^external-evidence/[A-Za-z0-9._-]+\\.artifact$"
+    },
+    "artifact_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "health_status": {
+      "enum": ["complete", "degraded", "incomplete", "unknown"]
+    },
+    "claim_scope": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["procedure", "caller", "attempt_count"],
+          "properties": {
+            "procedure": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            "caller": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            "attempt_count": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000
+            }
+          }
+        }
+      ]
+    },
+    "probe_identity": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/probeIdentity" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "claim_type": { "const": "not_observed_clean" } },
+        "required": ["claim_type"]
+      },
+      "then": {
+        "properties": { "claim_scope": { "type": "object" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "claim_type": {
+            "enum": [
+              "not_observed_clean",
+              "lookup_unavailable",
+              "call_denied",
+              "call_succeeded"
+            ]
+          }
+        },
+        "required": ["claim_type"]
+      },
+      "then": {
+        "properties": {
+          "probe_identity": {
+            "$ref": "#/$defs/probeIdentity"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "probeIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "apk_sha256",
+        "signing_certificate_sha256",
+        "package",
+        "version_code",
+        "version_name",
+        "target_sdk",
+        "device_boot_id",
+        "uid",
+        "install_state",
+        "granted_permissions"
+      ],
+      "properties": {
+        "schema": { "const": "neutron.external-probe-runtime/v1" },
+        "apk_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "signing_certificate_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "package": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$"
+        },
+        "version_code": { "type": "integer", "minimum": 1 },
+        "version_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "target_sdk": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "device_boot_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "install_state": { "const": "installed_enabled" },
+        "granted_permissions": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[!-~]+$"
+          }
+        }
+      }
+    }
+  }
+}

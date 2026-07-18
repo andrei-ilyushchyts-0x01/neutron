@@ -1,6 +1,6 @@
 # Security research packs
 
-`neutron research` runs a sealed, data-only pack through validation, static
+`neutron research` runs a validated, data-only pack through static
 surface preflight, one scoped child trace, one typed companion stimulus,
 postflight correlation, and a Markdown report.
 
@@ -33,13 +33,14 @@ broadcast interface.
 On hardware you are authorized to assess, a minimal KeyMint run is:
 
 ```bash
-SERIAL=USB_SERIAL
-NEUTRON=/data/local/tmp/neutron
-RUN=/data/local/tmp/neutron-runs/keymint-$(date -u +%Y%m%dT%H%M%SZ)
+export ANDROID_SERIAL=USB_SERIAL
+ADB=(adb -s "$ANDROID_SERIAL")
+NEUTRON=/data/local/share/neutron/neutron-agent
+RUN=/data/local/share/neutron/runs/keymint-$(date -u +%Y%m%dT%H%M%SZ)
 
-adb -s "$SERIAL" shell "su -c '$NEUTRON research --pack keymint \
+"${ADB[@]}" shell "su -c '$NEUTRON research --pack keymint \
   --authorized-use --probe-package dev.neutron.probe --output $RUN'"
-adb -s "$SERIAL" shell "su -c 'cat $RUN/run.json; cat $RUN/stimulus.json; \
+"${ADB[@]}" shell "su -c 'cat $RUN/run.json; cat $RUN/stimulus.json; \
   tail -n 1 $RUN/capture.health.ndjson'"
 ```
 
@@ -54,11 +55,11 @@ action permission that was not already granted. Cleanup revokes only grants
 made by that run. Android builds that do not provide `cmd package
 check-permission` are therefore supported.
 
-Research child traces pre-deny `servicemanager` and `system_server` as Binder
-followers before tracepoints attach. This prevents a package action from
-turning into process-wide coordinator tracing. The root Binder edge remains
-observable, and `follow_policy_filtered` records the deliberately incomplete
-branch.
+Research child traces use the causal follower's built-in coordinator transit
+limits for `servicemanager` and `system_server`. Domain allow/deny flags are
+rejected in 1.5 because they cannot be enforced at the first-event BPF
+admission boundary; pack runs do not inject those rejected flags or claim an
+unobserved pre-attach filter.
 
 The new output directory is mode `0700`; files are `0600`. `pack.lock.json`
 and the private `pack/` copy pin the exact bytes used by the child trace. The

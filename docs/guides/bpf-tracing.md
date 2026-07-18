@@ -32,12 +32,12 @@ sys_exit   ◄──────────────────────
            submit exit event (with ret + enter_ts)  delete INFLIGHT[pid_tgid]
 ```
 
-The `EVENTS` map is a single multi-producer `BPF_MAP_TYPE_RINGBUF`
-(kernel 5.8+) of 1 MiB. It is **lossless from the producer's
-perspective** — drops only happen when `ring.reserve()` returns `None`
-because the ring is full, which the BPF program handles silently. There
-is no per-CPU buffer juggling and no `--pages` to tune (the flag is
-accepted for backward compatibility but ignored).
+The `EVENTS` map is a bounded single multi-producer
+`BPF_MAP_TYPE_RINGBUF` (kernel 5.8+) of 1 MiB. When
+`ring.reserve()` returns `None` because the ring is full, the event is
+dropped and the reserve-failure health counter is incremented. There is no
+per-CPU buffer juggling and no `--pages` to tune (the flag is accepted for
+backward compatibility but ignored).
 
 ## PID Filtering
 

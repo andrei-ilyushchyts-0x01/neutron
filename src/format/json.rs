@@ -3,8 +3,8 @@
 use crate::decode::{
     compute_latency_us, decode_ioctl_with_context, decode_unix_msg_control,
     format_binder_event_json, format_binder_received_json, format_comm, format_data_field,
-    lookup_socket_by_inode, read_socket_inode, render_decoded_ioctl_json, resolve_path_from_fd,
-    syscall_name, IoctlFamily,
+    lookup_socket_by_inode, read_socket_inode, render_decoded_ioctl_identity_json,
+    render_decoded_ioctl_json, resolve_path_from_fd, syscall_name, IoctlFamily,
 };
 use crate::fdgraph::FdKind;
 use neutron_common::SyscallEvent;
@@ -12,6 +12,10 @@ use neutron_common::SyscallEvent;
 /// `ioctl(2)` syscall number on aarch64. The post-exit decoder/refresh logic
 /// is gated on this — file-name to keep the magic number out of inline checks.
 const SYSCALL_IOCTL: i32 = 29;
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
+}
 
 /// Pre-resolved fd reference for an event, computed by the caller from the
 /// userspace [`crate::fdgraph::FdGraph`]. Carried into the JSON line as
@@ -82,7 +86,13 @@ pub fn format_event_json_full(
     let args = { ev.args };
     let comm = format_comm(&{ ev.comm });
     let name = syscall_name(syscall_nr);
-    let mut data_info = format_data_field(ev);
+    let payload_read_failed = neutron_common::event_payload_read_failed(ev);
+    let payload_unavailable = neutron_common::event_payload_unavailable(ev);
+    let mut data_info = if payload_read_failed || payload_unavailable {
+        None
+    } else {
+        format_data_field(ev)
+    };
 
     // Userspace fallbacks on exit when in-kernel capture failed:
     // openat → /proc/<pid>/fd/<fd> readlink, connect → /proc/net/tcp*.
@@ -99,25 +109,26 @@ pub fn format_event_json_full(
     // Build data field for JSON
     let data_json = match &data_info {
         Some(d) if d == "[!RWX]" || d == "[!WX]" => String::new(), // handled below
-        Some(d) => {
-            let escaped = d.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(r#","data":"{}""#, escaped)
-        }
+        Some(d) => format!(r#","data":{}"#, json_string(d)),
         None => String::new(),
+    };
+    let payload_status_json = if payload_read_failed {
+        r#","payload_status":"read_failed""#
+    } else if payload_unavailable {
+        r#","payload_status":"unavailable""#
+    } else {
+        ""
     };
 
     // FD-graph enrichment: when the event takes a fd argument and the
     // userspace FD graph knows what it points to, emit `"fd_kind"` and
     // `"fd_path"` so ioctl/read/write/mmap/close events become attributable.
     let fd_json = match fd_hint {
-        Some(h) => {
-            let escaped = h.path.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(
-                r#","fd_kind":"{}","fd_path":"{}""#,
-                h.kind.as_str(),
-                escaped
-            )
-        }
+        Some(h) => format!(
+            r#","fd_kind":{},"fd_path":{}"#,
+            json_string(h.kind.as_str()),
+            json_string(&h.path)
+        ),
         None => String::new(),
     };
 
@@ -158,10 +169,7 @@ pub fn format_event_json_full(
     };
 
     let stack_field_json = match stack {
-        Some(s) => {
-            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(r#","stack":"{}""#, escaped)
-        }
+        Some(s) => format!(r#","stack":{}"#, json_string(s)),
         None => String::new(),
     };
 
@@ -208,25 +216,28 @@ pub fn format_event_json_full(
     // (when the cmd is in the registry's name table), and a per-family nested
     // object such as "dma_heap":{"len":N,"returned_fd":N,…}.
     //
-    // `data_phase` flips to "exit" exactly when the BPF program performed an
-    // exit-time re-read of `data[4..128]`. The two sides key off the shared
-    // [`neutron_common::ioctl_post_exit_refresh`] predicate so they can never
-    // disagree.
+    // `data_phase` flips to "exit" only when the BPF program marked a
+    // successful exit-time re-read of the bounded ioctl payload. Policy alone
+    // is insufficient: a failed user-memory read must leave the phase at
+    // "enter" and degrade capture health.
     let (ioctl_json, data_phase_json) = if syscall_nr == SYSCALL_IOCTL {
         let raw = { ev.data };
         let cmd = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         let fd_kind = fd_hint.as_ref().map(|h| h.kind);
         let fd_path = fd_hint.as_ref().map(|h| h.path.as_str());
-        let decoded = decode_ioctl_with_context(cmd, &raw[4..], ret, fd_kind, fd_path);
+        let payload_len = (neutron_common::ioctl_size(cmd) as usize).min(124);
+        let decoded =
+            decode_ioctl_with_context(cmd, &raw[4..4 + payload_len], ret, fd_kind, fd_path);
         let json = if decoded.family != IoctlFamily::Unknown || decoded.name.is_some() {
-            render_decoded_ioctl_json(&decoded)
+            if payload_read_failed || payload_unavailable {
+                render_decoded_ioctl_identity_json(&decoded)
+            } else {
+                render_decoded_ioctl_json(&decoded)
+            }
         } else {
             String::new()
         };
-        let reserved = { ev._reserved };
-        let phase = if is_enter == 0
-            && (neutron_common::ioctl_post_exit_refresh(cmd) || reserved[0] == 1)
-        {
+        let phase = if is_enter == 0 && neutron_common::event_ioctl_exit_refreshed(ev) {
             r#","data_phase":"exit""#
         } else {
             r#","data_phase":"enter""#
@@ -239,6 +250,8 @@ pub fn format_event_json_full(
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
     };
+    let name_json = json_string(name);
+    let comm_json = json_string(&comm);
     let unix_control_json = match decode_unix_msg_control(ev) {
         Some(c) => format!(
             r#","unix_msg_control":{{"flags":{},"controllen":{},"cmsg_len":{},"cmsg_level":{},"cmsg_type":{},"scm_rights_fds":{},"msg_peek":{}}}"#,
@@ -254,14 +267,16 @@ pub fn format_event_json_full(
     };
 
     format!(
-        r#"{{"type":"syscall","ts_ns":{},"pid":{},"tid":{},"uid":{},"nr":{},"name":"{}","comm":"{}","enter":{}{},"ret":{}{}{},"args":[{},{},{},{},{},{}]{}{}{}{}{}{}{}{}{}{}{}}}"#,
+        r#"{{"type":"syscall","ts_ns":{},"pid":{},"tid":{},"process_id":{},"thread_id":{},"uid":{},"nr":{},"name":{},"comm":{},"enter":{}{},"ret":{}{}{},"args":[{},{},{},{},{},{}]{}{}{}{}{}{}{}{}{}{}{}{}}}"#,
         ts_ns,
+        pid,
+        tid,
         pid,
         tid,
         uid,
         syscall_nr,
-        name,
-        comm,
+        name_json,
+        comm_json,
         is_enter == 1,
         phase_json,
         ret,
@@ -274,6 +289,7 @@ pub fn format_event_json_full(
         args[4],
         args[5],
         data_json,
+        payload_status_json,
         data_phase_json,
         ioctl_json,
         fd_json,
@@ -313,25 +329,28 @@ pub fn format_fd_snapshot_json(
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
     };
-    // Comm/path strings come straight from /proc — escape JSON-significant
-    // chars so a pathological filename can't break parsing.
-    let escaped_comm = sample.comm.replace('\\', "\\\\").replace('"', "\\\"");
+    // Comm/path strings come straight from /proc. Serialize each value with
+    // serde_json so control characters cannot split or forge NDJSON records.
+    let comm_json = json_string(&sample.comm);
     let mut top_paths_json = String::from(r#","top_paths":["#);
     for (i, (path, count)) in sample.top_paths.iter().enumerate() {
         if i > 0 {
             top_paths_json.push(',');
         }
-        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
-        top_paths_json.push_str(&format!(r#"{{"path":"{}","count":{}}}"#, escaped, count));
+        top_paths_json.push_str(&format!(
+            r#"{{"path":{},"count":{}}}"#,
+            json_string(path),
+            count
+        ));
     }
     top_paths_json.push(']');
 
     format!(
-        r#"{{"type":"fd_snapshot","ts_ns":{},"pid":{},"uid":{},"comm":"{}","fd_count":{},"fd_rlimit":{}{},"high_water_mark":{},"growth_rate_per_sec":{:.2}{}{}}}"#,
+        r#"{{"type":"fd_snapshot","ts_ns":{},"pid":{},"uid":{},"comm":{},"fd_count":{},"fd_rlimit":{}{},"high_water_mark":{},"growth_rate_per_sec":{:.2}{}{}}}"#,
         sample.ts_ns,
         sample.pid,
         sample.uid,
-        escaped_comm,
+        comm_json,
         sample.fd_count,
         sample.rlimit_nofile,
         pct_json,
@@ -356,14 +375,14 @@ pub fn format_process_exit_json(
     crash_context: &[String],
     event_id: Option<u64>,
 ) -> String {
-    let escaped_comm = ev.comm.replace('\\', "\\\\").replace('"', "\\\"");
+    let comm_json = json_string(&ev.comm);
     let signal_json = if ev.exit_signal == 0 {
         String::new()
     } else {
         format!(r#","exit_signal":{}"#, ev.exit_signal)
     };
     let signal_name_json = match ev.signal_name() {
-        Some(name) => format!(r#","signal_name":"{}""#, name),
+        Some(name) => format!(r#","signal_name":{}"#, json_string(name)),
         None => String::new(),
     };
     let exit_code_json = if ev.exit_code == 0 {
@@ -375,26 +394,22 @@ pub fn format_process_exit_json(
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
     };
-    let mut ctx_json = String::from(r#","crash_context":["#);
-    for (i, raw) in crash_context.iter().enumerate() {
-        if i > 0 {
-            ctx_json.push(',');
-        }
-        let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
-        ctx_json.push('"');
-        ctx_json.push_str(&escaped);
-        ctx_json.push('"');
-    }
-    ctx_json.push(']');
+    let ctx_json = format!(
+        r#","crash_context":{}"#,
+        serde_json::to_string(crash_context).expect("serializing crash context cannot fail")
+    );
+    let source_json = json_string(ev.source.as_str());
+    let classification_json = json_string(ev.classify().as_str());
+    let uid_json = ev.uid.map_or_else(|| "null".into(), |uid| uid.to_string());
 
     format!(
-        r#"{{"type":"process_exit","ts_ns":{},"pid":{},"uid":{},"comm":"{}","source":"{}","classification":"{}"{}{}{}{}{}}}"#,
+        r#"{{"type":"process_exit","ts_ns":{},"pid":{},"uid":{},"comm":{},"source":{},"classification":{}{}{}{}{}{}}}"#,
         ev.ts_ns,
         ev.pid,
-        ev.uid,
-        escaped_comm,
-        ev.source.as_str(),
-        ev.classify().as_str(),
+        uid_json,
+        comm_json,
+        source_json,
+        classification_json,
         signal_json,
         signal_name_json,
         exit_code_json,
@@ -471,7 +486,7 @@ fn format_binder_call_json_fields(
     aidl_version: Option<&str>,
     catalog_source: Option<&str>,
 ) -> String {
-    let escaped_comm = pair.caller_comm.replace('\\', "\\\\").replace('"', "\\\"");
+    let caller_comm_json = json_string(&pair.caller_comm);
     let event_id_json = match event_id {
         Some(id) => format!(r#","event_id":{}"#, id),
         None => String::new(),
@@ -485,20 +500,14 @@ fn format_binder_call_json_fields(
         None => String::new(),
     };
     let service_json = match service {
-        Some(name) => {
-            let esc = name.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(r#","service":"{esc}""#)
-        }
+        Some(name) => format!(r#","service":{}"#, json_string(name)),
         None => String::new(),
     };
     let method_json = method
-        .map(|name| {
-            let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(r#","method":"{escaped}""#)
-        })
+        .map(|name| format!(r#","method":{}"#, json_string(name)))
         .unwrap_or_default();
     let confidence_json = confidence
-        .map(|value| format!(r#","attribution_confidence":"{value}""#))
+        .map(|value| format!(r#","attribution_confidence":{}"#, json_string(value)))
         .unwrap_or_default();
     let candidates_json = if candidates.is_empty() {
         String::new()
@@ -541,13 +550,14 @@ fn format_binder_call_json_fields(
             )
         })
         .unwrap_or_default();
+    let status_json = json_string(pair.status.as_str());
     format!(
-        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":"{}","callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":"{}"{}{}{}{}{}{}{}{}{}}}"#,
+        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":{},"callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":{}{}{}{}{}{}{}{}{}{}}}"#,
         pair.sent_ts_ns,
         pair.debug_id,
         pair.caller_pid,
         pair.caller_uid,
-        escaped_comm,
+        caller_comm_json,
         pair.callee_pid,
         pair.code,
         pair.flags,
@@ -556,7 +566,7 @@ fn format_binder_call_json_fields(
         pair.sent_ts_ns,
         received_json,
         latency_json,
-        pair.status.as_str(),
+        status_json,
         service_json,
         method_json,
         confidence_json,
@@ -589,6 +599,7 @@ mod binder_call_json_tests {
             sent_ts_ns: 1_000_000,
             received_ts_ns: Some(1_500_000),
             status: BinderCallStatus::Completed,
+            causal_metadata: None,
         }
     }
 
@@ -626,6 +637,17 @@ mod binder_call_json_tests {
     }
 
     #[test]
+    fn caller_comm_control_characters_cannot_split_ndjson() {
+        let mut p = pair_completed();
+        p.caller_comm = "evil\n{\"type\":\"finding\"}\t".into();
+        let line = format_binder_call_json(&p, None);
+
+        assert_eq!(line.lines().count(), 1, "binder-call record was split");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["caller_comm"], p.caller_comm);
+    }
+
+    #[test]
     fn verified_attribution_emits_valid_service_method_json() {
         let exact = crate::binder_services::BinderServiceMap::from_json(
             r#"{"200":{"1":"camera/default"}}"#,
@@ -657,7 +679,7 @@ mod process_exit_json_tests {
         let ev = ProcessExitEvent {
             ts_ns: 1_000_000_000,
             pid: 42,
-            uid: 1000,
+            uid: Some(1000),
             comm: "vendor.qti.cam".into(),
             exit_code: 0,
             exit_signal: SIGSEGV,
@@ -670,6 +692,7 @@ mod process_exit_json_tests {
         let line = format_process_exit_json(&ev, &ctx, Some(99));
         assert!(line.contains(r#""type":"process_exit""#));
         assert!(line.contains(r#""pid":42"#));
+        assert!(line.contains(r#""uid":1000"#));
         assert!(line.contains(r#""source":"tombstone""#));
         assert!(line.contains(r#""classification":"crash""#));
         assert!(line.contains(r#""exit_signal":11"#));
@@ -685,7 +708,7 @@ mod process_exit_json_tests {
         let ev = ProcessExitEvent {
             ts_ns: 100,
             pid: 7,
-            uid: 1000,
+            uid: Some(1000),
             comm: "task".into(),
             exit_code: 0,
             exit_signal: 0,
@@ -704,7 +727,7 @@ mod process_exit_json_tests {
         let ev = ProcessExitEvent {
             ts_ns: 0,
             pid: 1,
-            uid: 0,
+            uid: Some(0),
             comm: r#"weird"name"#.into(),
             exit_code: 0,
             exit_signal: 0,
@@ -712,6 +735,27 @@ mod process_exit_json_tests {
         };
         let line = format_process_exit_json(&ev, &[], None);
         assert!(line.contains(r#""comm":"weird\"name""#));
+    }
+
+    #[test]
+    fn process_exit_strings_cannot_split_ndjson() {
+        let ev = ProcessExitEvent {
+            ts_ns: 0,
+            pid: 1,
+            uid: None,
+            comm: "evil\n\tcomm".into(),
+            exit_code: 0,
+            exit_signal: 0,
+            source: ExitSource::Tracepoint,
+        };
+        let context = vec!["line1\nline2".to_string()];
+        let line = format_process_exit_json(&ev, &context, None);
+
+        assert_eq!(line.lines().count(), 1, "process-exit record was split");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["comm"], ev.comm);
+        assert!(value["uid"].is_null());
+        assert_eq!(value["crash_context"][0], context[0]);
     }
 }
 
@@ -723,8 +767,7 @@ fn inject_stack_field(line: &mut String, stack: &str) {
         return;
     }
     line.pop();
-    let escaped = stack.replace('\\', "\\\\").replace('"', "\\\"");
-    line.push_str(&format!(r#","stack":"{}""#, escaped));
+    line.push_str(&format!(r#","stack":{}"#, json_string(stack)));
     line.push('}');
 }
 
@@ -770,7 +813,18 @@ mod tests {
         let v = parse(&s);
         let obj = v.as_object().expect("object");
         for k in [
-            "ts_ns", "pid", "tid", "uid", "nr", "name", "comm", "enter", "ret", "args",
+            "ts_ns",
+            "pid",
+            "tid",
+            "process_id",
+            "thread_id",
+            "uid",
+            "nr",
+            "name",
+            "comm",
+            "enter",
+            "ret",
+            "args",
         ] {
             assert!(obj.contains_key(k), "missing key {k}");
         }
@@ -782,6 +836,42 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("args array");
         assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn untrusted_event_strings_cannot_split_ndjson_records() {
+        let ev = SyscallEvent {
+            timestamp_ns: 100,
+            pid: 42,
+            tgid: 43,
+            uid: 1000,
+            syscall_nr: 56,
+            args: [(-100i64) as u64, 0, 0, 0, 0, 0],
+            is_enter: 1,
+            comm: comm_bytes("evil\n\tcomm"),
+            data: data_path(b"/tmp/a\n{\"type\":\"finding\"}\0"),
+            kernel_stackid: -1,
+            user_stackid: -1,
+            ..SyscallEvent::default()
+        };
+        let hint = FdHint {
+            kind: FdKind::File,
+            path: "/tmp/fd\r\npath".into(),
+        };
+        let line = format_event_json_full(
+            &ev,
+            false,
+            Some("frame\n\twith-control"),
+            Some(&hint),
+            Some(1),
+        );
+
+        assert_eq!(line.lines().count(), 1, "NDJSON record was split: {line:?}");
+        let value = parse(&line);
+        assert_eq!(value["comm"], "evil\n\tcomm");
+        assert_eq!(value["data"], "/tmp/a\n{\"type\":\"finding\"}");
+        assert_eq!(value["fd_path"], "/tmp/fd\r\npath");
+        assert_eq!(value["stack"], "frame\n\twith-control");
     }
 
     #[test]
@@ -1146,6 +1236,8 @@ mod tests {
         data[..4].copy_from_slice(&cmd.to_le_bytes());
         let take = payload.len().min(124);
         data[4..4 + take].copy_from_slice(&payload[..take]);
+        let mut reserved = [0u8; 6];
+        reserved[0] = neutron_common::EVENT_FLAG_IOCTL_EXIT_REFRESHED;
         SyscallEvent {
             syscall_nr: 29,
             is_enter: 0,
@@ -1154,6 +1246,7 @@ mod tests {
             // here so userspace sees a consistent view.
             args: [12, cmd as u64, 0, 0, 0, 0],
             data,
+            _reserved: reserved,
             ..SyscallEvent::default()
         }
     }
@@ -1202,7 +1295,8 @@ mod tests {
         // _IOW (write-only, dir=1) is NOT in the refresh whitelist — the
         // kernel doesn't write back, so data_phase stays "enter".
         let cmd: u32 = (1u32 << 30) | (32u32 << 16) | (0x62u32 << 8) | 5;
-        let ev = ioctl_exit_event(cmd, &[0u8; 32]);
+        let mut ev = ioctl_exit_event(cmd, &[0u8; 32]);
+        ev._reserved = [0u8; 6];
         let v = parse(&format_event_json(&ev, false));
         assert_eq!(v.get("data_phase").and_then(|x| x.as_str()), Some("enter"));
     }
@@ -1215,6 +1309,66 @@ mod tests {
         ev.is_enter = 1;
         let v = parse(&format_event_json(&ev, false));
         assert_eq!(v.get("data_phase").and_then(|x| x.as_str()), Some("enter"));
+    }
+
+    #[test]
+    fn failed_ioctl_refresh_does_not_claim_exit_payload() {
+        let mut ev = ioctl_exit_event(0xC018_4800, &[0u8; 24]);
+        let mut reserved = [0u8; 6];
+        reserved[0] = neutron_common::EVENT_FLAG_PAYLOAD_READ_FAILED;
+        ev._reserved = reserved;
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v.get("data_phase").and_then(|x| x.as_str()), Some("enter"));
+        assert_eq!(
+            v.get("payload_status").and_then(|x| x.as_str()),
+            Some("read_failed")
+        );
+        assert!(!v.as_object().unwrap().contains_key("dma_heap"));
+        assert_eq!(
+            v.get("ioctl_family").and_then(|x| x.as_str()),
+            Some("dma_heap")
+        );
+    }
+
+    #[test]
+    fn failed_sockaddr_read_suppresses_partial_positive_decode() {
+        let mut data = [0u8; 128];
+        data[0..2].copy_from_slice(&2u16.to_ne_bytes());
+        data[2..4].copy_from_slice(&443u16.to_be_bytes());
+        data[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let mut reserved = [0u8; 6];
+        reserved[0] = neutron_common::EVENT_FLAG_PAYLOAD_READ_FAILED;
+        let ev = SyscallEvent {
+            syscall_nr: 203,
+            is_enter: 1,
+            data,
+            _reserved: reserved,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v["payload_status"], "read_failed");
+        assert!(!v.as_object().unwrap().contains_key("data"));
+    }
+
+    #[test]
+    fn null_declared_payload_is_explicitly_unavailable_without_typed_fields() {
+        let cmd = 0xC018_4800_u32;
+        let mut data = [0u8; 128];
+        data[..4].copy_from_slice(&cmd.to_le_bytes());
+        let mut reserved = [0u8; 6];
+        reserved[0] = neutron_common::EVENT_FLAG_PAYLOAD_UNAVAILABLE;
+        let ev = SyscallEvent {
+            syscall_nr: 29,
+            is_enter: 1,
+            args: [3, cmd as u64, 0, 0, 0, 0],
+            data,
+            _reserved: reserved,
+            ..SyscallEvent::default()
+        };
+        let v = parse(&format_event_json(&ev, false));
+        assert_eq!(v["payload_status"], "unavailable");
+        assert_eq!(v["ioctl_family"], "dma_heap");
+        assert!(!v.as_object().unwrap().contains_key("dma_heap"));
     }
 
     #[test]

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.self-info-v1.schema.json",
+  "title": "Neutron self info v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "tool", "bpf"],
+  "properties": {
+    "schema": { "const": "neutron.self-info/v1" },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "git_commit",
+        "git_dirty",
+        "build_timestamp",
+        "rustc_version",
+        "target",
+        "feature_set"
+      ],
+      "properties": {
+        "version": { "type": "string" },
+        "git_commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "git_dirty": { "type": "boolean" },
+        "build_timestamp": { "type": "string", "minLength": 1 },
+        "rustc_version": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "feature_set": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "bpf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["abi_major", "event_size", "feature_bits"],
+      "properties": {
+        "abi_major": { "type": "integer", "minimum": 1 },
+        "event_size": { "const": 257 },
+        "feature_bits": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "bpf_objects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "identity"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "identity": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "object_sha256",
+              "section",
+              "magic",
+              "abi_major",
+              "abi_minor",
+              "syscall_event_size",
+              "feature_bits",
+              "build_id",
+              "build_id_present"
+            ],
+            "properties": {
+              "object_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "section": { "const": ".neutron_abi" },
+              "magic": { "type": "string", "pattern": "^0x[0-9a-f]{16}$" },
+              "abi_major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "abi_minor": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "syscall_event_size": { "const": 257 },
+              "feature_bits": { "type": "integer", "minimum": 0 },
+              "build_id": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "build_id_present": { "const": true }
+            }
+          }
+        }
+      }
+    }
+  }
+}

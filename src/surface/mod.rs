@@ -19,7 +19,7 @@ pub use surface_diff::{diff_snapshots, SurfaceDiff, SurfaceDiffArgs};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -195,7 +195,10 @@ pub struct Service {
 pub struct Process {
     pub id: String,
     pub pid: u32,
-    pub uid: u32,
+    /// Effective UID when known. Capture-imported process nodes may be built
+    /// from logcat/tombstone evidence that carries no UID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
     pub gid: u32,
     pub cmdline: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1160,7 +1163,7 @@ fn collect_processes(
         processes.push(Process {
             id: process_id,
             pid,
-            uid: status.uid,
+            uid: Some(status.uid),
             gid: status.gid,
             cmdline,
             executable,
@@ -1450,8 +1453,9 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
     let capture = crate::capture_normalize::normalize_capture(reader)?;
     let health = capture.health.as_ref();
     if health.is_none() {
-        add_snapshot_warning(
+        add_snapshot_issue(
             snapshot,
+            "unknown",
             "imported capture has no final capture_health record",
         );
     }
@@ -1468,8 +1472,12 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
         "candidate"
     };
     if let Some(health) = health {
-        if health.degraded || health.output_cap_hit {
-            add_snapshot_warning(snapshot, "imported capture health is degraded");
+        if health.status != "complete" {
+            add_snapshot_issue(
+                snapshot,
+                &health.status,
+                format!("imported capture health is {}", health.status),
+            );
         }
         if let Some(fingerprint) = health.fingerprint.as_deref() {
             if !snapshot.device.fingerprint.is_empty() && fingerprint != snapshot.device.fingerprint
@@ -1555,13 +1563,9 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
         }
     }
 
-    let capture_health = if health.is_none()
-        || health.is_some_and(|health| health.degraded || health.output_cap_hit)
-    {
-        "degraded"
-    } else {
-        "complete"
-    };
+    let capture_health = health
+        .map(|health| health.status.as_str())
+        .unwrap_or("incomplete");
     for (trace_id, root) in &roots {
         let scenario_id = if root.scenario_id.is_empty() {
             "unknown".to_string()
@@ -2305,13 +2309,13 @@ fn capture_process(
         .find(|process| process.id == id)
     {
         if let Some(uid) = uid {
-            process.uid = uid;
+            process.uid = Some(uid);
         }
     } else {
         snapshot.processes.push(Process {
             id: id.clone(),
             pid,
-            uid: uid.unwrap_or_default(),
+            uid,
             boot_id: if merge_confidence == "exact" {
                 snapshot.device.boot_id.clone()
             } else {
@@ -2408,8 +2412,12 @@ fn device_path_index(devices: &[Device]) -> BTreeMap<String, String> {
 }
 
 fn add_snapshot_warning(snapshot: &mut SurfaceSnapshot, warning: impl Into<String>) {
+    add_snapshot_issue(snapshot, "degraded", warning);
+}
+
+fn add_snapshot_issue(snapshot: &mut SurfaceSnapshot, status: &str, warning: impl Into<String>) {
     let warning = warning.into();
-    snapshot.health.status = "degraded".into();
+    promote_health_status(&mut snapshot.health.status, status);
     if !snapshot.health.warnings.contains(&warning) {
         snapshot.health.warnings.push(warning.clone());
     }
@@ -2430,9 +2438,29 @@ fn add_snapshot_warning(snapshot: &mut SurfaceSnapshot, warning: impl Into<Strin
             snapshot.health.collectors.last_mut().expect("just pushed")
         }
     };
-    collector.status = "degraded".into();
+    promote_health_status(&mut collector.status, status);
     if !collector.warnings.contains(&warning) {
         collector.warnings.push(warning);
+    }
+}
+
+fn promote_health_status(current: &mut String, candidate: &str) {
+    let rank = |status: &str| match status {
+        "complete" => 0,
+        "degraded" => 1,
+        "incomplete" => 2,
+        "unknown" => 3,
+        _ => 3,
+    };
+    if rank(candidate) > rank(current) {
+        *current = if matches!(
+            candidate,
+            "complete" | "degraded" | "incomplete" | "unknown"
+        ) {
+            candidate.into()
+        } else {
+            "unknown".into()
+        };
     }
 }
 
@@ -2687,14 +2715,11 @@ fn finish_snapshot(snapshot: &mut SurfaceSnapshot) {
     }
     snapshot.health.warnings.sort();
     snapshot.health.warnings.dedup();
-    if !snapshot.health.warnings.is_empty()
-        || snapshot
-            .health
-            .collectors
-            .iter()
-            .any(|collector| collector.status == "degraded")
-    {
-        snapshot.health.status = "degraded".into();
+    if !snapshot.health.warnings.is_empty() {
+        promote_health_status(&mut snapshot.health.status, "degraded");
+    }
+    for collector in &snapshot.health.collectors {
+        promote_health_status(&mut snapshot.health.status, &collector.status);
     }
 }
 
@@ -2727,33 +2752,7 @@ fn open_input(path: &str) -> Result<Box<dyn BufRead>> {
 
 fn write_json<T: Serialize>(path: Option<&str>, value: &T) -> Result<()> {
     match path {
-        Some(path) => {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .with_context(|| format!("opening {path} for secure output"))?;
-            let metadata = file
-                .metadata()
-                .with_context(|| format!("inspecting secure output {path}"))?;
-            if !metadata.file_type().is_file()
-                || metadata.nlink() != 1
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o077 != 0
-            {
-                bail!("secure output must be an owned regular file with one link: {path}");
-            }
-            file.set_len(0)
-                .with_context(|| format!("truncating verified output {path}"))?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 0600 {path}"))?;
-            serde_json::to_writer_pretty(&mut file, value)
-                .with_context(|| format!("writing JSON to {path}"))?;
-            writeln!(file).with_context(|| format!("finishing JSON output {path}"))?;
-            file.flush().with_context(|| format!("flushing {path}"))
-        }
+        Some(path) => crate::private_output::write_json(Path::new(path), value, true),
         None => {
             let stdout = io::stdout();
             let mut out = stdout.lock();
@@ -3133,6 +3132,7 @@ fn send_session_mark(path: &Path, name: &str, phase: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn observation_duration_is_validated_and_unit_aware() {

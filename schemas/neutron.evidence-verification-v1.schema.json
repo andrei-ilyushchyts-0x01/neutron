@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.evidence-verification-v1.schema.json",
+  "title": "Neutron evidence verification result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "authenticity", "scope", "artifacts"],
+  "properties": {
+    "schema": { "const": "neutron.evidence-verification/v1" },
+    "status": { "const": "integrity_verified" },
+    "authenticity": { "const": "not_verified" },
+    "scope": { "const": "internal_content_hashes_and_contracts" },
+    "artifacts": { "type": "integer", "minimum": 1 }
+  }
+}

@@ -33,6 +33,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::aidl::{normalize_descriptor, AidlCatalog};
 
@@ -123,33 +124,54 @@ impl BinderMethodMap {
 pub struct BinderCatalog {
     by_pid: BTreeMap<u32, Vec<String>>,
     interfaces_by_pid: BTreeMap<u32, Vec<String>>,
+    service_inventory_sha256: Option<String>,
+    hal_inventory_sha256: Option<String>,
 }
 
 impl BinderCatalog {
-    pub fn discover(include_services: bool, include_hal: bool) -> Self {
+    pub fn discover(include_services: bool, include_hal: bool) -> Result<Self> {
         let mut catalog = Self::default();
         if include_services || include_hal {
-            if let Ok(output) = crate::android::run_platform_command("service", &["list", "-p"]) {
-                if output.status.success() {
-                    catalog.merge_service_list(&String::from_utf8_lossy(&output.stdout));
-                }
+            let output = crate::android::run_platform_command("service", &["list", "-p"])
+                .context("running bounded service list -p discovery")?;
+            if !output.status.success() {
+                bail!("service list -p exited with {}", output.status);
             }
+            let stdout = String::from_utf8(output.stdout)
+                .context("service list -p returned non-UTF-8 output")?;
+            catalog.merge_service_list_checked(&stdout)?;
+            catalog.service_inventory_sha256 = Some(format!("{:x}", Sha256::digest(stdout)));
         }
         if include_hal {
-            if let Ok(output) = crate::android::run_platform_command("lshal", &["-i", "-p"]) {
-                if output.status.success() {
-                    catalog.merge_lshal(&String::from_utf8_lossy(&output.stdout));
-                }
+            let output = crate::android::run_platform_command("lshal", &["-i", "-p"])
+                .context("running bounded lshal -i -p discovery")?;
+            if !output.status.success() {
+                bail!("lshal -i -p exited with {}", output.status);
             }
+            let stdout =
+                String::from_utf8(output.stdout).context("lshal returned non-UTF-8 output")?;
+            catalog.merge_lshal(&stdout);
+            catalog.hal_inventory_sha256 = Some(format!("{:x}", Sha256::digest(stdout)));
         }
-        catalog
+        Ok(catalog)
+    }
+
+    pub fn service_inventory_sha256(&self) -> Option<&str> {
+        self.service_inventory_sha256.as_deref()
+    }
+
+    pub fn hal_inventory_sha256(&self) -> Option<&str> {
+        self.hal_inventory_sha256.as_deref()
     }
 
     pub fn merge_service_list(&mut self, output: &str) {
-        if let Ok(parsed) = crate::report::parse_service_list(output) {
-            self.merge(parsed);
-        }
+        let _ = self.merge_service_list_checked(output);
+    }
+
+    fn merge_service_list_checked(&mut self, output: &str) -> Result<()> {
+        self.merge(crate::report::parse_service_list(output)?);
         self.merge_interfaces(parse_service_list_interfaces(output));
+        Ok(())
     }
 
     pub fn merge_lshal(&mut self, output: &str) {

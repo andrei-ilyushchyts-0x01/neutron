@@ -28,7 +28,3 @@ neutron-common = { path = "../neutron-common" }
 [features]
 default = []
 stacks = []
-
-[profile.release]
-lto = true
-opt-level = 3  # required: verifier rejects unoptimized BPF bytecode patterns

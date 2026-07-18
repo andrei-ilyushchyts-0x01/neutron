@@ -50,6 +50,10 @@ fn coverage_accepts_target_scoped_minimal_repeat_outputs() {
         "coverage.json",
         "--tsv",
         "coverage.tsv",
+        "--run-dir",
+        "neutron-run-20260717T063901Z",
+        "--attacker-capability",
+        "ordinary_installed_app",
         "--fail-unresolved",
     ]);
 }

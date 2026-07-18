@@ -3,12 +3,17 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 script="$root/build.sh"
+xtask="$root/xtask/src/main.rs"
 
-rg -F "chown 0:0 /data/local/share/neutron && chmod 0755 /data/local/share/neutron && chown -R shell:shell /data/local/share/neutron/packs" "$script"
-rg -F "chown -R 0:0 /data/local/share/neutron/packs" "$script"
-if rg -F "chown shell:shell /data/local/share/neutron /data/local/share/neutron/packs" "$script"; then
+[[ -x "$script" ]]
+rg -Fq ': "${ANDROID_SERIAL:?Set ANDROID_SERIAL to the explicit authorized USB device serial}"' "$script"
+rg -Fq 'exec cargo xtask deploy --serial "$ANDROID_SERIAL"' "$script"
+
+if rg -n '(^|[[:space:]])adb([[:space:]]|$)|/data/local/tmp|/data/local/share/neutron' "$script"; then
+    echo "build.sh must delegate deployment instead of maintaining a second installer" >&2
     exit 1
 fi
-if rg -F "adb shell mkdir -p /data/local/share/neutron/packs" "$script"; then
-    exit 1
-fi
+
+rg -Fq 'rollback_publish' "$xtask"
+rg -Fq 'restore_backup' "$xtask"
+rg -Fq 'device_sha256(serial, &candidate)' "$xtask"

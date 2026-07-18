@@ -14,10 +14,9 @@ app action
   -> denial, allocation, state change, crash, or reboot
 ```
 
-The current workspace package version is `1.4.0`; features listed as
-Unreleased in the changelog are already implemented in this workspace but are
-not claimed as a published release. Status describes capability maturity, not
-just code presence.
+The current workspace package version is `1.5.0-rc.1`. It is a release
+candidate, not a stable support claim. Command maturity is defined in
+[`PRODUCT.md`](../PRODUCT.md); this ledger records capability maturity.
 
 Status meanings:
 
@@ -32,7 +31,7 @@ Status meanings:
 
 | Direction | Status | Implemented now | Remaining boundary |
 |---|---|---|---|
-| Dynamic Binder follow | **MVP** | One package/UID root, global BPF programs, bounded `TRACED_PROCESSES`, Binder caller/callee stitching, depth/process caps, PID TTL, SELinux allow/deny domains, servicemanager transit cap, exact-only system_server transit, global sampling/rate limits, incomplete-branch events, and health counters. Explicitly denied domains are seeded into a BPF map before tracepoints attach. | One authorized Pixel build has evidence; broaden to a device/kernel matrix and continue exercising restart/PID-reuse edges. |
+| Dynamic Binder follow | **MVP** | One package/UID root, global BPF programs, bounded `TRACED_PROCESSES`, Binder caller/callee stitching, depth/process caps, PID TTL, servicemanager transit cap, exact-only system_server transit, global sampling/rate limits, incomplete-branch events, and health counters. Reserved SELinux domain allow/deny flags are rejected in 1.5 because first-event BPF admission cannot enforce them. | One authorized Pixel build has evidence; broaden to a device/kernel matrix and continue exercising restart/PID-reuse edges. |
 | Causal graph | **Complete** | Scenario/trace/span/parent IDs; Binder/process/syscall/ioctl/crash nodes; shared Mermaid and versioned `neutron.causal-graph/v1` JSON rendering; deterministic same-parent syscall collapse; identity/device enrichment; capture-loss and incomplete-branch warnings. | Maintain compatibility fixtures as new event types are added. |
 | Android surface mapper | **MVP** | Deterministic Binder/HwBinder/VndBinder, VINTF, process, library, SELinux, device, sysfs driver/module, and causal evidence; explicit mmap/DMA resources and release lifetimes; causal-only `reachable`; semantic `surface diff` reports. | One clean Pixel snapshot exists; add authorized vendor-device coverage. Partial `munmap` intentionally remains conservative because bounded events cannot reconstruct split mappings. |
 | ioctl schema generation | **Complete** | Host clang pipeline for `_IO*` macros and record layouts, data-only schema packs, selector/provenance checks, trusted runtime loading, conflict handling, and generated Rust descriptors. | Publish maintained GKI/Pixel/vendor packs; cover nested unions, flexible arrays, and driver ownership with verified source evidence. |
@@ -110,9 +109,9 @@ it does not promote every pack or every device line to release-validated.
    CameraService's idle-UID restriction.
 2. Repeat clean KeyMint/GPU-style causal chains with matched start/end markers
    on every supported device/kernel line.
-3. Exercise max depth, max PID, TTL, allow/deny domain, servicemanager, and
-   system_server policies; retain an artifact for every deliberately truncated
-   branch.
+3. Exercise max depth, max PID, TTL, servicemanager, and system_server
+   policies; verify domain allow/deny flags fail closed; retain an artifact for
+   every deliberately truncated branch.
 4. Measure ring loss and event volume with and without follow policies, then
    validate PID reuse, package UID propagation, process exit, and scenario
    restart behavior.

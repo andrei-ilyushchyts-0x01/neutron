@@ -36,7 +36,7 @@ flags see [docs/REFERENCE.md](REFERENCE.md).
 │              │   BINDER_*_CONTEXT      HashMap                         │
 │              │   WATCH_FDS             HashMap                         │
 │              │   STACK_TRACES          StackTrace                      │
-│              │   COUNTERS              Array<u64>                      │
+│              │   COUNTERS              PerCpuArray<u64>                │
 │              │   MATCH_UID_SET         HashMap   (1.2)                 │
 │              │   MATCH_IOCTL_CMD_SET   HashMap   (1.2)                 │
 │              │   MATCH_IOCTL_TYPE_SET  HashMap   (1.2)                 │
@@ -227,9 +227,9 @@ loop {
 
 `RingBufItem` releases its slot when dropped (Aya semantics). There is no
 separate `data_head` / `data_tail` bookkeeping — that responsibility is
-inside Aya. Lossless from the producer's perspective: drops only happen if
-`reserve()` returns `None` inside the BPF program (ring full), which the
-BPF code handles silently.
+inside Aya. The ring buffer is bounded: a failed BPF `reserve()` drops the
+event and increments `COUNTER_RINGBUF_RESERVE_FAILED`; any non-zero value
+degrades capture health.
 
 ### Symbolization layer (`src/symbolize/`)
 
@@ -401,12 +401,12 @@ evicted, `latency_us` is `null` in JSON output.
 | `SYSCALL_FILTER` | `HashMap` | u32 syscall | u8 | 64 | Active syscall whitelist. |
 | `PID_WHITELIST` | `HashMap` | u32 PID | u8 | 256 | `--follow-children` PIDs. |
 | `TRACED_PROCESSES` | `HashMap` | u32 PID | `ProcessTraceContext` | 64 default, loader override | Bounded dynamic causal set (`--max-processes`). |
-| `BINDER_FOLLOW_DENY_PIDS` | `HashMap` | u32 PID | u8 | 64 | PIDs resolved from `--follow-deny-domain` and seeded before tracepoint attachment; they cannot enter the dynamic Binder-follow set. |
+| `BINDER_FOLLOW_DENY_PIDS` | `HashMap` | u32 PID | u8 | 64 | Reserved for pre-admission Binder deny policy. The related CLI flags are rejected in 1.5 because complete enforcement is not yet safe. |
 | `ADMITTED_THREAD_ENTERS` | `HashMap` | u64 pid_tgid | u8 | 4096 | Post-admission syscall-enter marker. It classifies a first exit from an already-active sibling Binder thread as a causal admission boundary rather than an `INFLIGHT` loss. |
 | `ROOT_UID_CONTEXT` | `Array` | u32 | `ProcessTraceContext` | 1 | Current explicit UID-root context. |
 | `BINDER_TRANSACTION_CONTEXT` | `HashMap` | u32 debug ID | Binder transaction context | 4096 | Caller-to-callee causal propagation, including a one-use admission-boundary marker for syscall-exit accounting. |
 | `THREAD_BINDER_CONTEXT` | `HashMap` | u64 pid_tgid | Binder thread context | 4096 | Exact receiving-thread attribution. |
-| `WATCH_FDS` | `HashMap` | u64 pid<<32\|fd | u8 | 256 | Selective read/write capture. |
+| `WATCH_FDS` | `HashMap` | u64 pid<<32\|fd | u8 | 256 | Selective read/write FD tracking; buffer content is not captured in ABI v1. |
 | `STACK_TRACES` | `StackTrace` | u32 stack ID | u64[127] | 16384 | Kernel and user IP arrays; present with `stacks`. |
 | `MATCH_UID_SET` | `HashMap` | u32 UID | u8 | 64 | UID predicate values. |
 | `MATCH_IOCTL_CMD_SET` | `HashMap` | u32 cmd | u8 | 64 | Full ioctl command predicates. |
@@ -415,7 +415,7 @@ evicted, `latency_us` is `null` in JSON output.
 | `MATCH_ARG_U32_VALS` | `HashMap` | u32 value | u8 | 32 | Bounded captured-argument predicates. |
 | `IOCTL_REFRESH_CMD_SET` | `HashMap` | u32 cmd | u8 | 64 | Schema-selected post-exit refresh commands. |
 | `IOCTL_REFRESH_TYPE_SET` | `HashMap` | u32 type | u8 | 32 | Schema-selected post-exit refresh families. |
-| `COUNTERS` | `Array<u64>` | u32 slot | u64 | 20 | Capture-health counters shared with userspace. |
+| `COUNTERS` | `PerCpuArray<u64>` | u32 slot | per-CPU u64 | 20 | Capture-health counters aggregated by userspace without racy read/add/write updates. |
 
 Map names are the **exact** Rust static identifiers in
 `neutron-ebpf/src/main.rs`. Aya does not lowercase them. The userspace
@@ -441,7 +441,7 @@ config.
   compatibility but ignored.
 - **No BPF LSM, no `fentry`/`fexit`**: see device profile. We use
   tracepoints + kprobes only.
-- **BPF stack limit still 512 bytes**: `SyscallEvent` (241) goes via
+- **BPF stack limit still 512 bytes**: `SyscallEvent` (257) goes via
   `MaybeUninit` and a `RingBuf::reserve()` slot, never as a stack-local
   copy.
 

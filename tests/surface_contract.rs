@@ -3,10 +3,53 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 
+use neutron::health::{
+    format_capture_health_json_with_metadata, CaptureHealth, CaptureMetadata, UserspaceHealth,
+};
 use neutron::surface::{
     import_capture, reachable, scan_with_reader, CommandOutput, FileKind, PlatformMetadata,
     PlatformReader, RootSelector,
 };
+
+fn complete_capture_health(root_package: &str, events: u64) -> String {
+    let mut health = CaptureHealth::default();
+    health.slots[neutron_common::COUNTER_EVENTS_SUBMITTED as usize] = events;
+    let mut capture_scope = neutron::health::CaptureScope::unfiltered_raw_ndjson();
+    capture_scope.observation.root_package = Some(root_package.into());
+    let line = format_capture_health_json_with_metadata(
+        &health,
+        &UserspaceHealth::default(),
+        events,
+        &CaptureMetadata {
+            max_depth: capture_scope.instrumentation.max_depth,
+            max_processes: capture_scope.instrumentation.max_processes,
+            capture_scope: Some(capture_scope),
+            attached_programs: vec![
+                "trace_sys_enter".into(),
+                "trace_sys_exit".into(),
+                "trace_sched_process_exit".into(),
+            ],
+            root_package: Some(root_package.into()),
+            boot_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            fingerprint: Some("google/husky/test:user/release-keys".into()),
+            bpf_object_sha256: Some("1".repeat(64)),
+            bpf_build_id: Some("2".repeat(40)),
+            bpf_abi_major: Some(neutron_common::BPF_ABI_MAJOR),
+            bpf_abi_minor: Some(neutron_common::BPF_ABI_MINOR),
+            bpf_event_size: Some(core::mem::size_of::<neutron_common::SyscallEvent>() as u32),
+            bpf_feature_bits: Some(
+                neutron_common::BPF_FEATURE_SYSCALL_TRACE
+                    | neutron_common::BPF_FEATURE_PROCESS_EXIT
+                    | neutron_common::BPF_FEATURE_PER_CPU_HEALTH,
+            ),
+            ring_size_bytes: Some(1 << 20),
+            ..CaptureMetadata::default()
+        },
+    );
+    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(value["status"], "complete", "{line}");
+    line
+}
 
 #[derive(Default)]
 struct FixtureReader {
@@ -185,7 +228,10 @@ fn fixture() -> FixtureReader {
     reader.dir("/proc", &["42"]);
     reader.dir("/proc/42", &["fd"]);
     reader.dir("/proc/42/fd", &["7"]);
-    reader.file("/proc/sys/kernel/random/boot_id", "boot-a\n");
+    reader.file(
+        "/proc/sys/kernel/random/boot_id",
+        "11111111-2222-3333-4444-555555555555\n",
+    );
     reader.file("/proc/modules", "trusty_core 4096 0 - Live 0xffff0000\n");
     reader.file(
         "/proc/42/status",
@@ -360,8 +406,8 @@ fn static_scan_is_deterministic_and_maps_process_service_device_and_module() {
         serde_json::to_value(&b).unwrap()
     );
     assert_eq!(a.schema, "neutron.surface/v1");
-    assert_eq!(a.neutron_version, "1.4.0");
-    assert_eq!(a.device.boot_id, "boot-a");
+    assert_eq!(a.neutron_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(a.device.boot_id, "11111111-2222-3333-4444-555555555555");
     assert_eq!(a.processes.len(), 1);
     assert_eq!(a.processes[0].pid, 42);
     assert_eq!(a.processes[0].starttime, 4242);
@@ -495,7 +541,7 @@ fn service_join_revalidates_process_starttime_to_reject_pid_reuse() {
     assert!(!snapshot
         .relations
         .iter()
-        .any(|relation| relation.from == "process:boot-a:42:4242"));
+        .any(|relation| relation.from == "process:11111111-2222-3333-4444-555555555555:42:4242"));
     let service = snapshot
         .services
         .iter()
@@ -541,7 +587,7 @@ fn identical_names_from_distinct_binder_transports_remain_distinct_services() {
     let capture = r#"
 {"type":"marker","phase":"start","name":"collision","scenario_id":"collision","trace_id":"trace-collision","root_package":"com.example.app"}
 {"type":"binder","pid":100,"to_proc":99,"debug_id":1,"service":"collision/default","trace_id":"trace-collision","span_id":"binder-1","scenario_id":"collision","depth":0,"causal_relation":"exact"}
-{"type":"capture_health","degraded":false,"root_package":"com.example.app","boot_id":"boot-a"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.app","boot_id":"11111111-2222-3333-4444-555555555555"}
 "#;
     import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
     assert!(snapshot.relations.iter().any(|relation| {
@@ -563,9 +609,13 @@ fn causal_capture_enriches_static_surface_and_reachability_ignores_proc_fd_edges
 {"type":"marker","phase":"start","name":"surface-observe","scenario_id":"surface-observe","trace_id":"0000000000001234","root_package":"com.example.app","generation":1}
 {"type":"binder","pid":100,"comm":"app","to_proc":42,"debug_id":7,"code":1,"target_node":2,"service":"android.hardware.security.keymint.IKeyMintDevice/default","trace_id":"0000000000001234","span_id":"0000000000000011","parent_span_id":"0000000000000010","scenario_id":"surface-observe","depth":1,"causal_relation":"exact"}
 {"type":"syscall","pid":42,"tid":43,"uid":1000,"name":"ioctl","nr":29,"phase":"exit","ret":0,"ts_ns":30,"enter_ts_ns":20,"args":[7,1074295424,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"0000000000001234","span_id":"0000000000000012","parent_span_id":"0000000000000011","scenario_id":"surface-observe","depth":2,"causal_relation":"exact"}
-{"type":"capture_health","degraded":false,"root_package":"com.example.app","boot_id":"boot-a","fingerprint":"google/husky/test:user/release-keys"}
 {"type":"marker","phase":"end","name":"surface-observe","scenario_id":"surface-observe","trace_id":"0000000000001234"}
+__COMPLETE_CAPTURE_HEALTH__
 "#;
+    let capture = capture.replace(
+        "__COMPLETE_CAPTURE_HEALTH__",
+        &complete_capture_health("com.example.app", 2),
+    );
     import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
 
     let service = snapshot
@@ -635,7 +685,7 @@ fn device_boundary_outcomes_and_crashes_remain_honest() {
 {"type":"syscall","pid":42,"tid":42,"uid":1000,"name":"mmap","phase":"exit","ret":4096,"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-boundary","span_id":"mmap-1","parent_span_id":"binder-1","scenario_id":"boundary","depth":1,"causal_relation":"exact"}
 {"type":"syscall","pid":42,"tid":42,"uid":1000,"name":"ioctl","phase":"exit","ret":-13,"ioctl_name":"TIPC_IOC_CONNECT","fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-boundary","span_id":"ioctl-denied","parent_span_id":"binder-1","scenario_id":"boundary","depth":1,"causal_relation":"exact"}
 {"type":"process_exit","ts_ns":50,"pid":42,"uid":1000,"comm":"keymint","classification":"crash","signal_name":"SIGSEGV","trace_id":"trace-boundary","span_id":"crash-1","parent_span_id":"binder-1","scenario_id":"boundary","depth":1,"causal_relation":"exact"}
-{"type":"capture_health","degraded":false,"root_package":"com.example.boundary","boot_id":"boot-a"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.boundary","boot_id":"11111111-2222-3333-4444-555555555555"}
 "#;
     import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
 
@@ -707,7 +757,7 @@ fn surface_models_dma_allocations_and_mmap_lifetimes_as_resources() {
 {"type":"syscall","ts_ns":20,"pid":42,"tid":42,"uid":1000,"name":"mmap","phase":"exit","ret":4096,"args":[0,8192,3,1,7,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-resources","span_id":"z-map","scenario_id":"resources","depth":0,"causal_relation":"exact"}
 {"type":"syscall","ts_ns":30,"pid":42,"tid":42,"uid":1000,"name":"munmap","phase":"exit","ret":0,"args":[4096,8192,0,0,0,0],"trace_id":"trace-resources","span_id":"a-unmap","scenario_id":"resources","depth":0,"causal_relation":"exact"}
 {"type":"syscall","ts_ns":40,"pid":42,"tid":42,"uid":1000,"name":"close","phase":"exit","ret":0,"args":[12,0,0,0,0,0],"trace_id":"trace-resources","span_id":"close-dma","scenario_id":"resources","depth":0,"causal_relation":"exact"}
-{"type":"capture_health","degraded":false,"root_package":"com.example.resources","boot_id":"boot-a"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.resources","boot_id":"11111111-2222-3333-4444-555555555555"}
 "#;
     import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
 
@@ -761,7 +811,7 @@ fn failed_device_open_is_attempt_evidence_not_reachability() {
     let capture = r#"
 {"type":"marker","phase":"start","name":"failed-open","scenario_id":"failed-open","trace_id":"trace-failed-open","root_package":"com.example.failed"}
 {"type":"syscall","pid":100,"tid":100,"uid":10123,"name":"openat","phase":"exit","ret":-13,"data":"/dev/trusty-ipc-dev0","trace_id":"trace-failed-open","span_id":"open-denied","scenario_id":"failed-open","depth":0,"causal_relation":"exact"}
-{"type":"capture_health","degraded":false,"root_package":"com.example.failed","boot_id":"boot-a"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.failed","boot_id":"11111111-2222-3333-4444-555555555555"}
 "#;
     import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
 
@@ -829,7 +879,7 @@ fn selinux_denials_are_surface_evidence_but_not_reachability_edges() {
     let capture = r#"
 {"type":"marker","phase":"start","name":"denial","scenario_id":"denial","trace_id":"trace-denial","root_package":"com.example.denied"}
 {"type":"selinux_denial","ts_ns":90,"pid":100,"tid":101,"uid":10123,"comm":"denied-app","source_domain":"untrusted_app","target_type":"tee_device","tclass":"chr_file","permissions":["ioctl"],"path":"/dev/trusty-ipc-dev0","result":"denied","trace_id":"trace-denial","scenario_id":"denial","span_id":"denial-1","depth":0,"causal_relation":"exact"}
-{"type":"capture_health","degraded":false,"root_package":"com.example.denied","boot_id":"boot-a"}
+{"type":"capture_health","degraded":false,"root_package":"com.example.denied","boot_id":"11111111-2222-3333-4444-555555555555"}
 "#;
     import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
 
@@ -880,7 +930,7 @@ fn legacy_capture_keeps_edges_as_candidate_and_warns_about_pid_identity() {
         relation.trace_id.as_deref() == Some("0000000000000001")
             && relation.confidence == "candidate"
     }));
-    assert_eq!(snapshot.captures[0].health, "degraded");
+    assert_eq!(snapshot.captures[0].health, "incomplete");
     assert!(snapshot
         .health
         .warnings
@@ -897,7 +947,7 @@ fn capture_can_create_services_from_exact_or_single_candidate_evidence() {
 {"type":"binder","pid":101,"to_proc":201,"debug_id":2,"service_candidates":["vendor.example.ICandidate/default"],"trace_id":"trace-new","span_id":"binder-2","scenario_id":"new-services","causal_relation":"inferred"}
 {"type":"binder","pid":102,"to_proc":202,"debug_id":3,"trace_id":"trace-new","span_id":"binder-3","scenario_id":"new-services","causal_relation":"exact"}
 {"type":"binder","pid":103,"debug_id":4,"trace_id":"trace-new","span_id":"malformed"}
-{"type":"capture_health","degraded":true,"root_package":"com.example.new","boot_id":"boot-a","fingerprint":"different/fingerprint","binder_depth_limit":1}
+{"type":"capture_health","degraded":true,"root_package":"com.example.new","boot_id":"11111111-2222-3333-4444-555555555555","fingerprint":"different/fingerprint","binder_depth_limit":1}
 "#;
 
     import_capture(&mut snapshot, Cursor::new(capture)).expect("capture import");
@@ -947,7 +997,7 @@ fn capture_process_uids_come_from_each_event_not_the_root_selector() {
 {"type":"binder","pid":100,"caller_uid":10123,"to_proc":200,"debug_id":1,"service":"example.IFirst/default","trace_id":"trace-uid","span_id":"binder-1","scenario_id":"uid-root","depth":0,"causal_relation":"exact"}
 {"type":"binder","pid":200,"caller_uid":1000,"to_proc":300,"debug_id":2,"service":"example.ISecond/default","trace_id":"trace-uid","span_id":"binder-2","scenario_id":"uid-root","depth":1,"causal_relation":"exact"}
 {"type":"syscall","pid":200,"uid":1000,"tid":201,"name":"ioctl","phase":"exit","args":[7,1074295424,0,0,0,0],"fd_path":"/dev/trusty-ipc-dev0","trace_id":"trace-uid","span_id":"ioctl-1","parent_span_id":"binder-2","scenario_id":"uid-root","depth":2,"causal_relation":"exact"}
-{"type":"capture_health","degraded":false,"root_uid":10123,"boot_id":"boot-a"}
+{"type":"capture_health","degraded":false,"root_uid":10123,"boot_id":"11111111-2222-3333-4444-555555555555"}
 "#;
 
     import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
@@ -957,7 +1007,7 @@ fn capture_process_uids_come_from_each_event_not_the_root_selector() {
         .filter(|process| process.id.starts_with("process:capture:trace-uid:"))
         .map(|process| (process.pid, process.uid))
         .collect();
-    assert_eq!(uid_by_pid.get(&100), Some(&10_123));
-    assert_eq!(uid_by_pid.get(&200), Some(&1000));
-    assert_eq!(uid_by_pid.get(&300), Some(&0));
+    assert_eq!(uid_by_pid.get(&100), Some(&Some(10_123)));
+    assert_eq!(uid_by_pid.get(&200), Some(&Some(1000)));
+    assert_eq!(uid_by_pid.get(&300), Some(&None));
 }

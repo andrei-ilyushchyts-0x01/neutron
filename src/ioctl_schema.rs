@@ -749,7 +749,7 @@ fn schema_directories() -> Vec<PathBuf> {
     directories.extend([
         PathBuf::from("/system/etc/neutron/schemas"),
         PathBuf::from("/vendor/etc/neutron/schemas"),
-        PathBuf::from("/data/local/tmp/neutron/schemas"),
+        PathBuf::from("/data/local/share/neutron/schemas"),
     ]);
     directories
 }

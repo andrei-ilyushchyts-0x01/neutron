@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.probe-identity-v1.schema.json",
+  "title": "Neutron research probe identity v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "file",
+    "sha256",
+    "signing_certificate_sha256",
+    "signing_certificate_approved",
+    "package",
+    "version_code",
+    "version_name",
+    "target_sdk",
+    "build_type",
+    "debuggable",
+    "attacker_model"
+  ],
+  "properties": {
+    "schema": { "const": "neutron.probe-identity/v1" },
+    "file": { "const": "neutron-probe.apk" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "signing_certificate_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "signing_certificate_approved": { "type": "boolean" },
+    "package": { "type": "string", "pattern": "^[A-Za-z0-9._]+$" },
+    "version_code": { "type": "integer", "minimum": 1 },
+    "version_name": { "type": "string", "minLength": 1 },
+    "target_sdk": { "type": "integer", "minimum": 1 },
+    "build_type": { "const": "debug" },
+    "debuggable": { "type": "boolean" },
+    "attacker_model": {
+      "type": "string",
+      "pattern": "^ordinary_installed_app_target_sdk_[0-9]+_debuggable_(true|false)$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "debuggable": { "const": true } },
+        "required": ["debuggable"]
+      },
+      "then": {
+        "properties": { "attacker_model": { "pattern": "_debuggable_true$" } }
+      },
+      "else": {
+        "properties": { "attacker_model": { "pattern": "_debuggable_false$" } }
+      }
+    }
+  ]
+}

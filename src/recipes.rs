@@ -37,7 +37,7 @@ direct vs wrapped reads with summarize/window/diff.
 
 1. Capture low-noise provider activity:
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --pid 0 \
   --json --raw --no-findings \
   --no-logcat --fdgraph-interval off --lookback-events 0 \
@@ -45,37 +45,37 @@ adb shell su -c '/data/local/tmp/neutron \
   --match-android-provider content://com.android.contacts/contacts \
   --rate-limit 1000 \
   --max-output-size 250mb \
-  --output /data/local/tmp/provider_probe.ndjson'
+  --output /data/local/share/neutron/runs/manual/provider_probe.ndjson'
 
 For unattended sessions, replace the stop-cap with rotation:
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --pid 0 \
   --json --raw --no-findings \
   --match-package com.example.probe \
   --match-android-provider com.android.contacts \
   --rate-limit 1000 \
   --rotate-output-size 250mb \
-  --output /data/local/tmp/provider_probe.ndjson'
+  --output /data/local/share/neutron/runs/manual/provider_probe.ndjson'
 
 2. Bracket each stimulus:
 
-adb shell su -c '/data/local/tmp/neutron mark direct_read \
-  --phase start --output /data/local/tmp/provider_probe.ndjson'
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent mark direct_read \
+  --phase start --output /data/local/share/neutron/runs/manual/provider_probe.ndjson'
 
 # Trigger the direct provider read.
 
-adb shell su -c '/data/local/tmp/neutron mark direct_read \
-  --phase end --output /data/local/tmp/provider_probe.ndjson'
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent mark direct_read \
+  --phase end --output /data/local/share/neutron/runs/manual/provider_probe.ndjson'
 
 3. Review:
 
-adb shell /data/local/tmp/neutron summarize \
+adb -s "$ANDROID_SERIAL" shell /data/local/share/neutron/neutron-agent summarize \
   --by comm,syscall,ret_class \
-  --top 30 /data/local/tmp/provider_probe.ndjson
+  --top 30 /data/local/share/neutron/runs/manual/provider_probe.ndjson
 
-adb shell /data/local/tmp/neutron window \
-  /data/local/tmp/provider_probe.ndjson \
+adb -s "$ANDROID_SERIAL" shell /data/local/share/neutron/neutron-agent window \
+  /data/local/share/neutron/runs/manual/provider_probe.ndjson \
   --anchor marker:direct_read --around 3s \
   > direct_read_windows.ndjson
 
@@ -92,14 +92,14 @@ Notes:
 pub fn binder_lpe_recipe() -> &'static str {
     r#"# Binder LPE Recipe
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --profile kernel-lpe --driver-pack binder \
   --json --raw --binder --capture matched+context=2s \
-  --output /data/local/tmp/binder_lpe.ndjson'
+  --output /data/local/share/neutron/runs/manual/binder_lpe.ndjson'
 
 Review with:
 
-adb shell /data/local/tmp/neutron window /data/local/tmp/binder_lpe.ndjson \
+adb -s "$ANDROID_SERIAL" shell /data/local/share/neutron/neutron-agent window /data/local/share/neutron/runs/manual/binder_lpe.ndjson \
   --anchor binder_call:callee_crashed --around 3s --summary
 "#
 }
@@ -107,31 +107,31 @@ adb shell /data/local/tmp/neutron window /data/local/tmp/binder_lpe.ndjson \
 pub fn gpu_driver_harness_recipe() -> &'static str {
     r#"# GPU Driver Harness Recipe
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --profile driver-harness --driver-pack kgsl,mali \
   --json --raw --fdgraph-interval 500ms \
   --capture matched+context=1s \
-  --output /data/local/tmp/gpu_driver_harness.ndjson'
+  --output /data/local/share/neutron/runs/manual/gpu_driver_harness.ndjson'
 
 Review with:
 
-adb shell /data/local/tmp/neutron summarize \
+adb -s "$ANDROID_SERIAL" shell /data/local/share/neutron/neutron-agent summarize \
   --by comm,ioctl_family,ioctl_name,ret_class \
-  /data/local/tmp/gpu_driver_harness.ndjson
+  /data/local/share/neutron/runs/manual/gpu_driver_harness.ndjson
 "#
 }
 
 pub fn alsa_mali_chain_recipe() -> &'static str {
     r#"# ALSA + Mali Chain Recipe
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --profile driver-harness --driver-pack alsa,mali \
   --json --raw --capture matched+context=2s \
-  --output /data/local/tmp/alsa_mali_chain.ndjson'
+  --output /data/local/share/neutron/runs/manual/alsa_mali_chain.ndjson'
 
 Review with:
 
-adb shell /data/local/tmp/neutron window /data/local/tmp/alsa_mali_chain.ndjson \
+adb -s "$ANDROID_SERIAL" shell /data/local/share/neutron/neutron-agent window /data/local/share/neutron/runs/manual/alsa_mali_chain.ndjson \
   --anchor finding:R008_alsa_compat_candidate_errors --around 2s --summary
 "#
 }
@@ -139,14 +139,14 @@ adb shell /data/local/tmp/neutron window /data/local/tmp/alsa_mali_chain.ndjson 
 pub fn unix_socket_race_recipe() -> &'static str {
     r#"# Unix Socket Race Recipe
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --profile kernel-lpe --driver-pack unix-socket \
   --json --raw --capture matched+context=1s \
-  --output /data/local/tmp/unix_socket_race.ndjson'
+  --output /data/local/share/neutron/runs/manual/unix_socket_race.ndjson'
 
 Review with:
 
-adb shell /data/local/tmp/neutron window /data/local/tmp/unix_socket_race.ndjson \
+adb -s "$ANDROID_SERIAL" shell /data/local/share/neutron/neutron-agent window /data/local/share/neutron/runs/manual/unix_socket_race.ndjson \
   --anchor finding:R009_unix_socket_rights_peek_race --around 1s
 "#
 }
@@ -154,14 +154,14 @@ adb shell /data/local/tmp/neutron window /data/local/tmp/unix_socket_race.ndjson
 pub fn media_service_crash_recipe() -> &'static str {
     r#"# Media Service Crash Recipe
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --profile driver-harness --driver-pack media-hal,binder \
   --json --raw --binder --fd-snapshot-on-finding \
-  --output /data/local/tmp/media_service_crash.ndjson'
+  --output /data/local/share/neutron/runs/manual/media_service_crash.ndjson'
 
 Review with:
 
-adb shell /data/local/tmp/neutron window /data/local/tmp/media_service_crash.ndjson \
+adb -s "$ANDROID_SERIAL" shell /data/local/share/neutron/neutron-agent window /data/local/share/neutron/runs/manual/media_service_crash.ndjson \
   --anchor crash --around 5s --summary
 "#
 }
@@ -172,17 +172,17 @@ pub fn system_app_sweep_recipe() -> &'static str {
 Run one package-scoped capture at a time and keep the final
 type:"capture_health" line in a sidecar so output caps remain auditable.
 
-adb shell 'cat > /data/local/tmp/neutron_system_app_sweep.sh' <<'EOF'
+adb -s "$ANDROID_SERIAL" shell 'cat > /data/local/share/neutron/runs/manual/neutron_system_app_sweep.sh' <<'EOF'
 #!/system/bin/sh
 set -u
 
-OUT_DIR="${1:-/data/local/tmp/neutron_system_app_sweep}"
+OUT_DIR="${1:-/data/local/share/neutron/runs/manual/neutron_system_app_sweep}"
 DURATION="${2:-4}"
 RATE_LIMIT="${3:-200}"
 MAX_OUTPUT="${4:-256k}"
 
-NEUTRON="/data/local/tmp/neutron"
-BPF="/data/local/tmp/neutron.bpf.elf"
+NEUTRON="/data/local/share/neutron/neutron-agent"
+BPF="/data/local/share/neutron/neutron.bpf.elf"
 
 mkdir -p "$OUT_DIR/captures"
 PKG_LIST="$OUT_DIR/pm_list_packages_s_f_U_show_versioncode.txt"
@@ -252,12 +252,12 @@ done < "$PKG_LIST"
 cleanup_neutron
 EOF
 
-adb shell chmod 755 /data/local/tmp/neutron_system_app_sweep.sh
-adb shell su -c '/data/local/tmp/neutron_system_app_sweep.sh'
+adb -s "$ANDROID_SERIAL" shell chmod 755 /data/local/share/neutron/runs/manual/neutron_system_app_sweep.sh
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/runs/manual/neutron_system_app_sweep.sh'
 
 Review:
 
-adb shell su -c "awk -F '\t' 'NR>1 && \$10==\"true\" {print}' /data/local/tmp/neutron_system_app_sweep/summary.tsv"
+adb -s "$ANDROID_SERIAL" shell su -c "awk -F '\t' 'NR>1 && \$10==\"true\" {print}' /data/local/share/neutron/runs/manual/neutron_system_app_sweep/summary.tsv"
 
 Notes:
 - Run sequentially; neutron also holds a capture lock and exits early if a
@@ -278,32 +278,32 @@ Markdown boundary report with explicit package labeling.
 
 1. Baseline:
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --json --raw --no-findings --no-logcat \
   --fdgraph-interval off --lookback-events 0 \
   --match-package com.example.app \
   --rate-limit 1000 \
   --max-output-size 250mb \
-  --health-output /data/local/tmp/launch_baseline.health.ndjson \
-  --output /data/local/tmp/launch_baseline.ndjson'
+  --health-output /data/local/share/neutron/runs/manual/launch_baseline.health.ndjson \
+  --output /data/local/share/neutron/runs/manual/launch_baseline.ndjson'
 
 2. Launch:
 
-adb shell monkey -p com.example.app -c android.intent.category.LAUNCHER 1
+adb -s "$ANDROID_SERIAL" shell monkey -p com.example.app -c android.intent.category.LAUNCHER 1
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --json --raw --binder --driver-pack binder \
   --match-package com.example.app \
   --capture matched+context=2s \
   --rate-limit 1000 \
   --max-output-size 250mb \
-  --health-output /data/local/tmp/launch_test.health.ndjson \
-  --output /data/local/tmp/launch_test.ndjson'
+  --health-output /data/local/share/neutron/runs/manual/launch_test.health.ndjson \
+  --output /data/local/share/neutron/runs/manual/launch_test.ndjson'
 
 3. Report:
 
-neutron report /data/local/tmp/launch_test.ndjson \
-  --baseline /data/local/tmp/launch_baseline.ndjson \
+neutron report /data/local/share/neutron/runs/manual/launch_test.ndjson \
+  --baseline /data/local/share/neutron/runs/manual/launch_baseline.ndjson \
   --package com.example.app \
   --title "Launch Boundary Report" \
   --output launch-boundary-report.md
@@ -318,38 +318,38 @@ delta into a Markdown boundary report.
 
 1. Baseline:
 
-adb shell su -c 'timeout -s INT 10 /data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c 'timeout -s INT 10 /data/local/share/neutron/neutron-agent trace \
   --json --raw --binder --driver-pack binder \
   --match-package com.example.app \
   --capture matched+context=1s \
   --rate-limit 1000 \
   --max-output-size 250mb \
-  --output /data/local/tmp/action_baseline.ndjson'
+  --output /data/local/share/neutron/runs/manual/action_baseline.ndjson'
 
 2. Action capture:
 
-adb shell su -c 'timeout -s INT 20 /data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c 'timeout -s INT 20 /data/local/share/neutron/neutron-agent trace \
   --json --raw --binder --driver-pack binder \
   --match-package com.example.app \
   --capture matched+context=2s \
   --rate-limit 1000 \
   --max-output-size 250mb \
-  --output /data/local/tmp/action_test.ndjson' &
+  --output /data/local/share/neutron/runs/manual/action_test.ndjson' &
 
-adb shell su -c '/data/local/tmp/neutron mark transfer_button \
-  --phase start --output /data/local/tmp/action_test.ndjson'
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent mark transfer_button \
+  --phase start --output /data/local/share/neutron/runs/manual/action_test.ndjson'
 
 # Trigger the user action under test.
 
-adb shell su -c '/data/local/tmp/neutron mark transfer_button \
-  --phase end --output /data/local/tmp/action_test.ndjson'
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent mark transfer_button \
+  --phase end --output /data/local/share/neutron/runs/manual/action_test.ndjson'
 
 wait
 
 3. Report:
 
-neutron report /data/local/tmp/action_test.ndjson \
-  --baseline /data/local/tmp/action_baseline.ndjson \
+neutron report /data/local/share/neutron/runs/manual/action_test.ndjson \
+  --baseline /data/local/share/neutron/runs/manual/action_baseline.ndjson \
   --package com.example.app \
   --title "Action Boundary Report" \
   --output action-boundary-report.md
@@ -364,7 +364,7 @@ inputs, then render the Markdown boundary report.
 
 1. Capture:
 
-adb shell su -c '/data/local/tmp/neutron \
+adb -s "$ANDROID_SERIAL" shell su -c '/data/local/share/neutron/neutron-agent trace \
   --profile driver-harness \
   --driver-pack binder,kgsl,mali,media-hal \
   --json --raw --binder \
@@ -372,22 +372,22 @@ adb shell su -c '/data/local/tmp/neutron \
   --capture matched+context=2s \
   --rate-limit 1000 \
   --max-output-size 500mb \
-  --output /data/local/tmp/native_surface.ndjson'
+  --output /data/local/share/neutron/runs/manual/native_surface.ndjson'
 
 2. Binder attribution inputs:
 
-adb shell service list -p > service-list-p.txt
+adb -s "$ANDROID_SERIAL" shell service list -p > service-list-p.txt
 
 neutron binder-map service-list \
   --input service-list-p.txt \
   --output binder-catalog.json
 
-neutron binder-map template /data/local/tmp/native_surface.ndjson \
+neutron binder-map template /data/local/share/neutron/runs/manual/native_surface.ndjson \
   --output binder-services.template.json
 
 3. Report:
 
-neutron report /data/local/tmp/native_surface.ndjson \
+neutron report /data/local/share/neutron/runs/manual/native_surface.ndjson \
   --package com.example.app \
   --binder-services binder-services.template.json \
   --binder-catalog binder-catalog.json \
