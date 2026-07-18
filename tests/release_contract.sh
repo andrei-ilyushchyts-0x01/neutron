@@ -298,23 +298,34 @@ evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
 limitations_disclose_filtered_fd_state_ceiling() {
     local limitations="$root/docs/LIMITATIONS.md"
     local reference="$root/docs/REFERENCE.md"
+    local guide="$root/docs/guides/bpf-tracing.md"
     local manpage="$root/man/man1/neutron.1"
     local main="$root/src/main.rs"
+    local matcher="$root/src/matcher.rs"
     local common="$root/neutron-common/src/lib.rs"
 
-    rg -Uq 'does \*\*not\*\* automatically[[:space:]]+add the lifecycle syscalls' "$limitations" &&
-        contains "$limitations" '`--resolve-paths`' &&
-        contains "$limitations" '`fd_path` predicates' &&
-        contains "$limitations" '`--capture-reads`' &&
-        contains "$limitations" '`--follow-children`' &&
+    for document in "$limitations" "$reference" "$guide"; do
+        contains "$document" '`STATE_EMIT_REQUIRED` is enabled by fd-path predicates' || return 1
+        contains "$document" '`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically' || return 1
+        contains "$document" 'active BPF predicates can suppress lifecycle events' || return 1
+    done
+
+    contains "$limitations" '`fd_path` predicates' &&
         contains "$limitations" '`fcntl` FD duplication' &&
         contains "$limitations" '`close_range`' &&
         contains "$limitations" 'not proof of a current live FD binding' &&
-        contains "$reference" 'after any active `SYSCALL_FILTER` admission' &&
-        contains "$manpage" 'only after admission by any active' &&
-        contains "$main" 'only after syscall-whitelist admission' &&
+        contains "$reference" 'An active `SYSCALL_FILTER` remains an earlier gate' &&
+        contains "$manpage" 'Only fd-path predicates enable' &&
+        contains "$manpage" 'do not enable it automatically' &&
+        contains "$manpage" 'active BPF predicates can suppress lifecycle events' &&
+        contains "$main" 'Only fd-path predicates drive `STATE_EMIT_REQUIRED`' &&
+        contains "$main" 'active BPF predicates can suppress required lifecycle events' &&
+        contains "$matcher" 'Only fd-path predicates require state-event exemption' &&
         contains "$common" 'This flag never expands' &&
-        contains "$common" '`SYSCALL_FILTER`. Userspace flips it' &&
+        contains "$common" 'Only fd-path predicates make userspace enable this flag' &&
+        ! contains "$common" '`--match-fd`, `--resolve-paths`' &&
+        ! contains "$common" '`--resolve-paths` / `--follow-children` feature' &&
+        ! contains "$matcher" 'path resolution, comm globbing, binder semantics, or arg accessors' &&
         ! contains "$main" 'state-tracking syscalls always-emit'
 }
 

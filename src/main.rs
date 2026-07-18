@@ -6023,6 +6023,51 @@ mod tests {
     }
 
     #[test]
+    fn security_profile_populates_documented_syscall_whitelist_and_exclusions() {
+        let mut args = Args {
+            profile: Some(SECURITY_PROFILE.into()),
+            ..Args::default()
+        };
+
+        apply_profile(&mut args).expect("security profile applies");
+        let spec = matcher::build_from_args(&args).expect("security profile match spec");
+
+        assert_eq!(
+            spec.syscalls,
+            BTreeSet::from([
+                29, 48, 56, 78, 79, 129, 167, 198, 200, 203, 206, 207, 220, 221, 222, 226, 281,
+            ])
+        );
+        assert_eq!(
+            args.exclude_comm,
+            SECURITY_EXCLUDE_COMM
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn security_profile_preserves_explicit_syscall_whitelist() {
+        let mut args = Args {
+            profile: Some(SECURITY_PROFILE.into()),
+            match_syscall: vec!["172".into()],
+            ..Args::default()
+        };
+
+        apply_profile(&mut args).expect("security profile applies");
+
+        assert_eq!(args.match_syscall, ["172"]);
+        assert_eq!(
+            args.exclude_comm,
+            SECURITY_EXCLUDE_COMM
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn driver_pack_defaults_scope_to_fd_and_ioctl_type_when_no_user_match() {
         let mut args = Args {
             driver_pack: vec!["kgsl".into()],

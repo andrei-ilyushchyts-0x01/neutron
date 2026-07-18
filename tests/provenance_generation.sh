@@ -87,6 +87,7 @@ export NEUTRON_PROV_BUILD_TIMESTAMP=2026-07-17T00:00:00Z
 export NEUTRON_PROV_RUSTC='rustc 1.90.0-nightly'
 export NEUTRON_PROV_CARGO='cargo 1.90.0-nightly'
 export NEUTRON_PROV_BPF_LINKER='bpf-linker 0.10.3'
+export NEUTRON_PROV_X86_64_LINKER='x86_64-linux-gnu-gcc 14.2.0'
 export NEUTRON_PROV_JAVA_RUNTIME=17.0.1
 export NEUTRON_PROV_JAVA_VENDOR=Eclipse
 export NEUTRON_PROV_GRADLE=8.10.2
@@ -130,6 +131,7 @@ jq -e '
   .schema == "neutron.provenance/v1" and
   .binaries.host.self_info.feature_set == ["host-feature"] and
   .binaries.android_agent.self_info.feature_set == ["agent-feature"] and
+  .toolchain.x86_64_linker == "x86_64-linux-gnu-gcc 14.2.0" and
   .bpf_objects["neutron.bpf.elf"].identity.feature_bits == 23 and
   .bpf_objects["neutron-stacks.bpf.elf"].identity.feature_bits == 31 and
   .bpf_abi == {major: 2, minor: 0, event_size: 257} and
@@ -139,6 +141,17 @@ jq -e '
   .probe.attacker_model == "ordinary_installed_app_target_sdk_35_debuggable_true" and
   .release_authentication.strict == true
 ' "$work/provenance.json" >/dev/null
+
+unset NEUTRON_PROV_X86_64_LINKER
+if node "$root/scripts/generate-provenance.mjs" "$work/missing-linker.json" \
+    >"$work/missing-linker.stdout" 2>"$work/missing-linker.stderr"; then
+  echo "provenance generator accepted a missing x86_64 linker identity" >&2
+  exit 1
+fi
+rg -F 'missing provenance input NEUTRON_PROV_X86_64_LINKER' \
+  "$work/missing-linker.stderr"
+[[ ! -e "$work/missing-linker.json" ]]
+export NEUTRON_PROV_X86_64_LINKER='x86_64-linux-gnu-gcc 14.2.0'
 
 jq '.bpf_objects[1].identity.feature_bits = 23' "$work/host.json" \
   > "$work/host-mismatch.json"
