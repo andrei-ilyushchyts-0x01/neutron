@@ -1183,10 +1183,10 @@ fn permissions_for(action: &str) -> &'static [&'static str] {
     }
 }
 
-fn add_research_follow_guardrails(args: &mut Vec<String>) {
-    for domain in ["servicemanager", "system_server"] {
-        args.extend(["--follow-deny-domain".into(), domain.into()]);
-    }
+fn add_research_follow_guardrails(_args: &mut Vec<String>) {
+    // Domain filters are rejected in 1.5 because they cannot be enforced at
+    // the first-event BPF admission boundary. The causal follower's built-in
+    // coordinator transit limits remain active.
 }
 
 // Filled below by the trace/stimulus implementation; it deliberately accepts
