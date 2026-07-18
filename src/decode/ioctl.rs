@@ -720,20 +720,54 @@ mod tests {
     #[test]
     fn ioctl_family_disambiguates_b_magic_via_fd_kind() {
         // type=0x62 collides between binder and dma-buf. With a Binder fd it
-        // resolves to Binder; an absent hint must preserve the ambiguity.
+        // resolves to Binder; absent, unknown, or merely non-Binder kinds must
+        // preserve the ambiguity unless the path proves dma-buf ownership.
         let cmd = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1; // BINDER_WRITE_READ
         assert_eq!(
             IoctlFamily::from_cmd(cmd, Some(FdKind::Binder)),
             IoctlFamily::Binder
         );
         assert_eq!(
-            IoctlFamily::from_cmd(cmd, Some(FdKind::File)),
-            IoctlFamily::DmaBuf
+            IoctlFamily::from_cmd(cmd, Some(FdKind::File)).as_str(),
+            "binder_or_dma_buf"
         );
         assert_eq!(
             IoctlFamily::from_cmd(cmd, None).as_str(),
             "binder_or_dma_buf"
         );
+        assert_eq!(
+            IoctlFamily::from_cmd(cmd, Some(FdKind::Unknown)).as_str(),
+            "binder_or_dma_buf"
+        );
+    }
+
+    #[test]
+    fn ioctl_family_uses_explicit_binder_and_dma_buf_paths() {
+        let cmd = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
+        for path in ["/dev/binder", "/dev/hwbinder", "/dev/vndbinder"] {
+            assert_eq!(
+                IoctlFamily::from_cmd_with_path(cmd, None, Some(path)),
+                IoctlFamily::Binder,
+                "path={path}"
+            );
+        }
+        assert_eq!(
+            IoctlFamily::from_cmd_with_path(
+                cmd,
+                Some(FdKind::AnonInode),
+                Some("anon_inode:dmabuf"),
+            ),
+            IoctlFamily::DmaBuf
+        );
+    }
+
+    #[test]
+    fn ambiguous_binder_write_read_has_no_concrete_name_or_payload_view() {
+        let cmd = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
+        let decoded = decode_ioctl(cmd, &[0u8; 48], 0, None);
+        assert_eq!(decoded.family.as_str(), "binder_or_dma_buf");
+        assert_eq!(decoded.name, None);
+        assert_eq!(decoded.fields, IoctlFields::None);
     }
 
     #[test]
