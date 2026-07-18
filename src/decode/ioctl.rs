@@ -34,8 +34,10 @@ pub fn format_ioctl_deep(raw: &[u8; 128]) -> String {
 
     // Known device types
     let device = match ioc_type {
-        0x62 => "binder", // 'b'
-        0x77 => "ashmem", // 'w' (0x77)
+        // Binder and dma-buf deliberately share the 'b' magic. This legacy
+        // formatter has no FD context, so keep that ambiguity visible.
+        0x62 => "binder_or_dma_buf", // 'b'
+        0x77 => "ashmem",            // 'w' (0x77)
         _ => "",
     };
 
@@ -69,6 +71,10 @@ pub fn format_ioctl_deep(raw: &[u8; 128]) -> String {
 pub enum IoctlFamily {
     DmaHeap,
     DmaBuf,
+    /// The shared `'b'` magic was observed without enough FD context to
+    /// distinguish Binder from dma-buf. Evidence consumers must not collapse
+    /// this into either concrete family.
+    BinderOrDmaBuf,
     Binder,
     Kgsl,
     Mali,
@@ -96,6 +102,7 @@ impl IoctlFamily {
         match self {
             IoctlFamily::DmaHeap => "dma_heap",
             IoctlFamily::DmaBuf => "dma_buf",
+            IoctlFamily::BinderOrDmaBuf => "binder_or_dma_buf",
             IoctlFamily::Binder => "binder",
             IoctlFamily::Kgsl => "kgsl",
             IoctlFamily::Mali => "mali",
@@ -112,7 +119,8 @@ impl IoctlFamily {
     /// Classify by `_IOC_TYPE` byte. The `'b'` (0x62) magic is reused by
     /// both binder and dma-buf in the kernel headers — they only diverge by
     /// the file_operations of the target fd. We use the FD-graph kind as the
-    /// disambiguator: `Binder` fd → binder, anything else → dma-buf.
+    /// disambiguator: `Binder` fd → binder, a known non-Binder fd → dma-buf,
+    /// and absent/unknown context → an explicit ambiguous family.
     pub fn from_cmd(cmd: u32, fd_kind: Option<FdKind>) -> Self {
         Self::from_cmd_with_path(cmd, fd_kind, None)
     }
@@ -150,6 +158,7 @@ impl IoctlFamily {
             t if t == neutron_common::IOCTL_TYPE_DMA_HEAP => IoctlFamily::DmaHeap,
             t if t == neutron_common::IOCTL_TYPE_BINDER_OR_DMA_BUF => match fd_kind {
                 Some(FdKind::Binder) => IoctlFamily::Binder,
+                None | Some(FdKind::Unknown) => IoctlFamily::BinderOrDmaBuf,
                 _ => IoctlFamily::DmaBuf,
             },
             t if t == neutron_common::IOCTL_TYPE_ASHMEM => IoctlFamily::Ashmem,

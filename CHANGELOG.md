@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is emitted on stderr, with an early completeness gate before artifact output.
 - Kept machine-readable output clean over non-interactive and ADB transports;
   maturity warnings remain visible in interactive use and command help.
+- Preserved the shared Binder/dma-buf ioctl magic as
+  `binder_or_dma_buf` when FD evidence is unavailable, instead of emitting
+  contradictory concrete family labels.
 
 ## [1.4.0] — 2026-07-10
 
