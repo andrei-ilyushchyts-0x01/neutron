@@ -1103,6 +1103,15 @@ mod tests {
     }
 
     #[test]
+    fn su_command_is_quoted_as_one_remote_shell_word() {
+        assert_eq!(
+            quote_remote_shell_word("test -f /data/local/share/neutron && chmod 0700 /data/local/share/neutron"),
+            "'test -f /data/local/share/neutron && chmod 0700 /data/local/share/neutron'"
+        );
+        assert_eq!(quote_remote_shell_word("printf '%s' safe"), "'printf '\"'\"'%s'\"'\"' safe'");
+    }
+
+    #[test]
     fn deploy_plan_uses_private_root_owned_paths_and_modes() {
         let artifacts = neutron_deploy_artifacts(Path::new("/workspace"));
 
