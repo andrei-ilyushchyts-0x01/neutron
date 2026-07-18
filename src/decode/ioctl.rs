@@ -140,8 +140,11 @@ impl IoctlFamily {
             if path.starts_with("/dev/mali") {
                 return IoctlFamily::Mali;
             }
-            if path.starts_with("/dev/binder") || path.starts_with("/dev/vndbinder") {
+            if crate::fdgraph::classify(path) == FdKind::Binder {
                 return IoctlFamily::Binder;
+            }
+            if is_dma_buf_path(path) {
+                return IoctlFamily::DmaBuf;
             }
             if path.starts_with("/dev/trusty-ipc") {
                 return IoctlFamily::TrustyTipc;
@@ -158,8 +161,7 @@ impl IoctlFamily {
             t if t == neutron_common::IOCTL_TYPE_DMA_HEAP => IoctlFamily::DmaHeap,
             t if t == neutron_common::IOCTL_TYPE_BINDER_OR_DMA_BUF => match fd_kind {
                 Some(FdKind::Binder) => IoctlFamily::Binder,
-                None | Some(FdKind::Unknown) => IoctlFamily::BinderOrDmaBuf,
-                _ => IoctlFamily::DmaBuf,
+                _ => IoctlFamily::BinderOrDmaBuf,
             },
             t if t == neutron_common::IOCTL_TYPE_ASHMEM => IoctlFamily::Ashmem,
             t if t == neutron_common::IOCTL_TYPE_KGSL => IoctlFamily::Kgsl,
@@ -176,6 +178,14 @@ impl IoctlFamily {
             _ => IoctlFamily::Unknown,
         }
     }
+}
+
+fn is_dma_buf_path(path: &str) -> bool {
+    path == "/dev/dmabuf"
+        || path.starts_with("/dev/dmabuf/")
+        || path.starts_with("/dmabuf:")
+        || path.starts_with("anon_inode:dmabuf")
+        || path.starts_with("anon_inode:[dmabuf")
 }
 
 fn is_alsa_type(ty: u32) -> bool {

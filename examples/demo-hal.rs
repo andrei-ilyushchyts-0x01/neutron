@@ -65,9 +65,8 @@ fn main() {
     );
 
     // 2. BINDER_WRITE_READ-shape (cmd type='b', dir=RW). With a Binder fd
-    //    hint we resolve to the binder family; without the hint we'd fall
-    //    back to dma_buf — the third emission demonstrates the
-    //    disambiguation path.
+    //    hint we resolve to the binder family; without the hint the third
+    //    emission preserves the Binder/dma-buf ambiguity.
     let binder_cmd: u32 = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
     let binder_hint = FdHint {
         kind: FdKind::Binder,
@@ -79,15 +78,16 @@ fn main() {
         format_event_json_full(&ev, false, None, Some(&binder_hint), Some(2))
     );
 
-    // 3. Same cmd, no FdHint → dma_buf classification (collision tiebreak).
+    // 3. Same cmd, no FdHint → explicit Binder/dma-buf ambiguity.
     let ev = ioctl_exit(540, binder_cmd, &[0u8; 48], 0, b"hal-allocator");
     println!(
         "{}",
         format_event_json_full(&ev, false, None, None, Some(3))
     );
 
-    // 4. Truncated dma-heap payload — decoder must classify family but emit
-    //    no nested object. Models a BPF capture that hit the ringbuf cap.
+    // 4. Short zero-padded dma-heap fixture. The fixed-size event buffer still
+    //    supplies the declared 24-byte view, so the missing tail decodes as
+    //    zeros; real truncation is accounted separately in capture health.
     let ev = ioctl_exit(540, 0xC018_4800, &[0u8; 12], 0, b"truncated-cap");
     println!(
         "{}",
