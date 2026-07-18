@@ -168,3 +168,21 @@ fn sys_enter_filters_disallowed_syscalls_before_tracking_inflight() {
         "sys_enter must preserve causal admission, then filter disallowed syscalls before reading arguments or inserting INFLIGHT state"
     );
 }
+
+#[test]
+fn state_required_syscalls_are_wired_into_the_active_bpf_filter() {
+    let source = include_str!("../src/main.rs");
+    let start = source
+        .find("fn populate_match_maps(")
+        .expect("populate_match_maps definition");
+    let end = source[start..]
+        .find("\nfn populate_ioctl_refresh_maps(")
+        .map(|offset| start + offset)
+        .expect("populate_ioctl_refresh_maps boundary");
+    let body = &source[start..end];
+
+    assert!(
+        body.contains("spec.effective_bpf_syscalls(state_events_required)"),
+        "populate_match_maps must extend an active syscall whitelist with required fdgraph state syscalls"
+    );
+}
