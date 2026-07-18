@@ -158,9 +158,7 @@ fn sys_enter_filters_disallowed_syscalls_before_tracking_inflight() {
         .find("if !syscall_allowed(nr) {")
         .expect("sys_enter must reject disallowed syscalls");
     let argument_read = body.find("let args =").expect("syscall argument read");
-    let inflight_insert = body
-        .find("if INFLIGHT.insert")
-        .expect("INFLIGHT insertion");
+    let inflight_insert = body.find("if INFLIGHT.insert").expect("INFLIGHT insertion");
 
     assert!(
         admission < syscall_number

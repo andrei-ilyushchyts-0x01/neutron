@@ -68,6 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of emitting contradictory concrete family labels. Dma-buf-looking path text
   alone is not treated as proof; the legacy context-free `data` view uses the
   same explicit ambiguity.
+- Stopped syscall-whitelist rejects before they populate BPF `INFLIGHT` state,
+  preventing long-blocking, non-emittable syscalls from falsely degrading a
+  clean scenario boundary while retaining state for allowlisted exit filters.
 
 ## [1.4.0] — 2026-07-10
 
@@ -137,8 +140,8 @@ subcommands.
   individual `--match-*` flags. Audit-print at startup labels each
   clause `[bpf]` or `[user]` so volume reduction is visible.
 - **Enter/exit decoupling.** BPF `try_sys_enter` now updates
-  `INFLIGHT` unconditionally after `pid_matches`; the ringbuf emit
-  decision is a separate gate. Exit-time predicates (ret class,
+  `INFLIGHT` for syscall-whitelist-eligible entries after `pid_matches`;
+  the ringbuf predicate decision is a separate gate. Exit-time predicates (ret class,
   latency threshold) can fire on syscalls whose enter was filtered
   from output without losing args / data / stack / enter_ts.
 - **State-tracking always-emit.** When a predicate references

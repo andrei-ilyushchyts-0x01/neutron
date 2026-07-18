@@ -628,7 +628,7 @@ fn exit_predicate_match(nr: i32, uid: u32, saved: *const SyscallEvent, ret: i64,
 
 /// Phase 1 emit gate for `sys_enter`. Returns true when the event should be
 /// submitted to the ringbuf. Independent of INFLIGHT update — by the time
-/// this is checked, INFLIGHT has already been populated unconditionally so
+/// this is checked, an allowlisted syscall has already populated INFLIGHT so
 /// exit-time predicates (ret/latency) keep working.
 ///
 /// Composition (safe over-approximation):
@@ -638,7 +638,7 @@ fn exit_predicate_match(nr: i32, uid: u32, saved: *const SyscallEvent, ret: i64,
 /// 4. When an exit-only predicate (`MATCH_BIT_RET` / `MATCH_BIT_LATENCY`)
 ///    is configured, drop enter events outright before ringbuf
 ///    reservation. The matching exit will still emit if it satisfies
-///    the predicate; INFLIGHT was populated unconditionally so the
+///    the predicate; INFLIGHT was populated for the allowlisted syscall so the
 ///    exit retains args/data/stack. Saves the ringbuf bandwidth that
 ///    the 2026-05-06 device test surfaced as 321k unwanted enter
 ///    events under `--match-ret negative`.
@@ -1240,13 +1240,15 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
     mark_admitted_thread_enter(pid_tgid, userspace_pid);
 
     let nr = required_tracepoint_field!(ctx, i64, SYS_ENTER_ID) as i32;
+    // A syscall rejected by the active whitelist can never pass the exit-side
+    // emit gate either. Do not retain invisible state for it: a long-blocking
+    // filtered syscall would otherwise be counted as lost evidence when a
+    // scenario boundary drains INFLIGHT. Causal admission bookkeeping stays
+    // above this gate so boundary-exit classification remains intact.
+    if !syscall_allowed(nr) {
+        return Err(());
+    }
     let args = required_tracepoint_field!(ctx, [u64; 6], SYS_ENTER_ARGS);
-
-    // CRITICAL: do NOT return early on a failed syscall_allowed() here. The
-    // INFLIGHT update below is the source of truth for exit-time predicates
-    // (ret/latency) added in Phase 1. Even when the ringbuf submission would
-    // be filtered, the matching sys_exit may still need args/data/stack from
-    // this entry. The emit gate runs after INFLIGHT.insert.
 
     // Build the event on stack first — we need to (a) insert it into INFLIGHT
     // for sys_exit correlation, and (b) submit a copy through the ring buffer.
@@ -1290,9 +1292,9 @@ fn try_sys_enter(ctx: &TracePointContext) -> Result<(), ()> {
         // correlation works for binder/JIT/worker threads, not just the main
         // thread). sys_exit looks up the same key.
         //
-        // INFLIGHT.insert is unconditional (after pid_matches): exit-time
-        // predicates need this state even when the ringbuf submission below
-        // is filtered. See `should_submit_enter` for the emit gate.
+        // Every allowlisted syscall gets INFLIGHT state: exit-time predicates
+        // need it even when the ringbuf submission below is filtered. See
+        // `should_submit_enter` for the predicate emit gate.
         if INFLIGHT.insert(&pid_tgid, &*ev, 0).is_err() {
             bump_counter(COUNTER_INFLIGHT_UPDATE_FAILED);
         }
@@ -1370,10 +1372,10 @@ fn try_sys_exit(ctx: &TracePointContext) -> Result<(), ()> {
             || consume_sibling_admission_boundary_exit(pid_tgid, userspace_pid));
 
     if !should_submit_exit(nr, uid_now, saved_ptr, ret, now) {
-        // Reclaim the INFLIGHT entry that the unconditional enter-side
-        // insertion left behind. Without this, filtered syscalls would
-        // gradually fill the cap and trigger LRU evictions that hurt
-        // unfiltered correlation.
+        // Reclaim the allowlisted INFLIGHT entry that enter-side predicates
+        // retained for possible exit matching. Without this, predicate-
+        // filtered syscalls would gradually fill the cap and trigger LRU
+        // evictions that hurt correlation.
         let _ = INFLIGHT.remove(&pid_tgid);
         return Err(());
     }

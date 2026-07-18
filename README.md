@@ -670,11 +670,12 @@ The primary output reached `--max-output-size`. Use the health sidecar to audit
 the capture, then rerun with a narrower scope, lower rate, or
 `--rotate-output-size`.
 
-### `ioctl_family:"dma_buf"` but `data` starts with `binder:`
+### `ioctl_family:"binder_or_dma_buf"`
 
 Binder and DMA-BUF share an ioctl magic value. neutron disambiguates with
-FD hints when available. Without a binder fd hint, the family can fall back to
-`dma_buf`; inspect `data`, `fd_kind`, and `fd_path` together.
+positive FD evidence when available. Without a conclusive Binder FD hint, the
+family remains `binder_or_dma_buf`; path-like text alone does not prove either
+family. Inspect `data`, `fd_kind`, and `fd_path` together.
 
 ### Stack traces do not work
 
