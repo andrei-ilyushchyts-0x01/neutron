@@ -3247,6 +3247,64 @@ mod tests {
         SchemaRegistry, Selectors,
     };
     use neutron_common::SyscallEvent;
+    use std::io::Write;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_COMMAND_TEST: AtomicU64 = AtomicU64::new(0);
+
+    fn command_fixture(mode: &str, marker: Option<&Path>) -> Vec<String> {
+        let mut argv = vec![
+            "/usr/bin/env".into(),
+            format!("NEUTRON_HARNESS_COMMAND_CHILD={mode}"),
+        ];
+        if let Some(marker) = marker {
+            argv.push(format!(
+                "NEUTRON_HARNESS_COMMAND_MARKER={}",
+                marker.display()
+            ));
+        }
+        argv.extend([
+            std::env::current_exe().unwrap().display().to_string(),
+            "--ignored".into(),
+            "bounded_harness_command_child".into(),
+            "--nocapture".into(),
+        ]);
+        argv
+    }
+
+    #[allow(clippy::zombie_processes)]
+    fn spawn_pipe_holding_descendant() {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "bounded_harness_command_child",
+                "--nocapture",
+            ])
+            .env("NEUTRON_HARNESS_COMMAND_CHILD", "pipe-descendant")
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for bounded harness command tests"]
+    fn bounded_harness_command_child() {
+        match std::env::var("NEUTRON_HARNESS_COMMAND_CHILD").as_deref() {
+            Ok("oversize") => std::io::stdout()
+                .write_all(&vec![b'o'; 2 * 1024 * 1024])
+                .unwrap(),
+            Ok("pipe-holder") => spawn_pipe_holding_descendant(),
+            Ok("pipe-descendant") => {
+                std::thread::sleep(Duration::from_secs(2));
+                fs::write(
+                    std::env::var("NEUTRON_HARNESS_COMMAND_MARKER").unwrap(),
+                    b"survived",
+                )
+                .unwrap();
+            }
+            mode => panic!("unexpected harness command fixture mode: {mode:?}"),
+        }
+    }
 
     struct FakeMemory(HashMap<(u32, u64), Vec<u8>>);
 
@@ -3518,6 +3576,42 @@ mod tests {
             String::from_utf8(output.stdout).unwrap(),
             "literal;not-shell\n"
         );
+    }
+
+    #[test]
+    fn runner_rejects_oversized_output() {
+        let started = Instant::now();
+        let error = run_argv(
+            &command_fixture("oversize", None),
+            None,
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("output exceeds"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn runner_timeout_kills_descendants_holding_output_pipes() {
+        let marker = std::env::temp_dir().join(format!(
+            "neutron-harness-command-{}-{}",
+            std::process::id(),
+            NEXT_COMMAND_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&marker);
+        let started = Instant::now();
+        let output = run_argv(
+            &command_fixture("pipe-holder", Some(&marker)),
+            None,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists(), "descendant survived the process-group kill");
     }
 
     #[test]
