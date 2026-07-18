@@ -27,10 +27,9 @@ dated_toolchain_omits_prebuilt_bpf_target() {
 build_requires_android_serial_before_cargo() {
     local script="$root/build.sh" serial_line cargo_line
     serial_line=$(rg -n --no-heading 'ANDROID_SERIAL' "$script" | head -n 1 | cut -d: -f1)
-    cargo_line=$(rg -n --no-heading '^[[:space:]]*cargo[[:space:]]' "$script" | head -n 1 | cut -d: -f1)
+    cargo_line=$(rg -n --no-heading 'exec cargo xtask deploy --serial "\$ANDROID_SERIAL"' "$script" | head -n 1 | cut -d: -f1)
 
-    [[ -n "$serial_line" && -n "$cargo_line" && "$serial_line" -lt "$cargo_line" ]] &&
-        rg -q -- '-s[[:space:]]+"?\$\{?ANDROID_SERIAL' "$script"
+    [[ -n "$serial_line" && -n "$cargo_line" && "$serial_line" -lt "$cargo_line" ]]
 }
 
 unwrapped_builds_cannot_claim_clean_provenance() {
@@ -184,7 +183,8 @@ signed_tag_workflow_requires_keys_and_attests_assets() {
     local workflow="$root/.github/workflows/release.yml"
     [[ -f "$workflow" ]] &&
         contains "$workflow" 'git verify-tag "$RELEASE_TAG"' &&
-        contains "$workflow" 'test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$GITHUB_SHA"' &&
+        contains "$workflow" 'test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"' &&
+        ! contains "$workflow" 'test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$GITHUB_SHA"' &&
         ! contains "$workflow" 'test "$GITHUB_EVENT_NAME" = workflow_dispatch' &&
         contains "$workflow" 'RELEASE_GPG_PUBLIC_KEY_B64' &&
         contains "$workflow" 'MINISIGN_SECRET_KEY_B64' &&
