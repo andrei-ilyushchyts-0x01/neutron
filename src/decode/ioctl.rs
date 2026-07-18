@@ -752,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn ioctl_family_uses_explicit_binder_and_dma_buf_paths() {
+    fn ioctl_family_uses_binder_paths_but_does_not_trust_dma_buf_path_text() {
         let cmd = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
         for path in ["/dev/binder", "/dev/hwbinder", "/dev/vndbinder"] {
             assert_eq!(
@@ -766,8 +766,9 @@ mod tests {
                 cmd,
                 Some(FdKind::AnonInode),
                 Some("anon_inode:dmabuf"),
-            ),
-            IoctlFamily::DmaBuf
+            )
+            .as_str(),
+            "binder_or_dma_buf"
         );
     }
 
