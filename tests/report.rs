@@ -147,6 +147,9 @@ fn markdown_report_renders_expected_sections() {
     assert!(md.contains("/proc/self/maps"));
     assert!(md.contains("RWX"));
     assert!(md.contains("R001"));
+    assert!(md.contains("triage priority, not vulnerability severity"));
+    assert!(md.contains("priority=high"));
+    assert!(!md.contains("severity=high"));
 }
 
 #[test]

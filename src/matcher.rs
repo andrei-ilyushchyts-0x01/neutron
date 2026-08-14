@@ -1572,6 +1572,29 @@ mod tests {
     }
 
     #[test]
+    fn effective_bpf_syscalls_preserve_internal_state_under_an_active_filter() {
+        let mut spec = MatchSpec::default();
+        spec.syscalls.insert(29);
+
+        let effective = spec.effective_bpf_syscalls(true);
+
+        assert!(effective.contains(&29));
+        for syscall in neutron_common::STATE_TRACKING_NRS {
+            assert!(
+                effective.contains(syscall),
+                "missing state-tracking syscall {syscall}"
+            );
+        }
+        assert_eq!(
+            effective.len(),
+            neutron_common::STATE_TRACKING_NRS.len() + 1
+        );
+        assert!(MatchSpec::default()
+            .effective_bpf_syscalls(true)
+            .is_empty());
+    }
+
+    #[test]
     fn build_from_args_translates_flag_set() {
         use crate::cli::Args;
         let args = Args {

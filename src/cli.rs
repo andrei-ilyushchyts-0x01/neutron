@@ -955,6 +955,27 @@ mod tests {
             experimental.command.as_ref().map(Command::maturity),
             Some(CommandMaturity::Experimental)
         );
+        assert!(experimental
+            .command
+            .as_ref()
+            .and_then(Command::deprecation_warning)
+            .is_some());
+    }
+
+    #[test]
+    fn pages_is_only_present_when_the_operator_requests_it() {
+        let default = Cli::try_parse_from(["neutron", "trace"]).expect("default trace");
+        let Some(Command::Trace(default)) = default.command else {
+            panic!("expected trace command");
+        };
+        assert_eq!(default.pages, None);
+
+        let explicit =
+            Cli::try_parse_from(["neutron", "trace", "--pages", "32"]).expect("legacy pages");
+        let Some(Command::Trace(explicit)) = explicit.command else {
+            panic!("expected trace command");
+        };
+        assert_eq!(explicit.pages, Some(32));
     }
 
     #[test]

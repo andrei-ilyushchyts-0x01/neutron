@@ -5228,6 +5228,60 @@ mod tests {
         assert_eq!(maturity_warning_for(None, false, false), None);
     }
 
+    #[test]
+    fn workflow_state_events_cover_every_state_dependent_trace_option() {
+        let empty = CapturePredicate::Empty;
+        assert!(!workflow_needs_state_events(&Args::default(), &empty));
+
+        for args in [
+            Args {
+                resolve_paths: true,
+                ..Args::default()
+            },
+            Args {
+                follow_children: true,
+                ..Args::default()
+            },
+            Args {
+                capture_reads: true,
+                ..Args::default()
+            },
+        ] {
+            assert!(workflow_needs_state_events(&args, &empty));
+        }
+
+        let mut spec = MatchSpec::default();
+        spec.fd_globs.push("/dev/*".into());
+        assert!(workflow_needs_state_events(
+            &Args::default(),
+            &CapturePredicate::Spec(spec)
+        ));
+    }
+
+    #[test]
+    fn deprecations_are_stderr_only_and_suppressed_for_trace_json() {
+        let legacy = Cli::try_parse_from(["neutron"]).expect("legacy trace");
+        assert!(deprecation_warnings_for(legacy.command.as_ref(), &legacy.args)
+            .iter()
+            .any(|warning| warning.contains("neutron trace")));
+
+        let pages = Cli::try_parse_from(["neutron", "trace", "--pages", "32"])
+            .expect("legacy pages");
+        let Some(Command::Trace(args)) = pages.command.as_ref() else {
+            panic!("expected trace command");
+        };
+        assert!(deprecation_warnings_for(pages.command.as_ref(), args)
+            .iter()
+            .any(|warning| warning.contains("--pages")));
+
+        let json = Cli::try_parse_from(["neutron", "trace", "--json", "--pages", "32"])
+            .expect("machine-readable trace");
+        let Some(Command::Trace(args)) = json.command.as_ref() else {
+            panic!("expected trace command");
+        };
+        assert!(deprecation_warnings_for(json.command.as_ref(), args).is_empty());
+    }
+
     fn private_test_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("neutron-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
