@@ -92,8 +92,8 @@ pub enum Command {
     #[command(subcommand)]
     Surface(crate::surface::SurfaceCommand),
 
-    /// [PREVIEW] Print built-in workflow recipes for common Android security
-    /// research tasks.
+    /// [DEPRECATED] [PREVIEW] Built-in recipes are retained through 1.x; use
+    /// the maintained guides for current workflows.
     ///
     /// PREVIEW: This command contract may change before it becomes stable.
     #[command(subcommand)]
@@ -117,17 +117,20 @@ pub enum Command {
     #[command(subcommand)]
     Aidl(AidlCommand),
 
-    /// [EXPERIMENTAL] Run a validated, bounded on-device security research scenario.
+    /// [DEPRECATED] [EXPERIMENTAL] Retained through 1.x; compose the core
+    /// surface, trace, evidence, and report commands instead.
     ///
     /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     Research(crate::research::ResearchArgs),
 
-    /// [EXPERIMENTAL] Resolve captured raw userspace IPs against ELF/APK/symbol artifacts.
+    /// [DEPRECATED] [EXPERIMENTAL] Native mapping is retained through 1.x
+    /// pending a qualified external consumer.
     ///
     /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     NativeMap(crate::native::NativeMapArgs),
 
-    /// [EXPERIMENTAL] Aggregate resolved native frames into neutral Ghidra bookmark JSON.
+    /// [DEPRECATED] [EXPERIMENTAL] Ghidra export is retained through 1.x
+    /// pending a qualified external consumer.
     ///
     /// EXPERIMENTAL: This lab command is not part of the stable 1.5 contract.
     GhidraExport(crate::native::GhidraExportArgs),
