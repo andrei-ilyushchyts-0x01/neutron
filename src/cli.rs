@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_help_labels_every_command_family_by_maturity() {
+    fn top_level_help_labels_every_command_family_by_status() {
         let cmd = Cli::command();
         let expected = [
             ("trace", "PREVIEW"),
@@ -849,17 +849,17 @@ mod tests {
             ("mark", "PREVIEW"),
             ("graph", "STABLE"),
             ("surface", "PREVIEW"),
-            ("recipes", "PREVIEW"),
+            ("recipes", "DEPRECATED"),
             ("ioctl", "EXPERIMENTAL"),
             ("harness", "EXPERIMENTAL"),
             ("aidl", "EXPERIMENTAL"),
-            ("research", "EXPERIMENTAL"),
-            ("native-map", "EXPERIMENTAL"),
-            ("ghidra-export", "EXPERIMENTAL"),
+            ("research", "DEPRECATED"),
+            ("native-map", "DEPRECATED"),
+            ("ghidra-export", "DEPRECATED"),
             ("selinux", "PREVIEW"),
         ];
 
-        for (name, maturity) in expected {
+        for (name, status) in expected {
             let subcommand = cmd
                 .find_subcommand(name)
                 .unwrap_or_else(|| panic!("missing {name} subcommand"));
@@ -868,8 +868,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {name} help"))
                 .to_string();
             assert!(
-                about.starts_with(&format!("[{maturity}]")),
-                "{name} help does not start with [{maturity}]: {about}"
+                about.starts_with(&format!("[{status}]")),
+                "{name} help does not start with [{status}]: {about}"
             );
         }
     }

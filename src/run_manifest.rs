@@ -1957,10 +1957,14 @@ mod tests {
         CoverageOwner, CoverageRepeat, CoverageRow, CoverageSummary, SourceEvidence,
     };
     use std::path::PathBuf;
-    use std::sync::OnceLock;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const LIVE_BOOT_ID: &str = "5ec7279f-c488-45f1-a625-7737c250b110";
+    static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
 
@@ -1970,8 +1974,9 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
+            let sequence = TEST_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             Self(std::env::temp_dir().join(format!(
-                "neutron-run-manifest-{}-{nonce}",
+                "neutron-run-manifest-{}-{nonce}-{sequence}",
                 std::process::id()
             )))
         }
