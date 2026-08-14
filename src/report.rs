@@ -849,6 +849,11 @@ fn render_findings(out: &mut String, snapshot: &Snapshot, top: usize) {
         out.push_str("_No finding or crash events observed._\n\n");
         return;
     }
+    if !snapshot.findings.is_empty() {
+        out.push_str(
+            "_Rule priority is analyst triage priority, not vulnerability severity; validate the primitive and crossed boundary separately._\n\n",
+        );
+    }
     for (key, count) in sorted_counts(&snapshot.findings, top) {
         out.push_str(&format!("- finding `{}`: {count}\n", markdown_code(key)));
     }
@@ -1290,9 +1295,9 @@ fn rwx_label(obj: &serde_json::Map<String, Value>, syscall: Option<&str>) -> Opt
 
 fn finding_label(obj: &serde_json::Map<String, Value>) -> String {
     let rule = str_field(obj, "rule_id").unwrap_or("<unknown>");
-    let severity = str_field(obj, "severity").unwrap_or("unknown");
+    let priority = str_field(obj, "severity").unwrap_or("unknown");
     let category = str_field(obj, "category").unwrap_or("unknown");
-    format!("{rule} severity={severity} category={category}")
+    format!("{rule} priority={priority} category={category}")
 }
 
 fn crash_label(obj: &serde_json::Map<String, Value>) -> String {

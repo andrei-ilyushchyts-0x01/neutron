@@ -201,6 +201,17 @@ impl MatchSpec {
         !self.fd_globs.is_empty()
     }
 
+    /// Return the syscall set installed in the BPF whitelist. Stateful
+    /// workflows extend an active operator filter with the shared lifecycle
+    /// set; an empty operator set keeps kernel syscall filtering disabled.
+    pub fn effective_bpf_syscalls(&self, state_events_required: bool) -> BTreeSet<i32> {
+        let mut syscalls = self.syscalls.clone();
+        if state_events_required && !syscalls.is_empty() {
+            syscalls.extend(neutron_common::STATE_TRACKING_NRS.iter().copied());
+        }
+        syscalls
+    }
+
     /// Render a human-readable audit of where each active clause lands —
     /// `bpf` for kernel-side prefilter, `user` for userspace post-filter.
     /// One line per non-empty clause; empty result for an empty spec.

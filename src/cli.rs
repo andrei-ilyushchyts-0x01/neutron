@@ -183,6 +183,23 @@ impl Command {
             | Self::GhidraExport(_) => CommandMaturity::Experimental,
         }
     }
+
+    /// Compatibility-only retirement notices for workflows that lack a
+    /// qualified 1.5 device path or duplicate maintained documentation.
+    pub const fn deprecation_warning(&self) -> Option<&'static str> {
+        match self {
+            Self::Recipes(_) => Some(
+                "`neutron recipes` is deprecated in 1.6; use the maintained guides instead (retained through 1.x)",
+            ),
+            Self::Research(_) => Some(
+                "`neutron research` is deprecated in 1.6; compose surface, trace, evidence, and report directly (retained through 1.x)",
+            ),
+            Self::NativeMap(_) | Self::GhidraExport(_) => Some(
+                "native-map and ghidra-export are deprecated in 1.6 pending a qualified external consumer (retained through 1.x)",
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -361,8 +378,8 @@ pub struct Args {
     /// (Deprecated as of CORE V1 — kept for backward compatibility. The
     /// kernel BPF ring buffer size is fixed in the BPF object; this flag is
     /// ignored.)
-    #[arg(long, default_value_t = 64)]
-    pub pages: usize,
+    #[arg(long)]
+    pub pages: Option<usize>,
 
     /// Verbose diagnostic output
     #[arg(short, long)]

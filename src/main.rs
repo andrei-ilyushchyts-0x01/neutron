@@ -752,16 +752,24 @@ impl CapturePredicate {
         matches!(self, CapturePredicate::Empty)
     }
 
-    fn needs_state_events_via_ast(&self) -> bool {
+    fn needs_state_events(&self) -> bool {
         match self {
+            CapturePredicate::Empty => false,
+            CapturePredicate::Spec(spec) => spec.needs_state_events(),
             CapturePredicate::Expr {
                 ast_mentions_fd_path,
                 bpf_spec,
                 ..
-            } => *ast_mentions_fd_path && !bpf_spec.needs_state_events(),
-            _ => false,
+            } => *ast_mentions_fd_path || bpf_spec.needs_state_events(),
         }
     }
+}
+
+fn workflow_needs_state_events(args: &Args, predicate: &CapturePredicate) -> bool {
+    args.resolve_paths
+        || args.follow_children
+        || args.capture_reads
+        || predicate.needs_state_events()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,6 +809,18 @@ fn effective_capture_scope(
         } else if let Some((_, value)) = line.split_once("[user]") {
             userspace_filters.push(value.trim().to_string());
         }
+    }
+    if workflow_needs_state_events(args, predicate)
+        && predicate
+            .bpf_spec()
+            .is_some_and(|spec| !spec.syscalls.is_empty())
+    {
+        let syscalls = neutron_common::STATE_TRACKING_NRS
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        bpf_filters.push(format!("internal state lifecycle IN {{{syscalls}}}"));
     }
     let (capture_mode, context_duration_ns) = match capture_mode {
         CaptureMode::Default => ("matched", None),
@@ -1084,12 +1104,16 @@ fn resolve_match_android_providers(args: &mut Args) -> Result<()> {
 
 /// Phase 1a — push every BPF-evaluable clause of `spec` into its kernel
 /// map, compute the `MATCH_BITS` mask, and toggle
-/// `STATE_EMIT_REQUIRED` when a clause contains an fd-path predicate.
+/// `STATE_EMIT_REQUIRED` when the configured workflow needs lifecycle state.
 ///
 /// Idempotent: setting a slot to its default zero value is the
 /// authoritative "off" signal. Userspace clauses (fd globs, comm globs,
 /// non-u32 arg widths, binder fields) leave no kernel residue.
-fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
+fn populate_match_maps(
+    bpf: &mut Ebpf,
+    spec: &MatchSpec,
+    state_events_required: bool,
+) -> Result<()> {
     let mut bits: u32 = 0;
 
     // Multi-PID via existing PID_WHITELIST. The single --pid case is still
@@ -1123,13 +1147,14 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
 
     // Syscall whitelist via existing SYSCALL_FILTER. Toggling
     // FILTER_KEY_ACTIVE is what the BPF-side `syscall_allowed` consults.
-    if !spec.syscalls.is_empty() {
+    let effective_syscalls = spec.effective_bpf_syscalls(state_events_required);
+    if !effective_syscalls.is_empty() {
         let map = bpf
             .map_mut("SYSCALL_FILTER")
             .context("SYSCALL_FILTER missing")?;
         let mut sf: AyaHashMap<_, u32, u8> =
             AyaHashMap::try_from(map).context("SYSCALL_FILTER is not HashMap<u32,u8>")?;
-        for nr in &spec.syscalls {
+        for nr in &effective_syscalls {
             sf.insert(*nr as u32, 1u8, 0)
                 .with_context(|| format!("SYSCALL_FILTER.insert({nr})"))?;
         }
@@ -1231,10 +1256,10 @@ fn populate_match_maps(bpf: &mut Ebpf, spec: &MatchSpec) -> Result<()> {
         bits |= MATCH_BIT_ARG_U32;
     }
 
-    // Only fd-path predicates drive `STATE_EMIT_REQUIRED`; without that fd-path exemption,
-    // active BPF predicates can suppress required lifecycle events. An active syscall
-    // whitelist remains the earlier gate even when the exemption is enabled.
-    let state_required = if spec.needs_state_events() {
+    // Stateful workflows must pass lifecycle events through both the early
+    // syscall whitelist and later predicate gates. Userspace consumes these
+    // before applying the operator's output predicate.
+    let state_required = if state_events_required {
         1u32
     } else {
         0u32
@@ -2615,6 +2640,35 @@ fn maturity_warning_for(
     }
 }
 
+fn deprecation_warnings_for(
+    command: Option<&Command>,
+    legacy_args: &Args,
+) -> Vec<&'static str> {
+    let trace_args = match command {
+        Some(Command::Trace(args)) => args.as_ref(),
+        _ => legacy_args,
+    };
+    if matches!(command, Some(Command::Trace(_)) | None) && trace_args.json {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    if command.is_none() {
+        warnings.push(
+            "legacy flag-only tracing is deprecated in 1.6; use `neutron trace` (retained through 1.x)",
+        );
+    }
+    if matches!(command, Some(Command::Trace(_)) | None) && trace_args.pages.is_some() {
+        warnings.push(
+            "`--pages` is ignored because the BPF ring size is fixed; remove the flag (retained through 1.x)",
+        );
+    }
+    if let Some(warning) = command.and_then(Command::deprecation_warning) {
+        warnings.push(warning);
+    }
+    warnings
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.version {
@@ -2624,6 +2678,9 @@ fn main() -> Result<()> {
             println!("neutron {}", env!("CARGO_PKG_VERSION"));
         }
         return Ok(());
+    }
+    for warning in deprecation_warnings_for(cli.command.as_ref(), &cli.args) {
+        eprintln!("warning: {warning}");
     }
     let maturity_warning = maturity_warning_for(
         cli.command.as_ref(),
@@ -3002,10 +3059,6 @@ fn run_trace(mut args: Args) -> Result<()> {
     for warning in capture_guardrail_warnings(&args) {
         eprintln!("neutron: WARNING: {warning}");
     }
-    // `--pages` is deprecated as of CORE V1 (RingBuf size is fixed in the BPF
-    // object). Silently ignored — kept only for CLI backward compatibility.
-    let _ = args.pages;
-
     // 1. Load BPF and attach tracepoints.
     let mut required_bpf_features = BPF_FEATURE_PROCESS_EXIT;
     if args.binder {
@@ -3074,20 +3127,13 @@ fn run_trace(mut args: Args) -> Result<()> {
     replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
     populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
     let capture_predicate = build_capture_predicate(&args)?;
+    let state_events_required = workflow_needs_state_events(&args, &capture_predicate);
     let (selinux_scope_pids, selinux_scope_uids) = capture_predicate
         .bpf_spec()
         .map(|spec| (spec.pids.clone(), spec.uids.clone()))
         .unwrap_or_default();
     if let Some(bpf_spec) = capture_predicate.bpf_spec() {
-        populate_match_maps(&mut bpf, bpf_spec)?;
-    }
-    if capture_predicate.needs_state_events_via_ast() {
-        let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
-        let mut filter: Array<_, u32> =
-            Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
-        filter
-            .set(FILTER_KEY_STATE_EMIT_REQUIRED, 1u32, 0)
-            .context("FILTER_MAP[STATE_EMIT_REQUIRED]=1")?;
+        populate_match_maps(&mut bpf, bpf_spec, state_events_required)?;
     }
 
     attach_tracepoint(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
@@ -3129,14 +3175,9 @@ fn run_trace(mut args: Args) -> Result<()> {
         for line in audit {
             eprintln!("    {line}");
         }
-        if capture_predicate
-            .bpf_spec()
-            .is_some_and(|s| s.needs_state_events())
-            || capture_predicate.needs_state_events_via_ast()
-        {
+        if state_events_required {
             eprintln!(
-                "    [bpf]  state-tracking syscalls bypass later match gates \
-                 only after syscall-whitelist admission; lifecycle state may be incomplete"
+                "    [bpf]  internal state-tracking syscalls admitted for path, FD, or child state"
             );
         }
         if let Some(spec) = capture_predicate.bpf_spec() {
