@@ -584,11 +584,11 @@ pub const fn ret_matches_class(ret: i64, class: u32) -> bool {
 // ── State-tracking syscalls (Phase 1a) ───────────────────────────────────────
 //
 // These syscalls can drive the userspace `FdGraph`: openat, dup, close,
-// socket, pipe, eventfd, memfd_create, accept, and clone. When an fd-path
-// predicate is active, `FILTER_KEY_STATE_EMIT_REQUIRED` lets an already-
-// admitted syscall bypass later match gates. Earlier BPF gates still apply,
-// so lifecycle state can be incomplete. The userspace post-filter decides
-// whether the event is written to NDJSON or consumed only for state.
+// socket, pipe, eventfd, memfd_create, accept, and clone. State-dependent
+// workflows enable `FILTER_KEY_STATE_EMIT_REQUIRED`; userspace also extends
+// an active syscall whitelist with this shared set. Earlier identity and
+// admission gates still apply. The userspace post-filter decides whether the
+// event is written to NDJSON or consumed only for state.
 //
 // Numbers are aarch64 generic (kernel/uapi/asm-generic/unistd.h). They
 // must stay in sync with `src/decode/syscalls.rs`.

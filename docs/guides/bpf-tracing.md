@@ -36,8 +36,8 @@ The `EVENTS` map is a bounded single multi-producer
 `BPF_MAP_TYPE_RINGBUF` (kernel 5.8+) of 1 MiB. When
 `ring.reserve()` returns `None` because the ring is full, the event is
 dropped and the reserve-failure health counter is incremented. There is no
-per-CPU buffer juggling and no `--pages` to tune (the flag is accepted for
-backward compatibility but ignored).
+per-CPU buffer juggling and no `--pages` to tune (the deprecated flag is
+accepted with a warning and ignored).
 
 ## PID Filtering
 
@@ -107,11 +107,11 @@ The userspace `--resolve-paths` flag is still useful as a safety net:
 This is independent of the BPF read path — it kicks in when the in-kernel
 read returned a truncated buffer or a closed/reused fd.
 
-`STATE_EMIT_REQUIRED` is enabled by fd-path predicates. It exempts admitted
-lifecycle events from later predicate gates; it does not expand an active
-syscall whitelist.
-`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically.
-Without that fd-path exemption, active BPF predicates can suppress lifecycle events.
+State-dependent workflows (`--resolve-paths`, `--follow-children`,
+`--capture-reads`, and fd-path predicates) extend an active syscall whitelist
+with the shared lifecycle set and enable `STATE_EMIT_REQUIRED`. These internal
+events are consumed for state regardless of the operator predicate and are not
+emitted unless they independently match it.
 The fdgraph does not model `fcntl` duplication or `close_range`, so a cached
 path is enrichment rather than proof of a current live FD binding.
 
@@ -154,9 +154,9 @@ the marker into a `type:"process_exit"` JSON line and (optionally) dumps
 the per-PID lookback ring buffer into the line's `crash_context` field.
 
 The BPF tracepoint payload does **not** carry `exit_code` /
-`exit_signal` — those live on `task_struct` and require BTF reads
-(deferred to V1.x backlog). Userspace logcat / tombstone watchers
-fill in the signal info when they observe the same crash.
+`exit_signal` — those live on `task_struct` and are not read by the current
+BPF program. Userspace logcat / tombstone watchers fill in the signal info
+when they observe the same crash.
 
 ```bash
 # Watch every process exit live (no rules, just raw events):
@@ -216,7 +216,7 @@ Stack frames are resolved by the userspace symbolizer (`src/symbolize/`):
   library.
 - **ART JIT**: `<JIT>+0xN`. Frames whose IP falls inside an
   `[anon:dalvik-jit-code-cache]` mapping are tagged but not
-  method-resolved (V1.x backlog).
+  method-resolved.
 - **Kernel frames**: `kernel_symbol+0xN` via a one-shot read of
   `/proc/kallsyms`. On Android, `kptr_restrict` typically masks the
   table when read by an unprivileged process; running as root usually

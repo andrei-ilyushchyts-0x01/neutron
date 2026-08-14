@@ -310,7 +310,7 @@ evidence_docs_do_not_overstate_capture_or_domain_filter_support() {
         contains "$changelog" 'domain follow-policy flags are rejected in 1.5'
 }
 
-limitations_disclose_filtered_fd_state_ceiling() {
+stateful_workflows_preserve_internal_lifecycle_contract() {
     local limitations="$root/docs/LIMITATIONS.md"
     local reference="$root/docs/REFERENCE.md"
     local guide="$root/docs/guides/bpf-tracing.md"
@@ -320,29 +320,30 @@ limitations_disclose_filtered_fd_state_ceiling() {
     local common="$root/neutron-common/src/lib.rs"
 
     for document in "$limitations" "$reference" "$guide"; do
-        contains "$document" '`STATE_EMIT_REQUIRED` is enabled by fd-path predicates' || return 1
-        contains "$document" '`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically' || return 1
-        contains "$document" 'Without that fd-path exemption, active BPF predicates can suppress lifecycle events' || return 1
+        contains "$document" '`STATE_EMIT_REQUIRED`' || return 1
+        contains "$document" '`--resolve-paths`' || return 1
+        contains "$document" '`--follow-children`' || return 1
+        contains "$document" '`--capture-reads`' || return 1
     done
 
-    contains "$limitations" '`fd_path` predicates' &&
+    contains "$limitations" 'internally add' &&
         contains "$limitations" '`fcntl` FD duplication' &&
         contains "$limitations" '`close_range`' &&
         contains "$limitations" 'not proof of a current live FD binding' &&
-        contains "$reference" 'An active `SYSCALL_FILTER` remains an earlier gate' &&
-        contains "$manpage" 'Only fd-path predicates enable' &&
-        contains "$manpage" 'do not enable it automatically' &&
-        contains "$manpage" 'Without that fd-path exemption, active BPF predicates can suppress lifecycle events' &&
-        contains "$main" 'Only fd-path predicates drive `STATE_EMIT_REQUIRED`' &&
-        contains "$main" 'without that fd-path exemption' &&
-        contains "$main" 'active BPF predicates can suppress required lifecycle events' &&
-        contains "$matcher" 'Only fd-path predicates require state-event exemption' &&
-        contains "$common" 'This flag never expands' &&
-        contains "$common" 'Only fd-path predicates make userspace enable this flag' &&
-        ! contains "$common" '`--match-fd`, `--resolve-paths`' &&
-        ! contains "$common" '`--resolve-paths` / `--follow-children` feature' &&
-        ! contains "$matcher" 'path resolution, comm globbing, binder semantics, or arg accessors' &&
-        ! contains "$main" 'state-tracking syscalls always-emit'
+        contains "$reference" 'extend an active `SYSCALL_FILTER`' &&
+        contains "$guide" 'extend an active syscall whitelist' &&
+        contains "$manpage" 'State-dependent workflows' &&
+        contains "$manpage" 'internal state remains complete' &&
+        contains "$manpage" 'do not broaden operator-requested' &&
+        contains "$main" 'workflow_needs_state_events' &&
+        contains "$main" 'effective_bpf_syscalls(state_events_required)' &&
+        contains "$main" 'internal state lifecycle IN' &&
+        contains "$matcher" 'effective_bpf_syscalls' &&
+        contains "$matcher" 'STATE_TRACKING_NRS.iter().copied()' &&
+        contains "$common" 'Userspace expands an active' &&
+        contains "$common" 'State-dependent' &&
+        ! rg -q 'Only fd-path predicates enable|do not enable it automatically|This flag never expands' \
+            "$limitations" "$reference" "$guide" "$manpage" "$main" "$matcher" "$common"
 }
 
 security_policy_has_private_only_reporting() {
@@ -385,7 +386,7 @@ run_test ci_and_release_gate_rustsec_advisories
 run_test release_archives_and_probe_identity_are_reproducible_inputs
 run_test current_abi_docs_match_wire_and_health_contracts
 run_test evidence_docs_do_not_overstate_capture_or_domain_filter_support
-run_test limitations_disclose_filtered_fd_state_ceiling
+run_test stateful_workflows_preserve_internal_lifecycle_contract
 run_test security_policy_has_private_only_reporting
 run_test product_contract_labels_every_command
 

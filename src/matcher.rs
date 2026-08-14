@@ -1600,9 +1600,7 @@ mod tests {
             effective.len(),
             neutron_common::STATE_TRACKING_NRS.len() + 1
         );
-        assert!(MatchSpec::default()
-            .effective_bpf_syscalls(true)
-            .is_empty());
+        assert!(MatchSpec::default().effective_bpf_syscalls(true).is_empty());
     }
 
     #[test]

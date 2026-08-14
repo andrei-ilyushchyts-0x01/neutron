@@ -14,19 +14,19 @@
 | `graph`       | Render causal NDJSON as Mermaid or `neutron.causal-graph/v1` JSON. |
 | `surface`     | Collect, query, or semantically diff Android service/HAL/process/device/resource snapshots. |
 | `report`      | Render a Markdown kernel-boundary report from one capture. |
-| `recipes`     | Print built-in workflow recipes, e.g. `neutron recipes android-content-provider`. |
-| `ioctl generate` | Build a deterministic `neutron.ioctl-schema/v1` pack from kernel UAPI/vendor headers with host `clang`. |
-| `aidl index` / `aidl decode` | Build an AIDL catalog or run a selective offline decoder plugin. |
-| `harness extract` / `build` / `minimize` / `replay` | Build and run bounded regression artifacts on an explicit physical USB device. |
+| `recipes`     | **Deprecated:** retained-through-1.x built-in workflow recipes. |
+| `ioctl generate` | Frozen experimental schema generation from reviewed kernel UAPI/vendor headers. |
+| `aidl index` / `aidl decode` | Frozen experimental AIDL catalog and selective offline decoder workflow. |
+| `harness extract` / `build` / `minimize` / `replay` | Frozen experimental regression workflow for an explicit physical USB device. |
 | `selinux explain` | Explain one captured AVC and exact observed delegation evidence. |
-| `research` | Run a validated data-only subsystem research pack. |
-| `native-map` / `ghidra-export` | Resolve captured native frames and export neutral bookmark JSON. |
+| `research` | **Deprecated:** retained-through-1.x data-only subsystem research packs. |
+| `native-map` / `ghidra-export` | **Deprecated:** retained-through-1.x native frame and bookmark export compatibility. |
 
 For `window`, see [docs/guides/window.md](guides/window.md). For
 `summarize` / `diff`, see the per-subcommand `--help`. For `mark`, see
 the **Marker workflow** section below. For Android provider work, use
-`neutron recipes android-content-provider` or
-[guides/android-content-provider.md](guides/android-content-provider.md).
+[guides/android-content-provider.md](guides/android-content-provider.md); the
+equivalent built-in recipe is retained only for 1.x compatibility.
 
 ## CLI Flags
 
@@ -47,7 +47,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--control-socket PATH|off`       | String           | `/data/local/share/neutron/runtime/neutron.control.sock` | Live scenario marker socket; `off` disables it. |
 | `--pid N`                         | u32              | `0`                                      | Target process ID. `0` traces all processes. |
 | `--object PATH`                   | String           | `/data/local/share/neutron/neutron.bpf.elf` | Path to the compiled Aya BPF ELF object on the device. |
-| `--pages N`                       | usize            | `64`                                     | **Deprecated.** Accepted for backward compatibility; ignored. The kernel `RingBuf` size is fixed in the BPF object. |
+| `--pages N`                       | usize            | 64 (ignored)                             | **Deprecated.** Accepted for backward compatibility with a warning when supplied; ignored. The kernel `RingBuf` size is fixed in the BPF object. |
 | `-v, --verbose`                   | flag             | off                                      | Print diagnostic information to stderr: attached programs, kallsyms status, follow-children / capture-reads decisions, Aya verifier log on a failed `prog.load()`. |
 | `--exclude-comm LIST`             | comma-separated  | empty                                    | Exclude events whose `comm` field contains any of the listed substrings. Applied in userspace after reading from the ring buffer. |
 | `--output PATH`                   | String           | stdout                                   | Write event output to a file instead of stdout. |
@@ -86,7 +86,7 @@ the **Marker workflow** section below. For Android provider work, use
 | `--match-package LIST`            | comma-separated  | empty                                    | Android package-name match. Resolved on-device to UID(s) through `cmd package` / `pm`, then applied through the BPF UID prefilter. |
 | `--match-android-provider LIST`   | comma-separated  | empty                                    | Android content-provider authority match. Accepts `authority` or `content://authority/path`, resolves through `dumpsys package providers` to the provider package, then applies the package UID through the BPF UID prefilter. |
 | `--match-syscall LIST`            | comma-separated  | empty                                    | Syscall whitelist by aarch64 nr. Reuses `SYSCALL_FILTER`. BPF-evaluable. |
-| `--match-fd LIST`                 | comma-separated  | empty                                    | Glob-matched fd path (e.g. `'/dev/lwis*,/dev/gxp'`). Userspace-only — needs `--resolve-paths` or an established fdgraph entry. Enables `STATE_EMIT_REQUIRED` for admitted lifecycle events; it does not expand an active syscall whitelist. |
+| `--match-fd LIST`                 | comma-separated  | empty                                    | Glob-matched fd path (e.g. `'/dev/lwis*,/dev/gxp'`). Userspace-only — needs `--resolve-paths` or an established fdgraph entry. Extends an active syscall whitelist with internal lifecycle events and enables `STATE_EMIT_REQUIRED`; those events do not broaden output. |
 | `--match-comm LIST`               | comma-separated  | empty                                    | Glob-matched `comm`. Userspace-only. |
 | `--match-ioctl-cmd LIST`          | comma-separated  | empty                                    | ioctl `cmd` 32-bit word. BPF-evaluable. |
 | `--match-ioctl-type LIST`         | comma-separated  | empty                                    | `_IOC_TYPE` byte (e.g. `0x4c` for LWIS). BPF-evaluable. |
@@ -837,9 +837,10 @@ the profile default:
 With the default list, all other syscall numbers are discarded in BPF before
 any RingBuf reservation.
 
-`STATE_EMIT_REQUIRED` is enabled by fd-path predicates. An active `SYSCALL_FILTER` remains an earlier gate.
-`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically.
-Without that fd-path exemption, active BPF predicates can suppress lifecycle events.
+State-dependent workflows extend an active `SYSCALL_FILTER` with the shared
+lifecycle set and enable `STATE_EMIT_REQUIRED`. Internal lifecycle events are
+consumed for state regardless of userspace filtering and do not broaden
+requested output.
 The `FdGraph` does not model `fcntl` duplication or `close_range`; a cached
 path is enrichment, not proof of a current live FD binding.
 

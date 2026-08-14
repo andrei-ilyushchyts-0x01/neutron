@@ -311,7 +311,8 @@ JSON document. Syscall collapse is deterministic and never crosses a causal
 parent or trace ID.
 .TP
 .B recipes
-Print one built-in Android research workflow. Run
+Deprecated and retained through 1.x. Print one built-in Android research
+workflow. Run
 .B neutron recipes \-\-help
 for available names.
 .TP
@@ -333,16 +334,18 @@ artifacts. Device execution requires an explicit physical USB target and
 authorized-use acknowledgement.
 .TP
 .B research
-Validate and run one data-only subsystem research pack with bounded typed
-stimulus and private artifact locking.
+Deprecated, frozen, and retained through 1.x. Validates and runs one data-only
+subsystem research pack with bounded typed stimulus and private artifact
+locking.
 .TP
 .B native-map
-Resolve captured raw user IPs against bounded ELF/APK/symbol inputs into
+Deprecated, frozen, and retained through 1.x. Resolves captured raw user IPs
+against bounded ELF/APK/symbol inputs into
 .BR neutron.native-map/v1 .
 .TP
 .B ghidra-export
-Export neutral, versioned ELF virtual-address bookmarks for a separate Ghidra
-consumer.
+Deprecated, frozen, and retained through 1.x. Exports neutral, versioned ELF
+virtual-address bookmarks for a separate Ghidra consumer.
 .TP
 .B selinux explain
 Explain one captured AVC and exact observed delegation evidence without
@@ -660,23 +663,28 @@ in
 .B \-\-match \fIEXPR\fR
 falls through to userspace as a safe over-approximation.
 .PP
-Only fd-path predicates enable
-.BR STATE_EMIT_REQUIRED .
-.BR \-\-resolve-paths ,
+State-dependent workflows
+.RB ( \-\-resolve-paths ,
 .BR \-\-follow-children ,
-and
-.B \-\-capture-reads
-do not enable it automatically. Kernel-side state-tracking syscalls bypass
-later predicate gates only after earlier BPF gates admit them; an active
+.BR \-\-capture-reads ,
+and fd-path predicates) enable
+.BR STATE_EMIT_REQUIRED .
+When an explicit syscall filter is active, userspace adds the shared lifecycle
+set to
 .B SYSCALL_FILTER
-is always enforced. Without that fd-path exemption, active BPF predicates can suppress lifecycle events.
+so internal state remains complete. Those internal events bypass later
+predicate gates for state maintenance and do not broaden operator-requested
+output. The effective internal set is recorded in the capture scope.
 The tracked set includes
 .RB ( open ", " close ", " dup ", " dup3 ", " socket ", " pipe2 ", "
 .BR memfd_create ", " clone )
 and can enrich the userspace
 .B FdGraph
 when those events are admitted. Sampling and rate-limiting exempt admitted
-state events, but a filtered lifecycle remains incomplete.
+state events. The set does not yet include
+.B fcntl
+duplication or
+.BR close_range .
 .TP
 .BI \-\-match-pid " LIST"
 Multi-PID match (comma-separated u32). BPF-evaluable.
@@ -694,10 +702,10 @@ map.
 .BI \-\-match-fd " LIST"
 Glob-matched fd path (e.g.
 .BR '/dev/lwis*,/dev/gxp' ).
-Userspace-only; toggles
+Userspace-only; enables
 .B STATE_EMIT_REQUIRED
-so admitted kernel-side fd-state syscalls bypass later predicates. It does
-not expand an active syscall whitelist.
+and extends an active syscall whitelist with internal lifecycle events. Those
+events update state without broadening requested output.
 .TP
 .BI \-\-match-comm " LIST"
 Glob-matched
@@ -873,7 +881,7 @@ and
 .TP
 .BI \-\-pages " N"
 .B Deprecated
-as of 1.0.0 and silently ignored.
+as of 1.0.0, accepted with a warning, and ignored.
 Kept for backward compatibility with scripts that still pass the old
 PerfEventArray page count.
 The kernel
@@ -1271,6 +1279,9 @@ add
 .BR first_seen_ms ", " last_seen_ms ", " period_ms ", " evidence ", " behavior ", "
 .BR "interpretation[]" ", " confidence ", " false_positives ", " evidence_quality ", "
 .BR capture_health ", " aggregates ", " raw_window ", and (1.2.0) " fdinfo_at_event .
+Rule
+.B severity
+is analyst triage priority, not demonstrated vulnerability severity.
 The last three are populated by the engine at flush time \(em see
 .BR "FINDING AGGREGATES" .
 .PP

@@ -502,7 +502,9 @@ The same `stack` string is what the rule engine sees for
 ## Findings
 
 When the rule engine fires, findings emit alongside (or instead of) raw
-events.
+events. The `severity` field is an analyst triage priority inherited from the
+rule definition; it is not vulnerability severity. A finding still requires
+separate reproduction of a security primitive and crossed trust boundary.
 
 ### Text Format
 

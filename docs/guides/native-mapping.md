@@ -1,5 +1,8 @@
 # Native code mapping
 
+> **Deprecated:** this experimental command family is frozen and retained
+> through 1.x pending a qualified external consumer.
+
 Captures made with `--stacks --json` include additive `process_maps` and
 `stack_trace` records. They preserve process start time, executable mappings,
 raw instruction pointers, rendered frames, ELF build IDs, and load bias. Event

@@ -4,6 +4,10 @@ The `neutron-rules` crate implements a small declarative DSL for matching
 syscall events and emitting findings. Rules are YAML; the engine evaluates
 them against the same JSON event schema produced by `neutron --json`.
 
+`severity` is an analyst triage priority, not vulnerability severity. Rules
+identify observable patterns; they do not establish a primitive, impact, or a
+crossed trust boundary by themselves.
+
 ## Schema
 
 A rule file is a top-level YAML list of rule objects:
@@ -35,7 +39,7 @@ A rule file is a top-level YAML list of rule objects:
 | `id`          | yes      | Stable identifier. Convention: `T0xx_short_slug`.                |
 | `name`        | yes      | Human-readable title.                                             |
 | `description` | yes      | Full description; shown in findings.                              |
-| `severity`    | yes      | `info` / `low` / `medium` / `high` / `critical`.                  |
+| `severity`    | yes      | Triage priority: `info` / `low` / `medium` / `high` / `critical`. |
 | `category`    | yes      | One of the seven categories above.                                |
 | `references`  | no       | List of strings. Free-form citations.                             |
 | `conditions`  | yes      | Non-empty list. AND-joined.                                       |

@@ -398,7 +398,7 @@ evicted, `latency_us` is `null` in JSON output.
 | `EVENTS` | `RingBuf` | — | bytes | 1 MiB | Single multi-producer event ring. |
 | `EVENT_SCRATCH` | `PerCpuArray` | u32 | aligned event | 1 | Exit-path scratch outside the 512-byte BPF stack. |
 | `INFLIGHT` | `HashMap` | u64 pid_tgid | `SyscallEvent` | 4096 | Syscall enter/exit correlation. |
-| `SYSCALL_FILTER` | `HashMap` | u32 syscall | u8 | 64 | Active syscall whitelist. |
+| `SYSCALL_FILTER` | `HashMap` | u32 syscall | u8 | 64 | Active syscall whitelist plus lifecycle syscalls required by state-dependent workflows. |
 | `PID_WHITELIST` | `HashMap` | u32 PID | u8 | 256 | `--follow-children` PIDs. |
 | `TRACED_PROCESSES` | `HashMap` | u32 PID | `ProcessTraceContext` | 64 default, loader override | Bounded dynamic causal set (`--max-processes`). |
 | `BINDER_FOLLOW_DENY_PIDS` | `HashMap` | u32 PID | u8 | 64 | Reserved for pre-admission Binder deny policy. The related CLI flags are rejected in 1.5 because complete enforcement is not yet safe. |
@@ -437,32 +437,26 @@ config.
   a belt-and-braces option for cases where the in-kernel read returned a
   truncated buffer or a closed fd.
 - **RingBuf available** (kernel 5.8+). `BPF_MAP_TYPE_RINGBUF` is the
-  output channel. The CLI `--pages` flag is accepted for backward
-  compatibility but ignored.
+  output channel. The deprecated CLI `--pages` flag is accepted with a
+  warning and ignored.
 - **No BPF LSM, no `fentry`/`fexit`**: see device profile. We use
   tracepoints + kprobes only.
 - **BPF stack limit still 512 bytes**: `SyscallEvent` (257) goes via
   `MaybeUninit` and a `RingBuf::reserve()` slot, never as a stack-local
   copy.
 
-## What is intentionally not yet implemented
+## Current platform boundaries
 
 - `bpf_d_path` for fd-to-path resolution. Requires BPF LSM hooks, which
   are not enabled on the husky GKI kernel.
 - ART method-resolved JIT symbolization. The current implementation tags
-  JIT regions but does not walk ART runtime structures — that is V1.x
-  backlog (see [docs/ROADMAP.md](ROADMAP.md)).
+  JIT regions but does not walk ART runtime structures.
 - `bpf_loop` for variable-length scans. The verifier on 6.1.x supports it,
   but the existing unrolled paths are short enough that the rewrite has
   not been justified.
-- Pinned maps (`/sys/fs/bpf/...`) for cross-process coordination. The
-  filesystem is mounted on the device — see V2 considerations in
-  ROADMAP.md.
-- `task_struct->exit_code` BTF read on the BPF `sched_process_exit` path.
-  The tracepoint payload doesn't carry exit_code/exit_signal; today
-  userspace logcat / tombstone sources fill them in. A BTF read would
-  let the BPF path emit `exit_signal` directly, useful on hosts where
-  logcat is unavailable.
+- Pinned maps (`/sys/fs/bpf/...`) for cross-process coordination are not used.
+- The BPF `sched_process_exit` tracepoint does not provide exit code or signal;
+  userspace logcat and tombstone sources provide them when available.
 - Generic Binder Parcel decoding beyond the AIDL `code` field. The correlator
   pairs caller↔callee and surfaces interface/method attribution where exact
   catalog evidence exists. A bounded offline KeyMint plugin can decode one

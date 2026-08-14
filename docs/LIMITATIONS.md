@@ -176,20 +176,12 @@ kernel event; their refresh is only for reconciliation and limit enforcement.
 
 ### 9. FD-state enrichment under syscall whitelists
 
-When a syscall whitelist is active (for example, through
-`--profile security` or `--match-syscall`), neutron does **not** automatically
-add the lifecycle syscalls needed by stateful userspace features.
-`STATE_EMIT_REQUIRED` is enabled by fd-path predicates so admitted state
-events can bypass later predicate filtering.
-`--resolve-paths`, `--follow-children`, and `--capture-reads` do not enable it automatically.
-An active `SYSCALL_FILTER` remains an earlier gate. Without that fd-path exemption, active BPF predicates can suppress lifecycle events.
-
-As a result, `--resolve-paths`, `--match-fd` and other `fd_path` predicates,
-`--capture-reads`, and `--follow-children` can be incomplete when active BPF
-predicates suppress lifecycle events. With a syscall whitelist, explicitly
-include the lifecycle syscalls each feature needs. For example, FD state
-depends on observed `openat`/`openat2`, `close`, and duplication events, while
-child following depends on `clone`.
+When a syscall whitelist is active, state-dependent workflows internally add
+the existing lifecycle syscall set to `SYSCALL_FILTER` and enable
+`STATE_EMIT_REQUIRED`. This applies to `--resolve-paths`, `--capture-reads`,
+`--follow-children`, and fd-path predicates. The events are consumed for state
+regardless of the operator predicate and do not broaden requested output. The
+effective capture scope records this internal instrumentation.
 
 The userspace `FdGraph` also does not model `fcntl` FD duplication or
 `close_range`. Its `/proc/<pid>/fd/<fd>` fallback can repair an individual

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserved FD/path/child lifecycle state when an active syscall whitelist is
+  combined with `--resolve-paths`, `--capture-reads`, `--follow-children`, or
+  an fd-path predicate. Internal lifecycle events update state but do not
+  broaden operator-requested output.
+- Added compatibility deprecation notices for legacy flag-only tracing,
+  ignored `--pages`, built-in recipes, research packs, native mapping, and
+  Ghidra export; all remain available through the 1.x line.
+- Froze the experimental ioctl, AIDL, and harness families to maintenance and
+  hardening; no new command surface is planned without concrete capture
+  evidence.
+- Reframed rule severity as analyst triage priority in reports. A rule match,
+  crash, or observed edge is not presented as a demonstrated vulnerability.
+- Removed speculative Frida/ecosystem/platform expansion guidance from the
+  maintained roadmap.
+
 ## [1.5.0] — 2026-07-18
 
 - Promoted the 1.5 release candidate to a stable distribution and schema

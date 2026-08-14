@@ -22,15 +22,14 @@ also operate on saved captures.
 | [guides/quickstart.md](guides/quickstart.md) | Build, deploy, capture your first trace in minutes |
 | [guides/harness.md](guides/harness.md) | Extract, minimize, and safely replay captured regression testcases |
 | [guides/aidl-intelligence.md](guides/aidl-intelligence.md) | Index AIDL catalogs and selectively decode complete offline testcases |
-| [guides/native-mapping.md](guides/native-mapping.md) | Resolve bounded native ELF/APK frames and export neutral Ghidra bookmarks |
-| [guides/research-packs.md](guides/research-packs.md) | Validate and run bounded data-only subsystem research scenarios |
+| [guides/native-mapping.md](guides/native-mapping.md) | **Deprecated:** retained-through-1.x native mapping compatibility workflow |
+| [guides/research-packs.md](guides/research-packs.md) | **Deprecated:** retained-through-1.x research-pack compatibility workflow |
 | [guides/android-content-provider.md](guides/android-content-provider.md) | Low-noise Android content-provider research workflow |
 | [guides/selinux.md](guides/selinux.md) | Capture AVC decisions and explain exact observed delegation |
 | [guides/bpf-tracing.md](guides/bpf-tracing.md) | Tracing concepts, profiles, filtering, stack traces |
 | [guides/security-assessment.md](guides/security-assessment.md) | End-to-end assessment workflow |
 | [guides/output-formats.md](guides/output-formats.md) | Text and NDJSON formats with parsing examples |
 | [guides/writing-rules.md](guides/writing-rules.md) | Authoring custom YAML detector rules |
-| [guides/frida-integration.md](guides/frida-integration.md) | Frida + BPF integration |
 
 ## Quick Reference
 
@@ -42,21 +41,28 @@ ADB=(adb -s "$ANDROID_SERIAL")
 # Build BPF + userspace and deploy to that device.
 ./build.sh
 
-# Use one private run directory for this example.
+# Use private run directories for authorized evidence.
 NEUTRON=/data/local/share/neutron/neutron-agent
-RUN=/data/local/share/neutron/runs/quick-reference
-"${ADB[@]}" shell "su -c 'install -d -m 0700 ${RUN}'"
+SURFACE_RUN=/data/local/share/neutron/runs/quick-surface
+TRACE_RUN=/data/local/share/neutron/runs/quick-trace
 
-# Security profile + Binder + stacks.
-"${ADB[@]}" shell "su -c '${NEUTRON} trace \
-    --pid <PID> --profile security --binder --stacks'"
+# Map exact service/HAL targets, then trace one bounded package scenario.
+"${ADB[@]}" shell "su -c '${NEUTRON} surface coverage \
+    --targets /data/local/share/neutron/targets.txt --minimal \
+    --json /data/local/share/neutron/coverage.json \
+    --tsv /data/local/share/neutron/coverage.tsv --run-dir ${SURFACE_RUN}'"
+"${ADB[@]}" shell "su -c 'timeout -s INT 30 ${NEUTRON} trace \
+    --match-package com.example.app --json --raw \
+    --attacker-capability not_tested --run-dir ${TRACE_RUN}'"
 
-# Raw NDJSON capture for offline analysis.
-"${ADB[@]}" shell "su -c '${NEUTRON} trace \
-    --pid <PID> --raw --no-findings --json \
-    --output ${RUN}/trace.ndjson'"
-"${ADB[@]}" exec-out "su -c 'cat ${RUN}/trace.ndjson'" > trace.ndjson
+# Retrieve the fixed bundle members as described in the quickstart, then:
+./neutron evidence verify quick-surface
+./neutron evidence verify quick-trace
+./neutron report quick-trace/capture.ndjson > report.md
 ```
+
+See [guides/quickstart.md](guides/quickstart.md) for the bounded, allowlisted
+bundle-transfer commands.
 
 ## Requirements
 

@@ -1,5 +1,9 @@
 # Security research packs
 
+> **Deprecated:** this experimental command family is frozen and retained
+> through 1.x. Compose `surface`, `trace`, `evidence`, and `report` for
+> maintained workflows.
+
 `neutron research` runs a validated, data-only pack through static
 surface preflight, one scoped child trace, one typed companion stimulus,
 postflight correlation, and a Markdown report.

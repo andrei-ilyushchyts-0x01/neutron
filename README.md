@@ -340,9 +340,9 @@ Trace a probing app plus the provider package UID resolved from an authority:
   --output ${REMOTE_RUN}/provider.ndjson'"
 ```
 
-### System App Sweep
+### Deprecated System App Sweep Recipe
 
-Print the built-in sweep recipe:
+The retained-through-1.x compatibility recipe prints the old sweep workflow:
 
 ```bash
 ./neutron recipes system-app-sweep
@@ -479,9 +479,9 @@ each matching process on its first observed kernel event, including processes
 created between `/proc` refreshes; the refresh reconciles exits and process
 limits. The option cannot be combined with `--package` or an explicit `--pid`.
 
-## Three Boundary Report Workflows
+## Deprecated Boundary Report Recipes
 
-These built-in recipes print end-to-end commands and finish with
+These retained-through-1.x compatibility recipes print end-to-end commands and finish with
 `neutron report`, so the final artifact is a Markdown boundary report rather
 than only a table or event window.
 
@@ -822,19 +822,18 @@ maintainers have approved the tag, notes, exact workflow SHA, and assets.
 - [docs/guides/quickstart.md](docs/guides/quickstart.md): longer first-trace walkthrough
 - [docs/guides/security-assessment.md](docs/guides/security-assessment.md): assessment workflow
 - [docs/guides/bpf-tracing.md](docs/guides/bpf-tracing.md): profiles, filtering, capture, stacks
-- [docs/guides/native-mapping.md](docs/guides/native-mapping.md): offline ELF/APK mapping and Ghidra bookmark export
+- [docs/guides/native-mapping.md](docs/guides/native-mapping.md): deprecated retained-through-1.x native mapping workflow
 - [docs/guides/harness.md](docs/guides/harness.md): capture, minimize, and replay regression testcases
-- [docs/guides/research-packs.md](docs/guides/research-packs.md): validated on-device research packs
+- [docs/guides/research-packs.md](docs/guides/research-packs.md): deprecated retained-through-1.x research-pack workflow
 - [docs/guides/writing-rules.md](docs/guides/writing-rules.md): custom detectors
 - [docs/guides/output-formats.md](docs/guides/output-formats.md): text and JSON schemas
 - [docs/REFERENCE.md](docs/REFERENCE.md): complete trace and Surface CLI/schema reference
 - [docs/guides/window.md](docs/guides/window.md): `neutron window`
 - [docs/guides/binder-attribution.md](docs/guides/binder-attribution.md): Binder service maps, templates, and catalogs
-- [docs/guides/frida-integration.md](docs/guides/frida-integration.md): Frida plus BPF workflows
 - [docs/case-studies/wallet-boundary.md](docs/case-studies/wallet-boundary.md): redacted wallet boundary report example
 - [docs/devices/pixel8pro.md](docs/devices/pixel8pro.md): verified device profile
 - [docs/LIMITATIONS.md](docs/LIMITATIONS.md): what neutron cannot see
-- [docs/ROADMAP.md](docs/ROADMAP.md): capability status, external gates, and planned work
+- [docs/ROADMAP.md](docs/ROADMAP.md): capability status, external gates, and non-goals
 - [CHANGELOG.md](CHANGELOG.md): version history
 
 ## License

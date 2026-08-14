@@ -35,17 +35,18 @@ Supported device rows remain narrower than the CLI surface.
 | `neutron mark` | PREVIEW | Scenario markers for a live bounded capture. |
 | `neutron graph` | STABLE | Versioned causal graph rendering. |
 | `neutron surface` | PREVIEW | Static/live ownership mapping and target coverage; device support is matrix-bound. |
-| `neutron recipes` | PREVIEW | Operator examples, not additional security claims. |
-| `neutron ioctl` | EXPERIMENTAL | Lab schema generation from reviewed headers. |
-| `neutron harness` | EXPERIMENTAL | Authorized physical-device replay and minimization. |
-| `neutron aidl` | EXPERIMENTAL | Catalog generation and selective offline decoding. |
-| `neutron research` | EXPERIMENTAL | Typed, bounded research packs requiring explicit authorization. |
-| `neutron native-map` | EXPERIMENTAL | Offline native address mapping. |
-| `neutron ghidra-export` | EXPERIMENTAL | Neutral bookmark export for a separate consumer. |
+| `neutron recipes` | DEPRECATED (PREVIEW) | Retained through 1.x; maintained guides are canonical. |
+| `neutron ioctl` | EXPERIMENTAL | Frozen lab schema generation from reviewed headers; maintenance and hardening only. |
+| `neutron harness` | EXPERIMENTAL | Frozen authorized physical-device replay and minimization workflow; maintenance and hardening only. |
+| `neutron aidl` | EXPERIMENTAL | Frozen catalog generation and selective offline decoding; maintenance and hardening only. |
+| `neutron research` | DEPRECATED (EXPERIMENTAL) | Retained through 1.x; compose the core workflow directly. |
+| `neutron native-map` | DEPRECATED (EXPERIMENTAL) | Retained through 1.x pending a qualified external consumer. |
+| `neutron ghidra-export` | DEPRECATED (EXPERIMENTAL) | Retained through 1.x pending a qualified external consumer. |
 | `neutron selinux` | PREVIEW | Explanation of observed policy evidence; never policy synthesis. |
 
 The legacy flag-only tracer invocation remains an alias for `neutron trace`
-through the 1.5 release line.
+through the 1.x release line and emits a deprecation notice outside
+machine-readable trace mode.
 
 ## Support matrix
 
