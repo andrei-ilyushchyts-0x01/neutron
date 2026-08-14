@@ -475,8 +475,8 @@ pub const FILTER_KEY_ARG_U32_OFF: u32 = 5;
 pub const FILTER_KEY_IOCTL_DIR: u32 = 6;
 /// Phase 1a — when set to `1`, BPF programs let state-tracking syscalls
 /// (see [`is_state_tracking_nr`]) bypass later match-predicate gates after
-/// any legacy syscall-whitelist admission. This flag never expands
-/// `SYSCALL_FILTER`. Only fd-path predicates make userspace enable this flag.
+/// any legacy syscall-whitelist admission. Userspace expands an active
+/// `SYSCALL_FILTER` with the shared lifecycle set before enabling this flag.
 pub const FILTER_KEY_STATE_EMIT_REQUIRED: u32 = 7;
 /// Enable matching through `TRACED_PROCESSES` instead of broad PID 0 mode.
 pub const FILTER_KEY_CAUSAL_MODE: u32 = 8;

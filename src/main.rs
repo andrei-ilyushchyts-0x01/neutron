@@ -10,6 +10,7 @@
 //! that targeted kernel 4.14 lives in git history before this commit.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -1258,12 +1259,8 @@ fn populate_match_maps(
 
     // Stateful workflows must pass lifecycle events through both the early
     // syscall whitelist and later predicate gates. Userspace consumes these
-    // before applying the operator's output predicate.
-    let state_required = if state_events_required {
-        1u32
-    } else {
-        0u32
-    };
+    // regardless of the operator's output predicate.
+    let state_required = if state_events_required { 1u32 } else { 0u32 };
     let map = bpf.map_mut("FILTER_MAP").context("FILTER_MAP missing")?;
     let mut filter: Array<_, u32> = Array::try_from(map).context("FILTER_MAP is not Array<u32>")?;
     filter
@@ -2643,6 +2640,7 @@ fn maturity_warning_for(
 fn deprecation_warnings_for(
     command: Option<&Command>,
     legacy_args: &Args,
+    pages_requested: bool,
 ) -> Vec<&'static str> {
     let trace_args = match command {
         Some(Command::Trace(args)) => args.as_ref(),
@@ -2658,7 +2656,7 @@ fn deprecation_warnings_for(
             "legacy flag-only tracing is deprecated in 1.6; use `neutron trace` (retained through 1.x)",
         );
     }
-    if matches!(command, Some(Command::Trace(_)) | None) && trace_args.pages.is_some() {
+    if matches!(command, Some(Command::Trace(_)) | None) && pages_requested {
         warnings.push(
             "`--pages` is ignored because the BPF ring size is fixed; remove the flag (retained through 1.x)",
         );
@@ -2669,7 +2667,17 @@ fn deprecation_warnings_for(
     warnings
 }
 
+fn pages_was_requested(args: impl IntoIterator<Item = OsString>) -> bool {
+    args.into_iter().any(|arg| {
+        arg == "--pages"
+            || arg
+                .to_str()
+                .is_some_and(|value| value.starts_with("--pages="))
+    })
+}
+
 fn main() -> Result<()> {
+    let pages_requested = pages_was_requested(std::env::args_os());
     let cli = Cli::parse();
     if cli.version {
         if cli.args.verbose {
@@ -2679,7 +2687,7 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    for warning in deprecation_warnings_for(cli.command.as_ref(), &cli.args) {
+    for warning in deprecation_warnings_for(cli.command.as_ref(), &cli.args, pages_requested) {
         eprintln!("warning: {warning}");
     }
     let maturity_warning = maturity_warning_for(
@@ -3132,9 +3140,9 @@ fn run_trace(mut args: Args) -> Result<()> {
         .bpf_spec()
         .map(|spec| (spec.pids.clone(), spec.uids.clone()))
         .unwrap_or_default();
-    if let Some(bpf_spec) = capture_predicate.bpf_spec() {
-        populate_match_maps(&mut bpf, bpf_spec, state_events_required)?;
-    }
+    let empty_bpf_spec = MatchSpec::default();
+    let bpf_spec = capture_predicate.bpf_spec().unwrap_or(&empty_bpf_spec);
+    populate_match_maps(&mut bpf, bpf_spec, state_events_required)?;
 
     attach_tracepoint(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
     attach_tracepoint(&mut bpf, "trace_sys_exit", "raw_syscalls", "sys_exit")?;
@@ -5302,16 +5310,18 @@ mod tests {
     #[test]
     fn deprecations_are_stderr_only_and_suppressed_for_trace_json() {
         let legacy = Cli::try_parse_from(["neutron"]).expect("legacy trace");
-        assert!(deprecation_warnings_for(legacy.command.as_ref(), &legacy.args)
-            .iter()
-            .any(|warning| warning.contains("neutron trace")));
+        assert!(
+            deprecation_warnings_for(legacy.command.as_ref(), &legacy.args, false)
+                .iter()
+                .any(|warning| warning.contains("neutron trace"))
+        );
 
-        let pages = Cli::try_parse_from(["neutron", "trace", "--pages", "32"])
-            .expect("legacy pages");
+        let pages =
+            Cli::try_parse_from(["neutron", "trace", "--pages", "32"]).expect("legacy pages");
         let Some(Command::Trace(args)) = pages.command.as_ref() else {
             panic!("expected trace command");
         };
-        assert!(deprecation_warnings_for(pages.command.as_ref(), args)
+        assert!(deprecation_warnings_for(pages.command.as_ref(), args, true)
             .iter()
             .any(|warning| warning.contains("--pages")));
 
@@ -5320,7 +5330,13 @@ mod tests {
         let Some(Command::Trace(args)) = json.command.as_ref() else {
             panic!("expected trace command");
         };
-        assert!(deprecation_warnings_for(json.command.as_ref(), args).is_empty());
+        assert!(deprecation_warnings_for(json.command.as_ref(), args, true).is_empty());
+
+        assert!(!pages_was_requested([OsString::from("neutron")]));
+        assert!(pages_was_requested([
+            OsString::from("neutron"),
+            OsString::from("--pages=64"),
+        ]));
     }
 
     fn private_test_dir(label: &str) -> std::path::PathBuf {

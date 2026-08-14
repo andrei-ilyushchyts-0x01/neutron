@@ -381,8 +381,8 @@ pub struct Args {
     /// (Deprecated as of CORE V1 — kept for backward compatibility. The
     /// kernel BPF ring buffer size is fixed in the BPF object; this flag is
     /// ignored.)
-    #[arg(long)]
-    pub pages: Option<usize>,
+    #[arg(long, default_value_t = 64)]
+    pub pages: usize,
 
     /// Verbose diagnostic output
     #[arg(short, long)]
@@ -1001,19 +1001,19 @@ mod tests {
     }
 
     #[test]
-    fn pages_is_only_present_when_the_operator_requests_it() {
+    fn pages_preserves_its_legacy_type_and_default() {
         let default = Cli::try_parse_from(["neutron", "trace"]).expect("default trace");
         let Some(Command::Trace(default)) = default.command else {
             panic!("expected trace command");
         };
-        assert_eq!(default.pages, None);
+        assert_eq!(default.pages, 64);
 
         let explicit =
             Cli::try_parse_from(["neutron", "trace", "--pages", "32"]).expect("legacy pages");
         let Some(Command::Trace(explicit)) = explicit.command else {
             panic!("expected trace command");
         };
-        assert_eq!(explicit.pages, Some(32));
+        assert_eq!(explicit.pages, 32);
     }
 
     #[test]
