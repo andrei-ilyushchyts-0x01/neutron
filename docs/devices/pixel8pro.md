@@ -135,6 +135,55 @@ limits. They do not pre-deny `servicemanager` or `system_server`: domain policy
 flags are rejected in 1.5 because first-event BPF admission cannot enforce
 them safely.
 
+## Filtered lifecycle validation (2026-08-14)
+
+This authorized validation covers commit
+`fbd5a23faa984e047efd33169b036c6ad8eeb8c6` on the qualified Android 17 row,
+not the historical Android 16 identity above:
+
+| Property | Observed value |
+|----------|----------------|
+| Fingerprint | `google/husky/husky:17/CP2A.260705.006/15641320:user/release-keys` |
+| Kernel | `6.1.157-android14-11-gbd23337e42e7-ab14791245` |
+| Runtime identity | root, `u:r:ksu:s0`; SELinux enforcing; verified boot orange; bootloader unlocked |
+| ADB | `1.0.41`, platform-tools `34.0.5-debian` |
+| Userspace SHA-256 | `07a11392050272782bb91b00eb37133c8befebfc8e8e68cb0b7894c935f79441` |
+| Stackless BPF SHA-256 | `4a6c7b93ef77e09012247b05d8020159a561246db5b595d8e1e67cfeff559ec3` |
+
+`neutron doctor --json --smoke` passed load, attach, exact sentinel delivery,
+per-CPU health read, and cleanup. Kernel symbols remained masked and SELinux
+remained enforcing; both were reported as warnings rather than silently
+treated as supported symbolization.
+
+The experiment tested one hypothesis: with `--match-syscall ioctl` plus
+`--resolve-paths`, internal open/dup/close lifecycle events populate FD state
+without broadening output. A stopped instance of the shipped
+`examples/demo-target.rs` was attached by exact PID and then resumed. The
+positive signal was an emitted ioctl carrying the path established by the
+internally consumed lifecycle events; the negative signal was any emitted
+syscall other than ioctl.
+
+Observed results:
+
+- the capture scope recorded operator filter `syscall IN {29}` separately from
+  internal lifecycle set `{19,23,24,56,57,59,198,199,202,220,242,279,437}`;
+- all eight emitted syscall records were syscall 29 (`ioctl`); no internal
+  lifecycle syscall was emitted;
+- the synthetic ioctl exit was enriched as `fd_path=/dev/null`,
+  `fd_kind=device`, and returned `-25` (`ENOTTY`), as expected;
+- there were no ring-buffer losses or inflight lookup misses. One unrelated
+  path read failed, so capture health was `degraded`; the run supports the
+  positive enrichment observation but no absence or completeness claim.
+
+An earlier broad `comm`-filtered attempt processed 2,042,582 userspace events
+in eight seconds and lacked paired scenario markers; it was rejected as
+evidence. A marked Binder variant retained integrity and resolved all emitted
+ioctls to `/dev/binder`, but one inflight lookup miss also kept it degraded.
+The integrity-verified Binder bundle remains on the device at
+`/data/local/share/neutron/runs/modernization-lifecycle-fbd5a23-03`; the small
+demo capture remains under the corresponding `-05` directory. The temporary
+probe executable was removed after validation.
+
 ## Helper inventory (kernel 6.1+)
 
 | Helper | Used for |
