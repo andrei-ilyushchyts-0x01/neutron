@@ -980,6 +980,24 @@ mod tests {
     }
 
     #[test]
+    fn command_help_marks_every_retired_family() {
+        let root = Cli::command();
+        for family in ["recipes", "research", "native-map", "ghidra-export"] {
+            let mut command = root
+                .find_subcommand(family)
+                .unwrap_or_else(|| panic!("missing {family} command"))
+                .clone();
+            let mut help = Vec::new();
+            command.write_long_help(&mut help).unwrap();
+            let help = String::from_utf8(help).unwrap();
+            assert!(
+                help.starts_with("[DEPRECATED]"),
+                "{family} help does not lead with its retirement status:\n{help}"
+            );
+        }
+    }
+
+    #[test]
     fn pages_is_only_present_when_the_operator_requests_it() {
         let default = Cli::try_parse_from(["neutron", "trace"]).expect("default trace");
         let Some(Command::Trace(default)) = default.command else {
