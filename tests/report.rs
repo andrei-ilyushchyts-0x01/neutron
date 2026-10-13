@@ -602,12 +602,16 @@ fn binder_template_groups_unique_pairs_with_codes_and_status_counts() {
     let json = render_binder_template_from_reader(Cursor::new(capture)).expect("template");
     let v: serde_json::Value = serde_json::from_str(&json).expect("valid template json");
 
-    assert_eq!(v["200"]["1"]["service"], "");
-    assert_eq!(v["200"]["1"]["observed_codes"]["8"], 2);
-    assert_eq!(v["200"]["1"]["status_counts"]["callee_crashed"], 2);
-    assert!(
-        v.get("201").is_none(),
-        "resolved pairs should not need a template"
+    assert_eq!(v["schema"], "neutron.binder-review/v1");
+    let endpoints = &v["endpoints"];
+    assert_eq!(endpoints["200"]["1"]["service"], "");
+    assert_eq!(endpoints["200"]["1"]["observed_codes"]["8"], 2);
+    assert_eq!(endpoints["200"]["1"]["status_counts"]["callee_crashed"], 2);
+    assert_eq!(endpoints["201"]["2"]["service"], "");
+    assert_eq!(
+        endpoints["201"]["2"]["candidates"],
+        serde_json::json!(["already.resolved"]),
+        "existing labels still require independent review"
     );
 }
 
