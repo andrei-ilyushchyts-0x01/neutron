@@ -155,9 +155,20 @@ impl SubjectSelector {
     }
 
     pub fn resolve(&self, max_roots: usize) -> Result<ResolvedSubject> {
-        // ponytail: reuse the bounded inventory; extract a lighter collector if
-        // measured refresh cost matters. Never fall back from an unresolved owner.
-        self.resolve_snapshot(&crate::surface::collect_snapshot()?, max_roots)
+        self.validate()?;
+        if !(1..=1024).contains(&max_roots) {
+            bail!("subject root cap must be 1..=1024");
+        }
+        let snapshot = if matches!(self, Self::Service { .. }) {
+            crate::surface::collect_snapshot()?
+        } else {
+            let pids = match self {
+                Self::Pids(roots) => Some(roots.iter().map(|root| root.pid).collect()),
+                _ => None,
+            };
+            crate::surface::collect_subject_snapshot(pids)?
+        };
+        self.resolve_snapshot(&snapshot, max_roots)
     }
 
     pub fn resolve_snapshot(

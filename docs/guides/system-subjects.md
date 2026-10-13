@@ -83,7 +83,9 @@ For the existing single-command observation workflow, use
 It observes first and collects static identities afterward. Static collection
 alone is not execution evidence. Check capture and collector health separately.
 
-Executable/service roots are refreshed using the bounded inventory. A changed
+PID, executable, package and UID roots use bounded process-identity collection;
+PID selectors read only the requested processes. Service roots retain the full
+exact-ownership inventory. A changed
 incarnation produces `subject_resolution`; a resolution gap disables admission,
 emits `subject_unavailable`, and makes health incomplete. The next resolved
 incarnation starts with cleared causal context. Pinned PID subjects expire rather

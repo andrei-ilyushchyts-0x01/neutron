@@ -504,6 +504,11 @@ for payload in "$HOST_PAYLOAD" "$AGENT_PAYLOAD"; do
   )
 done
 
+if [[ "$(git rev-parse HEAD)" != "$GIT_COMMIT" ||
+      -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  echo "source changed during packaging; refusing to sign inconsistent artifacts" >&2
+  exit 1
+fi
 echo "==> Creating archives"
 create_payload_archive() {
   local output=$1 payload=$2

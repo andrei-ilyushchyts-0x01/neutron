@@ -470,6 +470,51 @@ pub fn collect_snapshot() -> Result<SurfaceSnapshot> {
     Ok(snapshot)
 }
 
+/// Identity-only inventory for live selectors; never exported as a full surface scan.
+pub(crate) fn collect_subject_snapshot(pids: Option<Vec<u32>>) -> Result<SurfaceSnapshot> {
+    let reader = RealPlatformReader;
+    let entries = match pids {
+        Some(pids) => pids
+            .into_iter()
+            .map(|pid| PathBuf::from(format!("/proc/{pid}")))
+            .collect(),
+        None => reader
+            .read_dir(Path::new("/proc"))
+            .context("enumerating subject processes")?,
+    };
+    let boot_id = read_text(&reader, "/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_string();
+    let mut health = HealthBuilder::default();
+    health.collector("processes", &["/proc process identities"]);
+    let processes = collect_processes(
+        &reader,
+        entries,
+        &boot_id,
+        &[],
+        &mut Vec::new(),
+        &mut health,
+        false,
+    );
+    Ok(SurfaceSnapshot {
+        schema: SURFACE_SCHEMA.into(),
+        neutron_version: env!("CARGO_PKG_VERSION").into(),
+        collected_at: reader.collected_at(),
+        device: DeviceIdentity {
+            boot_id,
+            ..Default::default()
+        },
+        health: health.finish(),
+        processes,
+        services: Vec::new(),
+        devices: Vec::new(),
+        modules: Vec::new(),
+        resources: Vec::new(),
+        relations: Vec::new(),
+        captures: Vec::new(),
+    })
+}
+
 #[derive(Default)]
 struct HealthBuilder {
     collectors: BTreeMap<String, CollectorHealth>,
@@ -604,6 +649,7 @@ pub fn scan_with_reader(reader: &dyn PlatformReader) -> Result<SurfaceSnapshot> 
         &devices,
         &mut relations,
         &mut health,
+        true,
     );
     let services = collect_services(reader, &processes, &mut relations, &mut health);
 
@@ -984,6 +1030,7 @@ fn collect_processes(
     devices: &[Device],
     relations: &mut Vec<Relation>,
     health: &mut HealthBuilder,
+    include_resources: bool,
 ) -> Vec<Process> {
     let mut device_by_path = BTreeMap::<String, String>::new();
     for device in devices {
@@ -1064,83 +1111,89 @@ fn collect_processes(
                 String::new()
             }
         };
-        let libraries = match read_text(reader, &format!("/proc/{pid}/maps")) {
-            Ok(maps) => crate::symbolize::proc_maps::parse_maps_text(&maps)
-                .into_iter()
-                .filter_map(|entry| {
-                    (entry.name.starts_with('/')
-                        && (entry.name.ends_with(".so") || entry.name.contains(".so.")))
-                    .then_some(entry.name)
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                health.warn(
-                    "processes",
-                    format!("cannot read maps for PID {pid}: {error}"),
-                );
-                Vec::new()
+        let libraries = if include_resources {
+            match read_text(reader, &format!("/proc/{pid}/maps")) {
+                Ok(maps) => crate::symbolize::proc_maps::parse_maps_text(&maps)
+                    .into_iter()
+                    .filter_map(|entry| {
+                        (entry.name.starts_with('/')
+                            && (entry.name.ends_with(".so") || entry.name.contains(".so.")))
+                        .then_some(entry.name)
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    health.warn(
+                        "processes",
+                        format!("cannot read maps for PID {pid}: {error}"),
+                    );
+                    Vec::new()
+                }
             }
+        } else {
+            Vec::new()
         };
         let relation_checkpoint = relations.len();
         let mut file_descriptors = Vec::new();
-        match reader.read_dir(Path::new(&format!("/proc/{pid}/fd"))) {
-            Ok(mut fds) => {
-                fds.sort();
-                for fd_path in fds {
-                    let Some(fd) = basename(&fd_path).and_then(|name| name.parse::<u32>().ok())
-                    else {
-                        continue;
-                    };
-                    let target = match reader.read_link(&fd_path) {
-                        Ok(target) => target.to_string_lossy().into_owned(),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                        Err(error) => {
-                            health.warn(
-                                "processes",
-                                format!("cannot read PID {pid} fd {fd}: {error}"),
-                            );
+        if include_resources {
+            match reader.read_dir(Path::new(&format!("/proc/{pid}/fd"))) {
+                Ok(mut fds) => {
+                    fds.sort();
+                    for fd_path in fds {
+                        let Some(fd) = basename(&fd_path).and_then(|name| name.parse::<u32>().ok())
+                        else {
                             continue;
+                        };
+                        let target = match reader.read_link(&fd_path) {
+                            Ok(target) => target.to_string_lossy().into_owned(),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                            Err(error) => {
+                                health.warn(
+                                    "processes",
+                                    format!("cannot read PID {pid} fd {fd}: {error}"),
+                                );
+                                continue;
+                            }
+                        };
+                        let target = target
+                            .strip_suffix(" (deleted)")
+                            .unwrap_or(&target)
+                            .to_string();
+                        let device_id = device_by_path.get(&target).cloned().or_else(|| {
+                            reader.canonicalize(&fd_path).ok().and_then(|path| {
+                                device_by_path
+                                    .get(&path.to_string_lossy().into_owned())
+                                    .cloned()
+                            })
+                        });
+                        if let Some(device_id) = device_id.as_ref() {
+                            relations.push(make_relation(
+                                "proc_fd",
+                                &process_id,
+                                device_id,
+                                "proc_fd",
+                                "exact",
+                                None,
+                                None,
+                                None,
+                                None,
+                            ));
                         }
-                    };
-                    let target = target
-                        .strip_suffix(" (deleted)")
-                        .unwrap_or(&target)
-                        .to_string();
-                    let device_id = device_by_path.get(&target).cloned().or_else(|| {
-                        reader.canonicalize(&fd_path).ok().and_then(|path| {
-                            device_by_path
-                                .get(&path.to_string_lossy().into_owned())
-                                .cloned()
-                        })
-                    });
-                    if let Some(device_id) = device_id.as_ref() {
-                        relations.push(make_relation(
-                            "proc_fd",
-                            &process_id,
+                        file_descriptors.push(OpenFile {
+                            fd,
+                            target,
                             device_id,
-                            "proc_fd",
-                            "exact",
-                            None,
-                            None,
-                            None,
-                            None,
-                        ));
+                        });
                     }
-                    file_descriptors.push(OpenFile {
-                        fd,
-                        target,
-                        device_id,
-                    });
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => health.warn(
+                    "processes",
+                    format!("cannot enumerate file descriptors for PID {pid}: {error}"),
+                ),
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => health.warn(
-                "processes",
-                format!("cannot enumerate file descriptors for PID {pid}: {error}"),
-            ),
         }
         file_descriptors.sort_by_key(|fd| fd.fd);
         let final_starttime = read_text(reader, &format!("/proc/{pid}/stat"))

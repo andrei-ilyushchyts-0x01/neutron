@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.6.0] — 2026-10-13
 
+- Reused bounded process identity collection for live PID/package/UID/executable
+  selectors, avoiding a full service/device/FD inventory on every refresh.
+  Service selectors retain exact ownership discovery; incarnation checks remain.
+- Signed local packaging records measured local provenance and refuses to sign
+  when the source revision or working tree changes during the build.
+
 - Preserved unknown producer confidence; cleared stale Binder thread context on
   unmatched dequeues. Incomplete report chains retain missing-parent notices,
   bounded length and explicit alternatives for inferred ancestry.
