@@ -9,19 +9,19 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/andrei-ilyushchyts-0x01/neutron"
 homepage = "https://github.com/andrei-ilyushchyts-0x01/neutron"
-keywords = ["ebpf", "android", "security", "tracing", "bpf"]
+keywords = ["ai-agents", "android", "ebpf", "observability", "tracing"]
 categories = ["development-tools::debugging", "command-line-utilities"]
 authors = ["neutron contributors"]
 rust-version = "1.74"
 
 [package]
 name = "neutron"
-description = "Android kernel-boundary and cross-service causal tracer for authorized security assessment."
+description = "Android observability CLI for AI agents with syscall and Binder tracing, structured evidence, capture health, and provenance."
 readme = "README.md"
 build = "build.rs"
 version.workspace = true

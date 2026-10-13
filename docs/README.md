@@ -1,75 +1,52 @@
-# neutron Documentation
+# Neutron documentation for AI agents
 
-Evidence-grade Android boundary mapping and bounded causal tracing for
-authorized security assessment. Support claims are limited to the exact device,
-build, and capture rows in [PRODUCT.md](../PRODUCT.md); host analysis commands
-also operate on saved captures.
+Use this index to load only the contract needed for the next tool call. Neutron
+is an Android observability CLI for AI agents; it returns versioned JSON/NDJSON
+and saved evidence artifacts. Start with the [agent execution contract](../README.md#agent-execution-contract)
+and inspect installed command help before invoking a PREVIEW surface.
 
-## Contents
+## Route by task
 
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Aya loader flow, RingBuf consumer, symbolization layer, rule-engine pipeline |
-| [REFERENCE.md](REFERENCE.md) | CLI flags, JSON event schema, syscall table, BPF map reference |
-| [ROADMAP.md](ROADMAP.md) | Capability status, completed roadmap slices, external gates, and non-goals |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Build setup, how to add maps / syscalls / rules |
-| [devices/pixel8pro.md](devices/pixel8pro.md) | Reference device profile + kernel-config baseline |
+| Agent task | Load this document | Required outcome |
+|---|---|---|
+| Discover the tool and install it | [Root README](../README.md) | Verified artifact identity and explicit device selection. |
+| Select an operation | [Product contract](../PRODUCT.md#command-maturity) | Command maturity and qualified scope. |
+| Decode a structured result | [Schema index](../schemas/README.md) | Matching schema version; preserve unknowns and restrictions. |
+| Understand evidence strength | [Observability](guides/observability.md) | Separate transport, scope, integrity and causal confidence. |
+| Select a native/system process | [System subjects](guides/system-subjects.md) | PID incarnation or verified service ownership. |
+| Execute the device workflow | [Quickstart](guides/quickstart.md) | Private run, orderly shutdown, complete transfer and verification. |
+| Interpret Binder identities | [Binder attribution](guides/binder-attribution.md) | Reviewed capture binding; candidate labels remain candidates. |
+| Inspect flags and event fields | [Reference](REFERENCE.md), [output formats](guides/output-formats.md) | Supported arguments and typed event interpretation. |
+| Diagnose missing observations | [Limitations](LIMITATIONS.md), [BPF tracing](guides/bpf-tracing.md) | Explicit blind spots; no absence-as-safety inference. |
+| Use independent workload evidence | [Probe contract](../probe-app/README.md) | Separate stimulus result and capture evidence. |
+| Check device qualification | [Pixel 8 Pro notes](devices/pixel8pro.md), release validation summary | Matching build and payload hashes, not a model-name assumption. |
+| Explain observed SELinux decisions | [SELinux](guides/selinux.md) | Attribution to observed events; no policy synthesis. |
+| Maintain the implementation | [Architecture](ARCHITECTURE.md), [contributing](CONTRIBUTING.md), [AGENTS.md](../AGENTS.md) | Repository development workflow. |
 
-## Guides
+## Minimal offline calls
 
-| Guide | Description |
-|-------|-------------|
-| [guides/quickstart.md](guides/quickstart.md) | Build, deploy, capture your first trace in minutes |
-| [guides/harness.md](guides/harness.md) | Extract, minimize, and safely replay captured regression testcases |
-| [guides/aidl-intelligence.md](guides/aidl-intelligence.md) | Index AIDL catalogs and selectively decode complete offline testcases |
-| [guides/native-mapping.md](guides/native-mapping.md) | **Deprecated:** retained-through-1.x native mapping compatibility workflow |
-| [guides/research-packs.md](guides/research-packs.md) | **Deprecated:** retained-through-1.x research-pack compatibility workflow |
-| [guides/android-content-provider.md](guides/android-content-provider.md) | Low-noise Android content-provider research workflow |
-| [guides/selinux.md](guides/selinux.md) | Capture AVC decisions and explain exact observed delegation |
-| [guides/bpf-tracing.md](guides/bpf-tracing.md) | Tracing concepts, profiles, filtering, stack traces |
-| [guides/security-assessment.md](guides/security-assessment.md) | End-to-end assessment workflow |
-| [guides/output-formats.md](guides/output-formats.md) | Text and NDJSON formats with parsing examples |
-| [guides/writing-rules.md](guides/writing-rules.md) | Authoring custom YAML detector rules |
-
-## Quick Reference
-
-```bash
-# Select one physical device; build.sh refuses an implicit/default device.
-export ANDROID_SERIAL=USB_SERIAL
-ADB=(adb -s "$ANDROID_SERIAL")
-
-# Build BPF + userspace and deploy to that device.
-./build.sh
-
-# Use private run directories for authorized evidence.
-NEUTRON=/data/local/share/neutron/neutron-agent
-SURFACE_RUN=/data/local/share/neutron/runs/quick-surface
-TRACE_RUN=/data/local/share/neutron/runs/quick-trace
-
-# Map exact service/HAL targets, then trace one bounded package scenario.
-"${ADB[@]}" shell "su -c '${NEUTRON} surface coverage \
-    --targets /data/local/share/neutron/targets.txt --minimal \
-    --json /data/local/share/neutron/coverage.json \
-    --tsv /data/local/share/neutron/coverage.tsv --run-dir ${SURFACE_RUN}'"
-"${ADB[@]}" shell "su -c 'timeout -s INT 30 ${NEUTRON} trace \
-    --match-package com.example.app --json --raw \
-    --attacker-capability not_tested --run-dir ${TRACE_RUN}'"
-
-# Retrieve the fixed bundle members as described in the quickstart, then:
-./neutron evidence verify quick-surface
-./neutron evidence verify quick-trace
-./neutron report quick-trace/capture.ndjson > report.md
+```sh
+neutron self-info --json
+neutron evidence verify RUN_DIR
+neutron graph RUN_DIR/capture.ndjson --format json --output graph.json
+neutron report RUN_DIR/capture.ndjson --output report.md
+neutron summarize RUN_DIR/capture.ndjson --by type
 ```
 
-See [guides/quickstart.md](guides/quickstart.md) for the bounded, allowlisted
-bundle-transfer commands.
+Only run analysis after successful bundle verification. Graph JSON carries a
+capture passport; a detached analysis does not reverify the original run bundle.
+Inspect health and scope before using a derived report. Nonzero exits are failures,
+not empty successful observations. Keep stdout, stderr and return code separate.
 
-## Requirements
+## Specialized and compatibility documentation
 
-| Component | Requirement |
-|-----------|-------------|
-| Device | Pixel 8 Pro (`husky`) on a validated support-matrix build; other GKI devices are experimental |
-| Kernel | 6.1+ aarch64 (verified: 6.1.145-android14-11) |
-| Host build | rust nightly + `bpfel-unknown-none` target + `bpf-linker` + `aarch64-linux-gnu-gcc` |
-| Runtime | Root shell (`adb -s SERIAL shell su`) — KernelSU or Magisk |
-| BPF caps | Effective `CAP_BPF` + `CAP_SYS_ADMIN` in the `su` domain |
+Load these only when the task requires the corresponding capability:
+
+- [Content providers](guides/android-content-provider.md), [security assessment](guides/security-assessment.md), [rule authoring](guides/writing-rules.md).
+- [AIDL intelligence](guides/aidl-intelligence.md) and [harness replay](guides/harness.md): EXPERIMENTAL, with their own scope and authorization requirements.
+- [Research packs](guides/research-packs.md) and [native mapping](guides/native-mapping.md): deprecated compatibility paths retained through 1.x.
+- [Roadmap](ROADMAP.md): planned work is not an available tool capability.
+
+Live capture requires an authorized rooted aarch64 Android device, kernel 6.1+
+with BTF and the required BPF privileges. Host-side analysis uses saved artifacts.
+Device support remains tied to the exact release qualification evidence.

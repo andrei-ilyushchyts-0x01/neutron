@@ -1,56 +1,82 @@
-# Neutron research probe
+# Neutron probe APK — workload interface for AI agents
 
-Install this minimal companion APK before `neutron research`. Its explicit receiver is restricted to callers holding Android's platform `DUMP` permission (shell/root), dispatches exactly seven typed actions, and returns only a result code. Camera frames, GPU pixels, Bluetooth/Wi-Fi identifiers, USB descriptors, keys, and codec buffers are discarded in memory.
+`dev.neutron.probe` is a companion Android workload generator. An agent can invoke
+its explicit, `DUMP`-permission-protected receiver through an authorized shell to
+produce independent workload results while Neutron records kernel observations.
+It has no UI and is not a general-purpose shell or model endpoint.
 
-The `keymint` action defaults to ephemeral key generation. For a deterministic,
-read-only capture smoke test it also accepts `operation=lookup` and a bounded
-`delay_ms` and `finish_delay_ms` from 0 through 5000. Both delays are accepted
-only with the read-only lookup and their combined budget is 5000 ms. `delay_ms`
-lets the incoming protected broadcast finish admission before a marker-bounded
-trace begins. After the lookup returns, `finish_delay_ms` renames the worker to
-`neutron-finish` and holds its pending broadcast result so the marker can end
-before the receiver finishes. The lookup checks a nonce-derived alias expected
-to be absent and does not create or retain key material. It proves only the
-Android Keystore query path, not a KeyMint HAL handoff.
+## Invocation and result contract
 
-Device instrumentation should cover each action on the authorized hardware matrix; radio-off, absent hardware, ambiguous USB selection, and missing USB permission must return `unsupported`.
+Select an authorized device and install the approved, signature-verified release
+APK only when the task needs this attacker model. The APK is debuggable and targets
+SDK 35. Preserve its SHA-256, signing certificate and version alongside the run.
 
-On Android 16, CameraService may reject this broadcast-only probe as an idle
-UID. The probe reports that platform prerequisite as `unsupported`, not a
-generic failure; actual camera coverage needs a separately authorized
-foreground stimulus.
+```sh
+adb -s SERIAL install -r neutron-probe.apk
+adb -s SERIAL shell pm path dev.neutron.probe
+adb -s SERIAL shell am broadcast \
+  -n dev.neutron.probe/.ResearchReceiver \
+  --es action keymint --es operation lookup
+```
 
-## Build, test, install, and verify
+Continue only if installation succeeds and `pm path` returns a package path.
+The receiver accepts string extras only. Retain both the shell exit status and
+the final `Broadcast completed: result=N` response; shell success alone does not
+establish workload success.
 
-The probe requires JDK 17, Android SDK platform 35 with Build Tools 35.0.0,
-and Gradle 8.10.2. From the repository root:
+| Result code | Meaning | Agent response |
+|---|---|---|
+| `0` | Workload completed | Retain this as an external result, separate from observed Binder/syscall evidence. |
+| `1` | Invalid input or workload failure | Retain diagnostics; correct input or prerequisite before retrying. |
+| `3` | Unsupported hardware/platform prerequisite | Report unsupported; do not turn it into a successful empty observation. |
+
+## Action selection
+
+| `action` | Optional string parameters | Scope |
+|---|---|---|
+| `keymint` | `operation=lookup`, `delay_ms`, `finish_delay_ms` | Prefer explicit read-only lookup for capture smoke. Omitting `operation` requests ephemeral key generation. |
+| `gpu` | none | GPU workload; hardware-dependent. |
+| `camera` | `camera_id` | Camera workload; access and foreground/platform constraints apply. |
+| `media-codec` | `mime` | Codec workload; codec availability applies. |
+| `bluetooth` | none | Bluetooth workload; radio and permission prerequisites apply. |
+| `wifi` | none | Wi-Fi workload; radio and permission prerequisites apply. |
+| `usb` | `usb_device_id` | USB workload; explicit selection and device permission apply. |
+
+Do not infer authorization for camera, radio, USB or key-generation actions from
+a read-only tracing request. Frames, pixels, identifiers, descriptors, keys and
+codec buffers are discarded in memory; the workload can still have device side
+effects. Record the selected action and parameters.
+
+For `keymint` lookup only, each delay is 0–5000 ms and their sum is at most 5000 ms.
+`delay_ms` delays the lookup. `finish_delay_ms` holds the pending broadcast after
+the lookup and renames the worker to `neutron-finish`, allowing a marker window to
+end before receiver completion. The queried nonce-derived alias is expected to be
+absent; lookup does not create keys. A successful lookup proves neither a KeyMint
+HAL handoff nor authorization bypass. Concurrent/delayed completion does not
+prove exact async parentage in the trace.
+
+On Android 16, CameraService can reject a broadcast-only probe as an idle UID.
+That prerequisite is reported as unsupported; a foreground stimulus requires
+separate authorization. Validate every required action on the exact hardware.
+
+## Source build
+
+Use JDK 17, SDK platform 35, Build Tools 35.0.0 and the pinned Gradle 8.10.2 wrapper:
 
 ```bash
 export JAVA_HOME=/path/to/jdk-17
 export ANDROID_HOME=/path/to/android-sdk
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export PATH="$JAVA_HOME/bin:$PATH"
-
 "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-  "platforms;android-35" "build-tools;35.0.0"
-
+  "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 cd probe-app
-gradle --version # must report Gradle 8.10.2 and JVM 17
-gradle --no-daemon testDebugUnitTest assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell pm path dev.neutron.probe
+./gradlew --no-daemon assembleDebug
 ```
 
-Continue only when `pm path` prints a `package:` path. There is no UI and the
-receiver is not a general-purpose test endpoint. Invoke it through an
-authorized research pack, which passes only the action and typed parameters
-compiled into the probe:
-
-```bash
-adb shell "su -c '/data/local/tmp/neutron research --pack keymint \
-  --probe-package dev.neutron.probe --authorized-use'"
-
-# Add this only on hardware you are authorized to assess.
-adb shell "su -c '/data/local/tmp/neutron research --pack camera \
-  --param camera_id=0 --probe-package dev.neutron.probe --authorized-use'"
-```
+Development output is not an approved release identity. Signed packaging validates
+the configured certificate before publication. CI runs the existing probe unit
+checks separately; device qualification requires the exact APK and firmware.
+Deprecated `neutron research` remains a compatibility wrapper through 1.x;
+new agent integrations should compose the core capture and evidence commands.
+See the [agent workflow](../README.md#agent-execution-contract).

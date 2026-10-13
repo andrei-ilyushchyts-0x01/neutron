@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-10-13
+
+- Reworked every maintained README for AI-agent discovery, command selection,
+  structured observations, recovery and evidence limits; updated package metadata.
+
+- Fixed Android SDK setup in CI and signed release workflows by installing
+  supported `platform-tools` instead of the removed legacy `tools` package.
+- Updated CI branch selection for `main` and `develop` after branch cleanup.
+- Updated existing graph and Binder fixtures for graph v3 and reviewed,
+  capture-bound attribution; retained exact-method and candidate separation checks.
+- Updated existing diff assertions for the shared capture-passport refusal gate.
+
 ## [1.6.0] — 2026-10-13
 
 - Reused bounded process identity collection for live PID/package/UID/executable

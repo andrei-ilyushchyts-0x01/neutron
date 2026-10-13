@@ -14,7 +14,7 @@ app action
   -> denial, allocation, state change, crash, or reboot
 ```
 
-The current workspace package version is `1.6.0`. Stable refers to the
+The current workspace package version is `1.6.1`. Stable refers to the
 distribution and versioned schema contract, not universal Android runtime
 support. Command maturity and qualified device rows are defined in
 [`PRODUCT.md`](../PRODUCT.md); this ledger records capability maturity.

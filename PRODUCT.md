@@ -1,20 +1,22 @@
 # Neutron product contract
 
-Neutron is an evidence-grade Android boundary mapper and bounded causal tracer
-for rooted, authorized research devices.
-
-**Map ownership. Trace delegation. Preserve the evidence.**
+Neutron is an Android observability CLI designed primarily for AI agents
+working on explicitly authorized rooted devices. Agents invoke bounded commands
+and consume versioned JSON/NDJSON, health, scope and provenance artifacts.
 
 The stable product promise is deliberately narrow: identify which process,
 SELinux domain, and executable owns an Android service or HAL; record bounded
 Binder-to-syscall/ioctl/device handoffs; and preserve capture health and
 provenance so absence is never silently promoted to unreachability.
 
-## Intended users
+## Intended consumers
 
-- Android platform and OEM security engineers.
-- Researchers investigating vendor HAL and kernel attack surfaces.
-- Exploit-triage and OTA surface-regression teams.
+- AI agents investigating Android service ownership and kernel observations.
+- Coding and security-research agents that need verifiable tool results.
+- Agent orchestrators performing bounded capture and offline evidence analysis.
+
+Human operators authorize scope and can use the same CLI. The interface is a
+command-line tool with file artifacts; no MCP server or model API is implied.
 
 ## Command maturity
 
