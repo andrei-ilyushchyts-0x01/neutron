@@ -572,27 +572,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Binder causality (sprint-2 PR 2) — fed by paired binder_transaction (caller)
 # and binder_transaction_received (callee) tracepoints, cross-correlated with
-# process_exit events (PR 1). R004 fires when a callee crashed with one of
-# our caller's transactions still in flight — strong signal of a HAL/service
-# bug being triggered by a specific app interaction.
+# R004 correlates a crash with a pending delivery, not a triggering method.
 # ─────────────────────────────────────────────────────────────────────────────
 
 - id: R004_binder_callee_crash
-  name: Binder callee crashed mid-transaction
+  name: Callee crash correlated with pending Binder delivery
   description: >-
-    A process holding an in-flight binder transaction crashed before
-    delivering the call. The remote service died while one of our
-    traced apps was waiting on it — typically the bug-triggering call
-    is the one in the caller's last transaction. The emitted
-    binder_call event carries the caller_pid / callee_pid / code,
-    making it possible to attribute the crash to a specific AIDL
-    method.
+    A callee crashed before the tracked transaction was dequeued. This is
+    a temporal correlation with pending delivery, not proof of handler
+    execution, a triggering AIDL method, or an exploitation path.
   severity: high
   category: crash
   behavior: binder_callee_crashed_in_flight
   interpretation:
-    - possible service crash triggered by a specific AIDL transaction
-    - possible exploitation path against a privileged HAL service
+    - service crash temporally correlated with pending Binder delivery
+    - queued transaction may be incidental to the crash
   confidence: 0.85
   false_positives:
     - the callee was being intentionally killed (system shutdown,

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-10-13
+
+- Fixed live event reconciliation counting confirmed process death twice, once
+  as a kernel task-exit event and again as a synthesized userspace record.
+- Added a shared capture passport to reports, graph v3 and summaries, retaining
+  effective filters, source availability, bounded scenario markers, health,
+  restrictions and the SHA-256 of the exact consumed capture bytes.
+- Added a bounded report overview and causal timeline with input record
+  references. Graph warnings are visible in Mermaid and inferred edges explain
+  their process/follow-context basis; asynchronous causation remains experimental.
+- Added `doctor --output-dir`, sealed readiness/teardown artifacts for live run
+  bundles, and explicit failure evidence for unsuccessful finalization.
+- Added reviewed Binder maps bound to capture/boot/build identity, plus live
+  process-starttime validation. Legacy unbound maps now supply candidate labels;
+  exact AIDL method resolution requires reviewed attribution. Binder review
+  templates expose conflicting candidates and source record references.
+- Integrated native/system subjects, native stimulus evidence, shared ordered
+  scenario validation, unknown causal confidence and process-incarnation state.
+  BPF ABI 3 separates task exit from confirmed process death; unavailable exit
+  status stays unknown. The legacy spike diagnostic no longer changes sysctls.
+- Kept historical input schemas readable; graph JSON output is now
+  `neutron.causal-graph/v3` and review templates are `neutron.binder-review/v1`.
+  Consumers must select the matching shipped schemas. Current device validation
+  scope is documented separately; historical support rows do not qualify ABI 3.
+
+
 - Preserved FD/path/child lifecycle state when an active syscall whitelist is
   combined with `--resolve-paths`, `--capture-reads`, `--follow-children`, or
   an fd-path predicate. Internal lifecycle events update state but do not

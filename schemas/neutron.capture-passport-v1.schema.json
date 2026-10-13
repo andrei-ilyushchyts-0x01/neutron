@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Capture passport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "capture_sha256",
+    "bundle_integrity",
+    "transport_health",
+    "bounded_claims_eligible",
+    "restrictions",
+    "effective_scope",
+    "scenarios"
+  ],
+  "properties": {
+    "schema": {
+      "const": "neutron.capture-passport/v1"
+    },
+    "capture_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "bundle_integrity": {
+      "type": "string"
+    },
+    "transport_health": {
+      "enum": [
+        "complete",
+        "degraded",
+        "incomplete",
+        "unknown"
+      ]
+    },
+    "bounded_claims_eligible": {
+      "type": "boolean"
+    },
+    "restrictions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "effective_scope": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "scenarios": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}

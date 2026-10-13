@@ -27,7 +27,9 @@ use anyhow::{bail, Context, Result};
 
 use crate::capture_normalize::{normalize_capture, validated_scenario_contract, ScenarioContract};
 use crate::health::CaptureScope;
-use crate::summarize::{parse_by, summarize_scenarios, Aggregation, KeyField};
+#[cfg(test)]
+use crate::summarize::summarize_scenarios;
+use crate::summarize::{parse_by, summarize_with_passport, Aggregation, KeyField};
 
 /// CLI args for `neutron diff`.
 #[derive(clap::Parser, Debug)]
@@ -252,7 +254,8 @@ fn require_complete_capture<R: BufRead>(
     let Some(health) = capture.health.as_ref() else {
         bail!("{label} capture has no final capture_health record; diff is nonconclusive");
     };
-    if health.status != "complete"
+    if !crate::capture_view::CapturePassport::from_capture(&capture).bounded_claims_eligible
+        || health.status != "complete"
         || health.degraded
         || health.output_cap_hit
         || !capture.health_warnings.is_empty()
@@ -349,22 +352,30 @@ pub fn run(args: DiffArgs) -> Result<()> {
             "baseline and test bounded scenario contracts differ; refusing to emit added/removed claims"
         );
     }
-    let baseline = summarize_scenarios(
+    let (baseline, baseline_passport) = summarize_with_passport(
         BufReader::new(baseline_file),
         &keys,
         0,
-        &baseline_scenario.trace_ids,
+        Some(&baseline_scenario.trace_ids),
     )
     .context("aggregating pinned baseline")?;
-    let test = summarize_scenarios(
+    let (test, test_passport) = summarize_with_passport(
         BufReader::new(test_file),
         &keys,
         0,
-        &test_scenario.trace_ids,
+        Some(&test_scenario.trace_ids),
     )
     .context("aggregating pinned test")?;
+    if !baseline_passport.bounded_claims_eligible || !test_passport.bounded_claims_eligible {
+        bail!("capture became nonconclusive during aggregation; refusing to emit deltas");
+    }
     let rows = diff(&baseline, &test);
-    let table = render_table(rows, &keys, args.top, args.show_same);
+    let table =
+        format!(
+        "Baseline passport:\n{}\nTest passport:\n{}\nView: group_by={}, top={}, show_same={}\n\n{}",
+        baseline_passport.render_text(), test_passport.render_text(),
+        crate::decode::escape_text(&args.by), args.top, args.show_same,
+        render_table(rows, &keys, args.top, args.show_same));
     let mut stdout = io::stdout().lock();
     stdout
         .write_all(table.as_bytes())
@@ -422,9 +433,9 @@ mod tests {
     fn bounded_complete_capture(event: &str) -> String {
         format!(
             "{}\n{}\n{}\n{}\n",
-            r#"{"type":"marker","ts_ns":1,"name":"procedure","phase":"start","scenario_id":"procedure","trace_id":"trace-a","root_pid":1}"#,
+            r#"{"type":"marker","generation":1,"ts_ns":1,"name":"procedure","phase":"start","scenario_id":"procedure","trace_id":"0000000000000001","root_pid":1}"#,
             event,
-            r#"{"type":"marker","ts_ns":3,"name":"procedure","phase":"end","scenario_id":"procedure","trace_id":"trace-a","root_pid":1}"#,
+            r#"{"type":"marker","generation":1,"ts_ns":3,"name":"procedure","phase":"end","scenario_id":"procedure","trace_id":"0000000000000001","root_pid":1}"#,
             complete_health(),
         )
     }
@@ -581,7 +592,7 @@ mod tests {
         assert!(format!("{missing:#}").contains("no final capture_health"));
 
         let complete = bounded_complete_capture(
-            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"trace-a"}"#,
+            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"0000000000000001"}"#,
         );
         require_complete_capture(Cursor::new(complete), "baseline").unwrap();
     }
@@ -601,8 +612,8 @@ mod tests {
 
         let unfinished = format!(
             "{}\n{}\n{}\n",
-            r#"{"type":"marker","ts_ns":1,"name":"procedure","phase":"start","scenario_id":"procedure","trace_id":"trace-a","root_pid":1}"#,
-            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"trace-a"}"#,
+            r#"{"type":"marker","generation":1,"ts_ns":1,"name":"procedure","phase":"start","scenario_id":"procedure","trace_id":"0000000000000001","root_pid":1}"#,
+            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"0000000000000001"}"#,
             complete_health(),
         );
         assert!(format!(
@@ -615,7 +626,7 @@ mod tests {
     #[test]
     fn scenario_aggregation_ignores_events_outside_the_completed_boundary() {
         let capture = bounded_complete_capture(
-            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"trace-a"}"#,
+            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"0000000000000001"}"#,
         );
         let capture = format!(
             "{}\n{}",
@@ -634,13 +645,13 @@ mod tests {
     fn different_scenario_names_are_not_comparable() {
         let baseline = require_complete_capture(
             Cursor::new(bounded_complete_capture(
-                r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"trace-a"}"#,
+                r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"0000000000000001"}"#,
             )),
             "baseline",
         )
         .unwrap();
         let test_raw = bounded_complete_capture(
-            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"trace-a"}"#,
+            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"0000000000000001"}"#,
         )
         .replace("procedure", "different");
         let test = require_complete_capture(Cursor::new(test_raw), "test").unwrap();
@@ -667,7 +678,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("capture.ndjson");
         let original = bounded_complete_capture(
-            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"trace-a"}"#,
+            r#"{"type":"syscall","pid":1,"name":"ioctl","scenario_id":"procedure","trace_id":"0000000000000001"}"#,
         );
         std::fs::write(&path, original).unwrap();
 
@@ -715,5 +726,68 @@ mod tests {
         assert!(!table.contains('\u{1b}'));
         assert!(!table.contains("\nrow"));
         assert!(table.contains("\\u{1b}[2J\\nrow"));
+    }
+    #[test]
+    fn malformed_order_is_rejected_by_all_conclusive_consumers() {
+        let valid = bounded_complete_capture(
+            r#"{"type":"syscall","ts_ns":2,"pid":1,"name":"ioctl","generation":1,"scenario_id":"procedure","trace_id":"0000000000000001"}"#,
+        );
+        let records: Vec<serde_json::Value> = valid
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut cases = vec![
+            vec![
+                records[1].clone(),
+                records[0].clone(),
+                records[2].clone(),
+                records[3].clone(),
+            ],
+            vec![
+                records[0].clone(),
+                records[2].clone(),
+                records[1].clone(),
+                records[3].clone(),
+            ],
+        ];
+        for (field, value) in [
+            ("ts_ns", serde_json::json!(4)),
+            ("generation", serde_json::json!(2)),
+            ("root_pid", serde_json::json!(99)),
+        ] {
+            let mut changed = records.clone();
+            changed[1][field] = value;
+            cases.push(changed);
+        }
+        for records in cases {
+            let capture = records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(require_complete_capture(Cursor::new(&capture), "malformed").is_err());
+            let normalized =
+                crate::capture_normalize::normalize_capture(Cursor::new(&capture)).unwrap();
+            assert!(crate::capture_normalize::validated_scenario_contract(&normalized).is_err());
+            assert!(crate::summarize::summarize_scenarios(
+                Cursor::new(&capture),
+                &parse_by("syscall").unwrap(),
+                0,
+                &std::collections::BTreeMap::from([(
+                    "procedure".into(),
+                    "0000000000000001".into()
+                )])
+            )
+            .is_err());
+            let report = crate::report::render_report_from_reader(
+                Cursor::new(&capture),
+                crate::report::ReportOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                report.contains("scenario marker lifecycle is invalid"),
+                "{report}"
+            );
+        }
     }
 }

@@ -608,6 +608,22 @@ fn detach_attached_programs(bpf: &mut Ebpf, attached: &[&str]) -> Vec<String> {
     errors
 }
 
+fn kprobe_pack_candidates(raw: &str) -> Result<&'static [(&'static str, &'static str)]> {
+    Ok(match normalize_pack_name(raw).as_str() {
+        "binder" => &[("kprobe_binder_ioctl", "binder_ioctl")],
+        "kgsl" => &[("kprobe_kgsl_ioctl", "kgsl_ioctl")],
+        "mali" => &[("kprobe_mali_ioctl", "kbase_ioctl")],
+        "alsa" => &[("kprobe_alsa_ioctl", "snd_ctl_ioctl")],
+        "unix-socket" => &[
+            ("kprobe_unix_stream_sendmsg", "unix_stream_sendmsg"),
+            ("kprobe_unix_stream_recvmsg", "unix_stream_recvmsg"),
+        ],
+        _ => {
+            bail!("unknown kprobe pack '{raw}' (available: binder, kgsl, mali, alsa, unix-socket)")
+        }
+    })
+}
+
 fn attach_kprobe_packs(
     bpf: &mut Ebpf,
     packs: &[String],
@@ -616,19 +632,7 @@ fn attach_kprobe_packs(
     let mut statuses = Vec::new();
     for raw in packs {
         let pack = normalize_pack_name(raw);
-        let candidates: &[(&str, &str)] = match pack.as_str() {
-            "binder" => &[("kprobe_binder_ioctl", "binder_ioctl")],
-            "kgsl" => &[("kprobe_kgsl_ioctl", "kgsl_ioctl")],
-            "mali" => &[("kprobe_mali_ioctl", "kbase_ioctl")],
-            "alsa" => &[("kprobe_alsa_ioctl", "snd_ctl_ioctl")],
-            "unix-socket" => &[
-                ("kprobe_unix_stream_sendmsg", "unix_stream_sendmsg"),
-                ("kprobe_unix_stream_recvmsg", "unix_stream_recvmsg"),
-            ],
-            _ => bail!(
-                "unknown kprobe pack '{raw}' (available: binder, kgsl, mali, alsa, unix-socket)"
-            ),
-        };
+        let candidates = kprobe_pack_candidates(raw)?;
         let mut any = false;
         let mut status = KprobePackScope {
             name: pack.clone(),
@@ -853,6 +857,7 @@ fn effective_capture_scope(
             rotate_output_bytes,
         },
         observation: CaptureObservationScope {
+            subject: None,
             target_pid: args.pid,
             root_package: args.package.clone(),
             root_uid: effective_root_uid,
@@ -1800,6 +1805,15 @@ fn handle_capture_reads(
     let is_enter = { ev.is_enter };
     let pid = { ev.pid };
 
+    if is_enter == 0
+        && ev.ret >= 0
+        && (matches!(nr, 23 | 24 | 221 | 281 | 436)
+            || (nr == 25 && matches!({ ev.args[1] }, 0 | 1030)))
+    {
+        let errors = cleanup_watched_fds_for_pid(pid, watch_fds, watched_fds);
+        return (!errors.is_empty()).then(|| errors.join("; "));
+    }
+
     // openat() exit: watch any /proc/* or /sys/* fd
     if nr == SYSCALL_OPENAT && is_enter == 0 {
         let fd = { ev.ret };
@@ -2400,7 +2414,7 @@ fn selinux_denial_in_scope(
     {
         return false;
     }
-    if args.package.is_some() || args.root_uid.is_some() {
+    if args.package.is_some() || args.root_uid.is_some() || args.subject.is_some() {
         return causal_context.is_some() || root_pids.contains(&denial.pid);
     }
     if args.pid != 0 && denial.pid != args.pid {
@@ -2461,6 +2475,7 @@ fn live_marker_line(
     root_package: Option<&str>,
     root_uid: Option<u32>,
     root_pid: Option<u32>,
+    subject: Option<&neutron::subject::ResolvedSubject>,
 ) -> String {
     let mut value = serde_json::json!({
         "type": "marker",
@@ -2483,6 +2498,10 @@ fn live_marker_line(
     }
     if let (Some(pid), Some(object)) = (root_pid, value.as_object_mut()) {
         object.insert("root_pid".into(), serde_json::Value::from(pid));
+    }
+    if let Some(subject) = subject {
+        value["subject"] = serde_json::to_value(subject).expect("serializing subject");
+        value["schema"] = serde_json::Value::String("neutron.marker/v2".into());
     }
     serde_json::to_string(&value).expect("serializing marker JSON cannot fail")
 }
@@ -2904,8 +2923,60 @@ fn configure_trace_run_bundle(args: &mut Args) -> Result<Option<TraceRunBundle>>
     }))
 }
 
-fn run_trace(mut args: Args) -> Result<()> {
+/// Own the kernel handles and child thread across every startup/error path.
+struct TraceSession {
+    bpf: Ebpf,
+    attached: Vec<&'static str>,
+    poller: Option<poller::SpawnedPoller>,
+    detached: bool,
+}
+
+impl Drop for TraceSession {
+    fn drop(&mut self) {
+        if !self.detached {
+            for error in detach_attached_programs(&mut self.bpf, &self.attached) {
+                eprintln!("neutron: cleanup: {error}");
+            }
+        }
+        if let Some((_, _, stop, handle)) = self.poller.take() {
+            let _ = stop.try_send(());
+            if handle.join().is_err() {
+                eprintln!("neutron: cleanup: FD poller panicked");
+            }
+        }
+    }
+}
+
+fn run_trace(args: Args) -> Result<()> {
+    let run_dir = args.run_dir.clone();
+    let result = run_trace_inner(args);
+    if let (Err(error), Some(directory)) = (&result, run_dir) {
+        if directory.join("readiness.json").is_file() && !directory.join("manifest.json").exists() {
+            let _ = neutron::private_output::write_json(
+                &directory.join("failure.json"),
+                &serde_json::json!({
+                    "schema": "neutron.capture-lifecycle/v1", "phase": "failure", "error": format!("{error:#}"),
+                    "cleanup": "consult teardown.json; absent means not verified", "seal": "not completed"
+                }),
+                false,
+            );
+        }
+    }
+    result
+}
+
+fn run_trace_inner(mut args: Args) -> Result<()> {
     let trace_bundle = configure_trace_run_bundle(&mut args)?;
+    if let Some(bundle) = &trace_bundle {
+        neutron::private_output::write_json(
+            &bundle.run_dir.join("readiness.json"),
+            &serde_json::json!({
+                "schema": "neutron.capture-lifecycle/v1", "phase": "startup", "status": "not_ready",
+                "teardown": "not checked", "seal": "not completed"
+            }),
+            false,
+        )?;
+    }
     validate_harness_capture_args(&args)?;
     validate_distinct_output_paths(
         args.output.as_deref(),
@@ -2922,7 +2993,7 @@ fn run_trace(mut args: Args) -> Result<()> {
     if args.follow_binder {
         args.binder = true;
     }
-    if args.package.is_some() || args.root_uid.is_some() {
+    if args.package.is_some() || args.root_uid.is_some() || args.subject.is_some() {
         // Causal captures are NDJSON evidence streams even when the explicit
         // example omits the legacy output-mode flags.
         args.json = true;
@@ -3001,199 +3072,6 @@ fn run_trace(mut args: Args) -> Result<()> {
         bail!("--rotate-output-size requires --output");
     }
 
-    print_banner();
-    let privilege = doctor::check_privilege(&doctor::RealEnv);
-    capture_privilege_preflight(&privilege)?;
-    doctor::validate_live_capture_layouts(args.binder).map_err(anyhow::Error::msg)?;
-    let _capture_lock = acquire_capture_lock(&args.capture_lock)?;
-    let capture_boot_id = read_boot_id()?;
-    let capture_serial = required_android_property("ro.serialno")?;
-    let capture_device_identity = live_device_identity(capture_boot_id.clone(), &capture_serial)?;
-    let capture_fingerprint = capture_device_identity.fingerprint.clone();
-    let harness_serial = args.harness_capture.then(|| capture_serial.clone());
-    let package_uid = args
-        .package
-        .as_deref()
-        .map(|package| {
-            android::resolve_package_uid(package)
-                .with_context(|| format!("resolving --package {package}"))
-        })
-        .transpose()?;
-    let mut root_pids = if let Some(pids) = discover_dynamic_roots(&args, package_uid)? {
-        pids
-    } else if args.pid != 0 {
-        vec![args.pid]
-    } else {
-        Vec::new()
-    };
-    if let (Some(package), Some(uid)) = (args.package.as_deref(), package_uid) {
-        if root_pids.is_empty() {
-            bail!("no running process matches package {package} (uid {uid})");
-        }
-    }
-    if root_pids.len() > args.max_processes as usize {
-        bail!(
-            "causal root has {} processes, exceeding --max-processes {}",
-            root_pids.len(),
-            args.max_processes
-        );
-    }
-    eprintln!("  loading {}", args.object);
-    if let Some(package) = args.package.as_deref() {
-        eprintln!("  root package: {package}");
-    } else if let Some(uid) = args.root_uid {
-        eprintln!("  root uid: {uid} ({} current processes)", root_pids.len());
-    } else {
-        eprintln!(
-            "  target pid: {}",
-            if args.pid == 0 {
-                "all".to_string()
-            } else {
-                args.pid.to_string()
-            }
-        );
-    }
-    if args.pid == 0 && args.package.is_none() && args.root_uid.is_none() {
-        eprintln!("  note: tracing all processes; inflight map may overflow under heavy load");
-    }
-    if !driver_packs.names.is_empty() {
-        eprintln!("  driver packs: {}", driver_packs.names.join(", "));
-    }
-    if !schema_names.is_empty() {
-        eprintln!("  ioctl schema packs: {}", schema_names.join(", "));
-    }
-    resolve_match_android_providers(&mut args)?;
-    resolve_match_packages(&mut args)?;
-    for warning in capture_guardrail_warnings(&args) {
-        eprintln!("neutron: WARNING: {warning}");
-    }
-    // 1. Load BPF and attach tracepoints.
-    let mut required_bpf_features = BPF_FEATURE_PROCESS_EXIT;
-    if args.binder {
-        required_bpf_features |= BPF_FEATURE_BINDER_TRACE;
-    }
-    if args.stacks {
-        required_bpf_features |= BPF_FEATURE_STACKS;
-    }
-    let (mut bpf, bpf_identity) = load_bpf(
-        &args.object,
-        args.max_processes,
-        args.verbose,
-        required_bpf_features,
-    )?;
-    eprintln!(
-        "  BPF ABI: v{}.{} event_size={} object_sha256={}",
-        bpf_identity.abi_major,
-        bpf_identity.abi_minor,
-        bpf_identity.syscall_event_size,
-        bpf_identity.object_sha256,
-    );
-    if !bpf_identity.build_id_present {
-        eprintln!("neutron: WARNING: BPF object build ID is unavailable");
-    }
-    let tool_identity = neutron::run_manifest::ToolIdentity::current()
-        .context("identifying the running userspace binary")?;
-    let stack_traces = if args.stacks {
-        let stack_map = bpf.take_map("STACK_TRACES").with_context(|| {
-            format!(
-                "--stacks requires a STACK_TRACES map; use {STACKFUL_BPF_OBJECT} or rebuild with `cargo xtask build-ebpf --stacks`"
-            )
-        })?;
-        Some(
-            StackTraceMap::try_from(stack_map)
-                .context("STACK_TRACES has an incompatible map layout")?,
-        )
-    } else {
-        None
-    };
-
-    // Configure PID/causal gates before any global tracepoint is attached so
-    // the short loader setup window cannot capture unrelated processes.
-    populate_filter_map(
-        &mut bpf,
-        args.pid,
-        args.package.is_some() || args.root_uid.is_some(),
-        args.follow_binder,
-        args.max_depth,
-        args.root_uid.or(package_uid),
-        args.root_uid.is_some(),
-    )?;
-    let pre_admission_follow_denies = pre_admission_follow_deny_domains(&args)?;
-    let seeded_follow_denies =
-        seed_pre_admission_follow_denies(&mut bpf, &pre_admission_follow_denies)?;
-    if seeded_follow_denies > 0 {
-        eprintln!(
-            "  pre-admission Binder follow denies: {seeded_follow_denies} PID(s) in {}",
-            pre_admission_follow_denies
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    set_root_uid_context(&mut bpf, 0, 0)?;
-    replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
-    populate_ioctl_refresh_maps(&mut bpf, &driver_packs)?;
-    let capture_predicate = build_capture_predicate(&args)?;
-    let state_events_required = workflow_needs_state_events(&args, &capture_predicate);
-    let (selinux_scope_pids, selinux_scope_uids) = capture_predicate
-        .bpf_spec()
-        .map(|spec| (spec.pids.clone(), spec.uids.clone()))
-        .unwrap_or_default();
-    let empty_bpf_spec = MatchSpec::default();
-    let bpf_spec = capture_predicate.bpf_spec().unwrap_or(&empty_bpf_spec);
-    populate_match_maps(&mut bpf, bpf_spec, state_events_required)?;
-
-    attach_tracepoint(&mut bpf, "trace_sys_enter", "raw_syscalls", "sys_enter")?;
-    attach_tracepoint(&mut bpf, "trace_sys_exit", "raw_syscalls", "sys_exit")?;
-    attach_tracepoint(
-        &mut bpf,
-        "trace_sched_process_exit",
-        "sched",
-        "sched_process_exit",
-    )?;
-    let mut attached = vec![
-        "trace_sys_enter",
-        "trace_sys_exit",
-        "trace_sched_process_exit",
-    ];
-    if args.binder {
-        attach_tracepoint(
-            &mut bpf,
-            "trace_binder_transaction",
-            "binder",
-            "binder_transaction",
-        )?;
-        attached.push("trace_binder_transaction");
-        attach_tracepoint(
-            &mut bpf,
-            "trace_binder_transaction_received",
-            "binder",
-            "binder_transaction_received",
-        )?;
-        attached.push("trace_binder_transaction_received");
-    }
-    let kprobe_packs = attach_kprobe_packs(&mut bpf, &args.kprobe_pack, &mut attached)?;
-
-    // 2. Phase 1a/1b — the capture predicate was pushed before attach. Print
-    // its split BPF/userspace audit now that setup succeeded.
-    let audit = capture_predicate.audit_lines();
-    if !audit.is_empty() {
-        eprintln!("  match predicate (Phase 1):");
-        for line in audit {
-            eprintln!("    {line}");
-        }
-        if state_events_required {
-            eprintln!(
-                "    [bpf]  internal state-tracking syscalls admitted for path, FD, or child state"
-            );
-        }
-        if let Some(spec) = capture_predicate.bpf_spec() {
-            warn_likely_shell_expansion("--match-fd", &spec.fd_globs);
-            warn_likely_shell_expansion("--match-comm", &spec.comm_globs);
-        }
-    }
-
     // 2c. Phase 1c — capture mode (`--capture matched+context=<DUR>`).
     let capture_mode = CaptureMode::from_cli(args.capture.as_deref())?;
     let mut context_ring: Option<ContextRing> = match capture_mode {
@@ -3219,16 +3097,17 @@ fn run_trace(mut args: Args) -> Result<()> {
         .as_deref()
         .map(|path| read_pinned_configuration(path, "Binder service map"))
         .transpose()?;
-    let binder_services: BinderServiceMap = match (&args.binder_services, &binder_services_config) {
-        (Some(path), Some(config)) => {
-            let m = BinderServiceMap::from_json(&config.content)
-                .with_context(|| format!("parsing Binder service map: {path}"))?;
-            eprintln!("  binder service map: {} entries from {path}", m.len());
-            m
-        }
-        (None, None) => BinderServiceMap::default(),
-        _ => unreachable!("Binder service configuration presence is derived from its path"),
-    };
+    let mut binder_services: BinderServiceMap =
+        match (&args.binder_services, &binder_services_config) {
+            (Some(path), Some(config)) => {
+                let m = BinderServiceMap::from_json(&config.content)
+                    .with_context(|| format!("parsing Binder service map: {path}"))?;
+                eprintln!("  binder service map: {} entries from {path}", m.len());
+                m
+            }
+            (None, None) => BinderServiceMap::default(),
+            _ => unreachable!("Binder service configuration presence is derived from its path"),
+        };
     let binder_methods_config = args
         .binder_methods
         .as_deref()
@@ -3315,10 +3194,254 @@ fn run_trace(mut args: Args) -> Result<()> {
     let drain_interval = args.findings_drain_interval.max(1);
     let mut events_since_drain: u64 = 0;
 
-    eprintln!("  attached: {}", attached.join(", "));
+    let capture_predicate = build_capture_predicate(&args)?;
+    let scope = ScopePolicy::from_str(&args.fdgraph_pids).map_err(anyhow::Error::msg)?;
+    let interval = parse_fdgraph_interval(&args.fdgraph_interval)?;
+    for pack in &args.kprobe_pack {
+        kprobe_pack_candidates(pack)?;
+    }
+    binder_services.bind_live()?;
+    print_banner();
+    let privilege = doctor::check_privilege(&doctor::RealEnv);
+    capture_privilege_preflight(&privilege)?;
+    let output_storage = args.output.as_ref().map(|output| {
+        doctor::check_output_storage(
+            Path::new(output)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+    });
+    if let Some(check) = &output_storage {
+        if check.status == doctor::Status::Fail {
+            bail!("output preflight failed: {}", check.reason);
+        }
+    }
+    doctor::validate_live_capture_layouts(args.binder).map_err(anyhow::Error::msg)?;
+    let _capture_lock = acquire_capture_lock(&args.capture_lock)?;
+    let capture_boot_id = read_boot_id()?;
+    let capture_serial = required_android_property("ro.serialno")?;
+    let capture_device_identity = live_device_identity(capture_boot_id.clone(), &capture_serial)?;
+    let capture_fingerprint = capture_device_identity.fingerprint.clone();
+    let harness_serial = args.harness_capture.then(|| capture_serial.clone());
+    let package_uid = args
+        .package
+        .as_deref()
+        .map(|package| {
+            android::resolve_package_uid(package)
+                .with_context(|| format!("resolving --package {package}"))
+        })
+        .transpose()?;
+    let mut resolved_subject = args
+        .subject
+        .as_ref()
+        .map(|subject| subject.resolve(args.max_processes as usize))
+        .transpose()?;
+    let mut root_pids = if let Some(subject) = &resolved_subject {
+        subject.roots.iter().map(|root| root.pid).collect()
+    } else if let Some(pids) = discover_dynamic_roots(&args, package_uid)? {
+        pids
+    } else if args.pid != 0 {
+        vec![args.pid]
+    } else {
+        Vec::new()
+    };
+    if let (Some(package), Some(uid)) = (args.package.as_deref(), package_uid) {
+        if root_pids.is_empty() {
+            bail!("no running process matches package {package} (uid {uid})");
+        }
+    }
+    if root_pids.len() > args.max_processes as usize {
+        bail!(
+            "causal root has {} processes, exceeding --max-processes {}",
+            root_pids.len(),
+            args.max_processes
+        );
+    }
+    eprintln!("  loading {}", args.object);
+    if let Some(package) = args.package.as_deref() {
+        eprintln!("  root package: {package}");
+    } else if let Some(uid) = args.root_uid {
+        eprintln!("  root uid: {uid} ({} current processes)", root_pids.len());
+    } else if let Some(subject) = &resolved_subject {
+        eprintln!(
+            "  subject: {} ({} roots)",
+            subject.selector.id(),
+            subject.roots.len()
+        );
+    } else {
+        eprintln!(
+            "  target pid: {}",
+            if args.pid == 0 {
+                "all".to_string()
+            } else {
+                args.pid.to_string()
+            }
+        );
+    }
+    if args.pid == 0 && args.package.is_none() && args.root_uid.is_none() && args.subject.is_none()
+    {
+        eprintln!("  note: tracing all processes; inflight map may overflow under heavy load");
+    }
+    if !driver_packs.names.is_empty() {
+        eprintln!("  driver packs: {}", driver_packs.names.join(", "));
+    }
+    if !schema_names.is_empty() {
+        eprintln!("  ioctl schema packs: {}", schema_names.join(", "));
+    }
+    resolve_match_android_providers(&mut args)?;
+    resolve_match_packages(&mut args)?;
+    for warning in capture_guardrail_warnings(&args) {
+        eprintln!("neutron: WARNING: {warning}");
+    }
+    // 1. Load BPF and attach tracepoints.
+    let mut required_bpf_features = BPF_FEATURE_PROCESS_EXIT;
+    if args.binder {
+        required_bpf_features |= BPF_FEATURE_BINDER_TRACE;
+    }
+    if args.stacks {
+        required_bpf_features |= BPF_FEATURE_STACKS;
+    }
+    let (bpf, bpf_identity) = load_bpf(
+        &args.object,
+        args.max_processes,
+        args.verbose,
+        required_bpf_features,
+    )?;
+    let mut session = TraceSession {
+        bpf,
+        attached: Vec::new(),
+        poller: None,
+        detached: false,
+    };
+    eprintln!(
+        "  BPF ABI: v{}.{} event_size={} object_sha256={}",
+        bpf_identity.abi_major,
+        bpf_identity.abi_minor,
+        bpf_identity.syscall_event_size,
+        bpf_identity.object_sha256,
+    );
+    if !bpf_identity.build_id_present {
+        eprintln!("neutron: WARNING: BPF object build ID is unavailable");
+    }
+    let tool_identity = neutron::run_manifest::ToolIdentity::current()
+        .context("identifying the running userspace binary")?;
+    let stack_traces = if args.stacks {
+        let stack_map = session.bpf.take_map("STACK_TRACES").with_context(|| {
+            format!(
+                "--stacks requires a STACK_TRACES map; use {STACKFUL_BPF_OBJECT} or rebuild with `cargo xtask build-ebpf --stacks`"
+            )
+        })?;
+        Some(
+            StackTraceMap::try_from(stack_map)
+                .context("STACK_TRACES has an incompatible map layout")?,
+        )
+    } else {
+        None
+    };
+
+    // Configure PID/causal gates before any global tracepoint is attached so
+    // the short loader setup window cannot capture unrelated processes.
+    populate_filter_map(
+        &mut session.bpf,
+        args.pid,
+        args.package.is_some() || args.root_uid.is_some() || args.subject.is_some(),
+        args.follow_binder,
+        args.max_depth,
+        args.root_uid.or(package_uid),
+        args.root_uid.is_some(),
+    )?;
+    let pre_admission_follow_denies = pre_admission_follow_deny_domains(&args)?;
+    let seeded_follow_denies =
+        seed_pre_admission_follow_denies(&mut session.bpf, &pre_admission_follow_denies)?;
+    if seeded_follow_denies > 0 {
+        eprintln!(
+            "  pre-admission Binder follow denies: {seeded_follow_denies} PID(s) in {}",
+            pre_admission_follow_denies
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    set_root_uid_context(&mut session.bpf, 0, 0)?;
+    replace_causal_roots(&mut session.bpf, &root_pids, 0, 0)?;
+    populate_ioctl_refresh_maps(&mut session.bpf, &driver_packs)?;
+    let state_events_required = workflow_needs_state_events(&args, &capture_predicate);
+    let (selinux_scope_pids, selinux_scope_uids) = capture_predicate
+        .bpf_spec()
+        .map(|spec| (spec.pids.clone(), spec.uids.clone()))
+        .unwrap_or_default();
+    let empty_bpf_spec = MatchSpec::default();
+    let bpf_spec = capture_predicate.bpf_spec().unwrap_or(&empty_bpf_spec);
+    populate_match_maps(&mut session.bpf, bpf_spec, state_events_required)?;
+
+    attach_tracepoint(
+        &mut session.bpf,
+        "trace_sys_enter",
+        "raw_syscalls",
+        "sys_enter",
+    )?;
+    attach_tracepoint(
+        &mut session.bpf,
+        "trace_sys_exit",
+        "raw_syscalls",
+        "sys_exit",
+    )?;
+    attach_tracepoint(
+        &mut session.bpf,
+        "trace_sched_process_exit",
+        "sched",
+        "sched_process_exit",
+    )?;
+    session.attached = vec![
+        "trace_sys_enter",
+        "trace_sys_exit",
+        "trace_sched_process_exit",
+    ];
+    if args.binder {
+        attach_tracepoint(
+            &mut session.bpf,
+            "trace_binder_transaction",
+            "binder",
+            "binder_transaction",
+        )?;
+        session.attached.push("trace_binder_transaction");
+        attach_tracepoint(
+            &mut session.bpf,
+            "trace_binder_transaction_received",
+            "binder",
+            "binder_transaction_received",
+        )?;
+        session.attached.push("trace_binder_transaction_received");
+    }
+    let kprobe_packs =
+        attach_kprobe_packs(&mut session.bpf, &args.kprobe_pack, &mut session.attached)?;
+
+    // 2. Phase 1a/1b — the capture predicate was pushed before attach. Print
+    // its split BPF/userspace audit now that setup succeeded.
+    let audit = capture_predicate.audit_lines();
+    if !audit.is_empty() {
+        eprintln!("  match predicate (Phase 1):");
+        for line in audit {
+            eprintln!("    {line}");
+        }
+        if state_events_required {
+            eprintln!(
+                "    [bpf]  internal state-tracking syscalls admitted for path, FD, or child state"
+            );
+        }
+        if let Some(spec) = capture_predicate.bpf_spec() {
+            warn_likely_shell_expansion("--match-fd", &spec.fd_globs);
+            warn_likely_shell_expansion("--match-comm", &spec.comm_globs);
+        }
+    }
+
+    eprintln!("  attached: {}", session.attached.join(", "));
 
     // 4. Set up the ring buffer consumer (must happen after attach).
-    let events_map = bpf
+    let events_map = session
+        .bpf
         .take_map("EVENTS")
         .context("EVENTS map missing from BPF object")?;
     let mut ring: RingBuf<_> = RingBuf::try_from(events_map).context("EVENTS is not a RingBuf")?;
@@ -3328,8 +3451,8 @@ fn run_trace(mut args: Args) -> Result<()> {
     }
 
     // 5. Stack-trace map (immutable read borrow used per event).
-    //    We borrow this immutably from `bpf` later when needed. For the event
-    //    loop we keep a re-acquired binding per drain to avoid holding `bpf`.
+    //    We borrow this immutably from `session.bpf` later when needed. For the event
+    //    loop we keep a re-acquired binding per drain to avoid holding `session.bpf`.
 
     // 6. Output sink.
     let output_cap_hit = Arc::new(AtomicBool::new(false));
@@ -3393,7 +3516,8 @@ fn run_trace(mut args: Args) -> Result<()> {
     let ev_size = std::mem::size_of::<SyscallEvent>();
     // Per-PID symbolizer cache. `None` means we tried and failed to read
     // `/proc/<pid>/maps` (process exited, or insufficient permissions).
-    let mut proc_sym_cache: HashMap<u32, Option<ProcSymbolizer>> = HashMap::new();
+    let mut process_state = neutron::process_state::ProcessState::default();
+    let mut last_exit_reconciliation = std::time::Instant::now();
     let mut native_capture = neutron::native::CaptureNativeState::default();
     // Build the kernel-side resolver once. Two layers: kallsyms gives
     // `name+0x<offset>` when readable; /proc/modules still gives
@@ -3454,7 +3578,6 @@ fn run_trace(mut args: Args) -> Result<()> {
     // Userspace FD graph: tracks (pid, fd) → resource so ioctl/read/write/mmap
     // events can be enriched with `fd_kind`, `fd_path`. Updated every event;
     // miss/backfill counts are surfaced in the capture summary on exit.
-    let mut fd_graph = FdGraph::new();
 
     // ── FD poller (sprint-1 PR 3) ────────────────────────────────────────
     //
@@ -3467,13 +3590,11 @@ fn run_trace(mut args: Args) -> Result<()> {
     // startup) is the default scope — keeping the poller off broad /proc
     // scans under `--pid 0`. We send a fresh copy of the set whenever it
     // grows; the poller drains updates non-blockingly.
-    let scope = ScopePolicy::from_str(&args.fdgraph_pids).map_err(anyhow::Error::msg)?;
-    let interval = parse_fdgraph_interval(&args.fdgraph_interval)?;
     let mut active_pids: HashSet<u32> = root_pids.iter().copied().collect();
     let mut watched_sensitive_fds = HashSet::<u64>::new();
     let mut follow_children_map_failures = 0_u64;
     let mut watch_fds_map_failures = 0_u64;
-    let poller_state: Option<(_, _, _, _)> = match interval {
+    session.poller = match interval {
         Some(dt) => {
             let cfg = PollerConfig {
                 interval: dt,
@@ -3655,396 +3776,851 @@ fn run_trace(mut args: Args) -> Result<()> {
         initial_hal_inventory_sha256.as_deref(),
         &bpf_identity,
         &tool_identity,
-        poller_state.is_some(),
+        session.poller.is_some(),
         initial_logcat_available,
         initial_selinux_available,
         initial_tombstone_available,
     );
 
+    capture_scope.observation.subject = resolved_subject.clone();
+    if let Some(bundle) = &trace_bundle {
+        neutron::private_output::write_json(
+            &bundle.run_dir.join("readiness.json"),
+            &serde_json::json!({
+                "schema": "neutron.capture-lifecycle/v1", "phase": "startup", "status": "ready",
+                "privilege": privilege, "storage": output_storage, "btf": doctor::check_btf(&doctor::RealEnv),
+                "tracepoint_layouts": "validated for requested capture", "bpf_abi": "validated by loader",
+                "attached_programs": session.attached, "effective_scope": capture_scope,
+                "teardown": "not checked", "seal": "not completed"
+            }),
+            true,
+        )?;
+    }
+
+    let mut pending_confirmed_exits = std::collections::VecDeque::new();
+    let mut subject_resolution_failures = 0_u64;
+    let mut scenario_subject = resolved_subject.clone();
     let mut pending_scenario_end: Option<PendingScenarioEnd> = None;
     let mut scenario_inflight_discarded = 0_u64;
     let mut scenario_context_discarded = 0_u64;
     let mut scenario_context_baseline_discarded = 0_u64;
-    while running.load(Ordering::Relaxed) {
-        if pending_scenario_end.is_none() {
-            if let Some(server) = control_server.as_ref() {
-                while let Some(pending) = server.try_recv()? {
-                    let request = pending.request.clone();
-                    if request.phase == "end" {
-                        let scenario = match scenarios.validate_end(&request.name) {
-                            Ok(scenario) => scenario,
-                            Err(error) => {
-                                if let Err(response_error) =
-                                    pending.respond_error(format!("{error:#}"))
-                                {
-                                    eprintln!(
+    let loop_result = (|| -> Result<()> {
+        while running.load(Ordering::Relaxed) {
+            if pending_scenario_end.is_none() {
+                if let Some(server) = control_server.as_ref() {
+                    while let Some(pending) = server.try_recv()? {
+                        let request = pending.request.clone();
+                        if request.phase == "end" {
+                            let scenario = match scenarios.validate_end(&request.name) {
+                                Ok(scenario) => scenario,
+                                Err(error) => {
+                                    if let Err(response_error) =
+                                        pending.respond_error(format!("{error:#}"))
+                                    {
+                                        eprintln!(
                                     "neutron: warn: marker client disconnected: {response_error:#}"
                                 );
+                                    }
+                                    continue;
                                 }
-                                continue;
+                            };
+                            let transition = (|| -> Result<u64> {
+                                set_root_uid_context(&mut session.bpf, 0, 0)?;
+                                replace_causal_roots(&mut session.bpf, &root_pids, 0, 0)?;
+                                clear_causal_transients(&mut session.bpf)?;
+                                discard_inflight_at_scenario_end(&mut session.bpf)
+                            })();
+                            match transition {
+                                Ok(discarded) => {
+                                    scenario_inflight_discarded =
+                                        scenario_inflight_discarded.saturating_add(discarded);
+                                    pending_scenario_end = Some(PendingScenarioEnd {
+                                        pending,
+                                        request,
+                                        scenario,
+                                        settle_until: std::time::Instant::now()
+                                            + Duration::from_millis(100),
+                                        cleanup_complete: false,
+                                    });
+                                }
+                                Err(error) => {
+                                    marker_transition_error = Some(format!(
+                                        "scenario end kernel transition failed: {error:#}"
+                                    ));
+                                    if let Err(response_error) =
+                                        pending.respond_error(format!("{error:#}"))
+                                    {
+                                        eprintln!(
+                                    "neutron: warn: marker client disconnected: {response_error:#}"
+                                );
+                                    }
+                                    running.store(false, Ordering::Relaxed);
+                                }
                             }
-                        };
-                        let transition = (|| -> Result<u64> {
-                            set_root_uid_context(&mut bpf, 0, 0)?;
-                            replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
-                            clear_causal_transients(&mut bpf)?;
-                            discard_inflight_at_scenario_end(&mut bpf)
-                        })();
-                        match transition {
-                            Ok(discarded) => {
-                                scenario_inflight_discarded =
-                                    scenario_inflight_discarded.saturating_add(discarded);
-                                pending_scenario_end = Some(PendingScenarioEnd {
-                                    pending,
-                                    request,
-                                    scenario,
-                                    settle_until: std::time::Instant::now()
-                                        + Duration::from_millis(100),
-                                    cleanup_complete: false,
+                            break;
+                        }
+                        let result: Result<(ScenarioInfo, u64, String)> = (|| {
+                            scenarios.validate_start(&request.name)?;
+                            if let Some(selector) = &args.subject {
+                                resolved_subject = Some(match &resolved_subject {
+                                    Some(current) => {
+                                        current.refresh(args.max_processes as usize)?
+                                    }
+                                    None => selector.resolve(args.max_processes as usize)?,
                                 });
+                                root_pids = resolved_subject
+                                    .as_ref()
+                                    .unwrap()
+                                    .roots
+                                    .iter()
+                                    .map(|root| root.pid)
+                                    .collect();
+                                scenario_subject = resolved_subject.clone();
                             }
-                            Err(error) => {
-                                marker_transition_error = Some(format!(
-                                    "scenario end kernel transition failed: {error:#}"
-                                ));
-                                if let Err(response_error) =
-                                    pending.respond_error(format!("{error:#}"))
-                                {
-                                    eprintln!(
-                                    "neutron: warn: marker client disconnected: {response_error:#}"
-                                );
-                                }
-                                running.store(false, Ordering::Relaxed);
+                            if let Some(discovered) = discover_dynamic_roots(&args, package_uid)? {
+                                root_pids = discovered;
                             }
-                        }
-                        break;
-                    }
-                    let result: Result<(ScenarioInfo, u64, String)> = (|| {
-                        scenarios.validate_start(&request.name)?;
-                        if let Some(discovered) = discover_dynamic_roots(&args, package_uid)? {
-                            root_pids = discovered;
-                        }
-                        if root_pids.is_empty() && args.root_uid.is_none() {
-                            bail!(
+                            if root_pids.is_empty() && args.root_uid.is_none() {
+                                bail!(
                                 "live scenarios require --root-uid, a running --package root, or a non-zero --pid root"
                             );
+                            }
+                            if root_pids.len() > args.max_processes as usize {
+                                bail!(
+                                    "{} root processes exceed --max-processes {}",
+                                    root_pids.len(),
+                                    args.max_processes
+                                );
+                            }
+                            // Validate the transition before these baseline drains:
+                            // a rejected nested/duplicate marker must not discard
+                            // evidence from the active scenario.
+                            if let Some(watcher) = tombstone_watcher.as_mut() {
+                                watcher.prime().context(
+                                    "establishing tombstone baseline before scenario start",
+                                )?;
+                            }
+                            if let Some(reader) = logcat_reader.as_mut() {
+                                reader.prime(monotonic_timestamp_ns()).context(
+                                    "establishing logcat baseline before scenario start",
+                                )?;
+                            }
+                            if let Some(reader) = selinux_reader.as_mut() {
+                                reader.prime(monotonic_timestamp_ns()).context(
+                                    "establishing SELinux logcat baseline before scenario start",
+                                )?;
+                            }
+                            if let Some(ring) = context_ring.as_mut() {
+                                scenario_context_baseline_discarded =
+                                    scenario_context_baseline_discarded
+                                        .saturating_add(ring.reset_boundary() as u64);
+                            }
+                            // The boundary timestamp precedes BPF activation, so
+                            // every event stamped with this generation is
+                            // monotonically at or after the start marker.
+                            if let Some(eng) = engine.as_mut() {
+                                eng.set_scope(neutron_rules::FindingScope::default());
+                                emit_findings_with(
+                                    &eng.drain_ready(),
+                                    &mut *out,
+                                    args.json,
+                                    args.fd_snapshot_on_finding,
+                                )?;
+                            }
+                            let ts_ns = monotonic_timestamp_ns();
+                            let scenario = scenarios.start(&request.name)?;
+                            if let Some(eng) = engine.as_mut() {
+                                eng.set_scope(neutron_rules::FindingScope {
+                                    scenario_id: Some(scenario.scenario_id.clone()),
+                                    trace_id: Some(format!("{:016x}", scenario.trace_id)),
+                                    generation: Some(scenario.generation),
+                                    process_starttime: None,
+                                });
+                            }
+                            if let Err(error) = (|| -> Result<()> {
+                                set_root_uid_context(
+                                    &mut session.bpf,
+                                    scenario.trace_id,
+                                    scenario.generation,
+                                )?;
+                                replace_causal_roots(
+                                    &mut session.bpf,
+                                    &root_pids,
+                                    scenario.trace_id,
+                                    scenario.generation,
+                                )?;
+                                clear_causal_transients(&mut session.bpf)
+                            })() {
+                                marker_transition_error = Some(format!(
+                                    "scenario start kernel transition failed: {error:#}"
+                                ));
+                                return Err(error);
+                            }
+                            if let Some(tracker) = binder_tracker.as_mut() {
+                                if !tracker.begin_scenario(scenario.generation) {
+                                    let error = format!(
+                                        "Binder tracker rejected scenario generation {}",
+                                        scenario.generation
+                                    );
+                                    marker_transition_error = Some(error.clone());
+                                    bail!(error);
+                                }
+                            }
+                            recent_exit_causal.clear();
+                            followed_last_hop_ns.clear();
+                            policy_blocked_pids.clear();
+                            active_pids = root_pids.iter().copied().collect();
+                            if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
+                                let _ = active_tx.try_send(active_pids.clone());
+                            }
+                            let line = live_marker_line(
+                                &request,
+                                &scenario,
+                                ts_ns,
+                                args.package.as_deref(),
+                                args.root_uid.or(package_uid),
+                                (args.pid != 0).then_some(args.pid),
+                                scenario_subject.as_ref(),
+                            );
+                            Ok((scenario, ts_ns, line))
+                        })(
+                        );
+                        let response = match result {
+                            Ok((scenario, ts_ns, line)) => match writeln!(out, "{line}") {
+                                Ok(()) => pending.respond_ok(
+                                    ts_ns,
+                                    scenario.generation,
+                                    scenario.trace_id,
+                                ),
+                                Err(error) => {
+                                    marker_transition_error = Some(format!(
+                                        "scenario start marker write failed: {error}"
+                                    ));
+                                    running.store(false, Ordering::Relaxed);
+                                    pending.respond_error(format!(
+                                        "scenario start marker write failed: {error}"
+                                    ))
+                                }
+                            },
+                            Err(error) => pending.respond_error(format!("{error:#}")),
+                        };
+                        if let Err(error) = response {
+                            eprintln!("neutron: warn: marker client disconnected: {error:#}");
                         }
-                        if root_pids.len() > args.max_processes as usize {
-                            bail!(
-                                "{} root processes exceed --max-processes {}",
-                                root_pids.len(),
-                                args.max_processes
+                        if marker_transition_error.is_some() {
+                            running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // A camera burst can reveal dozens of new Binder PIDs in one ring
+            // drain. Coalesce those observations into one catalog refresh and
+            // always service marker requests first; running `service` + `lshal`
+            // once per PID can otherwise starve the control socket for minutes.
+            if discovery_refresh_pending
+                && last_discovery_refresh.elapsed() >= Duration::from_secs(1)
+            {
+                match BinderCatalog::discover(args.follow_services, args.follow_hal) {
+                    Ok(discovered) => {
+                        if discovered.service_inventory_sha256()
+                            != initial_service_inventory_sha256.as_deref()
+                            || discovered.hal_inventory_sha256()
+                                != initial_hal_inventory_sha256.as_deref()
+                        {
+                            binder_discovery_drift = binder_discovery_drift.saturating_add(1);
+                        }
+                        binder_catalog = discovered;
+                    }
+                    Err(error) => {
+                        binder_discovery_failures = binder_discovery_failures.saturating_add(1);
+                        if binder_discovery_failures == 1 {
+                            eprintln!(
+                                "neutron: WARNING: Binder inventory refresh failed: {error:#}"
                             );
                         }
-                        // Validate the transition before these baseline drains:
-                        // a rejected nested/duplicate marker must not discard
-                        // evidence from the active scenario.
-                        if let Some(watcher) = tombstone_watcher.as_mut() {
-                            watcher
-                                .prime()
-                                .context("establishing tombstone baseline before scenario start")?;
-                        }
-                        if let Some(reader) = logcat_reader.as_mut() {
-                            reader
-                                .prime(monotonic_timestamp_ns())
-                                .context("establishing logcat baseline before scenario start")?;
-                        }
-                        if let Some(reader) = selinux_reader.as_mut() {
-                            reader.prime(monotonic_timestamp_ns()).context(
-                                "establishing SELinux logcat baseline before scenario start",
-                            )?;
-                        }
-                        if let Some(ring) = context_ring.as_mut() {
-                            scenario_context_baseline_discarded =
-                                scenario_context_baseline_discarded
-                                    .saturating_add(ring.reset_boundary() as u64);
-                        }
-                        // The boundary timestamp precedes BPF activation, so
-                        // every event stamped with this generation is
-                        // monotonically at or after the start marker.
-                        let ts_ns = monotonic_timestamp_ns();
-                        let scenario = scenarios.start(&request.name)?;
-                        if let Err(error) = (|| -> Result<()> {
-                            set_root_uid_context(&mut bpf, scenario.trace_id, scenario.generation)?;
-                            replace_causal_roots(
-                                &mut bpf,
-                                &root_pids,
-                                scenario.trace_id,
-                                scenario.generation,
-                            )?;
-                            clear_causal_transients(&mut bpf)
-                        })() {
-                            marker_transition_error = Some(format!(
-                                "scenario start kernel transition failed: {error:#}"
-                            ));
-                            return Err(error);
-                        }
-                        if let Some(tracker) = binder_tracker.as_mut() {
-                            if !tracker.begin_scenario(scenario.generation) {
-                                let error = format!(
-                                    "Binder tracker rejected scenario generation {}",
-                                    scenario.generation
-                                );
-                                marker_transition_error = Some(error.clone());
-                                bail!(error);
-                            }
-                        }
-                        recent_exit_causal.clear();
-                        followed_last_hop_ns.clear();
-                        policy_blocked_pids.clear();
-                        active_pids = root_pids.iter().copied().collect();
-                        if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
-                            let _ = active_tx.try_send(active_pids.clone());
-                        }
-                        let line = live_marker_line(
-                            &request,
-                            &scenario,
-                            ts_ns,
-                            args.package.as_deref(),
-                            args.root_uid.or(package_uid),
-                            (args.pid != 0).then_some(args.pid),
-                        );
-                        Ok((scenario, ts_ns, line))
-                    })();
-                    let response = match result {
-                        Ok((scenario, ts_ns, line)) => match writeln!(out, "{line}") {
-                            Ok(()) => {
-                                pending.respond_ok(ts_ns, scenario.generation, scenario.trace_id)
-                            }
-                            Err(error) => {
-                                marker_transition_error =
-                                    Some(format!("scenario start marker write failed: {error}"));
-                                running.store(false, Ordering::Relaxed);
-                                pending.respond_error(format!(
-                                    "scenario start marker write failed: {error}"
-                                ))
-                            }
-                        },
-                        Err(error) => pending.respond_error(format!("{error:#}")),
+                    }
+                }
+                discovery_refresh_pending = false;
+                last_discovery_refresh = std::time::Instant::now();
+            }
+
+            if last_root_refresh.elapsed() >= Duration::from_secs(1) {
+                last_root_refresh = std::time::Instant::now();
+                if let Some(selector) = &args.subject {
+                    let resolution = match &resolved_subject {
+                        Some(current) => current.refresh(args.max_processes as usize),
+                        None => selector.resolve(args.max_processes as usize),
                     };
-                    if let Err(error) = response {
-                        eprintln!("neutron: warn: marker client disconnected: {error:#}");
-                    }
-                    if marker_transition_error.is_some() {
-                        running.store(false, Ordering::Relaxed);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // A camera burst can reveal dozens of new Binder PIDs in one ring
-        // drain. Coalesce those observations into one catalog refresh and
-        // always service marker requests first; running `service` + `lshal`
-        // once per PID can otherwise starve the control socket for minutes.
-        if discovery_refresh_pending && last_discovery_refresh.elapsed() >= Duration::from_secs(1) {
-            match BinderCatalog::discover(args.follow_services, args.follow_hal) {
-                Ok(discovered) => {
-                    if discovered.service_inventory_sha256()
-                        != initial_service_inventory_sha256.as_deref()
-                        || discovered.hal_inventory_sha256()
-                            != initial_hal_inventory_sha256.as_deref()
-                    {
-                        binder_discovery_drift = binder_discovery_drift.saturating_add(1);
-                    }
-                    binder_catalog = discovered;
-                }
-                Err(error) => {
-                    binder_discovery_failures = binder_discovery_failures.saturating_add(1);
-                    if binder_discovery_failures == 1 {
-                        eprintln!("neutron: WARNING: Binder inventory refresh failed: {error:#}");
-                    }
-                }
-            }
-            discovery_refresh_pending = false;
-            last_discovery_refresh = std::time::Instant::now();
-        }
-
-        if last_root_refresh.elapsed() >= Duration::from_secs(1) {
-            last_root_refresh = std::time::Instant::now();
-            if args.package.is_some() || args.root_uid.is_some() {
-                match discover_dynamic_roots(&args, package_uid) {
-                    Ok(None) => {}
-                    Ok(Some(discovered)) if discovered.len() <= args.max_processes as usize => {
-                        let previous_roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
-                        let (trace_id, generation) = if pending_scenario_end.is_some() {
-                            (0, 0)
-                        } else {
-                            scenarios
+                    match resolution {
+                        Ok(next)
+                            if root_pids.is_empty() || Some(&next) != resolved_subject.as_ref() =>
+                        {
+                            if let Some(previous) = &resolved_subject {
+                                for old in &previous.roots {
+                                    if !next.roots.contains(old) {
+                                        process_state.drop_pid(old.pid);
+                                        native_capture.invalidate(old.pid);
+                                        if args.capture_reads {
+                                            let mut map: AyaHashMap<_, u64, u8> =
+                                                AyaHashMap::try_from(
+                                                    session
+                                                        .bpf
+                                                        .map_mut("WATCH_FDS")
+                                                        .context("WATCH_FDS missing")?,
+                                                )?;
+                                            for _ in cleanup_watched_fds_for_pid(
+                                                old.pid,
+                                                &mut map,
+                                                &mut watched_sensitive_fds,
+                                            ) {
+                                                watch_fds_map_failures =
+                                                    watch_fds_map_failures.saturating_add(1);
+                                            }
+                                        }
+                                        active_pids.remove(&old.pid);
+                                        if let Some(eng) = engine.as_mut() {
+                                            eng.finish_process(old.pid);
+                                        }
+                                    }
+                                }
+                            }
+                            let (trace, generation) = scenarios
                                 .active()
+                                .filter(|_| pending_scenario_end.is_none())
                                 .map(|scenario| (scenario.trace_id, scenario.generation))
-                                .unwrap_or((0, 0))
-                        };
-                        reconcile_causal_roots(&mut bpf, &discovered, trace_id, generation)?;
-                        root_pids = discovered;
-                        let current_roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
-                        let mut changed = false;
-                        for exited_root in previous_roots.difference(&current_roots) {
-                            changed |= active_pids.remove(exited_root);
-                        }
-                        if changed {
-                            if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
+                                .unwrap_or((0, 0));
+                            root_pids = next.roots.iter().map(|root| root.pid).collect();
+                            replace_causal_roots(&mut session.bpf, &[], 0, 0)?;
+                            clear_causal_transients(&mut session.bpf)?;
+                            scenario_inflight_discarded = scenario_inflight_discarded
+                                .saturating_add(discard_inflight_at_scenario_end(
+                                    &mut session.bpf,
+                                )?);
+                            if let Some(tracker) = binder_tracker.as_mut() {
+                                tracker.discard_inflight();
+                            }
+                            replace_causal_roots(&mut session.bpf, &root_pids, trace, generation)?;
+                            let mut record = serde_json::json!({"type":"subject_resolution", "schema":"neutron.subject-admission/v1", "ts_ns":monotonic_timestamp_ns(), "subject":next, "reason":"process_incarnation_changed"});
+                            if let Some(scenario) = scenarios
+                                .active()
+                                .filter(|_| pending_scenario_end.is_none())
+                            {
+                                record["trace_id"] =
+                                    serde_json::json!(format!("{:016x}", scenario.trace_id));
+                                record["scenario_id"] = serde_json::json!(scenario.scenario_id);
+                                record["generation"] = serde_json::json!(scenario.generation);
+                            }
+                            write_or_output_cap(writeln!(out, "{record}"), &output_cap_hit)?;
+                            resolved_subject = Some(next);
+                            active_pids = root_pids.iter().copied().collect();
+                            if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
                                 let _ = active_tx.try_send(active_pids.clone());
                             }
                         }
-                    }
-                    Ok(Some(discovered)) => bail!(
-                        "causal root now has {} processes, above --max-processes {}",
-                        discovered.len(),
-                        args.max_processes
-                    ),
-                    Err(error) => return Err(error).context("refreshing causal root process set"),
-                }
-            }
-            if args.follow_binder && pending_scenario_end.is_none() && scenarios.active().is_some()
-            {
-                let roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
-                let now_ns = monotonic_timestamp_ns();
-                for pid in
-                    expired_followed_pids(&followed_last_hop_ns, &roots, now_ns, follow_ttl_ns)
-                {
-                    followed_last_hop_ns.remove(&pid);
-                    policy_blocked_pids.remove(&pid);
-                    if active_pids.remove(&pid) {
-                        if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
-                            let _ = active_tx.try_send(active_pids.clone());
+                        Ok(_) => {}
+                        Err(error) => {
+                            subject_resolution_failures =
+                                subject_resolution_failures.saturating_add(1);
+                            // No owner means no admission. Keep service/executable sessions
+                            // available for a later, explicitly fresh incarnation.
+                            replace_causal_roots(&mut session.bpf, &[], 0, 0)?;
+                            clear_causal_transients(&mut session.bpf)?;
+                            if !root_pids.is_empty() {
+                                let record = serde_json::json!({"type":"subject_unavailable",
+                                    "schema":"neutron.subject-admission/v1", "ts_ns":monotonic_timestamp_ns(),
+                                    "selector":selector, "reason":format!("{error:#}")});
+                                write_or_output_cap(writeln!(out, "{record}"), &output_cap_hit)?;
+                            }
+                            active_pids.clear();
+                            if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
+                                let _ = active_tx.try_send(active_pids.clone());
+                            }
+                            root_pids.clear();
+                            if matches!(selector, neutron::subject::SubjectSelector::Pids(_)) {
+                                marker_transition_error =
+                                    Some(format!("PID subject is no longer available: {error:#}"));
+                                running.store(false, Ordering::Relaxed);
+                            }
+                            continue;
                         }
                     }
-                    let Some(context) = remove_followed_process(&mut bpf, pid)? else {
-                        continue;
-                    };
-                    follow_ttl_expired = follow_ttl_expired.saturating_add(1);
-                    write_or_output_cap(
-                        emit_follow_guardrail(
-                            &mut *out,
-                            args.json,
-                            &mut event_id_counter,
-                            "expired",
-                            "pid_ttl",
-                            context.parent_pid,
-                            pid,
-                            context.binder_debug_id,
-                            context.depth,
-                            None,
-                            Some(context),
-                            &scenarios,
+                }
+                if args.package.is_some() || args.root_uid.is_some() {
+                    match discover_dynamic_roots(&args, package_uid) {
+                        Ok(None) => {}
+                        Ok(Some(discovered)) if discovered.len() <= args.max_processes as usize => {
+                            let previous_roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
+                            let (trace_id, generation) = if pending_scenario_end.is_some() {
+                                (0, 0)
+                            } else {
+                                scenarios
+                                    .active()
+                                    .map(|scenario| (scenario.trace_id, scenario.generation))
+                                    .unwrap_or((0, 0))
+                            };
+                            reconcile_causal_roots(
+                                &mut session.bpf,
+                                &discovered,
+                                trace_id,
+                                generation,
+                            )?;
+                            root_pids = discovered;
+                            let current_roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
+                            let mut changed = false;
+                            for exited_root in previous_roots.difference(&current_roots) {
+                                changed |= active_pids.remove(exited_root);
+                            }
+                            if changed {
+                                if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
+                                    let _ = active_tx.try_send(active_pids.clone());
+                                }
+                            }
+                        }
+                        Ok(Some(discovered)) => bail!(
+                            "causal root now has {} processes, above --max-processes {}",
+                            discovered.len(),
+                            args.max_processes
                         ),
-                        &output_cap_hit,
-                    )?;
-                }
-            }
-        }
-
-        let mut saw_any = false;
-        loop {
-            let bytes_owned: Vec<u8> = match ring.next() {
-                Some(item) => {
-                    let slice: &[u8] = &item;
-                    if slice.len() != ev_size {
-                        invalid_ring_records = invalid_ring_records.saturating_add(1);
-                        continue;
-                    }
-                    slice.to_vec()
-                }
-                None => break,
-            };
-            saw_any = true;
-            let bytes = bytes_owned;
-            {
-                // SAFETY: SyscallEvent is #[repr(C, packed)] of plain integers and
-                // byte arrays; every 257-byte payload is a valid bit-pattern.
-                let ev: SyscallEvent =
-                    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const _) };
-                total_events += 1;
-
-                let event_pid = { ev.pid };
-                let event_nr = { ev.syscall_nr };
-                let event_generation = { ev.maps_generation };
-                if event_nr != SYSCALL_NR_PROCESS_EXIT
-                    && should_skip_for_exclude_comm(&ev, &args.exclude_comm)
-                {
-                    continue;
-                }
-                if event_nr != SYSCALL_NR_PROCESS_EXIT
-                    && args.alert_rwx
-                    && should_skip_for_alert_rwx(&ev)
-                {
-                    continue;
-                }
-                let causal_event = causal_metadata_for_event(
-                    &ev,
-                    &scenarios,
-                    args.package.as_deref(),
-                    args.root_uid.or(package_uid),
-                );
-                if event_nr != SYSCALL_NR_PROCESS_EXIT {
-                    // Any post-exit activity proves that this PID has been
-                    // reused; stale crash attribution must be discarded.
-                    recent_exit_causal.remove(&event_pid);
-                }
-                if policy_blocked_pids.contains(&event_pid)
-                    && event_nr != SYSCALL_NR_BINDER_RECEIVED
-                    && event_nr != SYSCALL_NR_PROCESS_EXIT
-                    && !root_pids.contains(&event_pid)
-                {
-                    continue;
-                }
-
-                // ── Sprint-2 PR 1: BPF sched_process_exit handoff ────
-                //
-                // The tracepoint emits a synthetic SyscallEvent with
-                // syscall_nr == -3. Convert to a ProcessExitEvent and route
-                // through the shared emit path; do NOT format it as a normal
-                // syscall JSON line.
-                if { ev.syscall_nr } == SYSCALL_NR_PROCESS_EXIT {
-                    let args_arr = { ev.args };
-                    let pe = ProcessExitEvent {
-                        ts_ns: { ev.timestamp_ns },
-                        pid: { ev.pid },
-                        uid: Some(ev.uid),
-                        comm: format_comm(&{ ev.comm }),
-                        exit_code: (args_arr[0] & 0xff) as u8,
-                        exit_signal: (args_arr[1] & 0xffffffff) as u32,
-                        source: ExitSource::from_u8((args_arr[2] & 0xff) as u8)
-                            .unwrap_or(ExitSource::Tracepoint),
-                    };
-                    if active_pids.remove(&pe.pid) {
-                        if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
-                            let _ = active_tx.try_send(active_pids.clone());
+                        Err(error) => {
+                            return Err(error).context("refreshing causal root process set")
                         }
                     }
-                    if args.capture_reads {
-                        let map = bpf.map_mut("WATCH_FDS").context("WATCH_FDS missing")?;
-                        let mut watch_fds: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(map)
-                            .context("WATCH_FDS is not HashMap<u64,u8>")?;
-                        for error in cleanup_watched_fds_for_pid(
-                            pe.pid,
-                            &mut watch_fds,
-                            &mut watched_sensitive_fds,
-                        ) {
-                            watch_fds_map_failures = watch_fds_map_failures.saturating_add(1);
-                            if watch_fds_map_failures == 1 {
-                                eprintln!("neutron: WARNING: {error}");
+                }
+                if args.follow_binder
+                    && pending_scenario_end.is_none()
+                    && scenarios.active().is_some()
+                {
+                    let roots = root_pids.iter().copied().collect::<BTreeSet<_>>();
+                    let now_ns = monotonic_timestamp_ns();
+                    for pid in
+                        expired_followed_pids(&followed_last_hop_ns, &roots, now_ns, follow_ttl_ns)
+                    {
+                        followed_last_hop_ns.remove(&pid);
+                        policy_blocked_pids.remove(&pid);
+                        if active_pids.remove(&pid) {
+                            if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
+                                let _ = active_tx.try_send(active_pids.clone());
+                            }
+                        }
+                        let Some(context) = remove_followed_process(&mut session.bpf, pid)? else {
+                            continue;
+                        };
+                        follow_ttl_expired = follow_ttl_expired.saturating_add(1);
+                        write_or_output_cap(
+                            emit_follow_guardrail(
+                                &mut *out,
+                                args.json,
+                                &mut event_id_counter,
+                                "expired",
+                                "pid_ttl",
+                                context.parent_pid,
+                                pid,
+                                context.binder_debug_id,
+                                context.depth,
+                                None,
+                                Some(context),
+                                &scenarios,
+                            ),
+                            &output_cap_hit,
+                        )?;
+                    }
+                }
+            }
+
+            if last_exit_reconciliation.elapsed() >= Duration::from_millis(100) {
+                last_exit_reconciliation = std::time::Instant::now();
+                pending_confirmed_exits.extend(process_state.confirmed_exits());
+            }
+            let mut saw_any = false;
+            let mut drained_records = 0_usize;
+            loop {
+                // More than one full 1-MiB ring of 257-byte records. Finish
+                // queued worker events before process teardown, without starving control.
+                let item = if drained_records < 4096 {
+                    ring.next()
+                } else {
+                    None
+                };
+                drained_records += usize::from(item.is_some());
+                let confirmed_exit = if item.is_none() {
+                    pending_confirmed_exits.pop_front()
+                } else {
+                    None
+                };
+                let bytes_owned: Vec<u8> = if confirmed_exit.is_some() {
+                    Vec::new()
+                } else {
+                    match item {
+                        Some(item) => {
+                            let slice: &[u8] = &item;
+                            if slice.len() != ev_size {
+                                invalid_ring_records = invalid_ring_records.saturating_add(1);
+                                continue;
+                            }
+                            slice.to_vec()
+                        }
+                        None => break,
+                    }
+                };
+                saw_any = true;
+                let bytes = bytes_owned;
+                {
+                    // SAFETY: SyscallEvent is #[repr(C, packed)] of plain integers and
+                    // byte arrays; every 257-byte payload is a valid bit-pattern.
+                    if let Some((event, expected_starttime)) = confirmed_exit {
+                        if neutron::native::read_starttime(event.pid)
+                            .is_some_and(|current| Some(current) != expected_starttime)
+                        {
+                            // The ring may already contain a reused PID. Never retire
+                            // its new admission/caches using an earlier death observation.
+                            process_state.reconciliation_failures =
+                                process_state.reconciliation_failures.saturating_add(1);
+                            continue;
+                        }
+                    }
+                    let mut ev: SyscallEvent = confirmed_exit
+                        .map(|(event, _)| event)
+                        .unwrap_or_else(|| unsafe {
+                            std::ptr::read_unaligned(bytes.as_ptr() as *const _)
+                        });
+                    if confirmed_exit.is_some() {
+                        ev.timestamp_ns = monotonic_timestamp_ns();
+                        if scenarios.active().map(|scenario| scenario.generation)
+                            != Some(ev.maps_generation)
+                        {
+                            ev.maps_generation = 0;
+                        }
+                    }
+                    // Confirmed process death reuses a task-exit observation; it is not a second ring record.
+                    if confirmed_exit.is_none() {
+                        total_events += 1;
+                    }
+
+                    let event_pid = { ev.pid };
+                    let event_nr = { ev.syscall_nr };
+                    let event_generation = { ev.maps_generation };
+                    if event_nr == SYSCALL_NR_PROCESS_EXIT && confirmed_exit.is_none() {
+                        process_state.task_exit(ev);
+                        if args.json && !suppress_raw {
+                            let line = serde_json::json!({"type":"task_exit", "schema":"neutron.task-exit/v1", "ts_ns": ({ev.timestamp_ns}), "pid":event_pid, "tid":({ev.tgid}), "status_available":false, "process_death_confirmed":false});
+                            write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
+                        }
+                        continue;
+                    }
+                    if event_nr != SYSCALL_NR_PROCESS_EXIT {
+                        let identity = neutron::native::read_starttime(event_pid);
+                        if let Some(eng) = engine.as_mut() {
+                            eng.set_process_incarnation(event_pid, identity);
+                        }
+                        if process_state.refresh(event_pid, identity) {
+                            native_capture.invalidate(event_pid);
+                            recent_exit_causal.remove(&event_pid);
+                            if let Some(store) = lookback.as_mut() {
+                                store.take(event_pid);
+                            }
+                            if args.capture_reads {
+                                let mut watch_fds: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(
+                                    session
+                                        .bpf
+                                        .map_mut("WATCH_FDS")
+                                        .context("WATCH_FDS missing")?,
+                                )?;
+                                for error in cleanup_watched_fds_for_pid(
+                                    event_pid,
+                                    &mut watch_fds,
+                                    &mut watched_sensitive_fds,
+                                ) {
+                                    watch_fds_map_failures =
+                                        watch_fds_map_failures.saturating_add(1);
+                                    eprintln!("neutron: WARNING: {error}");
+                                }
                             }
                         }
                     }
-                    if let Some(metadata) = causal_event.as_ref() {
-                        recent_exit_causal.insert(
-                            pe.pid,
-                            RecentExitCausal {
-                                metadata: metadata.clone(),
-                                exit_ts_ns: pe.ts_ns,
-                                comm: pe.comm.clone(),
-                            },
-                        );
+
+                    if event_nr != SYSCALL_NR_PROCESS_EXIT
+                        && should_skip_for_exclude_comm(&ev, &args.exclude_comm)
+                    {
+                        continue;
                     }
-                    // Sprint-2 PR 2: drain in-flight binder transactions
-                    // for the dying PID before emitting the exit. Each
-                    // drained entry becomes a `binder_call` line with
-                    // status=callee_crashed, feeding R004.
-                    if pe.classify() == neutron::sources::ExitClassification::Crash {
+                    if event_nr != SYSCALL_NR_PROCESS_EXIT
+                        && args.alert_rwx
+                        && should_skip_for_alert_rwx(&ev)
+                    {
+                        continue;
+                    }
+                    let causal_event = causal_metadata_for_event(
+                        &ev,
+                        &scenarios,
+                        args.package.as_deref(),
+                        args.root_uid.or(package_uid),
+                    );
+                    if event_nr != SYSCALL_NR_PROCESS_EXIT {
+                        // Any post-exit activity proves that this PID has been
+                        // reused; stale crash attribution must be discarded.
+                        recent_exit_causal.remove(&event_pid);
+                    }
+                    if policy_blocked_pids.contains(&event_pid)
+                        && event_nr != SYSCALL_NR_BINDER_RECEIVED
+                        && event_nr != SYSCALL_NR_PROCESS_EXIT
+                        && !root_pids.contains(&event_pid)
+                    {
+                        continue;
+                    }
+
+                    // ── Sprint-2 PR 1: BPF sched_process_exit handoff ────
+                    //
+                    // The tracepoint emits a synthetic SyscallEvent with
+                    // syscall_nr == -3. Convert to a ProcessExitEvent and route
+                    // through the shared emit path; do NOT format it as a normal
+                    // syscall JSON line.
+                    if { ev.syscall_nr } == SYSCALL_NR_PROCESS_EXIT {
+                        let args_arr = { ev.args };
+                        let pe = ProcessExitEvent {
+                            ts_ns: { ev.timestamp_ns },
+                            pid: { ev.pid },
+                            uid: Some(ev.uid),
+                            comm: format_comm(&{ ev.comm }),
+                            exit_code: (args_arr[0] & 0xff) as u8,
+                            exit_signal: (args_arr[1] & 0xffffffff) as u32,
+                            source: ExitSource::from_u8((args_arr[2] & 0xff) as u8)
+                                .unwrap_or(ExitSource::Tracepoint),
+                        };
+                        process_state.drop_pid(pe.pid);
+                        native_capture.invalidate(pe.pid);
+                        for map_name in ["TRACED_PROCESSES", "PID_WHITELIST"] {
+                            if map_name == "TRACED_PROCESSES" {
+                                let mut map: AyaHashMap<_, u32, [u8; PROCESS_TRACE_CONTEXT_SIZE]> =
+                                    AyaHashMap::try_from(
+                                        session
+                                            .bpf
+                                            .map_mut(map_name)
+                                            .context("TRACED_PROCESSES missing")?,
+                                    )?;
+                                if let Err(error) = map.remove(&pe.pid) {
+                                    if !map_delete_already_absent(&error) {
+                                        return Err(error.into());
+                                    }
+                                }
+                            } else {
+                                let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+                                    session
+                                        .bpf
+                                        .map_mut(map_name)
+                                        .context("PID_WHITELIST missing")?,
+                                )?;
+                                if let Err(error) = map.remove(&pe.pid) {
+                                    if !map_delete_already_absent(&error) {
+                                        return Err(error.into());
+                                    }
+                                }
+                            }
+                        }
+                        if active_pids.remove(&pe.pid) {
+                            if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
+                                let _ = active_tx.try_send(active_pids.clone());
+                            }
+                        }
+                        if args.capture_reads {
+                            let map = session
+                                .bpf
+                                .map_mut("WATCH_FDS")
+                                .context("WATCH_FDS missing")?;
+                            let mut watch_fds: AyaHashMap<_, u64, u8> =
+                                AyaHashMap::try_from(map)
+                                    .context("WATCH_FDS is not HashMap<u64,u8>")?;
+                            for error in cleanup_watched_fds_for_pid(
+                                pe.pid,
+                                &mut watch_fds,
+                                &mut watched_sensitive_fds,
+                            ) {
+                                watch_fds_map_failures = watch_fds_map_failures.saturating_add(1);
+                                if watch_fds_map_failures == 1 {
+                                    eprintln!("neutron: WARNING: {error}");
+                                }
+                            }
+                        }
+                        if let Some(metadata) = causal_event.as_ref() {
+                            recent_exit_causal.insert(
+                                pe.pid,
+                                RecentExitCausal {
+                                    metadata: metadata.clone(),
+                                    exit_ts_ns: pe.ts_ns,
+                                    comm: pe.comm.clone(),
+                                },
+                            );
+                        }
+                        // Sprint-2 PR 2: drain in-flight binder transactions
+                        // for the dying PID before emitting the exit. Each
+                        // drained entry becomes a `binder_call` line with
+                        // status=callee_crashed, feeding R004.
+                        if pe.classify() == neutron::sources::ExitClassification::Crash {
+                            if let Some(t) = binder_tracker.as_mut() {
+                                for pair in
+                                    t.on_callee_crash_for_generation(event_generation, pe.pid)
+                                {
+                                    write_or_output_cap(
+                                        emit_binder_call(
+                                            &pair,
+                                            lookback.as_mut(),
+                                            &mut engine,
+                                            &mut *out,
+                                            suppress_raw,
+                                            args.json,
+                                            &mut event_id_counter,
+                                            &binder_services,
+                                            &binder_catalog,
+                                            &binder_methods,
+                                            aidl_catalog.as_ref(),
+                                            pair.causal_metadata.as_ref(),
+                                        ),
+                                        &output_cap_hit,
+                                    )?;
+                                }
+                            }
+                        }
+                        write_or_output_cap(
+                            emit_process_exit(
+                                &pe,
+                                lookback.as_mut(),
+                                &mut engine,
+                                &mut *out,
+                                suppress_raw,
+                                args.json,
+                                &mut event_id_counter,
+                                causal_event.as_ref(),
+                            ),
+                            &output_cap_hit,
+                        )?;
+                        if let Some(eng) = engine.as_mut() {
+                            eng.finish_process(pe.pid);
+                            neutron::rules::emit_findings_with(
+                                &eng.drain_ready(),
+                                &mut *out,
+                                args.json,
+                                args.fd_snapshot_on_finding,
+                            )?;
+                        }
+                        if args.pid != 0
+                            && args.package.is_none()
+                            && args.root_uid.is_none()
+                            && pe.pid == args.pid
+                        {
+                            running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // ── Sprint-2 PR 2: binder caller / received tracker ────
+                    //
+                    // Caller side (nr=-1) goes into the in-flight map. Callee
+                    // side (nr=-4) tries to match and emits a binder_call on
+                    // success. The raw binder / binder_received JSON line is
+                    // still emitted below so operators can grep low-level
+                    // detail.
+                    let nr_now = { ev.syscall_nr };
+                    if nr_now == -1 {
+                        let args_arr = { ev.args };
+                        let debug_id = { ev.ptr_hint } as u32 as i32;
+                        let callee_pid = args_arr[0] as u32;
+                        if callee_pid != 0
+                            && (args.follow_services || args.follow_hal)
+                            && discovery_seen_pids.insert(callee_pid)
+                        {
+                            discovery_refresh_pending = true;
+                        }
+                        if args.follow_binder
+                            && pending_scenario_end.is_none()
+                            && callee_pid != 0
+                            && !root_pids.contains(&callee_pid)
+                        {
+                            if let Some(metadata) = causal_event.as_ref() {
+                                let caller_pid = { ev.pid };
+                                let caller_comm = format_comm(&{ ev.comm });
+                                let (_, caller_domain) = follow_process_identity(caller_pid);
+                                let (callee_comm, callee_domain) =
+                                    follow_process_identity(callee_pid);
+                                let decision = follow_policy.decide(FollowCandidate {
+                                    caller_comm: Some(&caller_comm),
+                                    caller_domain: caller_domain.as_deref(),
+                                    callee_comm: callee_comm.as_deref(),
+                                    callee_domain: callee_domain.as_deref(),
+                                    caller_relation: metadata.relation,
+                                    caller_depth: metadata.depth.saturating_sub(1),
+                                });
+                                match decision {
+                                    FollowDecision::Allow => {
+                                        policy_blocked_pids.remove(&callee_pid);
+                                        let ts_ns = { ev.timestamp_ns };
+                                        if !root_pids.contains(&caller_pid) {
+                                            followed_last_hop_ns.insert(caller_pid, ts_ns);
+                                        }
+                                        followed_last_hop_ns.insert(callee_pid, ts_ns);
+                                    }
+                                    FollowDecision::Block(reason) => {
+                                        let _ =
+                                            remove_followed_process(&mut session.bpf, callee_pid)?;
+                                        followed_last_hop_ns.remove(&callee_pid);
+                                        if active_pids.remove(&callee_pid) {
+                                            if let Some((_, active_tx, _, _)) =
+                                                session.poller.as_ref()
+                                            {
+                                                let _ = active_tx.try_send(active_pids.clone());
+                                            }
+                                        }
+                                        policy_blocked_pids.insert(callee_pid);
+                                        follow_policy_filtered =
+                                            follow_policy_filtered.saturating_add(1);
+                                        write_or_output_cap(
+                                            emit_follow_guardrail(
+                                                &mut *out,
+                                                args.json,
+                                                &mut event_id_counter,
+                                                "blocked",
+                                                reason,
+                                                caller_pid,
+                                                callee_pid,
+                                                debug_id as u32,
+                                                metadata.depth,
+                                                Some(metadata),
+                                                None,
+                                                &scenarios,
+                                            ),
+                                            &output_cap_hit,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
                         if let Some(t) = binder_tracker.as_mut() {
-                            for pair in t.on_callee_crash_for_generation(event_generation, pe.pid) {
+                            let pid = { ev.pid };
+                            let uid = { ev.uid };
+                            let ts = { ev.timestamp_ns };
+                            t.record_caller_for_generation(
+                                event_generation,
+                                debug_id,
+                                pid,
+                                uid,
+                                format_comm(&{ ev.comm }),
+                                args_arr[0] as u32,
+                                args_arr[1] as u32,
+                                args_arr[2] as u32,
+                                args_arr[4] != 0,
+                                args_arr[5] as i32,
+                                ts,
+                                causal_event.clone(),
+                            );
+                        }
+                    } else if nr_now == SYSCALL_NR_BINDER_RECEIVED {
+                        if let Some(t) = binder_tracker.as_mut() {
+                            let debug_id = { ev.ptr_hint } as u32 as i32;
+                            let ts = { ev.timestamp_ns };
+                            if let Some(pair) =
+                                t.record_received_for_generation(event_generation, debug_id, ts)
+                            {
                                 write_or_output_cap(
                                     emit_binder_call(
                                         &pair,
@@ -4065,6 +4641,420 @@ fn run_trace(mut args: Args) -> Result<()> {
                             }
                         }
                     }
+
+                    // Resolve the stack BEFORE building the JSON line so the
+                    // rule engine can pattern-match against `stack_contains`.
+                    // This must happen before `format_event_json_with_stack`.
+                    let mapping_changed = { ev.is_enter } == 0
+                        && { ev.ret } >= 0
+                        && matches!(
+                            { ev.syscall_nr },
+                            SYSCALL_MMAP | SYSCALL_MUNMAP | SYSCALL_MPROTECT
+                        );
+                    if mapping_changed {
+                        native_capture.invalidate(ev.pid);
+                        process_state.symbols.remove(&{ ev.pid });
+                    }
+                    let exec_event = matches!({ ev.syscall_nr }, SYSCALL_EXECVE | SYSCALL_EXECVEAT);
+                    if exec_event && { ev.is_enter } == 0 && { ev.ret } < 0 {
+                        native_capture.clear_invalidation(ev.pid);
+                    }
+
+                    let (stack_str, stack_refs): (Option<String>, Vec<String>) = if args.stacks {
+                        let kstk = { ev.kernel_stackid };
+                        let ustk = { ev.user_stackid };
+                        if kstk >= 0 || ustk >= 0 {
+                            let pid = { ev.pid };
+                            let proc_sym_opt = process_state
+                                .symbols
+                                .entry(pid)
+                                .or_insert_with(|| ProcSymbolizer::new(pid));
+                            if let Some(stack_traces) = stack_traces.as_ref() {
+                                let proc_sym_mut = proc_sym_opt.as_mut();
+                                let kernel_stack = match format_stack(
+                                    stack_traces,
+                                    kstk,
+                                    None,
+                                    kernel_resolver.as_ref(),
+                                ) {
+                                    Ok(stack) => stack,
+                                    Err(_) => {
+                                        stack_read_failures = stack_read_failures.saturating_add(1);
+                                        None
+                                    }
+                                };
+                                let user_stack =
+                                    match format_stack(stack_traces, ustk, proc_sym_mut, None) {
+                                        Ok(stack) => stack,
+                                        Err(_) => {
+                                            stack_read_failures =
+                                                stack_read_failures.saturating_add(1);
+                                            None
+                                        }
+                                    };
+                                let mut references = Vec::new();
+                                for (kind, id, stack) in [
+                                    ("user", ustk, user_stack.as_ref()),
+                                    ("kernel", kstk, kernel_stack.as_ref()),
+                                ] {
+                                    let Some(stack) = stack else { continue };
+                                    let Some(captured) = native_capture.capture_stack(
+                                        pid,
+                                        ev.timestamp_ns,
+                                        kind,
+                                        id,
+                                        &stack.ips,
+                                        &stack.rendered,
+                                    ) else {
+                                        continue;
+                                    };
+                                    if args.json && !suppress_raw {
+                                        for record in captured.records {
+                                            write_or_output_cap(
+                                                writeln!(out, "{record}"),
+                                                &output_cap_hit,
+                                            )?;
+                                        }
+                                    }
+                                    references.push(captured.reference);
+                                }
+                                let kernel_str =
+                                    kernel_stack.map(|stack| stack.rendered.join(" <- "));
+                                let user_str = user_stack.map(|stack| stack.rendered.join(" <- "));
+                                let rendered = match (kernel_str, user_str) {
+                                    (Some(k), Some(u)) => Some(format!("{k} ;; {u}")),
+                                    (Some(k), None) => Some(k),
+                                    (None, Some(u)) => Some(u),
+                                    (None, None) => None,
+                                };
+                                (rendered, references)
+                            } else {
+                                (None, Vec::new())
+                            }
+                        } else {
+                            (None, Vec::new())
+                        }
+                    } else {
+                        (None, Vec::new())
+                    };
+                    if exec_event && { ev.is_enter } == 1 {
+                        native_capture.invalidate(ev.pid);
+                        process_state.symbols.remove(&{ ev.pid });
+                    }
+
+                    // Update the FD graph from this event (open/close/dup/socket/
+                    // memfd_create/etc. drive state transitions). Pass the
+                    // already-decoded path so we don't re-decode in the graph.
+                    let decoded_path = format_data_field(&ev);
+                    process_state.fds.update(&ev, decoded_path.as_deref());
+
+                    // If the event references a fd we know about, build an FdHint
+                    // for JSON enrichment. mmap with MAP_ANONYMOUS (fd == -1) is
+                    // skipped by `fd_arg_for_event`.
+                    let fd_hint = FdGraph::fd_arg_for_event(&ev).and_then(|(fd, _idx)| {
+                        let pid = { ev.pid };
+                        let ts = { ev.timestamp_ns };
+                        let opt = if args.resolve_paths {
+                            process_state.fds.lookup_or_resolve(pid, fd, ts)
+                        } else {
+                            process_state.fds.lookup(pid, fd).cloned()
+                        };
+                        opt.map(|e| FdHint {
+                            binding_source: e.source,
+                            kind: e.kind,
+                            path: e.path,
+                        })
+                    });
+
+                    // Phase 1a/1b — userspace post-filter. The BPF prefilter is a
+                    // safe over-approximation; here we apply the full predicate
+                    // (including userspace-only clauses, OR / NOT branches, and
+                    // `--match <expr>` AST nodes) to decide whether to emit the
+                    // event line, feed the rule engine, and record into the
+                    // crash-context lookback.
+                    //
+                    // fdgraph state has already been updated above so we can
+                    // reject state-tracking events without losing fd→path
+                    // information; a later ioctl whose match depends on the
+                    // resolved path then sees the up-to-date entry.
+                    let post_filter_ok = if capture_predicate.is_empty() {
+                        true
+                    } else {
+                        let lens = SyscallEventLens::new(
+                            &ev,
+                            format_comm(&{ ev.comm }),
+                            fd_hint.as_ref().map(|h| h.path.as_str()),
+                            compute_latency_us(&ev),
+                        );
+                        capture_predicate.evaluate(&lens)
+                    };
+                    if post_filter_ok {
+                        events_matched = events_matched.saturating_add(1);
+                    }
+
+                    // Always compute the JSON form: cheap and fed to the rule engine.
+                    event_id_counter = event_id_counter.wrapping_add(1);
+                    let mut json_line = format_event_json_full(
+                        &ev,
+                        args.resolve_paths,
+                        stack_str.as_deref(),
+                        fd_hint.as_ref(),
+                        Some(event_id_counter),
+                    );
+                    json_line = neutron::native::add_stack_references(&json_line, &stack_refs);
+                    if let Some(metadata) = causal_event.as_ref() {
+                        json_line = enrich_json(&json_line, metadata)?;
+                    }
+                    if let Some(capture) = harness_capture.as_ref() {
+                        json_line = capture.enrich_json(
+                            &ev,
+                            fd_hint.as_ref().map(|hint| hint.path.as_str()),
+                            &json_line,
+                        )?;
+                    }
+
+                    // Phase 1d — sampling decision. State-tracking syscalls
+                    // (open/close/dup/socket/...) and synthetic sentinels
+                    // bypass the chain so fdgraph and crash correlation stay
+                    // intact even at p=0.0 / rate=1.
+                    let nr_for_sampler = { ev.syscall_nr };
+                    let ts_ns = { ev.timestamp_ns };
+                    let sampler_keep = sampler.keep(ts_ns, nr_for_sampler);
+                    if !sampler_keep {
+                        events_sampled_out = events_sampled_out.saturating_add(1);
+                    }
+
+                    // Phase 1c — context-window dispatch. The post-filter +
+                    // sampler verdicts feed the ring (or the simple emit
+                    // path) together. State-tracking events that the sampler
+                    // exempts will reach the ring as `matched=false` if the
+                    // predicate also rejected them — so they sit in the
+                    // backward window without firing it themselves.
+                    let lines: Vec<String> = if !sampler_keep {
+                        Vec::new()
+                    } else {
+                        match context_ring.as_mut() {
+                            None => {
+                                if post_filter_ok {
+                                    vec![json_line.clone()]
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            Some(_ring)
+                                if pending_scenario_end.is_some() && causal_event.is_none() =>
+                            {
+                                if post_filter_ok {
+                                    vec![json_line.clone()]
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            Some(ring) => ring.observe(ts_ns, post_filter_ok, &json_line),
+                        }
+                    };
+
+                    if !lines.is_empty() {
+                        // Always feed the rule engine the *currently observed*
+                        // event when the post-filter agrees — flushing context
+                        // into the engine as if it were live would re-fire
+                        // rules on stale events. Backward-context lines from the
+                        // ring are write-only (they go to the output and the
+                        // lookback, but not the engine).
+                        if post_filter_ok {
+                            if let Some(eng) = engine.as_mut() {
+                                if let Some(owned) = neutron_rules::Event::parse_line(&json_line) {
+                                    if let Some(view) = owned.view() {
+                                        eng.feed(&view);
+                                    }
+                                }
+                            }
+                        }
+
+                        if !suppress_raw {
+                            for line in &lines {
+                                // For text mode we still render the live event
+                                // via the existing text formatter; backward-flush
+                                // lines from the ring stay in JSON to preserve
+                                // their original shape (mixing modes inside one
+                                // capture is unavoidable when the ring buffers
+                                // JSON).
+                                if args.json || line != &json_line {
+                                    write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
+                                } else {
+                                    let text = format_event_text_with_stack(
+                                        &ev,
+                                        args.resolve_paths,
+                                        stack_str.as_deref(),
+                                    );
+                                    write_or_output_cap(writeln!(out, "{text}"), &output_cap_hit)?;
+                                }
+                            }
+                        }
+
+                        // Lookback: record the JSON form (not the text form — JSON
+                        // round-trips losslessly into the crash_context array).
+                        if let Some(lb) = lookback.as_mut() {
+                            let pid = { ev.pid };
+                            lb.record(pid, &json_line);
+                        }
+                    }
+
+                    events_since_drain += 1;
+                    if events_since_drain >= drain_interval {
+                        events_since_drain = 0;
+                        if let Some(eng) = engine.as_mut() {
+                            let findings = eng.drain_ready();
+                            if !findings.is_empty() {
+                                write_or_output_cap(
+                                    emit_findings_with(
+                                        &findings,
+                                        &mut *out,
+                                        args.json,
+                                        args.fd_snapshot_on_finding,
+                                    ),
+                                    &output_cap_hit,
+                                )?;
+                            }
+                        }
+                    }
+
+                    // Active-set bookkeeping for the FD poller's "active" scope.
+                    // We add every PID that produced an event the userspace
+                    // pipeline saw — strictly broader than "fd-bearing" but
+                    // ensures the target process is sampled even if it does
+                    // nothing fd-related. Send updated set to poller only when
+                    // it grew; sending is non-blocking so we never stall the
+                    // event loop.
+                    if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
+                        let pid = { ev.pid };
+                        if pid != 0 && active_pids.insert(pid) {
+                            let _ = active_tx.try_send(active_pids.clone());
+                        }
+                    }
+
+                    // Side effects that need to happen AFTER the event is consumed.
+                    if args.follow_children {
+                        let map = session
+                            .bpf
+                            .map_mut("PID_WHITELIST")
+                            .context("PID_WHITELIST missing")?;
+                        let mut pid_whitelist: AyaHashMap<_, u32, u8> =
+                            AyaHashMap::try_from(map)
+                                .context("PID_WHITELIST is not HashMap<u32,u8>")?;
+                        if let Some(error) =
+                            handle_follow_children(&ev, &mut pid_whitelist, args.verbose)
+                        {
+                            follow_children_map_failures =
+                                follow_children_map_failures.saturating_add(1);
+                            if follow_children_map_failures == 1 {
+                                eprintln!("neutron: WARNING: {error}");
+                            }
+                        }
+                    }
+                    if args.capture_reads {
+                        let map = session
+                            .bpf
+                            .map_mut("WATCH_FDS")
+                            .context("WATCH_FDS missing")?;
+                        let mut watch_fds: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(map)
+                            .context("WATCH_FDS is not HashMap<u64,u8>")?;
+                        if let Some(error) = handle_capture_reads(
+                            &ev,
+                            &mut watch_fds,
+                            &mut watched_sensitive_fds,
+                            args.verbose,
+                        ) {
+                            watch_fds_map_failures = watch_fds_map_failures.saturating_add(1);
+                            if watch_fds_map_failures == 1 {
+                                eprintln!("neutron: WARNING: {error}");
+                            }
+                        }
+                    }
+
+                    if stop_if_output_cap_hit(
+                        &output_cap_hit,
+                        &mut output_cap_reported,
+                        running.as_ref(),
+                    ) {
+                        break;
+                    }
+
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            }
+            // Drain any FD-poller samples produced since the last iteration.
+            // Each sample becomes a `type:"fd_snapshot"` JSON line; the engine
+            // sees it as `EventKind::FdSnapshot` and matches `R001`-class rules.
+            if let Some((samples_rx, _, _, _)) = session.poller.as_ref() {
+                while let Ok(sample) = samples_rx.try_recv() {
+                    fd_poller_samples_consumed = fd_poller_samples_consumed.saturating_add(1);
+                    process_state.fds.record_sample(
+                        sample.pid,
+                        sample.fd_count,
+                        sample.rlimit_nofile,
+                        sample.ts_ns,
+                    );
+                    let stats_snapshot = process_state
+                        .fds
+                        .stats(sample.pid)
+                        .copied()
+                        .unwrap_or_default();
+                    event_id_counter = event_id_counter.wrapping_add(1);
+                    let line = format_fd_snapshot_json(
+                        &sample,
+                        stats_snapshot.high_water_mark,
+                        stats_snapshot.growth_rate_per_sec,
+                        Some(event_id_counter),
+                    );
+                    if let Some(eng) = engine.as_mut() {
+                        if let Some(owned) = neutron_rules::Event::parse_line(&line) {
+                            if let Some(view) = owned.view() {
+                                eng.feed(&view);
+                            }
+                        }
+                    }
+                    if !suppress_raw {
+                        write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
+                    }
+                    if let Some(lb) = lookback.as_mut() {
+                        lb.record(sample.pid, &line);
+                    }
+                    if stop_if_output_cap_hit(
+                        &output_cap_hit,
+                        &mut output_cap_reported,
+                        running.as_ref(),
+                    ) {
+                        break;
+                    }
+                }
+            }
+
+            // ── Crash-correlation watcher drain (sprint-2 PR 1) ──────────
+            //
+            // Pull any new ProcessExitEvent values from the tombstone watcher
+            // and the logcat tail. Each drains independently; per_process
+            // aggregation in the rule engine collapses dups when both sources
+            // describe the same crash.
+            let now_ns = monotonic_timestamp_ns();
+            if let Some(w) = tombstone_watcher.as_mut() {
+                for pe in w.poll(now_ns) {
+                    let Some(pe_causal) = correlate_recent_exit(&mut recent_exit_causal, &pe)
+                    else {
+                        let root_uid = args.root_uid.or(package_uid);
+                        if root_pids.contains(&pe.pid)
+                            || active_pids.contains(&pe.pid)
+                            || pe.uid.is_some_and(|uid| root_uid == Some(uid))
+                        {
+                            tombstone_unmatched_in_scope =
+                                tombstone_unmatched_in_scope.saturating_add(1);
+                        } else {
+                            tombstone_out_of_scope = tombstone_out_of_scope.saturating_add(1);
+                        }
+                        continue;
+                    };
                     write_or_output_cap(
                         emit_process_exit(
                             &pe,
@@ -4074,1175 +5064,737 @@ fn run_trace(mut args: Args) -> Result<()> {
                             suppress_raw,
                             args.json,
                             &mut event_id_counter,
-                            causal_event.as_ref(),
+                            Some(&pe_causal),
                         ),
                         &output_cap_hit,
                     )?;
-                    if args.pid != 0
-                        && args.package.is_none()
-                        && args.root_uid.is_none()
-                        && pe.pid == args.pid
-                    {
-                        running.store(false, Ordering::Relaxed);
+                    if stop_if_output_cap_hit(
+                        &output_cap_hit,
+                        &mut output_cap_reported,
+                        running.as_ref(),
+                    ) {
                         break;
                     }
-                    continue;
-                }
-
-                // ── Sprint-2 PR 2: binder caller / received tracker ────
-                //
-                // Caller side (nr=-1) goes into the in-flight map. Callee
-                // side (nr=-4) tries to match and emits a binder_call on
-                // success. The raw binder / binder_received JSON line is
-                // still emitted below so operators can grep low-level
-                // detail.
-                let nr_now = { ev.syscall_nr };
-                if nr_now == -1 {
-                    let args_arr = { ev.args };
-                    let debug_id = { ev.ptr_hint } as u32 as i32;
-                    let callee_pid = args_arr[0] as u32;
-                    if callee_pid != 0
-                        && (args.follow_services || args.follow_hal)
-                        && discovery_seen_pids.insert(callee_pid)
-                    {
-                        discovery_refresh_pending = true;
-                    }
-                    if args.follow_binder
-                        && pending_scenario_end.is_none()
-                        && callee_pid != 0
-                        && !root_pids.contains(&callee_pid)
-                    {
-                        if let Some(metadata) = causal_event.as_ref() {
-                            let caller_pid = { ev.pid };
-                            let caller_comm = format_comm(&{ ev.comm });
-                            let (_, caller_domain) = follow_process_identity(caller_pid);
-                            let (callee_comm, callee_domain) = follow_process_identity(callee_pid);
-                            let decision = follow_policy.decide(FollowCandidate {
-                                caller_comm: Some(&caller_comm),
-                                caller_domain: caller_domain.as_deref(),
-                                callee_comm: callee_comm.as_deref(),
-                                callee_domain: callee_domain.as_deref(),
-                                caller_relation: metadata.relation,
-                                caller_depth: metadata.depth.saturating_sub(1),
-                            });
-                            match decision {
-                                FollowDecision::Allow => {
-                                    policy_blocked_pids.remove(&callee_pid);
-                                    let ts_ns = { ev.timestamp_ns };
-                                    if !root_pids.contains(&caller_pid) {
-                                        followed_last_hop_ns.insert(caller_pid, ts_ns);
-                                    }
-                                    followed_last_hop_ns.insert(callee_pid, ts_ns);
-                                }
-                                FollowDecision::Block(reason) => {
-                                    let _ = remove_followed_process(&mut bpf, callee_pid)?;
-                                    followed_last_hop_ns.remove(&callee_pid);
-                                    if active_pids.remove(&callee_pid) {
-                                        if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
-                                            let _ = active_tx.try_send(active_pids.clone());
-                                        }
-                                    }
-                                    policy_blocked_pids.insert(callee_pid);
-                                    follow_policy_filtered =
-                                        follow_policy_filtered.saturating_add(1);
-                                    write_or_output_cap(
-                                        emit_follow_guardrail(
-                                            &mut *out,
-                                            args.json,
-                                            &mut event_id_counter,
-                                            "blocked",
-                                            reason,
-                                            caller_pid,
-                                            callee_pid,
-                                            debug_id as u32,
-                                            metadata.depth,
-                                            Some(metadata),
-                                            None,
-                                            &scenarios,
-                                        ),
-                                        &output_cap_hit,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(t) = binder_tracker.as_mut() {
-                        let pid = { ev.pid };
-                        let uid = { ev.uid };
-                        let ts = { ev.timestamp_ns };
-                        t.record_caller_for_generation(
-                            event_generation,
-                            debug_id,
-                            pid,
-                            uid,
-                            format_comm(&{ ev.comm }),
-                            args_arr[0] as u32,
-                            args_arr[1] as u32,
-                            args_arr[2] as u32,
-                            args_arr[4] != 0,
-                            args_arr[5] as i32,
-                            ts,
-                            causal_event.clone(),
-                        );
-                    }
-                } else if nr_now == SYSCALL_NR_BINDER_RECEIVED {
-                    if let Some(t) = binder_tracker.as_mut() {
-                        let debug_id = { ev.ptr_hint } as u32 as i32;
-                        let ts = { ev.timestamp_ns };
-                        if let Some(pair) =
-                            t.record_received_for_generation(event_generation, debug_id, ts)
-                        {
-                            write_or_output_cap(
-                                emit_binder_call(
-                                    &pair,
-                                    lookback.as_mut(),
-                                    &mut engine,
-                                    &mut *out,
-                                    suppress_raw,
-                                    args.json,
-                                    &mut event_id_counter,
-                                    &binder_services,
-                                    &binder_catalog,
-                                    &binder_methods,
-                                    aidl_catalog.as_ref(),
-                                    pair.causal_metadata.as_ref(),
-                                ),
-                                &output_cap_hit,
-                            )?;
-                        }
-                    }
-                }
-
-                // Resolve the stack BEFORE building the JSON line so the
-                // rule engine can pattern-match against `stack_contains`.
-                // This must happen before `format_event_json_with_stack`.
-                let mapping_changed = { ev.is_enter } == 0
-                    && { ev.ret } >= 0
-                    && matches!(
-                        { ev.syscall_nr },
-                        SYSCALL_MMAP | SYSCALL_MUNMAP | SYSCALL_MPROTECT
-                    );
-                if mapping_changed {
-                    native_capture.invalidate(ev.pid);
-                    proc_sym_cache.remove(&{ ev.pid });
-                }
-                let exec_event = matches!({ ev.syscall_nr }, SYSCALL_EXECVE | SYSCALL_EXECVEAT);
-                if exec_event && { ev.is_enter } == 0 && { ev.ret } < 0 {
-                    native_capture.clear_invalidation(ev.pid);
-                }
-
-                let (stack_str, stack_refs): (Option<String>, Vec<String>) = if args.stacks {
-                    let kstk = { ev.kernel_stackid };
-                    let ustk = { ev.user_stackid };
-                    if kstk >= 0 || ustk >= 0 {
-                        let pid = { ev.pid };
-                        let proc_sym_opt = proc_sym_cache
-                            .entry(pid)
-                            .or_insert_with(|| ProcSymbolizer::new(pid));
-                        if let Some(stack_traces) = stack_traces.as_ref() {
-                            let proc_sym_mut = proc_sym_opt.as_mut();
-                            let kernel_stack = match format_stack(
-                                stack_traces,
-                                kstk,
-                                None,
-                                kernel_resolver.as_ref(),
-                            ) {
-                                Ok(stack) => stack,
-                                Err(_) => {
-                                    stack_read_failures = stack_read_failures.saturating_add(1);
-                                    None
-                                }
-                            };
-                            let user_stack =
-                                match format_stack(stack_traces, ustk, proc_sym_mut, None) {
-                                    Ok(stack) => stack,
-                                    Err(_) => {
-                                        stack_read_failures = stack_read_failures.saturating_add(1);
-                                        None
-                                    }
-                                };
-                            let mut references = Vec::new();
-                            for (kind, id, stack) in [
-                                ("user", ustk, user_stack.as_ref()),
-                                ("kernel", kstk, kernel_stack.as_ref()),
-                            ] {
-                                let Some(stack) = stack else { continue };
-                                let Some(captured) = native_capture.capture_stack(
-                                    pid,
-                                    ev.timestamp_ns,
-                                    kind,
-                                    id,
-                                    &stack.ips,
-                                    &stack.rendered,
-                                ) else {
-                                    continue;
-                                };
-                                if args.json && !suppress_raw {
-                                    for record in captured.records {
-                                        write_or_output_cap(
-                                            writeln!(out, "{record}"),
-                                            &output_cap_hit,
-                                        )?;
-                                    }
-                                }
-                                references.push(captured.reference);
-                            }
-                            let kernel_str = kernel_stack.map(|stack| stack.rendered.join(" <- "));
-                            let user_str = user_stack.map(|stack| stack.rendered.join(" <- "));
-                            let rendered = match (kernel_str, user_str) {
-                                (Some(k), Some(u)) => Some(format!("{k} ;; {u}")),
-                                (Some(k), None) => Some(k),
-                                (None, Some(u)) => Some(u),
-                                (None, None) => None,
-                            };
-                            (rendered, references)
-                        } else {
-                            (None, Vec::new())
-                        }
-                    } else {
-                        (None, Vec::new())
-                    }
-                } else {
-                    (None, Vec::new())
-                };
-                if exec_event && { ev.is_enter } == 1 {
-                    native_capture.invalidate(ev.pid);
-                    proc_sym_cache.remove(&{ ev.pid });
-                }
-
-                // Update the FD graph from this event (open/close/dup/socket/
-                // memfd_create/etc. drive state transitions). Pass the
-                // already-decoded path so we don't re-decode in the graph.
-                let decoded_path = format_data_field(&ev);
-                fd_graph.update(&ev, decoded_path.as_deref());
-
-                // If the event references a fd we know about, build an FdHint
-                // for JSON enrichment. mmap with MAP_ANONYMOUS (fd == -1) is
-                // skipped by `fd_arg_for_event`.
-                let fd_hint = FdGraph::fd_arg_for_event(&ev).and_then(|(fd, _idx)| {
-                    let pid = { ev.pid };
-                    let ts = { ev.timestamp_ns };
-                    let opt = if args.resolve_paths {
-                        fd_graph.lookup_or_resolve(pid, fd, ts)
-                    } else {
-                        fd_graph.lookup(pid, fd).cloned()
-                    };
-                    opt.map(|e| FdHint {
-                        kind: e.kind,
-                        path: e.path,
-                    })
-                });
-
-                // Phase 1a/1b — userspace post-filter. The BPF prefilter is a
-                // safe over-approximation; here we apply the full predicate
-                // (including userspace-only clauses, OR / NOT branches, and
-                // `--match <expr>` AST nodes) to decide whether to emit the
-                // event line, feed the rule engine, and record into the
-                // crash-context lookback.
-                //
-                // fdgraph state has already been updated above so we can
-                // reject state-tracking events without losing fd→path
-                // information; a later ioctl whose match depends on the
-                // resolved path then sees the up-to-date entry.
-                let post_filter_ok = if capture_predicate.is_empty() {
-                    true
-                } else {
-                    let lens = SyscallEventLens::new(
-                        &ev,
-                        format_comm(&{ ev.comm }),
-                        fd_hint.as_ref().map(|h| h.path.as_str()),
-                        compute_latency_us(&ev),
-                    );
-                    capture_predicate.evaluate(&lens)
-                };
-                if post_filter_ok {
-                    events_matched = events_matched.saturating_add(1);
-                }
-
-                // Always compute the JSON form: cheap and fed to the rule engine.
-                event_id_counter = event_id_counter.wrapping_add(1);
-                let mut json_line = format_event_json_full(
-                    &ev,
-                    args.resolve_paths,
-                    stack_str.as_deref(),
-                    fd_hint.as_ref(),
-                    Some(event_id_counter),
-                );
-                json_line = neutron::native::add_stack_references(&json_line, &stack_refs);
-                if let Some(metadata) = causal_event.as_ref() {
-                    json_line = enrich_json(&json_line, metadata)?;
-                }
-                if let Some(capture) = harness_capture.as_ref() {
-                    json_line = capture.enrich_json(
-                        &ev,
-                        fd_hint.as_ref().map(|hint| hint.path.as_str()),
-                        &json_line,
-                    )?;
-                }
-
-                // Phase 1d — sampling decision. State-tracking syscalls
-                // (open/close/dup/socket/...) and synthetic sentinels
-                // bypass the chain so fdgraph and crash correlation stay
-                // intact even at p=0.0 / rate=1.
-                let nr_for_sampler = { ev.syscall_nr };
-                let ts_ns = { ev.timestamp_ns };
-                let sampler_keep = sampler.keep(ts_ns, nr_for_sampler);
-                if !sampler_keep {
-                    events_sampled_out = events_sampled_out.saturating_add(1);
-                }
-
-                // Phase 1c — context-window dispatch. The post-filter +
-                // sampler verdicts feed the ring (or the simple emit
-                // path) together. State-tracking events that the sampler
-                // exempts will reach the ring as `matched=false` if the
-                // predicate also rejected them — so they sit in the
-                // backward window without firing it themselves.
-                let lines: Vec<String> = if !sampler_keep {
-                    Vec::new()
-                } else {
-                    match context_ring.as_mut() {
-                        None => {
-                            if post_filter_ok {
-                                vec![json_line.clone()]
-                            } else {
-                                Vec::new()
-                            }
-                        }
-                        Some(_ring) if pending_scenario_end.is_some() && causal_event.is_none() => {
-                            if post_filter_ok {
-                                vec![json_line.clone()]
-                            } else {
-                                Vec::new()
-                            }
-                        }
-                        Some(ring) => ring.observe(ts_ns, post_filter_ok, &json_line),
-                    }
-                };
-
-                if !lines.is_empty() {
-                    // Always feed the rule engine the *currently observed*
-                    // event when the post-filter agrees — flushing context
-                    // into the engine as if it were live would re-fire
-                    // rules on stale events. Backward-context lines from the
-                    // ring are write-only (they go to the output and the
-                    // lookback, but not the engine).
-                    if post_filter_ok {
-                        if let Some(eng) = engine.as_mut() {
-                            if let Some(owned) = neutron_rules::Event::parse_line(&json_line) {
-                                if let Some(view) = owned.view() {
-                                    eng.feed(&view);
-                                }
-                            }
-                        }
-                    }
-
-                    if !suppress_raw {
-                        for line in &lines {
-                            // For text mode we still render the live event
-                            // via the existing text formatter; backward-flush
-                            // lines from the ring stay in JSON to preserve
-                            // their original shape (mixing modes inside one
-                            // capture is unavoidable when the ring buffers
-                            // JSON).
-                            if args.json || line != &json_line {
-                                write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
-                            } else {
-                                let text = format_event_text_with_stack(
-                                    &ev,
-                                    args.resolve_paths,
-                                    stack_str.as_deref(),
-                                );
-                                write_or_output_cap(writeln!(out, "{text}"), &output_cap_hit)?;
-                            }
-                        }
-                    }
-
-                    // Lookback: record the JSON form (not the text form — JSON
-                    // round-trips losslessly into the crash_context array).
-                    if let Some(lb) = lookback.as_mut() {
-                        let pid = { ev.pid };
-                        lb.record(pid, &json_line);
-                    }
-                }
-
-                events_since_drain += 1;
-                if events_since_drain >= drain_interval {
-                    events_since_drain = 0;
-                    if let Some(eng) = engine.as_mut() {
-                        let findings = eng.drain_ready();
-                        if !findings.is_empty() {
-                            write_or_output_cap(
-                                emit_findings_with(
-                                    &findings,
-                                    &mut *out,
-                                    args.json,
-                                    args.fd_snapshot_on_finding,
-                                ),
-                                &output_cap_hit,
-                            )?;
-                        }
-                    }
-                }
-
-                // Active-set bookkeeping for the FD poller's "active" scope.
-                // We add every PID that produced an event the userspace
-                // pipeline saw — strictly broader than "fd-bearing" but
-                // ensures the target process is sampled even if it does
-                // nothing fd-related. Send updated set to poller only when
-                // it grew; sending is non-blocking so we never stall the
-                // event loop.
-                if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
-                    let pid = { ev.pid };
-                    if pid != 0 && active_pids.insert(pid) {
-                        let _ = active_tx.try_send(active_pids.clone());
-                    }
-                }
-
-                // Side effects that need to happen AFTER the event is consumed.
-                if args.follow_children {
-                    let map = bpf
-                        .map_mut("PID_WHITELIST")
-                        .context("PID_WHITELIST missing")?;
-                    let mut pid_whitelist: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(map)
-                        .context("PID_WHITELIST is not HashMap<u32,u8>")?;
-                    if let Some(error) =
-                        handle_follow_children(&ev, &mut pid_whitelist, args.verbose)
-                    {
-                        follow_children_map_failures =
-                            follow_children_map_failures.saturating_add(1);
-                        if follow_children_map_failures == 1 {
-                            eprintln!("neutron: WARNING: {error}");
-                        }
-                    }
-                }
-                if args.capture_reads {
-                    let map = bpf.map_mut("WATCH_FDS").context("WATCH_FDS missing")?;
-                    let mut watch_fds: AyaHashMap<_, u64, u8> =
-                        AyaHashMap::try_from(map).context("WATCH_FDS is not HashMap<u64,u8>")?;
-                    if let Some(error) = handle_capture_reads(
-                        &ev,
-                        &mut watch_fds,
-                        &mut watched_sensitive_fds,
-                        args.verbose,
-                    ) {
-                        watch_fds_map_failures = watch_fds_map_failures.saturating_add(1);
-                        if watch_fds_map_failures == 1 {
-                            eprintln!("neutron: WARNING: {error}");
-                        }
-                    }
-                }
-
-                if stop_if_output_cap_hit(
-                    &output_cap_hit,
-                    &mut output_cap_reported,
-                    running.as_ref(),
-                ) {
-                    break;
-                }
-
-                if !running.load(Ordering::Relaxed) {
-                    break;
                 }
             }
-        }
-        // Drain any FD-poller samples produced since the last iteration.
-        // Each sample becomes a `type:"fd_snapshot"` JSON line; the engine
-        // sees it as `EventKind::FdSnapshot` and matches `R001`-class rules.
-        if let Some((samples_rx, _, _, _)) = poller_state.as_ref() {
-            while let Ok(sample) = samples_rx.try_recv() {
-                fd_poller_samples_consumed = fd_poller_samples_consumed.saturating_add(1);
-                fd_graph.record_sample(
-                    sample.pid,
-                    sample.fd_count,
-                    sample.rlimit_nofile,
-                    sample.ts_ns,
-                );
-                let stats_snapshot = fd_graph.stats(sample.pid).copied().unwrap_or_default();
-                event_id_counter = event_id_counter.wrapping_add(1);
-                let line = format_fd_snapshot_json(
-                    &sample,
-                    stats_snapshot.high_water_mark,
-                    stats_snapshot.growth_rate_per_sec,
-                    Some(event_id_counter),
-                );
-                if let Some(eng) = engine.as_mut() {
-                    if let Some(owned) = neutron_rules::Event::parse_line(&line) {
-                        if let Some(view) = owned.view() {
-                            eng.feed(&view);
-                        }
-                    }
-                }
-                if !suppress_raw {
-                    write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
-                }
-                if let Some(lb) = lookback.as_mut() {
-                    lb.record(sample.pid, &line);
-                }
-                if stop_if_output_cap_hit(
-                    &output_cap_hit,
-                    &mut output_cap_reported,
-                    running.as_ref(),
-                ) {
-                    break;
-                }
-            }
-        }
-
-        // ── Crash-correlation watcher drain (sprint-2 PR 1) ──────────
-        //
-        // Pull any new ProcessExitEvent values from the tombstone watcher
-        // and the logcat tail. Each drains independently; per_process
-        // aggregation in the rule engine collapses dups when both sources
-        // describe the same crash.
-        let now_ns = monotonic_timestamp_ns();
-        if let Some(w) = tombstone_watcher.as_mut() {
-            for pe in w.poll(now_ns) {
-                let Some(pe_causal) = correlate_recent_exit(&mut recent_exit_causal, &pe) else {
-                    let root_uid = args.root_uid.or(package_uid);
-                    if root_pids.contains(&pe.pid)
-                        || active_pids.contains(&pe.pid)
-                        || pe.uid.is_some_and(|uid| root_uid == Some(uid))
-                    {
-                        tombstone_unmatched_in_scope =
-                            tombstone_unmatched_in_scope.saturating_add(1);
-                    } else {
-                        tombstone_out_of_scope = tombstone_out_of_scope.saturating_add(1);
-                    }
-                    continue;
-                };
-                write_or_output_cap(
-                    emit_process_exit(
-                        &pe,
-                        lookback.as_mut(),
-                        &mut engine,
-                        &mut *out,
-                        suppress_raw,
-                        args.json,
-                        &mut event_id_counter,
-                        Some(&pe_causal),
-                    ),
-                    &output_cap_hit,
-                )?;
-                if stop_if_output_cap_hit(
-                    &output_cap_hit,
-                    &mut output_cap_reported,
-                    running.as_ref(),
-                ) {
-                    break;
-                }
-            }
-        }
-        if let Some(r) = logcat_reader.as_mut() {
-            for pe in r.drain(now_ns) {
-                let Some(pe_causal) = correlate_recent_exit(&mut recent_exit_causal, &pe) else {
-                    logcat_untrusted_native_exits = logcat_untrusted_native_exits.saturating_add(1);
-                    if args.verbose && logcat_untrusted_native_exits == 1 {
-                        eprintln!(
+            if let Some(r) = logcat_reader.as_mut() {
+                for pe in r.drain(now_ns) {
+                    let Some(pe_causal) = correlate_recent_exit(&mut recent_exit_causal, &pe)
+                    else {
+                        logcat_untrusted_native_exits =
+                            logcat_untrusted_native_exits.saturating_add(1);
+                        if args.verbose && logcat_untrusted_native_exits == 1 {
+                            eprintln!(
                             "neutron: WARNING: ignored native-fatal logcat text without a matching BPF process-exit event"
                         );
-                    }
-                    continue;
-                };
-                write_or_output_cap(
-                    emit_process_exit(
-                        &pe,
-                        lookback.as_mut(),
-                        &mut engine,
-                        &mut *out,
-                        suppress_raw,
-                        args.json,
-                        &mut event_id_counter,
-                        Some(&pe_causal),
-                    ),
-                    &output_cap_hit,
-                )?;
-                if stop_if_output_cap_hit(
-                    &output_cap_hit,
-                    &mut output_cap_reported,
-                    running.as_ref(),
-                ) {
-                    break;
-                }
-            }
-        }
-
-        if let Some(reader) = selinux_reader.as_mut() {
-            for mut denial in reader.drain(monotonic_timestamp_ns()) {
-                neutron::selinux::resolve_process_identity(&mut denial);
-                denial.ts_ns = monotonic_timestamp_ns();
-                let process_context = read_process_context(&bpf, denial.pid)?;
-                if !selinux_denial_in_scope(
-                    &denial,
-                    &args,
-                    &root_pids,
-                    &selinux_scope_pids,
-                    &selinux_scope_uids,
-                    process_context,
-                ) {
-                    reader.record_out_of_scope();
-                    continue;
-                }
-                // Logcat does not provide gap-free delivery or a timestamp
-                // that is atomically comparable to the live scenario marker.
-                // Preserve the positive AVC record, but do not synthesize a
-                // scenario edge from the process's *current* BPF context: a
-                // queued pre-marker line or PID reuse could otherwise be
-                // mislabeled as causal evidence.
-                let causal = None;
-                write_or_output_cap(
-                    emit_selinux_denial(
-                        &mut denial,
-                        causal.as_ref(),
-                        lookback.as_mut(),
-                        &mut *out,
-                        args.json,
-                        &mut event_id_counter,
-                    ),
-                    &output_cap_hit,
-                )?;
-                if stop_if_output_cap_hit(
-                    &output_cap_hit,
-                    &mut output_cap_reported,
-                    running.as_ref(),
-                ) {
-                    break;
-                }
-            }
-        }
-
-        if !saw_any {
-            // Block on `poll(2)` until the ring becomes readable (or timeout).
-            // SAFETY: `pollfd` is a POD; we initialise all fields before the call.
-            let mut pfd = libc::pollfd {
-                fd: ring_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let poll_result = unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) };
-            let errno = (poll_result < 0)
-                .then(|| std::io::Error::last_os_error().raw_os_error())
-                .flatten();
-            if let Some(error) = ring_poll_failure(poll_result, pfd.revents, errno) {
-                ring_poll_error = Some(error);
-                break;
-            }
-        }
-
-        let should_finish_cleanup = pending_scenario_end.as_ref().is_some_and(|pending| {
-            !pending.cleanup_complete && std::time::Instant::now() >= pending.settle_until
-        });
-        if should_finish_cleanup {
-            let cleanup = (|| -> Result<u64> {
-                set_root_uid_context(&mut bpf, 0, 0)?;
-                replace_causal_roots(&mut bpf, &root_pids, 0, 0)?;
-                clear_causal_transients(&mut bpf)?;
-                discard_inflight_at_scenario_end(&mut bpf)
-            })();
-            match cleanup {
-                Ok(discarded) => {
-                    scenario_inflight_discarded =
-                        scenario_inflight_discarded.saturating_add(discarded);
-                    if let Some(tracker) = binder_tracker.as_mut() {
-                        tracker.discard_inflight();
-                    }
-                    if let Some(ring) = context_ring.as_mut() {
-                        scenario_context_discarded =
-                            scenario_context_discarded.saturating_add(ring.reset_boundary() as u64);
-                    }
-                    if let Some(pending) = pending_scenario_end.as_mut() {
-                        pending.cleanup_complete = true;
-                    }
-                    // Run one complete ring/source drain after the final map
-                    // cleanup before committing the end marker.
-                    continue;
-                }
-                Err(error) => {
-                    marker_transition_error =
-                        Some(format!("scenario end final cleanup failed: {error:#}"));
-                    if let Some(pending) = pending_scenario_end.take() {
-                        if let Err(response_error) =
-                            pending.pending.respond_error(format!("{error:#}"))
-                        {
-                            eprintln!(
-                                "neutron: warn: marker client disconnected: {response_error:#}"
-                            );
                         }
+                        continue;
+                    };
+                    write_or_output_cap(
+                        emit_process_exit(
+                            &pe,
+                            lookback.as_mut(),
+                            &mut engine,
+                            &mut *out,
+                            suppress_raw,
+                            args.json,
+                            &mut event_id_counter,
+                            Some(&pe_causal),
+                        ),
+                        &output_cap_hit,
+                    )?;
+                    if stop_if_output_cap_hit(
+                        &output_cap_hit,
+                        &mut output_cap_reported,
+                        running.as_ref(),
+                    ) {
+                        break;
                     }
-                    running.store(false, Ordering::Relaxed);
-                    continue;
                 }
             }
-        }
 
-        if pending_scenario_end
-            .as_ref()
-            .is_some_and(|pending| pending.cleanup_complete)
-        {
-            let pending = pending_scenario_end
-                .take()
-                .expect("pending scenario end checked above");
-            if let Some(tracker) = binder_tracker.as_mut() {
-                tracker.discard_inflight();
+            if let Some(reader) = selinux_reader.as_mut() {
+                for mut denial in reader.drain(monotonic_timestamp_ns()) {
+                    neutron::selinux::resolve_process_identity(&mut denial);
+                    denial.ts_ns = monotonic_timestamp_ns();
+                    let process_context = read_process_context(&session.bpf, denial.pid)?;
+                    if !selinux_denial_in_scope(
+                        &denial,
+                        &args,
+                        &root_pids,
+                        &selinux_scope_pids,
+                        &selinux_scope_uids,
+                        process_context,
+                    ) {
+                        reader.record_out_of_scope();
+                        continue;
+                    }
+                    // Logcat does not provide gap-free delivery or a timestamp
+                    // that is atomically comparable to the live scenario marker.
+                    // Preserve the positive AVC record, but do not synthesize a
+                    // scenario edge from the process's *current* BPF context: a
+                    // queued pre-marker line or PID reuse could otherwise be
+                    // mislabeled as causal evidence.
+                    let causal = None;
+                    write_or_output_cap(
+                        emit_selinux_denial(
+                            &mut denial,
+                            causal.as_ref(),
+                            lookback.as_mut(),
+                            &mut *out,
+                            args.json,
+                            &mut event_id_counter,
+                        ),
+                        &output_cap_hit,
+                    )?;
+                    if stop_if_output_cap_hit(
+                        &output_cap_hit,
+                        &mut output_cap_reported,
+                        running.as_ref(),
+                    ) {
+                        break;
+                    }
+                }
             }
-            if let Some(ring) = context_ring.as_mut() {
-                scenario_context_discarded =
-                    scenario_context_discarded.saturating_add(ring.reset_boundary() as u64);
+
+            if !saw_any {
+                // Block on `poll(2)` until the ring becomes readable (or timeout).
+                // SAFETY: `pollfd` is a POD; we initialise all fields before the call.
+                let mut pfd = libc::pollfd {
+                    fd: ring_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let poll_result = unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) };
+                let errno = (poll_result < 0)
+                    .then(|| std::io::Error::last_os_error().raw_os_error())
+                    .flatten();
+                if let Some(error) = ring_poll_failure(poll_result, pfd.revents, errno) {
+                    ring_poll_error = Some(error);
+                    break;
+                }
             }
-            let ts_ns = monotonic_timestamp_ns();
-            let line = live_marker_line(
-                &pending.request,
-                &pending.scenario,
-                ts_ns,
-                args.package.as_deref(),
-                args.root_uid.or(package_uid),
-                (args.pid != 0).then_some(args.pid),
-            );
-            match writeln!(out, "{line}") {
-                Ok(()) => match scenarios.end(&pending.request.name) {
-                    Ok(committed) if committed == pending.scenario => {
-                        if binder_tracker
-                            .as_mut()
-                            .is_some_and(|tracker| !tracker.finish_scenario(committed.generation))
-                        {
+
+            let should_finish_cleanup = pending_scenario_end.as_ref().is_some_and(|pending| {
+                !pending.cleanup_complete && std::time::Instant::now() >= pending.settle_until
+            });
+            if should_finish_cleanup {
+                let cleanup = (|| -> Result<u64> {
+                    set_root_uid_context(&mut session.bpf, 0, 0)?;
+                    replace_causal_roots(&mut session.bpf, &root_pids, 0, 0)?;
+                    clear_causal_transients(&mut session.bpf)?;
+                    discard_inflight_at_scenario_end(&mut session.bpf)
+                })();
+                match cleanup {
+                    Ok(discarded) => {
+                        scenario_inflight_discarded =
+                            scenario_inflight_discarded.saturating_add(discarded);
+                        if let Some(tracker) = binder_tracker.as_mut() {
+                            tracker.discard_inflight();
+                        }
+                        if let Some(ring) = context_ring.as_mut() {
+                            scenario_context_discarded = scenario_context_discarded
+                                .saturating_add(ring.reset_boundary() as u64);
+                        }
+                        if let Some(pending) = pending_scenario_end.as_mut() {
+                            pending.cleanup_complete = true;
+                        }
+                        // Run one complete ring/source drain after the final map
+                        // cleanup before committing the end marker.
+                        continue;
+                    }
+                    Err(error) => {
+                        marker_transition_error =
+                            Some(format!("scenario end final cleanup failed: {error:#}"));
+                        if let Some(pending) = pending_scenario_end.take() {
+                            if let Err(response_error) =
+                                pending.pending.respond_error(format!("{error:#}"))
+                            {
+                                eprintln!(
+                                    "neutron: warn: marker client disconnected: {response_error:#}"
+                                );
+                            }
+                        }
+                        running.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            }
+
+            if pending_scenario_end
+                .as_ref()
+                .is_some_and(|pending| pending.cleanup_complete)
+            {
+                let pending = pending_scenario_end
+                    .take()
+                    .expect("pending scenario end checked above");
+                if let Some(tracker) = binder_tracker.as_mut() {
+                    tracker.discard_inflight();
+                }
+                if let Some(ring) = context_ring.as_mut() {
+                    scenario_context_discarded =
+                        scenario_context_discarded.saturating_add(ring.reset_boundary() as u64);
+                }
+                if let Some(eng) = engine.as_mut() {
+                    eng.set_scope(neutron_rules::FindingScope::default());
+                    write_or_output_cap(
+                        emit_findings_with(
+                            &eng.drain_ready(),
+                            &mut *out,
+                            args.json,
+                            args.fd_snapshot_on_finding,
+                        ),
+                        &output_cap_hit,
+                    )?;
+                }
+                let ts_ns = monotonic_timestamp_ns();
+                let line = live_marker_line(
+                    &pending.request,
+                    &pending.scenario,
+                    ts_ns,
+                    args.package.as_deref(),
+                    args.root_uid.or(package_uid),
+                    (args.pid != 0).then_some(args.pid),
+                    scenario_subject.as_ref(),
+                );
+                match writeln!(out, "{line}") {
+                    Ok(()) => match scenarios.end(&pending.request.name) {
+                        Ok(committed) if committed == pending.scenario => {
+                            if binder_tracker.as_mut().is_some_and(|tracker| {
+                                !tracker.finish_scenario(committed.generation)
+                            }) {
+                                marker_transition_error = Some(
+                                    "Binder tracker scenario boundary diverged after marker write"
+                                        .into(),
+                                );
+                                let _ = pending
+                                    .pending
+                                    .respond_error("Binder tracker scenario boundary diverged");
+                                running.store(false, Ordering::Relaxed);
+                                continue;
+                            }
+                            recent_exit_causal.clear();
+                            followed_last_hop_ns.clear();
+                            policy_blocked_pids.clear();
+                            active_pids = root_pids.iter().copied().collect();
+                            if let Some((_, active_tx, _, _)) = session.poller.as_ref() {
+                                let _ = active_tx.try_send(active_pids.clone());
+                            }
+                            if let Err(error) = pending.pending.respond_ok(
+                                ts_ns,
+                                committed.generation,
+                                committed.trace_id,
+                            ) {
+                                eprintln!("neutron: warn: marker client disconnected: {error:#}");
+                            }
+                        }
+                        Ok(_) | Err(_) => {
                             marker_transition_error = Some(
-                                "Binder tracker scenario boundary diverged after marker write"
-                                    .into(),
+                                "scenario end state commit diverged after marker write".into(),
                             );
                             let _ = pending
                                 .pending
-                                .respond_error("Binder tracker scenario boundary diverged");
+                                .respond_error("scenario end state commit diverged");
                             running.store(false, Ordering::Relaxed);
-                            continue;
                         }
-                        recent_exit_causal.clear();
-                        followed_last_hop_ns.clear();
-                        policy_blocked_pids.clear();
-                        active_pids = root_pids.iter().copied().collect();
-                        if let Some((_, active_tx, _, _)) = poller_state.as_ref() {
-                            let _ = active_tx.try_send(active_pids.clone());
-                        }
-                        if let Err(error) = pending.pending.respond_ok(
-                            ts_ns,
-                            committed.generation,
-                            committed.trace_id,
-                        ) {
-                            eprintln!("neutron: warn: marker client disconnected: {error:#}");
-                        }
-                    }
-                    Ok(_) | Err(_) => {
+                    },
+                    Err(error) => {
                         marker_transition_error =
-                            Some("scenario end state commit diverged after marker write".into());
+                            Some(format!("scenario end marker write failed: {error}"));
                         let _ = pending
                             .pending
-                            .respond_error("scenario end state commit diverged");
+                            .respond_error(format!("scenario end marker write failed: {error}"));
                         running.store(false, Ordering::Relaxed);
                     }
-                },
-                Err(error) => {
-                    marker_transition_error =
-                        Some(format!("scenario end marker write failed: {error}"));
-                    let _ = pending
-                        .pending
-                        .respond_error(format!("scenario end marker write failed: {error}"));
-                    running.store(false, Ordering::Relaxed);
                 }
             }
         }
-    }
 
-    // Stop kernel producers before taking the final health snapshot. Any
-    // records that were queued but not processed at the shutdown boundary are
-    // counted explicitly, so a clean-looking counter map cannot hide them.
-    let detach_errors = detach_attached_programs(&mut bpf, &attached);
-    let mut shutdown_events_discarded = 0_u64;
-    while ring.next().is_some() {
-        shutdown_events_discarded = shutdown_events_discarded.saturating_add(1);
-    }
-    let binder_tracker_stats = if let Some(tracker) = binder_tracker.as_mut() {
-        tracker.discard_inflight();
-        tracker.stats()
-    } else {
-        BinderTrackerStats::default()
-    };
+        Ok(())
+    })();
 
-    // Signal the FD poller to stop, join it, and retain its bounded-channel
-    // telemetry. A thread panic or a sample/update that never reached the
-    // consumer must not disappear behind a clean capture-health record.
-    let mut poller_join_failed = false;
-    let mut fd_poller_shutdown_samples_discarded = 0_u64;
-    let fd_poller_stats = if let Some((samples_rx, active_tx, stop_tx, handle)) = poller_state {
-        if stop_tx.send(()).is_err() {
-            poller_join_failed = true;
+    let loop_result = loop_result.and_then(|()| {
+        if let Some(error) = marker_transition_error
+            .as_ref()
+            .or(ring_poll_error.as_ref())
+        {
+            bail!("{error}");
         }
-        if handle.join().is_err() {
-            poller_join_failed = true;
+        Ok(())
+    });
+    let finalization_result = (|| -> Result<()> {
+        // Stop kernel producers before taking the final health snapshot. Any
+        // records that were queued but not processed at the shutdown boundary are
+        // counted explicitly, so a clean-looking counter map cannot hide them.
+        let detach_errors = detach_attached_programs(&mut session.bpf, &session.attached);
+        session.detached = detach_errors.is_empty();
+        let cleanup_error = (!detach_errors.is_empty()).then(|| detach_errors.join("; "));
+        let mut shutdown_events_discarded = 0_u64;
+        // A failed detach must not let a still-running producer delay shutdown.
+        // The cap exceeds one full 1-MiB ring; detach errors make health unknown.
+        while shutdown_events_discarded < 4096 && ring.next().is_some() {
+            shutdown_events_discarded = shutdown_events_discarded.saturating_add(1);
         }
-        while samples_rx.try_recv().is_ok() {
-            // These records were produced before shutdown but were not
-            // incorporated into the evidence stream.
-            fd_poller_shutdown_samples_discarded =
-                fd_poller_shutdown_samples_discarded.saturating_add(1);
-        }
-        active_tx.stats()
-    } else {
-        poller::FdPollerStats::default()
-    };
+        let binder_tracker_stats = if let Some(tracker) = binder_tracker.as_mut() {
+            tracker.discard_inflight();
+            tracker.stats()
+        } else {
+            BinderTrackerStats::default()
+        };
 
-    // 9. Flush rule engine.
-    if let Some(eng) = engine.take() {
-        let pending = eng.flush_all();
-        if !pending.is_empty() {
-            write_or_output_cap(
-                emit_findings_with(&pending, &mut *out, args.json, args.fd_snapshot_on_finding),
-                &output_cap_hit,
-            )?;
-        }
-    }
+        // Signal the FD poller to stop, join it, and retain its bounded-channel
+        // telemetry. A thread panic or a sample/update that never reached the
+        // consumer must not disappear behind a clean capture-health record.
+        let mut poller_join_failed = false;
+        let mut fd_poller_shutdown_samples_discarded = 0_u64;
+        let fd_poller_stats =
+            if let Some((samples_rx, active_tx, stop_tx, handle)) = session.poller.take() {
+                if stop_tx.send(()).is_err() {
+                    poller_join_failed = true;
+                }
+                if handle.join().is_err() {
+                    poller_join_failed = true;
+                }
+                while samples_rx.try_recv().is_ok() {
+                    // These records were produced before shutdown but were not
+                    // incorporated into the evidence stream.
+                    fd_poller_shutdown_samples_discarded =
+                        fd_poller_shutdown_samples_discarded.saturating_add(1);
+                }
+                active_tx.stats()
+            } else {
+                poller::FdPollerStats::default()
+            };
 
-    // 10. Capture summary. Read the COUNTERS map and print the slot values
-    // plus a warning if any drop or degradation counter is non-zero.
-    // RingBuf is *not* lossless: `reserve()` returns None when the ring is
-    // full, and the BPF programs increment COUNTER_RINGBUF_RESERVE_FAILED in
-    // that case. The summary surfaces this so operators can judge whether
-    // absence of a finding is conclusive.
-    let logcat_source_available = logcat_reader
-        .as_mut()
-        .is_some_and(RealLogcatReader::is_available);
-    let logcat_stats = logcat_reader
-        .as_ref()
-        .map(RealLogcatReader::stats)
-        .unwrap_or_default();
-    let logcat_terminal = logcat_reader
-        .as_ref()
-        .and_then(RealLogcatReader::terminal_state)
-        .map(|state| format!("{state:?}"));
-    let selinux_source_available = selinux_reader
-        .as_mut()
-        .is_some_and(SelinuxLogcatReader::is_available);
-    let selinux_stats = selinux_reader
-        .as_ref()
-        .map(SelinuxLogcatReader::stats)
-        .unwrap_or_default();
-    let selinux_terminal = selinux_reader
-        .as_ref()
-        .and_then(SelinuxLogcatReader::terminal_state)
-        .map(|state| format!("{state:?}"));
-    let tombstone_stats = tombstone_watcher
-        .as_ref()
-        .map(RealTombstoneWatcher::stats)
-        .unwrap_or_default();
-    let tombstone_source_available = tombstone_watcher
-        .as_ref()
-        .is_some_and(|watcher| watcher.runtime_state().primed && watcher.runtime_state().available);
-    let tombstone_last_error = tombstone_watcher
-        .as_ref()
-        .and_then(|watcher| watcher.runtime_state().last_error.as_ref())
-        .map(|error| format!("{} {}: {}", error.operation, error.path, error.message));
-    capture_scope.sources.logcat_available = logcat_source_available;
-    capture_scope.sources.selinux_logcat_available = selinux_source_available;
-    capture_scope.sources.tombstone_available = tombstone_source_available;
-    capture_scope = capture_scope.recompute_claim_scope();
-    let health = match bpf.map("COUNTERS") {
-        Some(map) => match PerCpuArray::<_, u64>::try_from(map) {
-            Ok(counters) => CaptureHealth::read(&counters),
-            Err(error) => CaptureHealth::unknown(format!("map:COUNTERS:{error}")),
-        },
-        None => CaptureHealth::unknown("map:COUNTERS:missing"),
-    };
-    let mut unknown_reasons = detach_errors;
-    match read_boot_id() {
-        Ok(final_boot_id) if final_boot_id == capture_boot_id => {}
-        Ok(final_boot_id) => unknown_reasons.push(format!(
-            "device boot identity changed during capture: {} -> {}",
-            capture_boot_id, final_boot_id
-        )),
-        Err(error) => unknown_reasons.push(format!(
-            "final device boot identity could not be read: {error:#}"
-        )),
-    }
-    if let Some(error) = marker_transition_error {
-        unknown_reasons.push(error);
-    }
-    if let Some(error) = ring_poll_error {
-        unknown_reasons.push(error);
-    }
-    if poller_join_failed || fd_poller_stats.running {
-        unknown_reasons.push("FD poller did not terminate cleanly".into());
-    }
-    let fd_poller_unconsumed = fd_poller_stats
-        .samples_sent
-        .saturating_sub(fd_poller_samples_consumed);
-    if fd_poller_unconsumed != fd_poller_shutdown_samples_discarded {
-        unknown_reasons.push(format!(
+        let dropped_rule_state_events = engine.as_ref().map_or(0, |eng| eng.dropped_state_events());
+        // 9. Flush rule engine.
+        if let Some(eng) = engine.take() {
+            let pending = eng.flush_all();
+            if !pending.is_empty() {
+                write_or_output_cap(
+                    emit_findings_with(&pending, &mut *out, args.json, args.fd_snapshot_on_finding),
+                    &output_cap_hit,
+                )?;
+            }
+        }
+
+        // 10. Capture summary. Read the COUNTERS map and print the slot values
+        // plus a warning if any drop or degradation counter is non-zero.
+        // RingBuf is *not* lossless: `reserve()` returns None when the ring is
+        // full, and the BPF programs increment COUNTER_RINGBUF_RESERVE_FAILED in
+        // that case. The summary surfaces this so operators can judge whether
+        // absence of a finding is conclusive.
+        let logcat_source_available = logcat_reader
+            .as_mut()
+            .is_some_and(RealLogcatReader::is_available);
+        let logcat_stats = logcat_reader
+            .as_ref()
+            .map(RealLogcatReader::stats)
+            .unwrap_or_default();
+        let logcat_terminal = logcat_reader
+            .as_ref()
+            .and_then(RealLogcatReader::terminal_state)
+            .map(|state| format!("{state:?}"));
+        let selinux_source_available = selinux_reader
+            .as_mut()
+            .is_some_and(SelinuxLogcatReader::is_available);
+        let selinux_stats = selinux_reader
+            .as_ref()
+            .map(SelinuxLogcatReader::stats)
+            .unwrap_or_default();
+        let selinux_terminal = selinux_reader
+            .as_ref()
+            .and_then(SelinuxLogcatReader::terminal_state)
+            .map(|state| format!("{state:?}"));
+        let tombstone_stats = tombstone_watcher
+            .as_ref()
+            .map(RealTombstoneWatcher::stats)
+            .unwrap_or_default();
+        let tombstone_source_available = tombstone_watcher.as_ref().is_some_and(|watcher| {
+            watcher.runtime_state().primed && watcher.runtime_state().available
+        });
+        let tombstone_last_error = tombstone_watcher
+            .as_ref()
+            .and_then(|watcher| watcher.runtime_state().last_error.as_ref())
+            .map(|error| format!("{} {}: {}", error.operation, error.path, error.message));
+        let mut source_cleanup_errors = Vec::new();
+        if let Some(reader) = logcat_reader.as_mut() {
+            if let Err(error) = reader.shutdown() {
+                source_cleanup_errors.push(format!("logcat cleanup: {error}"));
+            }
+        }
+        if let Some(reader) = selinux_reader.as_mut() {
+            if let Err(error) = reader.shutdown() {
+                source_cleanup_errors.push(format!("SELinux logcat cleanup: {error}"));
+            }
+        }
+        let source_cleanup_error =
+            (!source_cleanup_errors.is_empty()).then(|| source_cleanup_errors.join("; "));
+        capture_scope.sources.logcat_available = logcat_source_available;
+        capture_scope.sources.selinux_logcat_available = selinux_source_available;
+        capture_scope.sources.tombstone_available = tombstone_source_available;
+        capture_scope = capture_scope.recompute_claim_scope();
+        let health = match session.bpf.map("COUNTERS") {
+            Some(map) => match PerCpuArray::<_, u64>::try_from(map) {
+                Ok(counters) => CaptureHealth::read(&counters),
+                Err(error) => CaptureHealth::unknown(format!("map:COUNTERS:{error}")),
+            },
+            None => CaptureHealth::unknown("map:COUNTERS:missing"),
+        };
+        let mut unknown_reasons = detach_errors;
+        unknown_reasons.extend(source_cleanup_errors);
+        if let Err(error) = &loop_result {
+            unknown_reasons.push(format!("trace event loop failed: {error:#}"));
+        }
+        match read_boot_id() {
+            Ok(final_boot_id) if final_boot_id == capture_boot_id => {}
+            Ok(final_boot_id) => unknown_reasons.push(format!(
+                "device boot identity changed during capture: {} -> {}",
+                capture_boot_id, final_boot_id
+            )),
+            Err(error) => unknown_reasons.push(format!(
+                "final device boot identity could not be read: {error:#}"
+            )),
+        }
+        if let Some(error) = marker_transition_error {
+            unknown_reasons.push(error);
+        }
+        if let Some(error) = ring_poll_error {
+            unknown_reasons.push(error);
+        }
+        if poller_join_failed || fd_poller_stats.running {
+            unknown_reasons.push("FD poller did not terminate cleanly".into());
+        }
+        let fd_poller_unconsumed = fd_poller_stats
+            .samples_sent
+            .saturating_sub(fd_poller_samples_consumed);
+        if fd_poller_unconsumed != fd_poller_shutdown_samples_discarded {
+            unknown_reasons.push(format!(
             "FD poller sample reconciliation mismatch: sent={} consumed={} shutdown_discarded={}",
             fd_poller_stats.samples_sent,
             fd_poller_samples_consumed,
             fd_poller_shutdown_samples_discarded
         ));
-    }
-    if let Some(terminal) = logcat_terminal {
-        unknown_reasons.push(format!("logcat source terminated: {terminal}"));
-    }
-    if let Some(terminal) = selinux_terminal {
-        unknown_reasons.push(format!("SELinux logcat source terminated: {terminal}"));
-    }
-    if let Some(error) = tombstone_last_error {
-        unknown_reasons.push(format!("tombstone source error: {error}"));
-    }
-    if stack_read_failures > 0 {
-        unknown_reasons.push(format!(
-            "STACK_TRACES lookup failed {stack_read_failures} time(s)"
-        ));
-    }
-    if invalid_ring_records > 0 {
-        unknown_reasons.push(format!(
-            "ring buffer yielded {invalid_ring_records} record(s) whose size did not match the validated event ABI"
-        ));
-    }
-    let mut incomplete_reasons = Vec::new();
-    if let Some(active) = scenarios.active() {
-        incomplete_reasons.push(format!(
-            "scenario '{}' ended without a closing marker",
-            active.scenario_id
-        ));
-    }
-    if logcat_source_enabled && logcat_reader.is_none() {
-        incomplete_reasons.push("requested logcat source could not be started".into());
-    }
-    if selinux_source_enabled && selinux_reader.is_none() {
-        incomplete_reasons.push("requested SELinux logcat source could not be started".into());
-    }
-    if tombstone_source_enabled && tombstone_watcher.is_none() {
-        incomplete_reasons.push("requested tombstone source was unavailable at startup".into());
-    }
-    if follow_children_map_failures > 0 {
-        incomplete_reasons.push(format!(
-            "PID_WHITELIST update failed {follow_children_map_failures} time(s); child observation is incomplete"
-        ));
-    }
-    if watch_fds_map_failures > 0 {
-        incomplete_reasons.push(format!(
-            "WATCH_FDS update failed {watch_fds_map_failures} time(s); watched-FD instrumentation is incomplete"
-        ));
-    }
-    if binder_discovery_failures > 0 {
-        incomplete_reasons.push(format!(
-            "Binder service/HAL inventory refresh failed {binder_discovery_failures} time(s)"
-        ));
-    }
-    if binder_discovery_drift > 0 {
-        incomplete_reasons.push(format!(
-            "Binder service/HAL inventory changed during capture ({binder_discovery_drift} refresh(es)); candidate attribution is not stable"
-        ));
-    }
-    if scenario_inflight_discarded > 0 {
-        incomplete_reasons.push(format!(
-            "{scenario_inflight_discarded} syscall(s) were still in flight at a scenario end boundary"
-        ));
-    }
-    if scenario_context_discarded > 0 {
-        incomplete_reasons.push(format!(
-            "{scenario_context_discarded} buffered context record(s) were cleared at a scenario boundary"
-        ));
-    }
-    if tombstone_unmatched_in_scope > 0 {
-        incomplete_reasons.push(format!(
-            "{tombstone_unmatched_in_scope} in-scope tombstone crash record(s) lacked a matching BPF process-exit"
-        ));
-    }
-    if health.is_readable(neutron_common::COUNTER_EVENTS_SUBMITTED) {
-        let submitted = health.get(neutron_common::COUNTER_EVENTS_SUBMITTED);
-        let received = total_events
-            .saturating_add(invalid_ring_records)
-            .saturating_add(shutdown_events_discarded);
-        if submitted != received {
-            incomplete_reasons.push(format!(
-                "BPF/userspace event reconciliation mismatch: submitted={submitted} received={received}"
+        }
+        if let Some(terminal) = logcat_terminal {
+            unknown_reasons.push(format!("logcat source terminated: {terminal}"));
+        }
+        if let Some(terminal) = selinux_terminal {
+            unknown_reasons.push(format!("SELinux logcat source terminated: {terminal}"));
+        }
+        if let Some(error) = tombstone_last_error {
+            unknown_reasons.push(format!("tombstone source error: {error}"));
+        }
+        if stack_read_failures > 0 {
+            unknown_reasons.push(format!(
+                "STACK_TRACES lookup failed {stack_read_failures} time(s)"
             ));
         }
-    }
-    let user_health = UserspaceHealth {
-        fd_graph_miss: fd_graph.miss_count(),
-        fd_graph_backfilled: fd_graph.backfill_count(),
-        fd_poller_samples_dropped: fd_poller_stats.samples_dropped_full,
-        fd_poller_shutdown_samples_discarded,
-        fd_poller_sample_channel_errors: fd_poller_stats.sample_receiver_disconnected,
-        fd_poller_active_updates_dropped: fd_poller_stats
-            .active_updates_dropped_full
-            .saturating_add(
-                fd_poller_stats
-                    .active_updates_sent
-                    .saturating_sub(fd_poller_stats.active_updates_applied),
-            ),
-        fd_poller_active_channel_errors: fd_poller_stats.active_receiver_disconnected,
-        fd_poller_proc_disappeared: fd_poller_stats.proc_disappeared,
-        fd_poller_proc_permission_errors: fd_poller_stats.proc_permission_errors,
-        fd_poller_proc_io_errors: fd_poller_stats.proc_io_errors,
-        fd_poller_proc_parse_errors: fd_poller_stats.proc_parse_errors,
-        fd_poller_proc_truncations: fd_poller_stats.proc_truncations,
-        fd_poller_proc_races: fd_poller_stats.proc_races,
-        fd_poller_pid_reuse: fd_poller_stats.pid_reuse,
-        fd_poller_samples_suppressed_read_errors: fd_poller_stats.samples_suppressed_read_errors,
-        fd_poller_target_unreadable_polls: fd_poller_stats.target_unreadable_polls,
-        fd_poller_scope_read_errors: fd_poller_stats.scope_read_errors,
-        scenario_inflight_discarded,
-        scenario_context_discarded,
-        scenario_context_baseline_discarded,
-        events_matched,
-        events_sampled_out,
-        events_emitted: output_records.load(Ordering::Relaxed),
-        output_cap_hit: output_cap_hit.load(Ordering::Relaxed),
-        follow_policy_filtered,
-        follow_ttl_expired,
-        binder_tracker_evictions: binder_tracker_stats.tracker_evictions,
-        binder_unmatched_receives: binder_tracker_stats.unmatched_receives,
-        binder_causal_metadata_discarded: binder_tracker_stats.causal_metadata_discarded,
-        binder_invalid_callers: binder_tracker_stats.invalid_callers,
-        binder_baseline_discarded: binder_tracker_stats.baseline_discarded,
-        binder_tracker_disabled: binder_tracker.is_none(),
-        kprobe_attach_failures: kprobe_packs
-            .iter()
-            .flat_map(|pack| {
-                pack.failures
-                    .iter()
-                    .map(|failure| format!("{}:{failure}", pack.name))
-            })
-            .collect(),
-        native_capture_degraded: native_capture.degraded(),
-        native_maps_truncated: native_capture.maps_truncated,
-        native_stacks_truncated: native_capture.stacks_truncated,
-        native_refresh_failed: native_capture.refresh_failed,
-        logcat_source_enabled,
-        logcat_source_available,
-        logcat_baseline_drains: logcat_stats.baseline_drains,
-        logcat_baseline_lines_discarded: logcat_stats.baseline_lines_discarded,
-        logcat_baseline_events_discarded: logcat_stats.baseline_events_discarded,
-        logcat_baseline_pending_discarded: logcat_stats.baseline_pending_discarded,
-        logcat_baseline_errors: logcat_stats.baseline_errors,
-        logcat_unprimed_drains: logcat_stats.unprimed_drains,
-        logcat_lines_read: logcat_stats.lines_read,
-        logcat_oversized_lines: logcat_stats.oversized_lines,
-        logcat_eof: logcat_stats.eof,
-        logcat_read_errors: logcat_stats.read_errors,
-        logcat_incomplete_correlations: logcat_stats.incomplete_correlations,
-        logcat_malformed_correlations: logcat_stats.malformed_correlations,
-        logcat_unsupported_java_fatal: logcat_stats.unsupported_java_fatal,
-        logcat_unsupported_anr: logcat_stats.unsupported_anr,
-        logcat_untrusted_native_exits,
-        selinux_source_enabled,
-        selinux_source_available,
-        selinux_baseline_drains: selinux_stats.baseline_drains,
-        selinux_baseline_records_discarded: selinux_stats.baseline_records_discarded,
-        selinux_baseline_pending_discarded: selinux_stats.baseline_pending_discarded,
-        selinux_baseline_errors: selinux_stats.baseline_errors,
-        selinux_unprimed_drains: selinux_stats.unprimed_drains,
-        selinux_parsed: selinux_stats.parsed,
-        selinux_malformed: selinux_stats.malformed,
-        selinux_deduplicated: selinux_stats.deduplicated,
-        selinux_out_of_scope: selinux_stats.out_of_scope,
-        selinux_eof: selinux_stats.eof,
-        selinux_read_errors: selinux_stats.read_errors,
-        tombstone_source_enabled,
-        tombstone_source_available,
-        tombstone_baseline_primes: tombstone_stats.baseline_primes,
-        tombstone_baseline_errors: tombstone_stats.baseline_errors,
-        tombstone_baseline_files: tombstone_stats.baseline_files,
-        tombstone_unprimed_polls: tombstone_stats.unprimed_polls,
-        tombstone_directory_errors: tombstone_stats.directory_errors,
-        tombstone_directory_entry_errors: tombstone_stats.directory_entry_errors,
-        tombstone_directory_overflows: tombstone_stats.directory_overflows,
-        tombstone_file_read_errors: tombstone_stats.file_read_errors,
-        tombstone_oversized_files: tombstone_stats.oversized_files,
-        tombstone_file_identity_races: tombstone_stats.file_identity_races,
-        tombstone_malformed_files: tombstone_stats.malformed_files,
-        tombstone_unmatched_in_scope,
-        tombstone_out_of_scope,
-        incomplete_reasons,
-        unknown_reasons,
-        shutdown_events_discarded,
-    };
-    eprint!(
-        "{}",
-        format_summary_with(&health, &user_health, total_events)
-    );
-
-    // Machine-readable counterpart on the NDJSON stream and, optionally, a
-    // sidecar independent of the primary output cap. Unknown health is still
-    // emitted; it must never collapse to an innocent-looking zero snapshot.
-    let mut final_health_line = None;
-    if args.json || args.health_output.is_some() {
-        let mut match_pids = args.match_pid.clone();
-        if args.pid != 0 {
-            push_unique(&mut match_pids, args.pid.to_string());
+        if invalid_ring_records > 0 {
+            unknown_reasons.push(format!(
+            "ring buffer yielded {invalid_ring_records} record(s) whose size did not match the validated event ABI"
+        ));
         }
-        let capture_meta = CaptureMetadata {
-            capture_scope: Some(capture_scope),
-            driver_packs: driver_packs.names.clone(),
-            kprobe_packs: args
-                .kprobe_pack
+        let mut incomplete_reasons = Vec::new();
+        if subject_resolution_failures > 0 {
+            incomplete_reasons.push(format!("subject resolution unavailable {subject_resolution_failures} time(s); root admission disabled during gaps"));
+        }
+        if dropped_rule_state_events > 0 {
+            incomplete_reasons.push(format!(
+                "rule state cap discarded {dropped_rule_state_events} aggregation event(s)"
+            ));
+        }
+        if process_state.reconciliation_failures > 0 {
+            incomplete_reasons.push(format!(
+                "process death reconciliation unavailable {} time(s)",
+                process_state.reconciliation_failures
+            ));
+        }
+        if let Some(active) = scenarios.active() {
+            incomplete_reasons.push(format!(
+                "scenario '{}' ended without a closing marker",
+                active.scenario_id
+            ));
+        }
+        if logcat_source_enabled && logcat_reader.is_none() {
+            incomplete_reasons.push("requested logcat source could not be started".into());
+        }
+        if selinux_source_enabled && selinux_reader.is_none() {
+            incomplete_reasons.push("requested SELinux logcat source could not be started".into());
+        }
+        if tombstone_source_enabled && tombstone_watcher.is_none() {
+            incomplete_reasons.push("requested tombstone source was unavailable at startup".into());
+        }
+        if follow_children_map_failures > 0 {
+            incomplete_reasons.push(format!(
+            "PID_WHITELIST update failed {follow_children_map_failures} time(s); child observation is incomplete"
+        ));
+        }
+        if watch_fds_map_failures > 0 {
+            incomplete_reasons.push(format!(
+            "WATCH_FDS update failed {watch_fds_map_failures} time(s); watched-FD instrumentation is incomplete"
+        ));
+        }
+        if binder_discovery_failures > 0 {
+            incomplete_reasons.push(format!(
+                "Binder service/HAL inventory refresh failed {binder_discovery_failures} time(s)"
+            ));
+        }
+        if binder_discovery_drift > 0 {
+            incomplete_reasons.push(format!(
+            "Binder service/HAL inventory changed during capture ({binder_discovery_drift} refresh(es)); candidate attribution is not stable"
+        ));
+        }
+        if scenario_inflight_discarded > 0 {
+            incomplete_reasons.push(format!(
+            "{scenario_inflight_discarded} syscall(s) were still in flight at a scenario end boundary"
+        ));
+        }
+        if scenario_context_discarded > 0 {
+            incomplete_reasons.push(format!(
+            "{scenario_context_discarded} buffered context record(s) were cleared at a scenario boundary"
+        ));
+        }
+        if tombstone_unmatched_in_scope > 0 {
+            incomplete_reasons.push(format!(
+            "{tombstone_unmatched_in_scope} in-scope tombstone crash record(s) lacked a matching BPF process-exit"
+        ));
+        }
+        if health.is_readable(neutron_common::COUNTER_EVENTS_SUBMITTED) {
+            let submitted = health.get(neutron_common::COUNTER_EVENTS_SUBMITTED);
+            let received = total_events
+                .saturating_add(invalid_ring_records)
+                .saturating_add(shutdown_events_discarded);
+            if submitted != received {
+                incomplete_reasons.push(format!(
+                "BPF/userspace event reconciliation mismatch: submitted={submitted} received={received}"
+            ));
+            }
+        }
+        let user_health = UserspaceHealth {
+            fd_graph_miss: process_state.fds.miss_count(),
+            fd_graph_backfilled: process_state.fds.backfill_count(),
+            fd_poller_samples_dropped: fd_poller_stats.samples_dropped_full,
+            fd_poller_shutdown_samples_discarded,
+            fd_poller_sample_channel_errors: fd_poller_stats.sample_receiver_disconnected,
+            fd_poller_active_updates_dropped: fd_poller_stats
+                .active_updates_dropped_full
+                .saturating_add(
+                    fd_poller_stats
+                        .active_updates_sent
+                        .saturating_sub(fd_poller_stats.active_updates_applied),
+                ),
+            fd_poller_active_channel_errors: fd_poller_stats.active_receiver_disconnected,
+            fd_poller_proc_disappeared: fd_poller_stats.proc_disappeared,
+            fd_poller_proc_permission_errors: fd_poller_stats.proc_permission_errors,
+            fd_poller_proc_io_errors: fd_poller_stats.proc_io_errors,
+            fd_poller_proc_parse_errors: fd_poller_stats.proc_parse_errors,
+            fd_poller_proc_truncations: fd_poller_stats.proc_truncations,
+            fd_poller_proc_races: fd_poller_stats.proc_races,
+            fd_poller_pid_reuse: fd_poller_stats.pid_reuse,
+            fd_poller_samples_suppressed_read_errors: fd_poller_stats
+                .samples_suppressed_read_errors,
+            fd_poller_target_unreadable_polls: fd_poller_stats.target_unreadable_polls,
+            fd_poller_scope_read_errors: fd_poller_stats.scope_read_errors,
+            scenario_inflight_discarded,
+            scenario_context_discarded,
+            scenario_context_baseline_discarded,
+            events_matched,
+            events_sampled_out,
+            events_emitted: output_records.load(Ordering::Relaxed),
+            output_cap_hit: output_cap_hit.load(Ordering::Relaxed),
+            follow_policy_filtered,
+            follow_ttl_expired,
+            binder_tracker_evictions: binder_tracker_stats.tracker_evictions,
+            binder_unmatched_receives: binder_tracker_stats.unmatched_receives,
+            binder_causal_metadata_discarded: binder_tracker_stats.causal_metadata_discarded,
+            binder_invalid_callers: binder_tracker_stats.invalid_callers,
+            binder_baseline_discarded: binder_tracker_stats.baseline_discarded,
+            binder_tracker_disabled: binder_tracker.is_none(),
+            kprobe_attach_failures: kprobe_packs
                 .iter()
-                .map(|s| normalize_pack_name(s))
+                .flat_map(|pack| {
+                    pack.failures
+                        .iter()
+                        .map(|failure| format!("{}:{failure}", pack.name))
+                })
                 .collect(),
-            attached_programs: attached.iter().map(|s| (*s).to_string()).collect(),
-            ioctl_refresh_cmds: driver_packs.refresh_cmds.iter().copied().collect(),
-            ioctl_refresh_types: driver_packs.refresh_types.iter().copied().collect(),
-            match_packages: args.match_package.clone(),
-            match_uids: args.match_uid.clone(),
-            match_pids,
-            root_package: args.package.clone(),
-            root_uid: args.root_uid.or(package_uid),
-            boot_id: Some(capture_boot_id.clone()),
-            fingerprint: capture_fingerprint.clone(),
-            max_depth: args.max_depth,
-            max_processes: args.max_processes,
-            bpf_object_sha256: Some(bpf_identity.object_sha256.clone()),
-            bpf_build_id: Some(bpf_identity.build_id.clone()),
-            bpf_abi_major: Some(bpf_identity.abi_major),
-            bpf_abi_minor: Some(bpf_identity.abi_minor),
-            bpf_event_size: Some(bpf_identity.syscall_event_size),
-            bpf_feature_bits: Some(bpf_identity.feature_bits),
-            ring_size_bytes: Some(1 << 20),
+            native_capture_degraded: native_capture.degraded(),
+            native_maps_truncated: native_capture.maps_truncated,
+            native_stacks_truncated: native_capture.stacks_truncated,
+            native_refresh_failed: native_capture.refresh_failed,
+            logcat_source_enabled,
+            logcat_source_available,
+            logcat_baseline_drains: logcat_stats.baseline_drains,
+            logcat_baseline_lines_discarded: logcat_stats.baseline_lines_discarded,
+            logcat_baseline_events_discarded: logcat_stats.baseline_events_discarded,
+            logcat_baseline_pending_discarded: logcat_stats.baseline_pending_discarded,
+            logcat_baseline_errors: logcat_stats.baseline_errors,
+            logcat_unprimed_drains: logcat_stats.unprimed_drains,
+            logcat_lines_read: logcat_stats.lines_read,
+            logcat_oversized_lines: logcat_stats.oversized_lines,
+            logcat_eof: logcat_stats.eof,
+            logcat_read_errors: logcat_stats.read_errors,
+            logcat_incomplete_correlations: logcat_stats.incomplete_correlations,
+            logcat_malformed_correlations: logcat_stats.malformed_correlations,
+            logcat_unsupported_java_fatal: logcat_stats.unsupported_java_fatal,
+            logcat_unsupported_anr: logcat_stats.unsupported_anr,
+            logcat_untrusted_native_exits,
+            selinux_source_enabled,
+            selinux_source_available,
+            selinux_baseline_drains: selinux_stats.baseline_drains,
+            selinux_baseline_records_discarded: selinux_stats.baseline_records_discarded,
+            selinux_baseline_pending_discarded: selinux_stats.baseline_pending_discarded,
+            selinux_baseline_errors: selinux_stats.baseline_errors,
+            selinux_unprimed_drains: selinux_stats.unprimed_drains,
+            selinux_parsed: selinux_stats.parsed,
+            selinux_malformed: selinux_stats.malformed,
+            selinux_deduplicated: selinux_stats.deduplicated,
+            selinux_out_of_scope: selinux_stats.out_of_scope,
+            selinux_eof: selinux_stats.eof,
+            selinux_read_errors: selinux_stats.read_errors,
+            tombstone_source_enabled,
+            tombstone_source_available,
+            tombstone_baseline_primes: tombstone_stats.baseline_primes,
+            tombstone_baseline_errors: tombstone_stats.baseline_errors,
+            tombstone_baseline_files: tombstone_stats.baseline_files,
+            tombstone_unprimed_polls: tombstone_stats.unprimed_polls,
+            tombstone_directory_errors: tombstone_stats.directory_errors,
+            tombstone_directory_entry_errors: tombstone_stats.directory_entry_errors,
+            tombstone_directory_overflows: tombstone_stats.directory_overflows,
+            tombstone_file_read_errors: tombstone_stats.file_read_errors,
+            tombstone_oversized_files: tombstone_stats.oversized_files,
+            tombstone_file_identity_races: tombstone_stats.file_identity_races,
+            tombstone_malformed_files: tombstone_stats.malformed_files,
+            tombstone_unmatched_in_scope,
+            tombstone_out_of_scope,
+            incomplete_reasons,
+            unknown_reasons,
+            shutdown_events_discarded,
         };
-        let line = format_capture_health_json_with_metadata(
-            &health,
-            &user_health,
-            total_events,
-            &capture_meta,
+        eprint!(
+            "{}",
+            format_summary_with(&health, &user_health, total_events)
         );
-        write_health_sidecar(args.health_output.as_deref(), &line)?;
-        if args.json {
-            write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
-        }
-        final_health_line = Some(line);
-    }
-    out.flush().context("flushing final capture output")?;
-    drop(out);
 
-    if let Some(bundle) = trace_bundle {
-        let line = final_health_line.context("trace run bundle has no final capture health")?;
-        let capture_health: serde_json::Value =
-            serde_json::from_str(&line).context("parsing final capture health for manifest")?;
-        let capture = neutron::run_manifest::identify_artifact(&bundle.run_dir, "capture.ndjson")?;
-        let health =
-            neutron::run_manifest::identify_artifact(&bundle.run_dir, "capture.health.json")?;
-        let manifest = neutron::run_manifest::RunManifest::live_capture(
-            neutron::run_manifest::LiveCaptureManifest {
-                run_id: bundle.run_id,
-                started_at: bundle.started_at,
-                completed_at: neutron::run_manifest::utc_timestamp(),
-                device: capture_device_identity,
-                research_model: neutron::run_manifest::ResearchModel {
-                    observer_privilege: observer_privilege_after_preflight(),
-                    attacker_capability: args.attacker_capability.clone(),
+        // Machine-readable counterpart on the NDJSON stream and, optionally, a
+        // sidecar independent of the primary output cap. Unknown health is still
+        // emitted; it must never collapse to an innocent-looking zero snapshot.
+        let mut final_health_line = None;
+        if args.json || args.health_output.is_some() {
+            let mut match_pids = args.match_pid.clone();
+            if args.pid != 0 {
+                push_unique(&mut match_pids, args.pid.to_string());
+            }
+            let capture_meta = CaptureMetadata {
+                capture_scope: Some(capture_scope),
+                driver_packs: driver_packs.names.clone(),
+                kprobe_packs: args
+                    .kprobe_pack
+                    .iter()
+                    .map(|s| normalize_pack_name(s))
+                    .collect(),
+                attached_programs: session.attached.iter().map(|s| (*s).to_string()).collect(),
+                ioctl_refresh_cmds: driver_packs.refresh_cmds.iter().copied().collect(),
+                ioctl_refresh_types: driver_packs.refresh_types.iter().copied().collect(),
+                match_packages: args.match_package.clone(),
+                match_uids: args.match_uid.clone(),
+                match_pids,
+                root_package: args.package.clone(),
+                root_uid: args.root_uid.or(package_uid),
+                boot_id: Some(capture_boot_id.clone()),
+                fingerprint: capture_fingerprint.clone(),
+                max_depth: args.max_depth,
+                max_processes: args.max_processes,
+                bpf_object_sha256: Some(bpf_identity.object_sha256.clone()),
+                bpf_build_id: Some(bpf_identity.build_id.clone()),
+                bpf_abi_major: Some(bpf_identity.abi_major),
+                bpf_abi_minor: Some(bpf_identity.abi_minor),
+                bpf_event_size: Some(bpf_identity.syscall_event_size),
+                bpf_feature_bits: Some(bpf_identity.feature_bits),
+                ring_size_bytes: Some(1 << 20),
+            };
+            let line = format_capture_health_json_with_metadata(
+                &health,
+                &user_health,
+                total_events,
+                &capture_meta,
+            );
+            write_health_sidecar(args.health_output.as_deref(), &line)?;
+            if args.json {
+                write_or_output_cap(writeln!(out, "{line}"), &output_cap_hit)?;
+            }
+            final_health_line = Some(line);
+        }
+        out.flush().context("flushing final capture output")?;
+        drop(out);
+
+        if let Some(bundle) = trace_bundle {
+            neutron::private_output::write_json(
+                &bundle.run_dir.join("teardown.json"),
+                &serde_json::json!({
+                    "schema": "neutron.capture-lifecycle/v1", "phase": "teardown",
+                    "detach": if cleanup_error.is_none() { "passed" } else { "failed" },
+                    "detach_error": cleanup_error, "source_error": source_cleanup_error,
+                    "fd_poller": if poller_join_failed { "failed" } else { "passed or not requested" },
+                    "shutdown_events_discarded": shutdown_events_discarded,
+                    "output_flush": "passed", "seal": "pending; verify manifest and checksums"
+                }),
+                false,
+            )?;
+            if cleanup_error.is_some()
+                || source_cleanup_error.is_some()
+                || poller_join_failed
+                || loop_result.is_err()
+            {
+                bail!("capture did not finish cleanly; run bundle remains unsealed");
+            }
+            let readiness =
+                neutron::run_manifest::identify_artifact(&bundle.run_dir, "readiness.json")?;
+            let teardown =
+                neutron::run_manifest::identify_artifact(&bundle.run_dir, "teardown.json")?;
+            let line = final_health_line.context("trace run bundle has no final capture health")?;
+            let capture_health: serde_json::Value =
+                serde_json::from_str(&line).context("parsing final capture health for manifest")?;
+            let capture =
+                neutron::run_manifest::identify_artifact(&bundle.run_dir, "capture.ndjson")?;
+            let health =
+                neutron::run_manifest::identify_artifact(&bundle.run_dir, "capture.health.json")?;
+            let manifest = neutron::run_manifest::RunManifest::live_capture(
+                neutron::run_manifest::LiveCaptureManifest {
+                    run_id: bundle.run_id,
+                    started_at: bundle.started_at,
+                    completed_at: neutron::run_manifest::utc_timestamp(),
+                    device: capture_device_identity,
+                    research_model: neutron::run_manifest::ResearchModel {
+                        observer_privilege: observer_privilege_after_preflight(),
+                        attacker_capability: args.attacker_capability.clone(),
+                    },
+                    bpf: neutron::run_manifest::BpfIdentity::from_loaded(&bpf_identity),
+                    capture_health,
+                    artifacts: vec![capture, health, readiness, teardown],
                 },
-                bpf: neutron::run_manifest::BpfIdentity::from_loaded(&bpf_identity),
-                capture_health,
-                artifacts: vec![capture, health],
-            },
-        )?;
-        neutron::run_manifest::finalize_bundle(&bundle.run_dir, &manifest)?;
+            )?;
+            neutron::run_manifest::finalize_bundle(&bundle.run_dir, &manifest)?;
+        }
+        if let Some(error) = cleanup_error {
+            bail!("trace cleanup failed: {error}");
+        }
+        if let Some(error) = source_cleanup_error {
+            bail!("{error}");
+        }
+        if poller_join_failed {
+            bail!("trace FD poller did not shut down cleanly");
+        }
+        Ok(())
+    })();
+    match (loop_result, finalization_result) {
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("finalization also failed: {cleanup:#}")))
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), result) => result,
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -5494,7 +6046,7 @@ mod tests {
             trace_id: 1,
             generation: 1,
         };
-        let line = live_marker_line(&request, &scenario, 42, None, Some(10123), None);
+        let line = live_marker_line(&request, &scenario, 42, None, Some(10123), None, None);
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["root_uid"], 10123);
         assert!(value.get("root_package").is_none());

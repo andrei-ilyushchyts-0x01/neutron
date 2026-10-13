@@ -114,6 +114,15 @@ pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 }
 
 impl RealLogcatReader {
+    /// Stop and reap the owned source before final health is published.
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            stop_child(child)?;
+            self.child = None;
+        }
+        Ok(())
+    }
+
     /// Spawn a current-tail, explicit-tag logcat stream. Returns `Err` when
     /// the binary is missing (host without `logcat`) so the caller can
     /// degrade gracefully.
@@ -127,12 +136,12 @@ impl RealLogcatReader {
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                stop_child(&mut child);
+                let _ = stop_child(&mut child);
                 return Err(io::Error::other("logcat stdout missing"));
             }
         };
         if let Err(error) = set_nonblocking(stdout.as_raw_fd()) {
-            stop_child(&mut child);
+            let _ = stop_child(&mut child);
             return Err(error);
         }
         Ok(Self::from_reader(Some(child), BufReader::new(stdout)))
@@ -297,15 +306,21 @@ impl RealLogcatReader {
     }
 }
 
-pub(crate) fn stop_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+pub(crate) fn stop_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_none() {
+        if let Err(error) = child.kill() {
+            if child.try_wait()?.is_none() {
+                return Err(error);
+            }
+        }
+    }
+    child.wait().map(|_| ())
 }
 
 impl Drop for RealLogcatReader {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            stop_child(&mut c);
+            let _ = stop_child(&mut c);
         }
     }
 }
@@ -491,6 +506,18 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn explicit_shutdown_reaps_owned_child_and_is_idempotent() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let mut reader = RealLogcatReader::from_reader(Some(child), Cursor::new(Vec::<u8>::new()));
+        reader.shutdown().unwrap();
+        reader.shutdown().unwrap();
+        assert!(reader.child.is_none());
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
 
     struct ErrorReader(io::ErrorKind);
 

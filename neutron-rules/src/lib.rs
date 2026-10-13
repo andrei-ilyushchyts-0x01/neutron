@@ -52,3 +52,5 @@ pub use event::{Event, EventKind};
 pub use finding::{Aggregates, CaptureHealthSnapshot, EventSnapshot, EvidenceQuality, Finding};
 pub use loader::{load_rules_yaml_file, load_rules_yaml_str, LoaderError};
 pub use rule::{AggregateMode, Category, FrequencySpec, Rule, Severity};
+
+pub use finding::FindingScope;

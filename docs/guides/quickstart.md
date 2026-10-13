@@ -3,6 +3,9 @@
 This quickstart uses only release artifacts and an explicitly selected rooted
 Android device. It does not write evidence under `/data/local/tmp`.
 
+For native daemons, exact service owners and PID incarnations, continue with
+[Native and system subjects](system-subjects.md) after installation.
+
 ## Prerequisites
 
 - An authorized rooted device listed in [PRODUCT.md](../../PRODUCT.md).

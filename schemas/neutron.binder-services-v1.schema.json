@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reviewed Binder services bound to evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "context",
+    "services"
+  ],
+  "properties": {
+    "schema": {
+      "const": "neutron.binder-services/v1"
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_sha256",
+        "boot_id",
+        "fingerprint",
+        "process_starttimes",
+        "review_evidence"
+      ],
+      "properties": {
+        "capture_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "boot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fingerprint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "process_starttimes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "review_evidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      }
+    }
+  }
+}

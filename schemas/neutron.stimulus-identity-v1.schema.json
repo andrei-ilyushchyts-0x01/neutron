@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.stimulus-identity-v1.schema.json",
+  "title": "External stimulus identity (collector asserted)",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "identity"
+      ],
+      "properties": {
+        "kind": {
+          "const": "android_app"
+        },
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "apk_sha256",
+            "signing_certificate_sha256",
+            "package",
+            "version_code",
+            "version_name",
+            "target_sdk",
+            "device_boot_id",
+            "uid",
+            "install_state",
+            "granted_permissions"
+          ],
+          "properties": {
+            "schema": {
+              "const": "neutron.external-probe-runtime/v1"
+            },
+            "apk_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "signing_certificate_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "package": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 255,
+              "pattern": "^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$"
+            },
+            "version_code": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "version_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            "target_sdk": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000
+            },
+            "device_boot_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "uid": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "install_state": {
+              "const": "installed_enabled"
+            },
+            "granted_permissions": {
+              "type": "array",
+              "maxItems": 256,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[!-~]+$"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "identity"
+      ],
+      "properties": {
+        "kind": {
+          "const": "native_process"
+        },
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "device_boot_id",
+            "pid",
+            "starttime",
+            "uid",
+            "gid",
+            "executable_path",
+            "binary_sha256",
+            "build_id",
+            "selinux_domain",
+            "effective_capabilities"
+          ],
+          "properties": {
+            "schema": {
+              "const": "neutron.native-process-runtime/v1"
+            },
+            "device_boot_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "pid": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "starttime": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "uid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "gid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "executable_path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^/"
+            },
+            "binary_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "build_id": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^([0-9a-f]{2}){1,64}$"
+                }
+              ]
+            },
+            "selinux_domain": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^u:r:[^:]+:"
+            },
+            "effective_capabilities": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{16}$"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -8,7 +8,7 @@
 //! neutron accepts a JSON file an operator pre-populates and uses it to
 //! splice a `service` field into emitted `binder_call` events.
 //!
-//! File format — flat, hand-editable:
+//! Legacy candidate format — flat, hand-editable (never exact by itself):
 //!
 //! ```json
 //! {
@@ -24,7 +24,9 @@
 //!
 //! Outer key: `callee_pid` as a string. Inner key: `target_node` as a
 //! string. Both string-keyed because JSON object keys are strings; the
-//! loader parses them back to integers. Unknown (pid, node) pairs
+//! loader parses them back to integers. Reviewed exact labels additionally require
+//! `neutron.binder-services/v1` context bound to the capture or live incarnation.
+//! Unknown (pid, node) pairs
 //! return `None` from `lookup` — the formatter then omits the
 //! `service` field rather than emitting a placeholder.
 
@@ -42,6 +44,59 @@ use crate::aidl::{normalize_descriptor, AidlCatalog};
 #[derive(Clone, Debug, Default)]
 pub struct BinderServiceMap {
     by_pair: HashMap<(u32, i32), String>,
+    context: Option<ReviewedContext>,
+    capture_bound: bool,
+    live_bound: bool,
+}
+
+#[derive(Debug)]
+struct UniqueMap<V>(BTreeMap<String, V>);
+
+impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for UniqueMap<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor<V>(std::marker::PhantomData<V>);
+        impl<'de, V: serde::Deserialize<'de>> serde::de::Visitor<'de> for Visitor<V> {
+            type Value = UniqueMap<V>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object with unique keys")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut result = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, V>()? {
+                    if result.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate Binder map key: {key}"
+                        )));
+                    }
+                }
+                Ok(UniqueMap(result))
+            }
+        }
+        deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewedContext {
+    capture_sha256: String,
+    boot_id: String,
+    fingerprint: String,
+    process_starttimes: BTreeMap<u32, u64>,
+    review_evidence: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewedMap {
+    schema: String,
+    context: ReviewedContext,
+    services: UniqueMap<UniqueMap<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +261,15 @@ impl BinderCatalog {
         code: u32,
     ) -> Result<BinderAttribution> {
         if let Some(service) = exact.lookup(pid, target_node) {
+            if !exact.is_exact(pid) {
+                return Ok(BinderAttribution {
+                    service: None,
+                    candidates: vec![service.into()],
+                    confidence: Some(AttributionConfidence::Candidate),
+                    code,
+                    ..Default::default()
+                });
+            }
             let descriptor = normalize_descriptor(service);
             let catalog_match = aidl.and_then(|catalog| catalog.lookup(descriptor, code));
             let legacy_method = methods
@@ -394,21 +458,112 @@ impl BinderServiceMap {
 
     /// Parse from a JSON string. Public for test use.
     pub fn from_json(content: &str) -> Result<Self> {
-        let raw: HashMap<String, HashMap<String, String>> =
-            serde_json::from_str(content).context("expected `{pid: {node: name}}` object")?;
+        if content.len() > 16 * 1024 * 1024 {
+            bail!("Binder service map exceeds 16 MiB");
+        }
+        let value: serde_json::Value = serde_json::from_str(content)?;
+        let (raw, context) = if value.get("schema").is_some() {
+            let reviewed: ReviewedMap = serde_json::from_str(content)?;
+            if reviewed.schema != "neutron.binder-services/v1" {
+                bail!("unsupported Binder map schema");
+            }
+            let context = reviewed.context;
+            if context.capture_sha256.len() != 64
+                || !context
+                    .capture_sha256
+                    .bytes()
+                    .all(|v| v.is_ascii_hexdigit())
+                || context.boot_id.is_empty()
+                || context.fingerprint.is_empty()
+                || context.review_evidence.trim().is_empty()
+            {
+                bail!("reviewed Binder map needs capture hash, boot/build identity and review evidence");
+            }
+            (reviewed.services, Some(context))
+        } else {
+            (
+                serde_json::from_str(content).context("expected `{pid: {node: name}}` object")?,
+                None,
+            )
+        };
         let mut by_pair = HashMap::new();
-        for (pid_s, nodes) in raw {
+        for (pid_s, nodes) in raw.0 {
             let pid: u32 = pid_s
                 .parse()
                 .with_context(|| format!("invalid pid key '{pid_s}'"))?;
-            for (node_s, name) in nodes {
+            for (node_s, name) in nodes.0 {
                 let node: i32 = node_s
                     .parse()
                     .with_context(|| format!("invalid target_node key '{node_s}'"))?;
-                by_pair.insert((pid, node), name);
+                if name.trim().is_empty() || name.len() > 4096 || name.chars().any(char::is_control)
+                {
+                    bail!("Binder service labels must be bounded nonempty printable strings");
+                }
+                if by_pair.insert((pid, node), name).is_some() {
+                    bail!("conflicting normalized Binder endpoint {pid}/{node}");
+                }
             }
         }
-        Ok(Self { by_pair })
+        Ok(Self {
+            by_pair,
+            context,
+            capture_bound: false,
+            live_bound: false,
+        })
+    }
+
+    pub fn bind_capture(
+        &mut self,
+        capture: &crate::capture_normalize::NormalizedCapture,
+    ) -> Result<()> {
+        if let Some(context) = &self.context {
+            let health = capture
+                .health
+                .as_ref()
+                .context("reviewed map requires capture device identity")?;
+            if context.capture_sha256 != capture.capture_sha256
+                || health.boot_id.as_deref() != Some(&context.boot_id)
+                || health.fingerprint.as_deref() != Some(&context.fingerprint)
+            {
+                bail!("reviewed Binder map belongs to a different capture, boot or build");
+            }
+            self.capture_bound = true;
+        }
+        Ok(())
+    }
+
+    pub fn bind_live(&mut self) -> Result<()> {
+        if let Some(context) = &self.context {
+            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+            let output =
+                crate::android::run_platform_command("getprop", &["ro.build.fingerprint"])?;
+            if !output.status.success()
+                || boot.trim() != context.boot_id
+                || String::from_utf8(output.stdout)?.trim() != context.fingerprint
+            {
+                bail!("reviewed Binder map belongs to a different boot or build");
+            }
+            if self.by_pair.keys().any(|(pid, _)| {
+                !context.process_starttimes.get(pid).is_some_and(|start| {
+                    *start > 0 && crate::native::read_starttime(*pid) == Some(*start)
+                })
+            }) {
+                bail!("reviewed Binder map needs matching process starttimes for live use");
+            }
+            self.live_bound = true;
+        }
+        Ok(())
+    }
+
+    pub fn is_exact(&self, pid: u32) -> bool {
+        self.capture_bound
+            || (self.live_bound
+                && self.context.as_ref().is_some_and(|context| {
+                    context
+                        .process_starttimes
+                        .get(&pid)
+                        .is_some_and(|start| crate::native::read_starttime(pid) == Some(*start))
+                }))
     }
 
     /// `Some(name)` if `(callee_pid, target_node)` is mapped, else `None`.

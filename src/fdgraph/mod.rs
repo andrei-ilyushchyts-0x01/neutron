@@ -85,6 +85,7 @@ pub struct FdEntry {
     /// Open-time wallclock-equivalent (BPF `bpf_ktime_get_ns()`). 0 for
     /// entries backfilled via `/proc`.
     pub opened_at_ns: u64,
+    pub source: &'static str,
 }
 
 impl FdEntry {
@@ -95,6 +96,7 @@ impl FdEntry {
             kind,
             path,
             opened_at_ns: ts_ns,
+            source: "syscall",
         }
     }
 
@@ -104,6 +106,7 @@ impl FdEntry {
             kind,
             path,
             opened_at_ns: ts_ns,
+            source: "syscall",
         }
     }
 }
@@ -216,6 +219,7 @@ impl FdStats {
 pub struct FdGraph {
     per_pid: HashMap<u32, HashMap<i32, FdEntry>>,
     per_stats: HashMap<u32, FdStats>,
+    incarnations: HashMap<u32, u64>,
     miss_count: u64,
     backfill_count: u64,
 }
@@ -241,6 +245,21 @@ impl FdGraph {
     pub fn drop_pid(&mut self, pid: u32) {
         self.per_pid.remove(&pid);
         self.per_stats.remove(&pid);
+        self.incarnations.remove(&pid);
+    }
+
+    /// Fail closed when proc identity is unavailable or changed. The session
+    /// boot is fixed; starttime distinguishes recycled PIDs within it.
+    pub fn validate_incarnation(&mut self, pid: u32, starttime: Option<u64>) -> bool {
+        if starttime.is_none() || self.incarnations.get(&pid).copied() != starttime {
+            self.drop_pid(pid);
+        }
+        if let Some(starttime) = starttime {
+            self.incarnations.insert(pid, starttime);
+            true
+        } else {
+            false
+        }
     }
 
     /// First-class metrics for `pid`. `None` when no sample has been
@@ -312,12 +331,24 @@ impl FdGraph {
     /// graph for subsequent lookups. The miss counter increments either
     /// way; `backfill_count` increments only on a successful readlink.
     pub fn lookup_or_resolve(&mut self, pid: u32, fd: i32, ts_hint_ns: u64) -> Option<FdEntry> {
+        let starttime = crate::native::read_starttime(pid);
+        if !self.validate_incarnation(pid, starttime) {
+            self.miss_count = self.miss_count.saturating_add(1);
+            return None;
+        }
         if let Some(entry) = self.per_pid.get(&pid).and_then(|m| m.get(&fd)) {
             return Some(entry.clone());
         }
         self.miss_count = self.miss_count.saturating_add(1);
         let path = crate::decode::resolve_path_from_fd(pid, fd as i64)?;
-        let entry = FdEntry::new(path, ts_hint_ns);
+        if crate::native::read_starttime(pid) != starttime {
+            self.drop_pid(pid);
+            return None;
+        }
+        let entry = FdEntry {
+            source: "proc_readlink",
+            ..FdEntry::new(path, ts_hint_ns)
+        };
         self.backfill_count = self.backfill_count.saturating_add(1);
         self.per_pid
             .entry(pid)
@@ -373,6 +404,7 @@ impl FdGraph {
         match (nr, is_enter) {
             // openat / openat2 — insert on successful exit
             (56 | 437, false) if ret >= 0 => {
+                self.remove(pid, ret as i32);
                 if let Some(p) = decoded_path {
                     self.insert(pid, ret as i32, FdEntry::new(p, ts));
                 }
@@ -383,10 +415,14 @@ impl FdGraph {
                 self.remove(pid, fd);
             }
             // dup / dup3 — clone old → new on successful exit
-            (23 | 24, false) if ret >= 0 => {
+            (23 | 24, false) | (25, false)
+                if ret >= 0 && (nr != 25 || matches!(args[1], 0 | 1030)) =>
+            {
                 let old = args[0] as i32;
                 let new = ret as i32;
-                if let Some(entry) = self.per_pid.get(&pid).and_then(|m| m.get(&old)).cloned() {
+                let entry = self.per_pid.get(&pid).and_then(|m| m.get(&old)).cloned();
+                self.remove(pid, new);
+                if let Some(entry) = entry {
                     self.insert(pid, new, entry);
                 }
             }
@@ -404,6 +440,15 @@ impl FdGraph {
             // memfd_create — synthetic memfd on success
             (279, false) if ret >= 0 => {
                 self.insert(pid, ret as i32, FdEntry::synthetic(FdKind::Memfd, ts));
+            }
+            // A successful exec may close CLOEXEC descriptors. Refill on demand.
+            (221 | 281, false) if ret == 0 => self.drop_pid(pid),
+            (436, false) if ret == 0 && args[2] & 4 == 0 => {
+                if let Some(entries) = self.per_pid.get_mut(&pid) {
+                    entries.retain(|fd, _| {
+                        (*fd as u32) < args[0] as u32 || (*fd as u32) > args[1] as u32
+                    });
+                }
             }
             // exit_group — process died; drop all its fds so memory doesn't
             // grow unbounded across long --pid 0 captures.
@@ -495,6 +540,42 @@ mod tests {
     }
 
     #[test]
+    fn incarnation_and_descriptor_replacement_discard_stale_paths() {
+        let mut graph = FdGraph::new();
+        graph.validate_incarnation(42, Some(100));
+        graph.update(&ev_exit_openat(42, 5), Some("/old"));
+        graph.validate_incarnation(42, Some(200));
+        assert!(graph.lookup(42, 5).is_none());
+        graph.update(&ev_exit_openat(42, 5), Some("/new"));
+        graph.validate_incarnation(42, None);
+        assert!(graph.lookup(42, 5).is_none());
+        graph.update(&ev_exit_openat(42, 5), Some("/destination"));
+        let mut event = SyscallEvent {
+            pid: 42,
+            syscall_nr: 24,
+            ret: 5,
+            args: [99, 5, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        graph.update(&event, None);
+        assert!(graph.lookup(42, 5).is_none());
+        graph.update(&ev_exit_openat(42, 3), Some("/source"));
+        event.syscall_nr = 25;
+        event.args = [3, 1030, 0, 0, 0, 0];
+        graph.update(&event, None);
+        assert_eq!(graph.lookup(42, 5).unwrap().path, "/source");
+        event.syscall_nr = 436;
+        event.ret = 0;
+        event.args = [4, 6, 0, 0, 0, 0];
+        graph.update(&event, None);
+        assert!(graph.lookup(42, 5).is_none());
+        assert!(graph.lookup(42, 3).is_some());
+        event.syscall_nr = 221;
+        graph.update(&event, None);
+        assert!(graph.lookup(42, 3).is_none());
+    }
+
+    #[test]
     fn classify_recognizes_binder_devices() {
         assert_eq!(classify("/dev/binder"), FdKind::Binder);
         assert_eq!(classify("/dev/hwbinder"), FdKind::Binder);
@@ -552,6 +633,14 @@ mod tests {
         g.update(&ev_exit_openat(42, -2), Some("/nonexistent"));
         assert!(g.lookup(42, -2).is_none());
         assert!(g.per_pid.get(&42).map(|m| m.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn successful_open_without_path_clears_previous_fd_binding() {
+        let mut graph = FdGraph::new();
+        graph.update(&ev_exit_openat(42, 7), Some("/old/path"));
+        graph.update(&ev_exit_openat(42, 7), None);
+        assert!(graph.lookup(42, 7).is_none());
     }
 
     #[test]
@@ -640,8 +729,10 @@ mod tests {
     #[test]
     fn lookup_or_resolve_returns_tracked_entry_without_miss() {
         let mut g = FdGraph::new();
-        g.insert(7, 3, FdEntry::new("/dev/null", 0));
-        let hit = g.lookup_or_resolve(7, 3, 0).expect("tracked");
+        let pid = std::process::id();
+        g.validate_incarnation(pid, crate::native::read_starttime(pid));
+        g.insert(pid, 3, FdEntry::new("/dev/null", 0));
+        let hit = g.lookup_or_resolve(pid, 3, 0).expect("tracked");
         assert_eq!(hit.path, "/dev/null");
         assert_eq!(g.miss_count(), 0);
     }

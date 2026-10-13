@@ -23,8 +23,8 @@ Supported device rows remain narrower than the CLI surface.
 
 | Command | Maturity | Contract |
 |---|---|---|
-| `neutron trace` | PREVIEW | 1.5 command/schema contract; runtime claims are limited to qualified device rows and matching run evidence. |
-| `neutron doctor` | PREVIEW | 1.5 compatibility workflow; runtime claims require signed smoke evidence for the exact published payload and device row. |
+| `neutron trace` | PREVIEW | Versioned command/schema contract; runtime claims are limited to qualified device rows and matching run evidence. |
+| `neutron doctor` | PREVIEW | Versioned compatibility workflow; runtime claims require signed smoke evidence for the exact published payload and device row. |
 | `neutron self-info` | STABLE | Machine-readable source, toolchain, target, and default BPF ABI identity. |
 | `neutron evidence` | STABLE | Run-bundle verification and explicitly attributed external evidence import. |
 | `neutron window` | STABLE | Deterministic host-side capture windowing. |
@@ -90,3 +90,14 @@ Neutron is not a vulnerability scanner, generic Binder Parcel decoder,
 method-level authorization prover, static reachability solver, mutation engine,
 Frida/Perfetto/VTS/syzkaller replacement, or proof of safety from a missing
 event.
+
+## 1.6 observability contract
+
+The current workspace uses BPF ABI 3. Capture passports, graph v3, bounded report
+timelines, verified lifecycle artifacts and reviewed Binder maps are described in
+[Observability](docs/guides/observability.md). Existing support rows above describe
+their original payload only. The connected Pixel 8 Pro on Android 17
+`CP3A.260905.009` has development-payload smoke and positive Binder/lifecycle
+evidence; see [device notes](docs/devices/pixel8pro.md#october-2026-abi-3-validation).
+This is not a promotion of the historical support matrix. Other firmware, HALs,
+complete asynchronous causation and performance remain unqualified.

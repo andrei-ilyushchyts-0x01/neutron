@@ -107,6 +107,9 @@ fn minimal_snapshot() -> SurfaceSnapshot {
             ioctl: None,
         }],
         captures: vec![CaptureRecord {
+            subject_admissions: Vec::new(),
+            subject: None,
+            root_pid: None,
             id: "capture:0000000000000001:surface-observe".into(),
             trace_id: "0000000000000001".into(),
             scenario_id: "surface-observe".into(),
@@ -186,6 +189,7 @@ fn query_command_variants_emit_secure_json_envelopes() {
             "reachable",
             "nodes",
             SurfaceCommand::Reachable(SurfaceReachableArgs {
+                from_subject: None,
                 from_package: Some("com.example.app".into()),
                 from_uid: None,
                 io: input_args(&snapshot_path, &temp.path("reachable.json")),
@@ -312,6 +316,7 @@ fn static_scan_with_real_reader_writes_a_secure_round_trip_snapshot() {
     let output = temp.path("surface.json");
 
     run(SurfaceCommand::Scan(SurfaceScanArgs {
+        from_subject: None,
         capture: None,
         observe: None,
         from_package: None,
@@ -342,6 +347,7 @@ fn uid_queries_and_selector_errors_are_reported_as_json_command_errors() {
 
     let reachable = temp.path("uid-reachable.json");
     run(SurfaceCommand::Reachable(SurfaceReachableArgs {
+        from_subject: None,
         from_package: None,
         from_uid: Some(10_123),
         io: input_args(&snapshot_path, &reachable),
@@ -365,6 +371,7 @@ fn uid_queries_and_selector_errors_are_reported_as_json_command_errors() {
     assert!(format!("{missing_process:#}").contains("not present"));
 
     let no_selector = run(SurfaceCommand::Reachable(SurfaceReachableArgs {
+        from_subject: None,
         from_package: None,
         from_uid: None,
         io: input_args(&snapshot_path, &temp.path("no-selector.json")),
@@ -414,6 +421,7 @@ fn capture_scan_marks_invalid_health_unknown_and_rejects_unsafe_outputs() {
     .unwrap();
     let output = temp.path("surface.json");
     run(SurfaceCommand::Scan(SurfaceScanArgs {
+        from_subject: None,
         capture: Some(capture.to_string_lossy().into_owned()),
         observe: None,
         from_package: None,

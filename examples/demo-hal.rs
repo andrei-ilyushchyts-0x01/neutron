@@ -55,6 +55,7 @@ fn main() {
     //    Models a HAL allocating a DMA buffer from /dev/dma_heap/system.
     let dh_payload = dma_heap_payload(4096, 32, 0x80002, 0);
     let dh_hint = FdHint {
+        binding_source: "syscall",
         kind: FdKind::Device,
         path: "/dev/dma_heap/system".into(),
     };
@@ -69,6 +70,7 @@ fn main() {
     //    emission preserves the Binder/dma-buf ambiguity.
     let binder_cmd: u32 = (3u32 << 30) | (48u32 << 16) | (0x62u32 << 8) | 1;
     let binder_hint = FdHint {
+        binding_source: "syscall",
         kind: FdKind::Binder,
         path: "/dev/binder".into(),
     };

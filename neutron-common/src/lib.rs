@@ -182,7 +182,7 @@ pub const BPF_ABI_SECTION_NAME: &str = ".neutron_abi";
 pub const BPF_ABI_MAGIC: u64 = u64::from_le_bytes(*b"NEUTRON\0");
 /// Breaking ABI generation. A mismatch must be rejected before BPF load or
 /// tracepoint attachment.
-pub const BPF_ABI_MAJOR: u16 = 2;
+pub const BPF_ABI_MAJOR: u16 = 3;
 /// Backward-compatible ABI revision within [`BPF_ABI_MAJOR`].
 pub const BPF_ABI_MINOR: u16 = 0;
 
@@ -595,13 +595,14 @@ pub const fn ret_matches_class(ret: i64, class: u32) -> bool {
 
 /// Stable set of state-tracking syscall numbers used for predicate and
 /// userspace-sampling exemptions. This is not a complete FD lifecycle model:
-/// for example, `fcntl` duplication and `close_range` are not represented.
+/// entries remain best-effort when lifecycle records are filtered or lost.
 /// BPF uses [`is_state_tracking_nr`] for the same classification via a
 /// `match` expression that compiles to a jump table.
 pub const STATE_TRACKING_NRS: &[i32] = &[
     19,  // eventfd2
     23,  // dup
     24,  // dup3
+    25,  // fcntl duplication
     56,  // openat
     57,  // close
     59,  // pipe2
@@ -609,8 +610,11 @@ pub const STATE_TRACKING_NRS: &[i32] = &[
     199, // socketpair
     202, // accept
     220, // clone
+    221, // execve
     242, // accept4
     279, // memfd_create
+    281, // execveat
+    436, // close_range
     437, // openat2
 ];
 
@@ -621,7 +625,22 @@ pub const STATE_TRACKING_NRS: &[i32] = &[
 pub const fn is_state_tracking_nr(nr: i32) -> bool {
     matches!(
         nr,
-        19 | 23 | 24 | 56 | 57 | 59 | 198 | 199 | 202 | 220 | 242 | 279 | 437
+        19 | 23
+            | 24
+            | 25
+            | 56
+            | 57
+            | 59
+            | 198
+            | 199
+            | 202
+            | 220
+            | 221
+            | 242
+            | 279
+            | 281
+            | 436
+            | 437
     )
 }
 

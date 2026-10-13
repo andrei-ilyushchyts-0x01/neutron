@@ -684,3 +684,95 @@ fn verify_rejects_symlinked_artifact_parent() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
 }
+
+#[test]
+fn native_stimulus_keeps_root_identity_and_rejects_changed_incarnation() {
+    for uid in [0, 1000, 2000] {
+        let run = TestDir::new("native-evidence");
+        write_minimal_bundle(run.path());
+        let source = TestDir::new("native-source");
+        let identity = serde_json::json!({"schema":"neutron.native-process-runtime/v1","device_boot_id":"12345678-1234-1234-1234-123456789abc","pid":42,"starttime":100,"uid":uid,"gid":uid,"executable_path":"/data/local/tmp/native-probe","binary_sha256":"a".repeat(64),"build_id":null,"selinux_domain":"u:r:shell:s0","effective_capabilities":"0000000000000000"});
+        let caller = match uid {
+            0 => "native_root",
+            2000 => "native_shell",
+            _ => "native_process",
+        };
+        let scope =
+            serde_json::json!({"procedure":"safe_lookup","caller":caller,"attempt_count":1});
+        let stimulus = source.path().join("identity.json");
+        fs::write(
+            &stimulus,
+            serde_json::json!({"kind":"native_process","identity":identity}).to_string(),
+        )
+        .unwrap();
+        let input = source.path().join("observation.json");
+        let mut observation = serde_json::json!({"schema":"neutron.native-stimulus-observation/v1","identity":identity,"claim_scope":scope,"attempts":[{"identity":identity,"outcome":"observed"}]});
+        let import = |id: &str| {
+            neutron()
+                .args([
+                    "evidence",
+                    "import",
+                    "--run-dir",
+                    run.path().to_str().unwrap(),
+                    "--input",
+                    input.to_str().unwrap(),
+                    "--id",
+                    id,
+                    "--claim",
+                    "observed-edge",
+                    "--imported-from",
+                    "native-test",
+                    "--subject-id",
+                    "service:binder:vendor.example.IExample/default",
+                    "--claim-scope",
+                    &scope.to_string(),
+                    "--stimulus-identity",
+                    stimulus.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+        };
+        observation["attempts"][0]["identity"]["starttime"] = serde_json::json!(200);
+        fs::write(&input, observation.to_string()).unwrap();
+        assert!(!import("reused-pid").status.success());
+        observation["attempts"][0]["identity"] = identity.clone();
+        fs::write(&input, observation.to_string()).unwrap();
+        let output = import("native-valid");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let annotation =
+            fs::read_to_string(run.path().join("external-evidence/native-valid.json")).unwrap();
+        assert!(annotation.contains("neutron.external-evidence/v2"));
+        assert!(!annotation.contains("apk_sha256"));
+        if uid == 0 {
+            let report = neutron()
+                .args(["evidence", "report", run.path().to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(
+                report.status.success(),
+                "{}",
+                String::from_utf8_lossy(&report.stderr)
+            );
+            let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+            assert_eq!(report["observer_privilege"], "test");
+            assert_eq!(
+                report["observations"][0]["stimulus_identity"]["identity"]["uid"],
+                0
+            );
+            assert_eq!(
+                report["observations"][0]["claim_scope"]["caller"],
+                "native_root"
+            );
+        }
+        assert!(neutron()
+            .args(["evidence", "verify", run.path().to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+}

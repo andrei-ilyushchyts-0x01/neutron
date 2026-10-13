@@ -146,9 +146,24 @@ fn true_default() -> bool {
     true
 }
 
+/// Versioned context for one independent aggregation lifetime.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct FindingScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_starttime: Option<u64>,
+}
+
 /// A finalized rule match.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Finding {
+    #[serde(default, flatten)]
+    pub scope: FindingScope,
     pub rule_id: String,
     pub rule_name: String,
     pub severity: Severity,
@@ -212,6 +227,7 @@ mod tests {
 
     fn minimal() -> Finding {
         Finding {
+            scope: FindingScope::default(),
             rule_id: "T999_x".into(),
             rule_name: "x".into(),
             severity: Severity::Low,

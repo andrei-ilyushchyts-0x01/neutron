@@ -22,6 +22,7 @@ fn json_string(value: &str) -> String {
 /// `"fd_kind"` + `"fd_path"` when present.
 #[derive(Debug, Clone)]
 pub struct FdHint {
+    pub binding_source: &'static str,
     pub kind: FdKind,
     pub path: String,
 }
@@ -125,9 +126,10 @@ pub fn format_event_json_full(
     // `"fd_path"` so ioctl/read/write/mmap/close events become attributable.
     let fd_json = match fd_hint {
         Some(h) => format!(
-            r#","fd_kind":{},"fd_path":{}"#,
+            r#","fd_kind":{},"fd_path":{},"fd_binding_source":{},"fd_binding_confidence":"best_effort""#,
             json_string(h.kind.as_str()),
-            json_string(&h.path)
+            json_string(&h.path),
+            json_string(h.binding_source)
         ),
         None => String::new(),
     };
@@ -403,7 +405,9 @@ pub fn format_process_exit_json(
     let uid_json = ev.uid.map_or_else(|| "null".into(), |uid| uid.to_string());
 
     format!(
-        r#"{{"type":"process_exit","ts_ns":{},"pid":{},"uid":{},"comm":{},"source":{},"classification":{}{}{}{}{}{}}}"#,
+        r#"{{"type":"process_exit","schema":"neutron.process-exit/v2","status_available":{},"process_death_confirmed":{},"ts_ns":{},"pid":{},"uid":{},"comm":{},"source":{},"classification":{}{}{}{}{}{}}}"#,
+        ev.classify() != crate::sources::ExitClassification::Unknown,
+        ev.source == neutron_common::ExitSource::Tracepoint,
         ev.ts_ns,
         ev.pid,
         uid_json,
@@ -492,7 +496,7 @@ fn format_binder_call_json_fields(
         None => String::new(),
     };
     let latency_json = match pair.latency_us() {
-        Some(l) => format!(r#","latency_us":{}"#, l),
+        Some(l) => format!(r#","queue_latency_us":{},"latency_us":{}"#, l, l),
         None => String::new(),
     };
     let received_json = match pair.received_ts_ns {
@@ -552,7 +556,12 @@ fn format_binder_call_json_fields(
         .unwrap_or_default();
     let status_json = json_string(pair.status.as_str());
     format!(
-        r#"{{"type":"binder_call","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":{},"callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":{}{}{}{}{}{}{}{}{}{}}}"#,
+        r#"{{"type":"binder_call","schema":"neutron.binder-call/v2","delivery_phase":"{}","ts_ns":{},"debug_id":{},"caller_pid":{},"caller_uid":{},"caller_comm":{},"callee_pid":{},"code":{},"flags":{},"reply":{},"target_node":{},"sent_ts_ns":{}{}{},"status":{}{}{}{}{}{}{}{}{}{}}}"#,
+        match pair.status {
+            neutron_common::BinderCallStatus::Completed => "dequeued",
+            neutron_common::BinderCallStatus::CalleeCrashed => "crash_before_dequeue",
+            neutron_common::BinderCallStatus::Unmatched => "unknown",
+        },
         pair.sent_ts_ns,
         pair.debug_id,
         pair.caller_pid,
@@ -604,7 +613,7 @@ mod binder_call_json_tests {
     }
 
     #[test]
-    fn completed_pair_includes_latency() {
+    fn dequeued_pair_includes_queue_latency_and_legacy_alias() {
         let line = format_binder_call_json(&pair_completed(), Some(99));
         assert!(line.contains(r#""type":"binder_call""#));
         assert!(line.contains(r#""status":"completed""#));
@@ -612,6 +621,8 @@ mod binder_call_json_tests {
         assert!(line.contains(r#""caller_pid":100"#));
         assert!(line.contains(r#""callee_pid":200"#));
         assert!(line.contains(r#""latency_us":500"#));
+        assert!(line.contains(r#""queue_latency_us":500"#));
+        assert!(line.contains(r#""delivery_phase":"dequeued""#));
         assert!(line.contains(r#""received_ts_ns":1500000"#));
         assert!(line.contains(r#""event_id":99"#));
     }
@@ -715,7 +726,7 @@ mod process_exit_json_tests {
             source: ExitSource::Tracepoint,
         };
         let line = format_process_exit_json(&ev, &[], None);
-        assert!(line.contains(r#""classification":"normal_exit""#));
+        assert!(line.contains(r#""classification":"unknown""#));
         assert!(!line.contains("exit_signal"));
         assert!(!line.contains("signal_name"));
         assert!(!line.contains("event_id"));
@@ -855,6 +866,7 @@ mod tests {
             ..SyscallEvent::default()
         };
         let hint = FdHint {
+            binding_source: "syscall",
             kind: FdKind::File,
             path: "/tmp/fd\r\npath".into(),
         };
@@ -1086,6 +1098,7 @@ mod tests {
         };
         ev.args[0] = 12;
         let hint = FdHint {
+            binding_source: "syscall",
             kind: FdKind::Binder,
             path: "/dev/binder".into(),
         };
@@ -1120,6 +1133,7 @@ mod tests {
             ..SyscallEvent::default()
         };
         let hint = FdHint {
+            binding_source: "syscall",
             kind: FdKind::File,
             path: r#"/tmp/wei"rd"#.into(),
         };
@@ -1385,6 +1399,7 @@ mod tests {
         );
 
         let hint = FdHint {
+            binding_source: "syscall",
             kind: FdKind::Binder,
             path: "/dev/binder".into(),
         };

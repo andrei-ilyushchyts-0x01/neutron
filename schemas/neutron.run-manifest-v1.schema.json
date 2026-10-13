@@ -65,6 +65,10 @@
           }
         },
         "captureScope": {
+      "allOf": [{
+        "if": {"properties": {"schema": {"const": "neutron.capture-scope/v1"}}},
+        "then": {"properties": {"observation": {"not": {"required": ["subject"]}}}}
+      }],
           "type": "object",
           "additionalProperties": false,
           "required": [
@@ -84,7 +88,7 @@
           ],
           "properties": {
             "schema": {
-              "const": "neutron.capture-scope/v1"
+              "enum": ["neutron.capture-scope/v1", "neutron.capture-scope/v2"]
             },
             "output": {
               "type": "object",
@@ -157,6 +161,7 @@
                 "follow_children"
               ],
               "properties": {
+                "subject": { "$ref": "neutron.subject-v1.schema.json" },
                 "target_pid": {
                   "type": "integer",
                   "minimum": 0,

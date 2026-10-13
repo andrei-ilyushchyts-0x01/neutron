@@ -315,6 +315,10 @@
       "items": { "type": "string" }
     },
     "captureScope": {
+      "allOf": [{
+        "if": {"properties": {"schema": {"const": "neutron.capture-scope/v1"}}},
+        "then": {"properties": {"observation": {"not": {"required": ["subject"]}}}}
+      }],
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -333,7 +337,7 @@
         "claim_scope_reasons"
       ],
       "properties": {
-        "schema": { "const": "neutron.capture-scope/v1" },
+        "schema": { "enum": ["neutron.capture-scope/v1", "neutron.capture-scope/v2"] },
         "output": {
           "type": "object",
           "additionalProperties": false,
@@ -361,7 +365,8 @@
           "additionalProperties": false,
           "required": ["target_pid", "root_package", "root_uid", "follow_children"],
           "properties": {
-            "target_pid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "subject": { "$ref": "neutron.subject-v1.schema.json" },
+                "target_pid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
             "root_package": { "type": ["string", "null"] },
             "root_uid": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
             "follow_children": { "type": "boolean" }

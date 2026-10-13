@@ -556,6 +556,15 @@ fn selinux_logcat_args() -> &'static [&'static str] {
 }
 
 impl SelinuxLogcatReader {
+    /// Stop and reap the owned source before final health is published.
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            stop_child(child)?;
+            self.child = None;
+        }
+        Ok(())
+    }
+
     pub fn spawn() -> io::Result<Self> {
         let mut child = Command::new("/system/bin/logcat")
             .args(selinux_logcat_args())
@@ -566,12 +575,12 @@ impl SelinuxLogcatReader {
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                stop_child(&mut child);
+                let _ = stop_child(&mut child);
                 return Err(io::Error::other("SELinux logcat stdout missing"));
             }
         };
         if let Err(error) = set_nonblocking(stdout.as_raw_fd()) {
-            stop_child(&mut child);
+            let _ = stop_child(&mut child);
             return Err(error);
         }
         Ok(Self::from_reader(Some(child), BufReader::new(stdout)))
@@ -746,7 +755,7 @@ impl SelinuxLogcatReader {
 impl Drop for SelinuxLogcatReader {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            stop_child(&mut child);
+            let _ = stop_child(&mut child);
         }
     }
 }

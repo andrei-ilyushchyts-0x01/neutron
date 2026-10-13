@@ -58,6 +58,7 @@ fn bounded_capture_with_health(
 ) -> String {
     let mut lines = vec![serde_json::json!({
         "type": "marker",
+        "generation": 1,
         "ts_ns": 1,
         "name": scenario,
         "phase": "start",
@@ -80,6 +81,7 @@ fn bounded_capture_with_health(
     lines.push(
         serde_json::json!({
             "type": "marker",
+        "generation": 1,
             "ts_ns": 3,
             "name": scenario,
             "phase": "end",
@@ -239,7 +241,7 @@ fn baseline_diff_reports_new_and_removed_behavior() {
 {"type":"binder_call","debug_id":1,"caller_pid":10,"callee_pid":200,"target_node":1,"code":7,"status":"completed","service":"activity"}
 "#,
         "procedure",
-        "trace-base",
+        "0000000000000001",
     );
     let test = bounded_capture(
         r#"
@@ -249,7 +251,7 @@ fn baseline_diff_reports_new_and_removed_behavior() {
 {"type":"syscall","pid":10,"name":"socket","fd_path":"socket:[1]"}
 "#,
         "procedure",
-        "trace-test",
+        "0000000000000002",
     );
 
     let md = report(
@@ -274,7 +276,7 @@ fn baseline_diff_rejects_different_effective_capture_scopes() {
     let baseline = bounded_capture(
         r#"{"type":"syscall","pid":10,"name":"openat"}"#,
         "procedure",
-        "trace-base",
+        "0000000000000001",
     );
     let mut test_health: serde_json::Value =
         serde_json::from_str(&complete_health()).expect("health JSON");
@@ -282,7 +284,7 @@ fn baseline_diff_rejects_different_effective_capture_scopes() {
     let test = bounded_capture_with_health(
         r#"{"type":"syscall","pid":20,"name":"socket"}"#,
         "procedure",
-        "trace-test",
+        "0000000000000002",
         test_health.to_string(),
     );
 
@@ -304,7 +306,7 @@ fn baseline_diff_rejects_different_effective_capture_scopes() {
 #[test]
 fn baseline_diff_requires_matching_completed_scenario_lifecycles() {
     let event = r#"{"type":"syscall","pid":10,"name":"openat"}"#;
-    let bounded = bounded_capture(event, "procedure", "trace-base");
+    let bounded = bounded_capture(event, "procedure", "0000000000000001");
     let unmarked = format!("{event}\n{}\n", complete_health());
     let md = report(
         &unmarked,
@@ -316,7 +318,7 @@ fn baseline_diff_requires_matching_completed_scenario_lifecycles() {
     assert!(md.contains("paired scenario lifecycle/root contract"));
     assert!(!md.contains("- - openat"));
 
-    let different = bounded_capture(event, "different", "trace-test");
+    let different = bounded_capture(event, "different", "0000000000000002");
     let md = report(
         &different,
         ReportOptions {
@@ -326,7 +328,7 @@ fn baseline_diff_requires_matching_completed_scenario_lifecycles() {
     );
     assert!(md.contains("behavior diff is nonconclusive"));
 
-    let unfinished = bounded_capture(event, "procedure", "trace-test")
+    let unfinished = bounded_capture(event, "procedure", "0000000000000002")
         .lines()
         .filter(|line| !line.contains(r#""phase":"end""#))
         .collect::<Vec<_>>()
@@ -347,12 +349,12 @@ fn baseline_diff_ignores_behavior_outside_the_scenario_boundary() {
     let baseline = format!(
         "{}\n{}",
         r#"{"type":"syscall","pid":10,"name":"outside_baseline"}"#,
-        bounded_capture(inside, "procedure", "trace-base")
+        bounded_capture(inside, "procedure", "0000000000000001")
     );
     let test = format!(
         "{}\n{}",
         r#"{"type":"syscall","pid":10,"name":"outside_test"}"#,
-        bounded_capture(inside, "procedure", "trace-test")
+        bounded_capture(inside, "procedure", "0000000000000002")
     );
     let md = report(
         &test,
@@ -380,6 +382,7 @@ fn report_rejects_hard_linked_capture_and_baseline() {
     std::fs::hard_link(&capture, &baseline).unwrap();
 
     let error = run_report(ReportArgs {
+        subject: None,
         capture: capture.to_string_lossy().into_owned(),
         baseline: Some(baseline.to_string_lossy().into_owned()),
         title: None,
@@ -488,7 +491,7 @@ fn malformed_synthetic_binder_call_makes_report_health_unknown() {
 fn malformed_marker_cannot_hide_unscoped_zero_binder_identity() {
     let capture = [
         r#"{"type":"binder","ts_ns":1,"pid":1545,"to_proc":0,"debug_id":0}"#.to_string(),
-        r#"{"type":"marker","name":"not-a-valid-boundary"}"#.to_string(),
+        r#"{"type":"marker","generation":1,"name":"not-a-valid-boundary"}"#.to_string(),
         complete_health(),
     ]
     .join("\n")
@@ -504,8 +507,8 @@ fn malformed_marker_cannot_hide_unscoped_zero_binder_identity() {
 fn unscoped_zero_binder_warns_without_tainting_bounded_health() {
     let capture = [
         r#"{"type":"binder","ts_ns":1,"pid":1545,"to_proc":0,"debug_id":0}"#.to_string(),
-        r#"{"type":"marker","ts_ns":2,"name":"scenario","phase":"start","scenario_id":"scenario","trace_id":"0000000000001234","root_pid":10}"#.to_string(),
-        r#"{"type":"marker","ts_ns":3,"name":"scenario","phase":"end","scenario_id":"scenario","trace_id":"0000000000001234","root_pid":10}"#.to_string(),
+        r#"{"type":"marker","generation":1,"ts_ns":2,"name":"scenario","phase":"start","scenario_id":"scenario","trace_id":"0000000000001234","root_pid":10}"#.to_string(),
+        r#"{"type":"marker","generation":1,"ts_ns":3,"name":"scenario","phase":"end","scenario_id":"scenario","trace_id":"0000000000001234","root_pid":10}"#.to_string(),
         complete_health(),
     ]
     .join("\n")

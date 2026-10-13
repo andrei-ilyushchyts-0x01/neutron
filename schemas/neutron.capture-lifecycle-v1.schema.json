@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Capture startup, failure and teardown evidence",
+  "type": "object",
+  "required": [
+    "schema",
+    "phase"
+  ],
+  "properties": {
+    "schema": {
+      "const": "neutron.capture-lifecycle/v1"
+    },
+    "phase": {
+      "enum": [
+        "startup",
+        "teardown",
+        "failure"
+      ]
+    }
+  }
+}

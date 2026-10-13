@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.causal-graph-v2.schema.json",
+  "title": "Causal graph with explicit unknown confidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "nodes",
+    "edges"
+  ],
+  "properties": {
+    "schema": {
+      "const": "neutron.causal-graph/v2"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "from",
+          "to",
+          "kind",
+          "relation"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+          },
+          "to": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+          },
+          "kind": {
+            "enum": [
+              "causal_parent",
+              "process_membership",
+              "binder_target"
+            ]
+          },
+          "relation": {
+            "enum": [
+              "exact",
+              "inferred",
+              "unknown"
+            ]
+          }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+      }
+    }
+  }
+}

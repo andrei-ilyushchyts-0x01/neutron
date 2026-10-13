@@ -14,7 +14,7 @@ app action
   -> denial, allocation, state change, crash, or reboot
 ```
 
-The current workspace package version is `1.5.0`. Stable refers to the
+The current workspace package version is `1.6.0`. Stable refers to the
 distribution and versioned schema contract, not universal Android runtime
 support. Command maturity and qualified device rows are defined in
 [`PRODUCT.md`](../PRODUCT.md); this ledger records capability maturity.
@@ -158,3 +158,14 @@ validate OTA-differential behavior.
 - Non-Android targets.
 - Defeating a specific anti-tamper product.
 - Automatically turning observed behavior into an exploit.
+
+## Observability delivery in 1.6
+
+The maintained workflow now includes a shared capture passport, a bounded report
+narrative, visible graph limitations, capture lifecycle artifacts and reviewed
+Binder attribution. See [Observability](guides/observability.md).
+
+Asynchronous links preserve the existing exact/inferred/unknown classification;
+process context does not prove that queued work belongs to one semantic request.
+No temporal-proximity heuristic is promoted to exact causation. Additional device,
+HAL and asynchronous-oracle qualification remains evidence-gated.

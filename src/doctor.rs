@@ -35,6 +35,9 @@ use crate::bpf_abi::{
 
 #[derive(Args, Debug, Clone, Eq, PartialEq)]
 pub struct DoctorArgs {
+    /// Check private output creation and available storage in this directory.
+    #[arg(long)]
+    pub output_dir: Option<std::path::PathBuf>,
     /// Emit the versioned `neutron.doctor/v1` report to stdout.
     #[arg(long)]
     pub json: bool,
@@ -52,6 +55,7 @@ pub struct DoctorArgs {
 impl Default for DoctorArgs {
     fn default() -> Self {
         Self {
+            output_dir: None,
             json: false,
             smoke: false,
             object: "/data/local/share/neutron/neutron.bpf.elf".to_string(),
@@ -506,6 +510,9 @@ pub trait Env {
     fn euid(&self) -> u32;
     fn read_to_string(&self, path: &str) -> std::io::Result<String>;
     fn path_exists(&self, path: &str) -> bool;
+    fn open_readable(&self, path: &str) -> io::Result<()> {
+        self.read_to_string(path).map(|_| ())
+    }
     fn arch(&self) -> &str;
     fn create_stack_trace_map(&self) -> io::Result<()>;
 }
@@ -522,6 +529,9 @@ impl Env for RealEnv {
     }
     fn path_exists(&self, path: &str) -> bool {
         Path::new(path).exists()
+    }
+    fn open_readable(&self, path: &str) -> io::Result<()> {
+        fs::File::open(path).map(|_| ())
     }
     fn arch(&self) -> &str {
         std::env::consts::ARCH
@@ -695,13 +705,16 @@ pub fn check_kernel_version<E: Env>(env: &E) -> CheckResult {
 
 pub fn check_btf<E: Env>(env: &E) -> CheckResult {
     let path = "/sys/kernel/btf/vmlinux";
-    if env.path_exists(path) {
-        CheckResult::pass("BTF", "/sys/kernel/btf/vmlinux present")
-    } else {
-        CheckResult::fail(
+    match env.open_readable(path) {
+        Ok(()) => CheckResult::pass("BTF", format!("{path} readable")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => CheckResult::fail(
             "BTF",
             format!("{path} missing — kernel must be built with CONFIG_DEBUG_INFO_BTF=y"),
-        )
+        ),
+        Err(error) => CheckResult::fail(
+            "BTF",
+            format!("{path} inaccessible: {error}; BTF availability is unknown"),
+        ),
     }
 }
 
@@ -778,7 +791,7 @@ fn stack_trace_map_create_check_from_result(result: io::Result<()>) -> CheckResu
             "STACK_TRACES map",
             format!(
                 "STACK_TRACES map create failed ({}: {err}); default stackless captures \
-                 still work, but --stacks requires neutron-stacks.bpf.elf and a domain \
+                 require all mandatory checks to pass; --stacks requires neutron-stacks.bpf.elf and a domain \
                  allowed to create BPF_MAP_TYPE_STACK_TRACE",
                 errno_label(&err)
             ),
@@ -1431,6 +1444,43 @@ pub struct DoctorReport {
 }
 
 /// Run all checks in display order.
+/// Check a real private write and filesystem capacity; runtime writes can still fail.
+pub fn check_output_storage(directory: &Path) -> CheckResult {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let result = (|| -> anyhow::Result<u64> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let path = directory.join(format!(
+            ".neutron-readiness-{}-{nonce:x}",
+            std::process::id()
+        ));
+        let mut file = crate::private_output::open_private_file(
+            &path,
+            crate::private_output::PrivateFileMode::CreateNew,
+        )?;
+        let checked = (|| -> anyhow::Result<u64> {
+            file.write_all(b"neutron readiness\n")?;
+            file.sync_all()?;
+            let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            if unsafe { libc::fstatvfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let stat = unsafe { stat.assume_init() };
+            Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+        })();
+        drop(file);
+        fs::remove_file(&path)?;
+        checked
+    })();
+    match result {
+        Ok(bytes) if bytes > 0 => CheckResult::pass("Output storage", format!("private write/sync/remove passed; available_bytes={bytes}; capacity is a startup snapshot")),
+        Ok(_) => CheckResult::fail("Output storage", "no space available"),
+        Err(error) => CheckResult::fail("Output storage", format!("{}: {error:#}", directory.display())),
+    }
+}
+
 pub fn run_all<E: Env>(env: &E) -> Vec<CheckResult> {
     vec![
         check_privilege(env),
@@ -1487,6 +1537,9 @@ pub fn run() -> i32 {
 pub fn run_with_args(args: &DoctorArgs) -> i32 {
     let env = RealEnv;
     let mut checks = run_all(&env);
+    if let Some(path) = &args.output_dir {
+        checks.push(check_output_storage(path));
+    }
     let tracepoint_layouts = inspect_installed_tracepoint_layouts(&env);
     checks.push(tracepoint_layout_check(&tracepoint_layouts));
 
@@ -1606,6 +1659,7 @@ mod tests {
         files: RefCell<HashMap<String, String>>,
         existing: RefCell<Vec<String>>,
         arch: String,
+        denied: bool,
     }
 
     impl FakeEnv {
@@ -1615,6 +1669,7 @@ mod tests {
                 files: RefCell::new(HashMap::new()),
                 existing: RefCell::new(vec![]),
                 arch: "aarch64".to_string(),
+                denied: false,
             }
         }
         fn with_file(self, path: &str, contents: &str) -> Self {
@@ -1649,6 +1704,15 @@ mod tests {
         }
         fn path_exists(&self, path: &str) -> bool {
             self.existing.borrow().iter().any(|p| p == path)
+        }
+        fn open_readable(&self, path: &str) -> io::Result<()> {
+            if self.denied {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else if self.path_exists(path) {
+                Ok(())
+            } else {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
         }
         fn arch(&self) -> &str {
             &self.arch
@@ -1712,8 +1776,18 @@ mod tests {
     }
 
     #[test]
+    fn btf_access_denied_is_not_reported_missing() {
+        let mut env = FakeEnv::new();
+        env.denied = true;
+        let result = check_btf(&env);
+        assert_eq!(result.status, Status::Fail);
+        assert!(result.reason.contains("inaccessible"));
+        assert!(!result.reason.contains("missing"));
+    }
+
+    #[test]
     fn btf_pass_when_present() {
-        let env = FakeEnv::new().with_existing("/sys/kernel/btf/vmlinux");
+        let env = FakeEnv::new().with_file("/sys/kernel/btf/vmlinux", "BTF");
         assert_eq!(check_btf(&env).status, Status::Pass);
     }
 

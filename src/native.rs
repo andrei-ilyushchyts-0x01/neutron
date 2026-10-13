@@ -474,8 +474,13 @@ fn stack_ref(pid: u32, starttime: u64, generation: u64, kind: &str, stack_id: i3
     format!("{pid}:{starttime}:{generation}:{kind}:{stack_id}")
 }
 
-fn read_starttime(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+pub fn read_starttime(pid: u32) -> Option<u64> {
+    let bytes = crate::fdgraph::poller::read_bounded_proc_file(
+        Path::new(&format!("/proc/{pid}/stat")),
+        64 * 1024,
+    )
+    .ok()?;
+    let stat = std::str::from_utf8(&bytes).ok()?;
     let end = stat.rfind(')')?;
     stat[end + 1..].split_whitespace().nth(19)?.parse().ok()
 }

@@ -1011,3 +1011,177 @@ fn capture_process_uids_come_from_each_event_not_the_root_selector() {
     assert_eq!(uid_by_pid.get(&200), Some(&Some(1000)));
     assert_eq!(uid_by_pid.get(&300), Some(&None));
 }
+
+#[test]
+fn native_subject_stays_bounded_through_capture_surface_graph_and_report() {
+    use neutron::subject::SubjectSelector;
+    let mut snapshot = scan_with_reader(&fixture()).unwrap();
+    let original = snapshot.processes[0].clone();
+    let mut unrelated = original.clone();
+    unrelated.pid = 99;
+    unrelated.id = "unrelated".into();
+    unrelated.executable = Some("/system/bin/unrelated".into());
+    snapshot.processes.push(unrelated);
+    let selector: SubjectSelector = format!("exe:{}", original.executable.as_deref().unwrap())
+        .parse()
+        .unwrap();
+    let resolved = selector.resolve_snapshot(&snapshot, 1).unwrap();
+    assert_eq!(resolved.roots.len(), 1);
+    assert_eq!(resolved.roots[0].pid, 42);
+    assert!("pid:42@9999"
+        .parse::<SubjectSelector>()
+        .unwrap()
+        .resolve_snapshot(&snapshot, 1)
+        .is_err());
+    assert!("pid:42,99"
+        .parse::<SubjectSelector>()
+        .unwrap()
+        .resolve_snapshot(&snapshot, 1)
+        .is_err());
+    let marker = |phase, ts| serde_json::json!({"type":"marker", "ts_ns":ts, "phase":phase, "name":"native", "scenario_id":"native", "trace_id":"0000000000001234", "generation":1, "subject":resolved});
+    let event = serde_json::json!({"type":"syscall", "ts_ns":20, "pid":42, "tid":42, "uid":1000, "name":"openat", "phase":"exit", "ret":7, "data":"/dev/trusty-ipc-dev0", "scenario_id":"native", "trace_id":"0000000000001234", "span_id":"0000000000000011", "causal_relation":"exact", "depth":0});
+    let mut restarted = resolved.clone();
+    restarted.roots[0].pid = 44;
+    restarted.roots[0].starttime += 1;
+    let admission = serde_json::json!({"type":"subject_resolution", "ts_ns":25, "trace_id":"0000000000001234", "scenario_id":"native", "generation":1, "subject":restarted});
+    let restarted_binder = serde_json::json!({"type":"binder", "ts_ns":26, "pid":44, "to_proc":88, "debug_id":7, "trace_id":"0000000000001234", "scenario_id":"native", "span_id":"0000000000000077", "depth":1, "causal_relation":"exact"});
+    let other_selector: SubjectSelector = "exe:/system/bin/unrelated".parse().unwrap();
+    let other = other_selector.resolve_snapshot(&snapshot, 1).unwrap();
+    let other_marker = |phase, ts| serde_json::json!({"type":"marker", "ts_ns":ts, "phase":phase, "name":"unrelated", "scenario_id":"unrelated", "trace_id":"0000000000005678", "generation":2, "subject":other});
+    let unrelated_event = serde_json::json!({"type":"syscall", "ts_ns":50, "pid":99,"tid":99,"name":"unrelated_only", "scenario_id":"unrelated", "trace_id":"0000000000005678", "span_id":"0000000000000099", "causal_relation":"exact"});
+    let capture = format!(
+        "{}\n{event}\n{admission}\n{restarted_binder}\n{}\n{}\n{unrelated_event}\n{}\n",
+        marker("start", 10),
+        marker("end", 30),
+        other_marker("start", 40),
+        other_marker("end", 60)
+    );
+    let normalized = neutron::capture_normalize::normalize_capture(Cursor::new(&capture)).unwrap();
+    neutron::capture_normalize::validated_scenario_contract(&normalized).unwrap();
+    import_capture(&mut snapshot, Cursor::new(&capture)).unwrap();
+    let reach = reachable(&snapshot, &selector).unwrap();
+    assert!(reach.processes.iter().any(|process| process.pid == 44));
+    assert!(snapshot
+        .captures
+        .iter()
+        .any(|capture| capture.subject_admissions.contains(&restarted)));
+    assert!(reach
+        .relations
+        .iter()
+        .any(|relation| relation.relation_type == "open"));
+    assert!(!reach.processes.iter().any(|process| process.pid == 99));
+    let graph = neutron::graph::render_json_from_reader(
+        Cursor::new(&capture),
+        &neutron::graph::GraphOptions {
+            subject: Some(selector.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(graph.contains("openat"));
+    assert!(!graph.contains("unrelated_only"));
+    let report = neutron::report::render_report_from_reader(
+        Cursor::new(&capture),
+        neutron::report::ReportOptions {
+            subject: Some(selector),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(report.contains("Subjects"));
+    assert!(!report.contains("unrelated_only"));
+    assert!(report.contains("/vendor/bin/"));
+    assert!(!capture.contains("root_package"));
+}
+
+#[test]
+fn subject_admission_rejects_another_boot_and_explicit_pid_reuse() {
+    use neutron::{capture_normalize, subject::SubjectSelector};
+    let snapshot = scan_with_reader(&fixture()).unwrap();
+    for raw in [
+        "pid:42".to_owned(),
+        format!(
+            "exe:{}",
+            snapshot.processes[0].executable.as_deref().unwrap()
+        ),
+    ] {
+        let selector: SubjectSelector = raw.parse().unwrap();
+        let original = selector.resolve_snapshot(&snapshot, 1).unwrap();
+        for change_boot in [false, true] {
+            let mut next = original.clone();
+            if change_boot {
+                next.roots[0].boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into();
+            } else {
+                next.roots[0].starttime += 1;
+            }
+            let marker = |phase, ts| serde_json::json!({"type":"marker", "ts_ns":ts, "phase":phase, "name":"native", "scenario_id":"native", "trace_id":"0000000000001234", "generation":1, "subject":original});
+            let admission = serde_json::json!({"type":"subject_resolution", "ts_ns":20, "scenario_id":"native", "trace_id":"0000000000001234", "generation":1, "subject":next});
+            let capture = format!(
+                "{}\n{admission}\n{}\n",
+                marker("start", 10),
+                marker("end", 30)
+            );
+            let normalized = capture_normalize::normalize_capture(Cursor::new(capture)).unwrap();
+            let valid = capture_normalize::validated_scenario_contract(&normalized).is_ok();
+            assert_eq!(
+                valid,
+                !change_boot && raw.starts_with("exe:"),
+                "{raw}: changed boot={change_boot}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_parent_cannot_be_bypassed_by_a_downstream_binder_caller() {
+    for relation in [
+        "",
+        ",\"causal_relation\":null",
+        ",\"causal_relation\":\"future\"",
+        ",\"causal_relation\":\"unknown\"",
+    ] {
+        let mut snapshot = scan_with_reader(&fixture()).unwrap();
+        let capture = format!(
+            r#"
+{{"type":"marker","phase":"start","name":"unknown","scenario_id":"unknown","trace_id":"0000000000001234","root_package":"com.example.probe"}}
+{{"type":"binder","pid":100,"to_proc":42,"debug_id":1,"trace_id":"0000000000001234","span_id":"a","depth":1{relation}}}
+{{"type":"binder","pid":42,"to_proc":200,"debug_id":2,"trace_id":"0000000000001234","span_id":"b","parent_span_id":"a","depth":2,"causal_relation":"exact"}}
+"#
+        );
+        import_capture(&mut snapshot, Cursor::new(capture)).unwrap();
+        let reachable = reachable(
+            &snapshot,
+            &RootSelector::Package("com.example.probe".into()),
+        )
+        .unwrap();
+        assert!(reachable.processes.is_empty());
+        assert!(reachable.services.is_empty());
+    }
+}
+
+#[test]
+fn service_subject_requires_exact_transport_and_current_owner_incarnation() {
+    use neutron::subject::SubjectSelector;
+    let original = scan_with_reader(&fixture()).unwrap();
+    let service = original
+        .services
+        .iter()
+        .find(|service| service.confidence == "exact")
+        .unwrap();
+    for transport in ["binder", "vndbinder", "hwbinder"] {
+        let mut snapshot = original.clone();
+        let mut owned = service.clone();
+        owned.transport = transport.into();
+        snapshot.services = vec![owned.clone()];
+        let selector: SubjectSelector = format!("{transport}:{}", owned.name).parse().unwrap();
+        let resolved = selector.resolve_snapshot(&snapshot, 1).unwrap();
+        assert_eq!(resolved.roots[0].pid, 42);
+        snapshot.services[0].process_id = Some("recycled-owner".into());
+        assert!(selector.resolve_snapshot(&snapshot, 1).is_err());
+        snapshot.services = vec![owned.clone(), owned];
+        assert!(selector.resolve_snapshot(&snapshot, 1).is_err());
+        snapshot.services.truncate(1);
+        snapshot.processes[0].executable = None;
+        assert!(selector.resolve_snapshot(&snapshot, 1).is_err());
+    }
+}

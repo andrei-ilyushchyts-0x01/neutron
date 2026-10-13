@@ -13,9 +13,10 @@ const MAX_NORMALIZED_STRING_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CausalRelation {
-    #[default]
     Exact,
     Inferred,
+    #[default]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -63,6 +64,8 @@ pub struct SyscallSpan {
     pub ioctl_name: Option<String>,
     pub ioctl_family: Option<String>,
     pub fd_path: Option<String>,
+    pub fd_binding_source: Option<String>,
+    pub fd_binding_confidence: Option<String>,
     pub args: Option<[u64; 6]>,
     pub data_phase: Option<String>,
     pub dma_heap: Option<DmaHeapAllocation>,
@@ -134,6 +137,7 @@ pub struct SelinuxSpan {
 
 #[derive(Clone, Debug, Default)]
 pub struct Marker {
+    pub subject: Option<crate::subject::ResolvedSubject>,
     pub ts_ns: Option<u64>,
     pub name: String,
     pub phase: Option<String>,
@@ -150,6 +154,7 @@ pub struct Marker {
 /// scenario name and root selector define what may be compared.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScenarioIdentity {
+    pub subject: Option<crate::subject::SubjectSelector>,
     pub scenario_id: String,
     pub root_package: Option<String>,
     pub root_uid: Option<u32>,
@@ -187,6 +192,9 @@ pub struct CaptureHealth {
 
 #[derive(Clone, Debug, Default)]
 pub struct NormalizedCapture {
+    pub capture_sha256: String,
+    pub source_records: BTreeMap<(String, String), Vec<usize>>,
+    pub subject_admissions: BTreeMap<String, Vec<crate::subject::ResolvedSubject>>,
     pub binders: Vec<BinderSpan>,
     pub syscalls: Vec<SyscallSpan>,
     pub exits: Vec<ExitSpan>,
@@ -196,6 +204,8 @@ pub struct NormalizedCapture {
     pub trace_packages: BTreeMap<String, String>,
     pub health_warnings: BTreeSet<String>,
     pub has_causal: bool,
+    pub scenario_contract: Option<ScenarioContract>,
+    pub scenario_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -210,13 +220,22 @@ enum SyscallKey {
     Legacy(Option<String>, u32, u32, u64, i64),
 }
 
-pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture> {
+pub fn normalize_capture<R: BufRead>(reader: R) -> Result<NormalizedCapture> {
+    normalize_capture_observing(reader, |_, _, _| Ok(()))
+}
+
+pub(crate) fn normalize_capture_observing<R: BufRead>(
+    reader: R,
+    mut observe: impl FnMut(&Value, usize, &str) -> Result<()>,
+) -> Result<NormalizedCapture> {
+    let mut reader = crate::capture_input::DigestReader::new(reader);
     let mut binders = BTreeMap::<BinderKey, BinderSpan>::new();
     let mut syscalls = BTreeMap::<SyscallKey, SyscallSpan>::new();
     let mut capture = NormalizedCapture::default();
     let mut malformed_lines = 0_u64;
     let mut invalid_known_records = 0_u64;
     let mut unknown_records = 0_u64;
+    let mut lifecycle = crate::capture_validation::LiveScenarioLifecycle::default();
     let mut health_records = 0_u64;
     let mut final_record_is_health = false;
     let mut record = Vec::new();
@@ -247,6 +266,7 @@ pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture>
         if string_bytes > MAX_NORMALIZED_STRING_BYTES {
             anyhow::bail!("normalized capture strings exceed {MAX_NORMALIZED_STRING_BYTES} bytes");
         }
+        observe(&value, record_number, line)?;
         let Some(object) = value.as_object() else {
             malformed_lines = malformed_lines.saturating_add(1);
             record_number += 1;
@@ -266,6 +286,11 @@ pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture>
                 .get("permissions")
                 .and_then(Value::as_array)
                 .map_or(1, |values| values.len().saturating_add(1)),
+            "subject_resolution" => object
+                .get("subject")
+                .and_then(|subject| subject.get("roots"))
+                .and_then(Value::as_array)
+                .map_or(1, |roots| roots.len().saturating_add(1)),
             "syscall" | "process_exit" | "marker" | "capture_health" => 1,
             _ => 0,
         };
@@ -275,7 +300,24 @@ pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture>
         if normalized_items > MAX_NORMALIZED_ITEMS {
             anyhow::bail!("normalized capture exceeds {MAX_NORMALIZED_ITEMS} retained items");
         }
+        if let Some(key) = causal_key(object) {
+            capture
+                .source_records
+                .entry(key)
+                .or_default()
+                .push(record_number);
+        }
         final_record_is_health = kind == "capture_health";
+        if kind != "capture_health" && capture.scenario_error.is_none() {
+            if let Err(error) = lifecycle.observe(kind, object) {
+                capture.scenario_error = Some(error.to_string());
+            }
+        }
+        if has_causal(object) && relation(object).is_none() && kind != "marker" {
+            capture.health_warnings.insert(
+                "causal confidence is missing or unknown; causal parent edges are unproven".into(),
+            );
+        }
 
         if let (Some(trace), Some(package)) =
             (text(object, "trace_id"), text(object, "root_package"))
@@ -325,7 +367,28 @@ pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture>
                 health_records = health_records.saturating_add(1);
                 merge_health(&mut capture, object);
             }
-            "fd_snapshot" | "finding" | "process_maps" | "stack_trace" | "follow_guardrail" => {
+            "subject_resolution" => {
+                if valid_ignorable_record(kind, object) {
+                    if let Some(trace_id) = text(object, "trace_id") {
+                        let subject = serde_json::from_value(object["subject"].clone())
+                            .expect("subject validated above");
+                        capture
+                            .subject_admissions
+                            .entry(trace_id.into())
+                            .or_default()
+                            .push(subject);
+                    }
+                } else {
+                    invalid_known_records = invalid_known_records.saturating_add(1);
+                }
+            }
+            "subject_unavailable"
+            | "task_exit"
+            | "fd_snapshot"
+            | "finding"
+            | "process_maps"
+            | "stack_trace"
+            | "follow_guardrail" => {
                 if !valid_ignorable_record(kind, object) {
                     invalid_known_records = invalid_known_records.saturating_add(1);
                 }
@@ -335,6 +398,19 @@ pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture>
         record_number += 1;
     }
 
+    if capture.scenario_error.is_none() {
+        match lifecycle.contract() {
+            Ok(contract) => capture.scenario_contract = Some(contract),
+            Err(error) => capture.scenario_error = Some(error.to_string()),
+        }
+    }
+    if capture.has_causal || !capture.markers.is_empty() {
+        if let Some(error) = &capture.scenario_error {
+            capture.health_warnings.insert(format!(
+                "invalid scenario lifecycle: {error}; conclusions are unavailable"
+            ));
+        }
+    }
     for binder in binders.into_values() {
         if binder.caller_pid == 0 || binder.callee_pid == 0 {
             capture
@@ -400,6 +476,7 @@ pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture>
             health.degraded = true;
         }
     }
+    capture.capture_sha256 = reader.sha256();
     Ok(capture)
 }
 
@@ -408,42 +485,16 @@ pub fn normalize_capture<R: BufRead>(mut reader: R) -> Result<NormalizedCapture>
 /// declared scenario. This is an additional gate for negative/diff claims;
 /// clean transport health alone cannot prove that the same stimulus ran.
 pub fn validated_scenario_contract(capture: &NormalizedCapture) -> Result<ScenarioContract> {
-    let contract = validated_marker_contract(&capture.markers)?;
-    for (scenario_id, trace_id) in capture
-        .binders
-        .iter()
-        .filter_map(|event| {
-            event
-                .scenario_id
-                .as_deref()
-                .map(|id| (id, event.trace_id.as_deref()))
-        })
-        .chain(capture.syscalls.iter().filter_map(|event| {
-            event
-                .scenario_id
-                .as_deref()
-                .map(|id| (id, event.trace_id.as_deref()))
-        }))
-        .chain(capture.exits.iter().filter_map(|event| {
-            event
-                .scenario_id
-                .as_deref()
-                .map(|id| (id, event.trace_id.as_deref()))
-        }))
-        .chain(capture.denials.iter().filter_map(|event| {
-            event
-                .scenario_id
-                .as_deref()
-                .map(|id| (id, event.trace_id.as_deref()))
-        }))
-    {
-        if contract.trace_ids.get(scenario_id).map(String::as_str) != trace_id {
-            anyhow::bail!("event scenario_id/trace_id does not match a completed scenario");
-        }
-    }
-    Ok(contract)
+    capture.scenario_contract.clone().with_context(|| {
+        capture
+            .scenario_error
+            .clone()
+            .unwrap_or_else(|| "capture has no validated ordered scenario lifecycle".into())
+    })
 }
 
+/// Legacy marker-pair check only: it cannot establish event ordering.
+/// Use `validated_scenario_contract` for any conclusive consumer.
 pub fn validated_marker_contract(markers: &[Marker]) -> Result<ScenarioContract> {
     let mut active: Option<(&Marker, String)> = None;
     let mut scenarios = Vec::new();
@@ -472,7 +523,11 @@ pub fn validated_marker_contract(markers: &[Marker]) -> Result<ScenarioContract>
             .ts_ns
             .filter(|value| *value > 0)
             .context("scenario marker is missing a positive timestamp")?;
-        if marker.root_package.is_none() && marker.root_uid.is_none() && marker.root_pid.is_none() {
+        if marker.subject.is_none()
+            && marker.root_package.is_none()
+            && marker.root_uid.is_none()
+            && marker.root_pid.is_none()
+        {
             anyhow::bail!("scenario marker is missing a package, UID, or PID root selector");
         }
         match phase {
@@ -501,6 +556,10 @@ pub fn validated_marker_contract(markers: &[Marker]) -> Result<ScenarioContract>
                     anyhow::bail!("scenario end timestamp precedes its start");
                 }
                 scenarios.push(ScenarioIdentity {
+                    subject: marker
+                        .subject
+                        .as_ref()
+                        .map(|subject| subject.selector.clone()),
                     scenario_id: scenario_id.to_string(),
                     root_package: marker.root_package.clone(),
                     root_uid: marker.root_uid,
@@ -523,9 +582,31 @@ pub fn validated_marker_contract(markers: &[Marker]) -> Result<ScenarioContract>
     })
 }
 
-fn valid_ignorable_record(kind: &str, object: &Map<String, Value>) -> bool {
+pub(crate) fn valid_ignorable_record(kind: &str, object: &Map<String, Value>) -> bool {
     let positive = |field| number_u64(object, field).is_some_and(|value| value > 0);
     match kind {
+        "subject_unavailable" => {
+            object.get("selector").is_some_and(|value| {
+                serde_json::from_value::<crate::subject::SubjectSelector>(value.clone())
+                    .is_ok_and(|selector| selector.validate().is_ok())
+            }) && object.get("reason").and_then(Value::as_str).is_some()
+        }
+        "subject_resolution" => object
+            .get("subject")
+            .and_then(|value| {
+                serde_json::from_value::<crate::subject::ResolvedSubject>(value.clone()).ok()
+            })
+            .is_some_and(|subject| subject.validate().is_ok()),
+        "task_exit" => {
+            object
+                .get("pid")
+                .and_then(Value::as_u64)
+                .is_some_and(|pid| pid > 0)
+                && object
+                    .get("tid")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|tid| tid > 0)
+        }
         "fd_snapshot" => positive("pid"),
         "finding" => text(object, "rule_id").is_some_and(|value| !value.is_empty()),
         "process_maps" => positive("pid") && object.get("mappings").is_some_and(Value::is_array),
@@ -568,6 +649,7 @@ fn merge_binder(
 
     let node = binders.entry(key).or_insert_with(|| BinderSpan {
         debug_id,
+        relation: relation(object).unwrap_or_default(),
         ..BinderSpan::default()
     });
     apply_binder_fields(node, object);
@@ -586,6 +668,7 @@ fn merge_binder_received(
         .unwrap_or_else(|| BinderKey::Legacy(debug_id));
     let node = binders.entry(key).or_insert_with(|| BinderSpan {
         debug_id,
+        relation: relation(object).unwrap_or_default(),
         ..BinderSpan::default()
     });
     node.ts_ns = node.ts_ns.or_else(|| number_u64(object, "ts_ns"));
@@ -600,8 +683,8 @@ fn merge_binder_received(
         .or(node.depth);
     replace_text(&mut node.root_package, object, "root_package");
     node.root_uid = number_u32(object, "root_uid").or(node.root_uid);
-    if let Some(relation) = relation(object) {
-        node.relation = relation;
+    if has_causal(object) {
+        node.relation = node.relation.max(relation(object).unwrap_or_default());
     }
     true
 }
@@ -640,7 +723,9 @@ fn apply_binder_fields(node: &mut BinderSpan, object: &Map<String, Value>) {
         object,
         "attribution_confidence",
     );
-    node.latency_us = number_u64(object, "latency_us").or(node.latency_us);
+    node.latency_us = number_u64(object, "queue_latency_us")
+        .or_else(|| number_u64(object, "latency_us"))
+        .or(node.latency_us);
     replace_text(&mut node.status, object, "status");
     replace_text(&mut node.trace_id, object, "trace_id");
     replace_text(&mut node.scenario_id, object, "scenario_id");
@@ -651,8 +736,8 @@ fn apply_binder_fields(node: &mut BinderSpan, object: &Map<String, Value>) {
         .or(node.depth);
     replace_text(&mut node.root_package, object, "root_package");
     node.root_uid = number_u32(object, "root_uid").or(node.root_uid);
-    if let Some(relation) = relation(object) {
-        node.relation = relation;
+    if has_causal(object) {
+        node.relation = node.relation.max(relation(object).unwrap_or_default());
     }
 }
 
@@ -717,6 +802,8 @@ fn merge_syscall(
         ioctl_name: text(object, "ioctl_name").map(str::to_string),
         ioctl_family: text(object, "ioctl_family").map(str::to_string),
         fd_path: fd_path.map(str::to_string),
+        fd_binding_source: text(object, "fd_binding_source").map(str::to_string),
+        fd_binding_confidence: text(object, "fd_binding_confidence").map(str::to_string),
         args: syscall_args(object),
         data_phase: text(object, "data_phase").map(str::to_string),
         dma_heap: parse_dma_heap(object),
@@ -732,8 +819,10 @@ fn merge_syscall(
     };
 
     match syscalls.get_mut(&key) {
-        Some(existing) if existing.is_exit() && !candidate.is_exit() => {}
-        Some(existing) => merge_syscall_fields(existing, candidate, relation(object)),
+        Some(existing) if existing.is_exit() && !candidate.is_exit() => {
+            existing.relation = existing.relation.max(candidate.relation);
+        }
+        Some(existing) => merge_syscall_fields(existing, candidate),
         None => {
             syscalls.insert(key, candidate);
         }
@@ -741,11 +830,7 @@ fn merge_syscall(
     true
 }
 
-fn merge_syscall_fields(
-    existing: &mut SyscallSpan,
-    candidate: SyscallSpan,
-    candidate_relation: Option<CausalRelation>,
-) {
+fn merge_syscall_fields(existing: &mut SyscallSpan, candidate: SyscallSpan) {
     let previous = std::mem::take(existing);
     *existing = candidate;
     existing.ts_ns = existing.ts_ns.or(previous.ts_ns);
@@ -756,7 +841,11 @@ fn merge_syscall_fields(
     existing.ioctl_cmd = existing.ioctl_cmd.or(previous.ioctl_cmd);
     existing.ioctl_name = existing.ioctl_name.take().or(previous.ioctl_name);
     existing.ioctl_family = existing.ioctl_family.take().or(previous.ioctl_family);
-    existing.fd_path = existing.fd_path.take().or(previous.fd_path);
+    if existing.fd_path.is_none() {
+        existing.fd_path = previous.fd_path;
+        existing.fd_binding_source = previous.fd_binding_source;
+        existing.fd_binding_confidence = previous.fd_binding_confidence;
+    }
     existing.args = existing.args.or(previous.args);
     existing.data_phase = existing.data_phase.take().or(previous.data_phase);
     existing.dma_heap = existing.dma_heap.take().or(previous.dma_heap);
@@ -767,25 +856,35 @@ fn merge_syscall_fields(
     existing.depth = existing.depth.or(previous.depth);
     existing.root_package = existing.root_package.take().or(previous.root_package);
     existing.root_uid = existing.root_uid.or(previous.root_uid);
-    if candidate_relation.is_none() {
-        existing.relation = previous.relation;
-    }
+    existing.relation = existing.relation.max(previous.relation);
 }
 
 fn parse_exit(object: &Map<String, Value>) -> Option<ExitSpan> {
     let pid = number_u32(object, "pid")?;
+    // Old tracepoint zero fields did not establish normal exit status.
+    let unavailable = text(object, "source") == Some("tracepoint")
+        && object.get("status_available").and_then(Value::as_bool) != Some(true)
+        && number_u64(object, "exit_signal").unwrap_or(0) == 0
+        && number_i64(object, "exit_code").unwrap_or(0) == 0;
     Some(ExitSpan {
         ts_ns: number_u64(object, "ts_ns"),
         pid,
         uid: number_u32(object, "uid"),
         comm: text(object, "comm").map(str::to_string),
-        classification: text(object, "classification")
-            .unwrap_or("unknown")
-            .to_string(),
-        label: text(object, "signal_name")
-            .or_else(|| text(object, "classification"))
-            .unwrap_or("process exit")
-            .to_string(),
+        classification: if unavailable {
+            "unknown"
+        } else {
+            text(object, "classification").unwrap_or("unknown")
+        }
+        .to_string(),
+        label: if unavailable {
+            "exit status unknown"
+        } else {
+            text(object, "signal_name")
+                .or_else(|| text(object, "classification"))
+                .unwrap_or("process exit")
+        }
+        .to_string(),
         trace_id: text(object, "trace_id").map(str::to_string),
         scenario_id: text(object, "scenario_id").map(str::to_string),
         span_id: text(object, "span_id").map(str::to_string),
@@ -836,6 +935,9 @@ fn parse_selinux_denial(object: &Map<String, Value>) -> Option<SelinuxSpan> {
 
 fn parse_marker(object: &Map<String, Value>) -> Marker {
     Marker {
+        subject: object
+            .get("subject")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
         ts_ns: number_u64(object, "ts_ns"),
         name: text(object, "name").unwrap_or_default().to_string(),
         phase: text(object, "phase").map(str::to_string),

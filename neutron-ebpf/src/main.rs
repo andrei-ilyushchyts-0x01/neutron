@@ -1711,8 +1711,8 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
 // on `task_struct` and require BTF to read safely. We deliberately leave
 // args[0..2] zero here; userspace logcat / tombstone watchers (sources
 // 1 / 2) supply the signal info when they observe the same crash. The
-// tracepoint event is the lookback synchronisation point: when userspace
-// sees `nr == -3` it knows to dump the per-PID ring buffer.
+// ABI 3 task events trigger userspace whole-process reconciliation. A task
+// exit alone must not flush process lookback or remove group admission.
 
 #[tracepoint]
 pub fn trace_sched_process_exit(ctx: TracePointContext) -> i32 {
@@ -1741,16 +1741,8 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
     let _ = INFLIGHT.remove(&pid_tgid);
     let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
     let _ = ADMITTED_THREAD_ENTERS.remove(&pid_tgid);
-    if userspace_tid != userspace_pid {
-        return Ok(());
-    }
-    if target_pid() == Some(userspace_pid)
-        && EXITED_TARGET_PIDS.insert(&userspace_pid, &1, 0).is_err()
-    {
-        bump_counter(COUNTER_INFLIGHT_UPDATE_FAILED);
-    }
-    let _ = TRACED_PROCESSES.remove(&userspace_pid);
-    let _ = PID_WHITELIST.remove(&userspace_pid);
+    // ABI 3: this is a task exit. A leader can exit before its workers;
+    // userspace reconciles whole-process death before removing admission.
 
     let mut ev_buf: MaybeUninit<AlignedEvent> = MaybeUninit::uninit();
     let ev = unsafe { addr_of_mut!((*ev_buf.as_mut_ptr()).event) };

@@ -3,13 +3,15 @@
 Evidence-grade Android boundary mapping and bounded causal tracing for rooted,
 authorized research devices.
 
-**Map ownership. Trace delegation. Preserve the evidence.** Neutron identifies
+**Map ownership. Trace delegation. Preserve the evidence.**
+
+See [Observability](docs/guides/observability.md) for evidence limits and the 1.6 workflow. Neutron identifies
 which process, SELinux domain, and executable owns a service or HAL, then
 records bounded Binder-to-syscall/ioctl/device handoffs with explicit capture
 health and provenance. See [PRODUCT.md](PRODUCT.md) for command maturity and
 non-goals.
 
-Version 1.5 is a stable distribution and schema release. Live Android
+Version 1.6 adds capture passports, bounded narratives and reviewed attribution. Live Android
 commands remain PREVIEW and support-matrix-bound: Android 16 is not qualified
 for the 1.5 payload, and other unlisted device builds remain best effort.
 
@@ -116,7 +118,7 @@ cargo install bpf-linker
 Use this path when a release with Android assets has been published.
 
 ```bash
-VERSION=1.5.0
+VERSION=1.6.0
 TAG="v${VERSION}"
 REPO=andrei-ilyushchyts-0x01/neutron
 ASSET="neutron-agent-v${VERSION}-android-aarch64.tar.zst"

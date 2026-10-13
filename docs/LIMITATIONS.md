@@ -151,8 +151,10 @@ including `TIPC_IOC_CONNECT` and `VIDIOC_QBUF`. An unmapped command remains
 The `sched/sched_process_exit` BPF tracepoint payload carries `comm`,
 `pid`, and scheduling priority — but **not** `exit_code` or
 `exit_signal`. Reading those from `task_struct` requires BTF and is
-deferred. As a result, the BPF source of `type:"process_exit"` events
-emits `exit_signal: 0` (the userspace formatter omits the field).
+deferred. ABI 3 emits task-exit observations. Userspace reconciles whole-process
+death before emitting a tracepoint-sourced `process_exit`; unavailable status
+is `classification:"unknown"`, `status_available:false`. Zero fields do not
+establish normal termination.
 
 The userspace logcat tail and tombstone watcher fill in signal info
 from their respective stream formats. On hosts where neither is
@@ -183,9 +185,10 @@ the existing lifecycle syscall set to `SYSCALL_FILTER` and enable
 regardless of the operator predicate and do not broaden requested output. The
 effective capture scope records this internal instrumentation.
 
-The userspace `FdGraph` also does not model `fcntl` FD duplication or
-`close_range`. Its `/proc/<pid>/fd/<fd>` fallback can repair an individual
-cache miss, but retained entries can still become stale. A cached `fd_path` is
+The userspace `FdGraph` models observed `fcntl` FD duplication and `close_range` and
+invalidates bindings on exec or changed/unavailable process starttime. Its
+`/proc/<pid>/fd/<fd>` fallback can repair an individual cache miss, but lost
+transitions and proc/event races still make bindings best effort. A cached `fd_path` is
 enrichment, not proof of a current live FD binding. Likewise, a missing path or
 failed path predicate is not proof that the process did not access the
 resource; use a complete lifecycle trace or contemporaneous `/proc` evidence

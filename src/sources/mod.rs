@@ -60,6 +60,8 @@ pub enum ExitClassification {
     AbnormalExit,
     /// `exit(0)` — clean termination.
     NormalExit,
+    /// The observing source did not supply an exit status.
+    Unknown,
 }
 
 impl ExitClassification {
@@ -69,6 +71,7 @@ impl ExitClassification {
             ExitClassification::SignalExit => "signal_exit",
             ExitClassification::AbnormalExit => "abnormal_exit",
             ExitClassification::NormalExit => "normal_exit",
+            ExitClassification::Unknown => "unknown",
         }
     }
 }
@@ -85,6 +88,8 @@ impl ProcessExitEvent {
             }
         } else if self.exit_code != 0 {
             ExitClassification::AbnormalExit
+        } else if self.source == ExitSource::Tracepoint {
+            ExitClassification::Unknown
         } else {
             ExitClassification::NormalExit
         }
@@ -135,9 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_exit_no_signal_is_normal() {
+    fn unavailable_tracepoint_exit_status_is_unknown() {
         let ev = ProcessExitEvent::default();
-        assert_eq!(ev.classify(), ExitClassification::NormalExit);
+        assert_eq!(ev.classify(), ExitClassification::Unknown);
         assert_eq!(ev.signal_name(), None);
     }
 

@@ -11,67 +11,57 @@ The kernel does not provide a stable human service name for every
 - an exact service map for `(callee_pid,target_node) -> service`
 - a candidate catalog for `callee_pid -> possible services`
 
-The report treats these differently. Exact service-map entries are labels.
-Catalog entries are candidates and are shown as candidates.
+In 1.6, exact labels require a reviewed map bound to capture or live process
+identity. Legacy PID/node maps remain readable as candidates. Candidate catalogs
+never establish a descriptor or exact method.
 
 An optional descriptor-centric AIDL catalog maps transaction codes to methods
 only after the exact service map proves the descriptor. See
 [AIDL Intelligence](aidl-intelligence.md).
 
-## Exact Service Map
+## Reviewed service map
 
-Pass an exact map to either capture-time enrichment or report-time rendering:
+Generate a review document from the actual capture:
 
-```bash
-neutron report app.ndjson \
-  --binder-services binder-services.json \
-  --output app-boundary-report.md
+```sh
+neutron binder-map template capture.ndjson --output binder-review.json
 ```
 
-Format:
+The `neutron.binder-review/v1` output records the capture hash, boot/build identity,
+endpoint candidates, observed codes/status counts and up to 16 input record
+references per endpoint. Multiple candidate names are a conflict to investigate,
+not a choice the tool makes automatically. The template is not an exact map.
+
+After independently verifying each endpoint, export this reviewed format:
 
 ```json
 {
-  "1234": {
-    "1": "android.hardware.security.keymint.IKeyMintDevice/default",
-    "2": "android.security.IKeystoreService/default"
-  }
+  "schema": "neutron.binder-services/v1",
+  "context": {
+    "capture_sha256": "<64 lowercase hex digits from the review document>",
+    "boot_id": "<captured boot ID>",
+    "fingerprint": "<captured build fingerprint>",
+    "process_starttimes": {"1234": 45678},
+    "review_evidence": "<retained evidence establishing each PID/node/service pair>"
+  },
+  "services": {"1234": {"7": "android.example.IService/default"}}
 }
 ```
 
-The outer key is `callee_pid`. The inner key is `target_node`. Values are the
-service/interface labels you have verified for that exact pair.
-
-## Template Workflow
-
-Use a capture to generate unresolved pairs:
-
-```bash
-neutron binder-map template app.ndjson \
-  --output binder-services.template.json
+```sh
+neutron report capture.ndjson --binder-services reviewed-services.json --output report.md
 ```
 
-The template contains only unresolved `binder_call` pairs and includes observed
-transaction codes and status counts:
+Offline use requires matching capture hash, boot and build. Live use requires the
+same boot/build and matching nonzero starttimes for every listed PID; starttime
+is rechecked at lookup so PID reuse cannot inherit exactness. Offline review may
+leave `process_starttimes` empty, in which case live use fails. Node identity can
+change within a process: review evidence must cover the endpoint's actual lifetime.
 
-```json
-{
-  "1234": {
-    "1": {
-      "service": "",
-      "observed_codes": {
-        "7": 3
-      },
-      "status_counts": {
-        "completed": 3
-      }
-    }
-  }
-}
-```
-
-Edit `service` values after you have verified them, then use the edited file as
-`--binder-services`.
+Duplicate endpoint keys and conflicting normalized PID/node spellings are rejected.
+A captured exact label conflicting with the supplied reviewed map is also rejected.
+Existing unversioned maps are candidate annotations and cannot authorize AIDL method
+resolution. Unknown/candidate labels in captures remain explicitly marked.
 
 ## Candidate Catalog
 

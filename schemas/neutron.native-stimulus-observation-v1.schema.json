@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.native-stimulus-observation-v1.schema.json",
+  "title": "Bounded native external observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "identity",
+    "claim_scope",
+    "attempts"
+  ],
+  "properties": {
+    "schema": {
+      "const": "neutron.native-stimulus-observation/v1"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "device_boot_id",
+        "pid",
+        "starttime",
+        "uid",
+        "gid",
+        "executable_path",
+        "binary_sha256",
+        "build_id",
+        "selinux_domain",
+        "effective_capabilities"
+      ],
+      "properties": {
+        "schema": {
+          "const": "neutron.native-process-runtime/v1"
+        },
+        "device_boot_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "starttime": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "executable_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^/"
+        },
+        "binary_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^([0-9a-f]{2}){1,64}$"
+            }
+          ]
+        },
+        "selinux_domain": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^u:r:[^:]+:"
+        },
+        "effective_capabilities": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        }
+      }
+    },
+    "claim_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "procedure",
+        "caller",
+        "attempt_count"
+      ],
+      "properties": {
+        "procedure": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "caller": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "attempt_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        }
+      }
+    },
+    "attempts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1000000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "identity",
+          "outcome"
+        ],
+        "properties": {
+          "identity": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema",
+              "device_boot_id",
+              "pid",
+              "starttime",
+              "uid",
+              "gid",
+              "executable_path",
+              "binary_sha256",
+              "build_id",
+              "selinux_domain",
+              "effective_capabilities"
+            ],
+            "properties": {
+              "schema": {
+                "const": "neutron.native-process-runtime/v1"
+              },
+              "device_boot_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              "pid": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4294967295
+              },
+              "starttime": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "uid": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+              },
+              "gid": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+              },
+              "executable_path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "pattern": "^/"
+              },
+              "binary_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "build_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^([0-9a-f]{2}){1,64}$"
+                  }
+                ]
+              },
+              "selinux_domain": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "pattern": "^u:r:[^:]+:"
+              },
+              "effective_capabilities": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            }
+          },
+          "outcome": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+          }
+        }
+      }
+    }
+  }
+}

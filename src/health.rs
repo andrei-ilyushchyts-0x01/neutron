@@ -1084,7 +1084,7 @@ pub fn health_status(health: &CaptureHealth, user: &UserspaceHealth) -> HealthSt
     }
 }
 
-pub const CAPTURE_SCOPE_SCHEMA: &str = "neutron.capture-scope/v1";
+pub const CAPTURE_SCOPE_SCHEMA: &str = "neutron.capture-scope/v2";
 
 /// Effective observation and output boundary for one capture. Transport
 /// health and claim scope are deliberately separate: a filtered capture can
@@ -1123,6 +1123,8 @@ pub struct CaptureOutputScope {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureObservationScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<crate::subject::ResolvedSubject>,
     pub target_pid: u32,
     pub root_package: Option<String>,
     pub root_uid: Option<u32>,
@@ -1326,10 +1328,17 @@ impl CaptureScope {
 
     fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        if self.schema != CAPTURE_SCOPE_SCHEMA {
+        if self.schema != CAPTURE_SCOPE_SCHEMA
+            && !(self.schema == "neutron.capture-scope/v1" && self.observation.subject.is_none())
+        {
             errors.push(format!(
                 "capture_scope.schema must be {CAPTURE_SCOPE_SCHEMA}"
             ));
+        }
+        if let Some(subject) = &self.observation.subject {
+            if let Err(error) = subject.validate() {
+                errors.push(error.to_string());
+            }
         }
         if !matches!(
             self.output.event_mode.as_str(),

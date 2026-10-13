@@ -109,7 +109,7 @@ fn clean_health_json_status_is_complete() {
     assert_eq!(value["degraded"], false);
     assert_eq!(value["binder_tracker_enabled"], true);
     assert!(value["read_errors"].as_array().is_some_and(Vec::is_empty));
-    assert_eq!(value["capture_scope"]["schema"], "neutron.capture-scope/v1");
+    assert_eq!(value["capture_scope"]["schema"], "neutron.capture-scope/v2");
     assert_eq!(value["capture_scope"]["claim_scope_complete"], true);
     assert!(capture_health_is_complete(value.as_object().unwrap()));
 }

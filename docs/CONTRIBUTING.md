@@ -34,16 +34,14 @@ The resulting binary will not run on the device.
 ### Full build + deploy
 
 ```bash
-./build.sh
+ANDROID_SERIAL="$SERIAL" ./build.sh
 ```
 
-Steps performed:
-
-1. `cargo xtask build-ebpf release` — build Aya BPF programs to
-   `neutron.bpf.elf`.
-2. `cargo build --release --target aarch64-unknown-linux-musl --bin neutron`.
-3. `adb push neutron.bpf.elf /data/local/tmp/`.
-4. `adb push target/aarch64-unknown-linux-musl/release/neutron /data/local/tmp/`.
+The release/deploy path requires an explicit authorized USB serial, a clean
+checkout, and recorded provenance. It builds both BPF variants and userspace,
+then uses the private installation workflow. See the canonical
+[quickstart](guides/quickstart.md); do not replace it with ad-hoc public-path
+pushes or relax artifact permissions.
 
 ### Per-step builds
 
@@ -57,7 +55,7 @@ cargo build --release --target aarch64-unknown-linux-musl --bin neutron
 
 # Build everything via xtask:
 cargo xtask build
-cargo xtask deploy
+cargo xtask deploy --serial "$SERIAL"
 ```
 
 ## Critical Sync Points
@@ -174,21 +172,10 @@ adb shell su -c '/data/local/tmp/neutron --pid <PID> \
     --profile security --binder --stacks'
 ```
 
-The `neutron-spike` binary (`src/bin/spike.rs`) is a low-level diagnostic
-that loads the BPF object, attaches the three programs, and dumps a few
-raw events. Useful for debugging Aya / verifier / attach issues:
-
-```bash
-adb shell su -c '/data/local/tmp/neutron-spike \
-    --object /data/local/tmp/neutron.bpf.elf'
-```
-
-Expected output:
-
-```
-[OK] Ebpf::load succeeded
-[OK] trace_sys_enter loaded + attached to raw_syscalls/sys_enter
-[OK] trace_sys_exit loaded + attached to raw_syscalls/sys_exit
-...
-[DONE] events=N lost=0
-```
+`neutron-spike` is a deprecated 1.x compatibility entry point. It forwards
+object-only diagnostics to `neutron doctor --smoke`; explicit `--pid` forwards
+to `neutron trace --raw`. It never loads BPF itself or writes sysctls.
+`--duration`, `--max-events`, and `--quiet` are rejected because their old
+semantics have no exact maintained mapping. Use `timeout --signal=INT SECONDS`
+with trace and `--max-output-size SIZE`, or bounded doctor smoke. Put the
+maintained `neutron` binary beside the compatibility binary.

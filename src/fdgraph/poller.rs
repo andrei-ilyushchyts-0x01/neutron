@@ -462,7 +462,7 @@ fn parse_process_starttime(stat: &str) -> Option<u64> {
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
-fn read_bounded_proc_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn read_bounded_proc_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)

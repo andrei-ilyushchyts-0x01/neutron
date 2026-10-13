@@ -82,6 +82,52 @@ pub(crate) fn validate_capture_strings(value: &Value, record_number: usize) -> R
     Ok(total)
 }
 
+/// Hash exactly the bytes consumed, including line endings, without reopening input.
+pub(crate) struct DigestReader<R> {
+    inner: R,
+    digest: sha2::Sha256,
+}
+
+impl<R: BufRead> DigestReader<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        use sha2::Digest;
+        Self {
+            inner,
+            digest: sha2::Sha256::new(),
+        }
+    }
+
+    pub(crate) fn sha256(&self) -> String {
+        use sha2::Digest;
+        format!("{:x}", self.digest.clone().finalize())
+    }
+}
+
+impl<R: BufRead> std::io::Read for DigestReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let size = buf.len().min(available.len());
+        buf[..size].copy_from_slice(&available[..size]);
+        self.consume(size);
+        Ok(size)
+    }
+}
+
+impl<R: BufRead> BufRead for DigestReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, size: usize) {
+        use sha2::Digest;
+        // consume follows a successful fill_buf, so these bytes are already buffered.
+        if let Ok(bytes) = self.inner.fill_buf() {
+            self.digest.update(&bytes[..size]);
+        }
+        self.inner.consume(size);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

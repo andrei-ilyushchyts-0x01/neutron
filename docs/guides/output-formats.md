@@ -184,6 +184,12 @@ to disable polling entirely.
 
 ### Binder Call Event (`type == "binder_call"`)
 
+The v2 schema adds `delivery_phase` and `queue_latency_us`. `dequeued` and
+legacy `completed` mean send-to-dequeue, never method completion or a successful
+reply. Legacy `latency_us` is the same queue interval. Missing receive time
+remains unknown, including one-way transactions without an observed dequeue.
+
+
 Sprint-2 PR 2. Synthesised pair: caller-side `binder_transaction` plus
 callee-side `binder_transaction_received` matched by `debug_id`. On callee
 crash, in-flight transactions are flushed with `status:"callee_crashed"`.
@@ -194,6 +200,7 @@ see low-level detail.
 ```json
 {
   "type":           "binder_call",
+  "schema":         "neutron.binder-call/v2",
   "ts_ns":          1234567890,
   "debug_id":       8421,
   "caller_pid":     12345,
@@ -205,7 +212,9 @@ see low-level detail.
   "reply":          false,
   "target_node":    1,
   "sent_ts_ns":     1234567890,
-  "received_ts_ns": 1234568390,
+  "received_ts_ns": 1235067890,
+  "queue_latency_us": 500,
+  "delivery_phase": "dequeued",
   "latency_us":     500,
   "status":         "completed",
   "service":        "android.hardware.camera2",
@@ -297,8 +306,8 @@ marker lines can additionally carry `scenario_id`, `trace_id`, `span_id`,
 
 ### Process Exit Event (`type == "process_exit"`)
 
-Sprint-2 PR 1 introduces a fourth event class. Three independent sources can
-emit `process_exit` lines: the `sched_process_exit` BPF tracepoint, the
+Three independent sources can emit `process_exit` lines: userspace death
+reconciliation following an ABI 3 `sched_process_exit` task observation, the
 logcat tail (`FATAL EXCEPTION`, native `DEBUG`, `ANR in`), and a poll-based
 watcher over `/data/tombstones/`. Per-process aggregation in the rule engine
 collapses the typical fan-out.
@@ -323,8 +332,11 @@ collapses the typical fan-out.
 |------------------|-----------|------------------------------------------------------------------------|
 | `type`           | string    | Always `"process_exit"`.                                               |
 | `uid`            | u32/null  | Effective UID when observed. `null` for logcat and tombstones without a `uid:` header; unknown is never UID 0. |
+| `schema`         | string    | `neutron.process-exit/v2`; old records remain readable. |
+| `status_available` | boolean | False for unavailable tracepoint exit status. |
+| `process_death_confirmed` | boolean | True only after whole-process reconciliation, not merely a task exit or auxiliary crash report. |
 | `source`         | string    | `"tracepoint"` (BPF), `"logcat"`, or `"tombstone"`.                    |
-| `classification` | string    | `"crash"`, `"signal_exit"`, `"abnormal_exit"`, or `"normal_exit"`.     |
+| `classification` | string    | `"crash"`, `"signal_exit"`, `"abnormal_exit"`, `"normal_exit"`, or `"unknown"`.     |
 | `exit_signal`    | u32       | POSIX signal number. Omitted when 0.                                   |
 | `signal_name`    | string    | Symbolic name (`"SIGSEGV"`). Omitted when not in the lookup table.     |
 | `exit_code`      | u8        | exit(2) status. Omitted when 0.                                        |
@@ -338,11 +350,11 @@ with `--tombstone-dir ""` and the logcat tail with `--no-logcat`.
 ## Causal Graph Documents
 
 `neutron graph CAPTURE --format json` emits one pretty-printed
-`neutron.causal-graph/v1` document:
+`neutron.causal-graph/v2` document:
 
 ```json
 {
-  "schema": "neutron.causal-graph/v1",
+  "schema": "neutron.causal-graph/v2",
   "nodes": [
     {
       "id": "process:123",
@@ -359,7 +371,9 @@ with `--tombstone-dir ""` and the logcat tail with `--no-logcat`.
 }
 ```
 
-Each edge contains `from`, `to`, and `relation` (`exact` or `inferred`).
+Each edge contains `from`, `to`, `kind` (`process_membership`, `causal_parent`,
+or `binder_target`), and `relation` (`exact`, `inferred`, or `unknown`).
+Missing/invalid confidence never becomes an exact causal parent.
 `--collapse-syscalls` increases a node's `count` only for identical syscalls
 under one causal parent and trace. It does not merge success/failure states,
 ioctl/device identities, distinct parents, or trace IDs. Mermaid and JSON are
@@ -627,7 +641,7 @@ def ts_to_wall(ts_ns):
 
 ## Latency Computation
 
-`latency_us` on exit events is computed from `args[5]` (enter event's
+`latency_us` on syscall exit events is computed from `enter_timestamp_ns` (enter event's
 `ts_ns`) subtracted from the exit event's `ts_ns`, divided by 1000.
 This is available only for exit events where the `INFLIGHT` map lookup
 succeeded. Events evicted from `INFLIGHT` (4096-entry cap) have
@@ -651,3 +665,13 @@ Surface commands also default to JSON on stdout. Their `--output PATH` rejects
 a final-component symlink and any existing file that is not already
 mode-private, owned, regular, and single-link. The verified descriptor is
 truncated and kept at mode `0600`.
+
+See [Native and system subjects](system-subjects.md#contract-changes) for subject,
+FD provenance, finding scope and native stimulus identity contracts.
+
+## Observability projections (1.6)
+
+See [Observability](observability.md) for capture passports, bounded timelines,
+visible Mermaid warnings, graph v3, and sealed capture lifecycle artifacts.
+Reviewed Binder service maps and review templates have distinct contracts; see
+[Binder attribution](binder-attribution.md). Legacy unbound maps provide candidates.

@@ -1639,3 +1639,74 @@ fn aggregates_omit_unrelated_fields_in_json() {
     // events_per_sec is None for a single event → also omitted.
     assert!(!s.contains("events_per_sec"));
 }
+
+#[test]
+fn aggregation_resets_at_scenario_and_incarnation_boundaries_and_reports_caps() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    let event = r#"{"type":"binder_call","ts_ns":10,"pid":42,"caller_pid":42,"callee_pid":77,"status":"callee_crashed","code":1,"debug_id":1}"#;
+    let scope = |id: &str, generation| neutron_rules::FindingScope {
+        scenario_id: Some(id.into()),
+        trace_id: Some(format!("{generation:016x}")),
+        generation: Some(generation),
+        process_starttime: None,
+    };
+    let tagged = |id: &str, generation| {
+        let mut value: serde_json::Value = serde_json::from_str(event).unwrap();
+        value["scenario_id"] = serde_json::json!(id);
+        value["trace_id"] = serde_json::json!(format!("{generation:016x}"));
+        value["generation"] = serde_json::json!(generation);
+        value.to_string()
+    };
+    let first_event = tagged("first", 1);
+    let second_event = tagged("second", 2);
+    engine.set_scope(scope("first", 1));
+    engine.set_process_incarnation(42, Some(100));
+    feed_lines(&mut engine, &[&first_event]);
+    let first = engine.drain_ready();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].scope.scenario_id.as_deref(), Some("first"));
+    assert_eq!(first[0].scope.process_starttime, Some(100));
+    engine.set_scope(scope("second", 2));
+    feed_lines(&mut engine, &[&second_event]);
+    let second = engine.drain_ready();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].event_count, 1);
+    assert_eq!(second[0].scope.scenario_id.as_deref(), Some("second"));
+    engine.set_process_incarnation(42, Some(200));
+    feed_lines(&mut engine, &[&second_event]);
+    assert_eq!(engine.drain_ready()[0].scope.process_starttime, Some(200));
+    feed_lines(&mut engine, &[event]);
+    let untagged = engine.drain_ready();
+    assert_eq!(untagged.len(), 1);
+    assert_eq!(untagged[0].scope.scenario_id, None);
+    engine.finish_process(42);
+    engine.set_state_cap(0);
+    feed_lines(&mut engine, &[&second_event]);
+    assert!(engine.drain_ready().is_empty());
+    assert_eq!(engine.dropped_state_events(), 1);
+}
+
+#[test]
+fn frequency_threshold_does_not_combine_two_scenarios() {
+    let mut engine = RuleEngine::with_default_rules().unwrap();
+    for generation in 1..=2 {
+        let scenario = format!("scenario-{generation}");
+        let trace = format!("{generation:016x}");
+        engine.set_scope(neutron_rules::FindingScope {
+            scenario_id: Some(scenario.clone()),
+            trace_id: Some(trace.clone()),
+            generation: Some(generation),
+            process_starttime: None,
+        });
+        // Live causal records can omit generation: the accepted unique trace
+        // still binds them to the current scenario's generation.
+        let event = serde_json::json!({"ts_ns":u64::from(generation)*1_000_000_000,
+            "pid":42,"tid":42,"nr":56,"name":"openat","enter":false,"ret":7,
+            "data":"/proc/self/maps","scenario_id":scenario,"trace_id":trace});
+        feed_lines(&mut engine, &[&event.to_string()]);
+        assert!(engine
+            .drain_ready()
+            .iter()
+            .all(|finding| finding.rule_id != "T001_proc_self_maps_polling"));
+    }
+}

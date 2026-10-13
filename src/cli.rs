@@ -370,6 +370,10 @@ pub struct Args {
     )]
     pub control_socket: String,
 
+    /// Exact system subject: pid:42@START,43@START, exe:/path, or binder:ENDPOINT.
+    #[arg(long, conflicts_with_all = ["pid", "package", "root_uid"])]
+    pub subject: Option<crate::subject::SubjectSelector>,
+
     /// Target PID (0 = all processes)
     #[arg(long, default_value_t = 0)]
     pub pid: u32,

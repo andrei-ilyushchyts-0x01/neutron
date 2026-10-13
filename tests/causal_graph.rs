@@ -347,7 +347,7 @@ fn json_graph_is_versioned_and_collapses_repeated_syscalls() {
     .unwrap();
     let graph: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(graph["schema"], "neutron.causal-graph/v1");
+    assert_eq!(graph["schema"], "neutron.causal-graph/v2");
     let syscalls: Vec<_> = graph["nodes"]
         .as_array()
         .unwrap()
@@ -361,4 +361,54 @@ fn json_graph_is_versioned_and_collapses_repeated_syscalls() {
         .unwrap()
         .iter()
         .any(|edge| { edge["from"] == "b_00000001" && edge["to"] == syscalls[0]["id"] }));
+}
+
+#[test]
+fn unknown_causal_confidence_never_becomes_an_exact_parent() {
+    for label in [
+        None,
+        Some("null"),
+        Some("\"future\""),
+        Some("\"inferred\""),
+        Some("\"exact\""),
+    ] {
+        for enter_label in [None, Some("\"exact\"")] {
+            let record = |phase: &str, relation: Option<&str>| {
+                format!(
+                    r#"{{"type":"syscall","pid":20,"tid":20,"name":"ioctl","phase":"{phase}","trace_id":"t","span_id":"s","parent_span_id":"b"{}}}"#,
+                    relation
+                        .map(|value| format!(",\"causal_relation\":{value}"))
+                        .unwrap_or_default()
+                )
+            };
+            let input = format!("{{\"type\":\"binder\",\"pid\":10,\"to_proc\":20,\"debug_id\":1,\"trace_id\":\"t\",\"span_id\":\"b\",\"causal_relation\":\"exact\"}}\n{}\n{}\n", record("enter", enter_label), record("exit", label));
+            let graph: serde_json::Value = serde_json::from_str(
+                &render_json_from_reader(Cursor::new(&input), &GraphOptions::default()).unwrap(),
+            )
+            .unwrap();
+            let syscall = graph["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["kind"] == "syscall")
+                .unwrap();
+            let edge = graph["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|edge| edge["to"] == syscall["id"])
+                .unwrap();
+            let expected = match (enter_label, label) {
+                (Some(_), Some("\"exact\"")) => "exact",
+                (Some(_), Some("\"inferred\"")) => "inferred",
+                _ => "unknown",
+            };
+            assert_eq!(edge["relation"], expected);
+            let mermaid =
+                render_mermaid_from_reader(Cursor::new(&input), &GraphOptions::default()).unwrap();
+            if expected == "unknown" {
+                assert!(mermaid.contains("-. unknown .->"));
+            }
+        }
+    }
 }

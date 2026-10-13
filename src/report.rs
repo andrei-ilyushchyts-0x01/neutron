@@ -27,6 +27,9 @@ const MAX_AUXILIARY_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 pub struct ReportArgs {
+    /// Select bounded scenarios for this exact native/system subject.
+    #[arg(long)]
+    pub subject: Option<crate::subject::SubjectSelector>,
     /// Path to the NDJSON capture file (`-` for stdin).
     pub capture: String,
 
@@ -95,6 +98,7 @@ pub struct ServiceListArgs {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReportOptions {
+    pub subject: Option<crate::subject::SubjectSelector>,
     pub title: Option<String>,
     pub package: Option<String>,
     pub binder_services_json: Option<String>,
@@ -106,6 +110,7 @@ pub struct ReportOptions {
 
 #[derive(Clone, Debug, Default)]
 struct Snapshot {
+    normalized: crate::capture_normalize::NormalizedCapture,
     parsed_events: u64,
     health: Option<Value>,
     malformed_records: u64,
@@ -127,6 +132,8 @@ struct Snapshot {
     crashes: CountMap,
     markers: Vec<crate::capture_normalize::Marker>,
     scenario_event_bindings: BTreeSet<(String, String)>,
+    scenario_contract: Option<crate::capture_normalize::ScenarioContract>,
+    scenario_error: Option<String>,
     scenario_syscalls: CountMap,
     scenario_sensitive_paths: CountMap,
     scenario_sockets: CountMap,
@@ -181,8 +188,14 @@ impl BinderAttribution {
 
     fn label_for(&self, obj: &serde_json::Map<String, Value>) -> Option<String> {
         if let Some(service) = str_field(obj, "service") {
+            if str_field(obj, "attribution_confidence") != Some("exact") {
+                return Some(format!(
+                    "{service} [attribution: {}]",
+                    str_field(obj, "attribution_confidence").unwrap_or("unknown")
+                ));
+            }
             let method = str_field(obj, "method").or_else(|| {
-                (str_field(obj, "attribution_confidence") != Some("candidate"))
+                (str_field(obj, "attribution_confidence") == Some("exact"))
                     .then(|| {
                         u32_field(obj, "code").and_then(|code| {
                             self.aidl.as_ref().and_then(|catalog| {
@@ -209,6 +222,15 @@ impl BinderAttribution {
             .as_ref()
             .and_then(|m| m.lookup(callee_pid, target_node))
         {
+            if !self
+                .services
+                .as_ref()
+                .is_some_and(|map| map.is_exact(callee_pid))
+            {
+                return Some(format!(
+                    "{service} [candidate: legacy map has no capture/process binding]"
+                ));
+            }
             let method = code.and_then(|code| {
                 self.aidl
                     .as_ref()
@@ -259,6 +281,7 @@ pub fn run_report(args: ReportArgs) -> Result<()> {
         .map(read_input_to_string)
         .transpose()?;
     let opts = ReportOptions {
+        subject: args.subject,
         title: args.title,
         package: args.package,
         binder_services_json,
@@ -268,13 +291,17 @@ pub fn run_report(args: ReportArgs) -> Result<()> {
         top: args.top,
     };
     let attribution = BinderAttribution::from_options(&opts)?;
-    let mut snapshot = collect_snapshot(reader, &attribution).context("reading capture")?;
+    let mut snapshot =
+        collect_snapshot(reader, &attribution, opts.subject.as_ref()).context("reading capture")?;
     if let Some(package) = opts.package.as_deref() {
         snapshot.packages.insert(package.to_string());
     }
     ensure_snapshot_bounds(&snapshot)?;
     let baseline = baseline_reader
-        .map(|reader| collect_snapshot(reader, &attribution).context("reading baseline capture"))
+        .map(|reader| {
+            collect_snapshot(reader, &attribution, opts.subject.as_ref())
+                .context("reading baseline capture")
+        })
         .transpose()?;
     let markdown = render_markdown(&snapshot, baseline.as_ref(), &opts);
     write_output(args.output.as_deref(), markdown.as_bytes())
@@ -318,15 +345,20 @@ pub fn run_binder_map(command: BinderMapCommand) -> Result<()> {
 
 pub fn render_report_from_reader<R: BufRead>(reader: R, opts: ReportOptions) -> Result<String> {
     let attribution = BinderAttribution::from_options(&opts)?;
-    let mut snapshot = collect_snapshot(reader, &attribution).context("reading capture")?;
+    let mut snapshot =
+        collect_snapshot(reader, &attribution, opts.subject.as_ref()).context("reading capture")?;
     if let Some(package) = opts.package.as_deref() {
         snapshot.packages.insert(package.to_string());
     }
 
     let baseline = match opts.baseline_capture.as_deref() {
         Some(raw) => Some(
-            collect_snapshot(BufReader::new(raw.as_bytes()), &attribution)
-                .context("reading baseline capture")?,
+            collect_snapshot(
+                BufReader::new(raw.as_bytes()),
+                &attribution,
+                opts.subject.as_ref(),
+            )
+            .context("reading baseline capture")?,
         ),
         None => None,
     };
@@ -335,82 +367,145 @@ pub fn render_report_from_reader<R: BufRead>(reader: R, opts: ReportOptions) -> 
 }
 
 fn collect_snapshot<R: BufRead>(
-    mut reader: R,
+    reader: R,
     attribution: &BinderAttribution,
+    subject: Option<&crate::subject::SubjectSelector>,
 ) -> Result<Snapshot> {
-    let mut snapshot = Snapshot::default();
-    let mut record = Vec::new();
-    let mut record_number = 1usize;
+    let mut selected_traces = BTreeSet::new();
+    let mut binder_records = Vec::new();
     let mut string_bytes = 0usize;
-    while read_capture_record(&mut reader, &mut record, record_number)? {
-        if record_number > MAX_CAPTURE_RECORDS {
-            bail!("capture exceeds {MAX_CAPTURE_RECORDS} records");
-        }
-        let current_record = record_number;
-        record_number += 1;
-        let trimmed = std::str::from_utf8(&record)
-            .with_context(|| format!("capture record {current_record} is not UTF-8"))?
-            .trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        snapshot.final_record_is_health = false;
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => {
+    let mut snapshot = Snapshot::default();
+    let mut normalized = crate::capture_normalize::normalize_capture_observing(
+        reader,
+        |value, current_record, _| {
+            if current_record > MAX_CAPTURE_RECORDS {
+                bail!("capture exceeds {MAX_CAPTURE_RECORDS} records");
+            }
+            string_bytes = string_bytes
+                .checked_add(validate_capture_strings(value, current_record)?)
+                .context("report string budget overflow")?;
+            if string_bytes > MAX_REPORT_STRING_BYTES {
+                bail!("report strings exceed {MAX_REPORT_STRING_BYTES} bytes");
+            }
+            snapshot.final_record_is_health = false;
+            let Some(obj) = value.as_object() else {
                 snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
-                continue;
+                return Ok(());
+            };
+            let Some(kind) = str_field(obj, "type") else {
+                snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
+                return Ok(());
+            };
+            if kind == "capture_health" {
+                ingest_health(&mut snapshot, value);
+                snapshot.final_record_is_health = true;
+                ensure_snapshot_bounds(&snapshot)?;
+                return Ok(());
             }
-        };
-        string_bytes = string_bytes
-            .checked_add(validate_capture_strings(&value, current_record)?)
-            .context("report capture string byte count overflow")?;
-        if string_bytes > MAX_REPORT_STRING_BYTES {
-            bail!("report capture strings exceed {MAX_REPORT_STRING_BYTES} bytes");
-        }
-        let Some(obj) = value.as_object() else {
-            snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
-            continue;
-        };
-        let Some(kind) = str_field(obj, "type") else {
-            snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
-            continue;
-        };
-        if kind == "capture_health" {
-            ingest_health(&mut snapshot, &value);
-            snapshot.final_record_is_health = true;
+            if let Some(subject) = subject {
+                let resolved = obj.get("subject").and_then(|value| {
+                    serde_json::from_value::<crate::subject::ResolvedSubject>(value.clone()).ok()
+                });
+                if kind == "marker"
+                    && subject.matches_capture(
+                        resolved.as_ref(),
+                        str_field(obj, "root_package"),
+                        u32_field(obj, "root_uid"),
+                        u32_field(obj, "root_pid"),
+                    )
+                {
+                    if let Some(trace) = str_field(obj, "trace_id") {
+                        selected_traces.insert(trace.to_string());
+                    }
+                }
+                if !str_field(obj, "trace_id").is_some_and(|trace| selected_traces.contains(trace))
+                {
+                    return Ok(());
+                }
+            }
+            snapshot.parsed_events = snapshot.parsed_events.saturating_add(1);
+            if !recognized_event_valid(kind, obj) {
+                snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
+                return Ok(());
+            }
+            if unusable_raw_binder_identity(kind, obj) {
+                snapshot.unusable_binder_identity_records =
+                    snapshot.unusable_binder_identity_records.saturating_add(1);
+                if obj.contains_key("scenario_id") || obj.contains_key("trace_id") {
+                    snapshot.scenario_unusable_binder_identity_records = snapshot
+                        .scenario_unusable_binder_identity_records
+                        .saturating_add(1);
+                }
+            }
+            if kind == "marker" {
+                snapshot.markers.push(crate::capture_normalize::Marker {
+                    subject: obj
+                        .get("subject")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok()),
+                    ts_ns: u64_field(obj, "ts_ns"),
+                    name: str_field(obj, "name").unwrap_or_default().to_string(),
+                    phase: str_field(obj, "phase").map(str::to_string),
+                    scenario_id: str_field(obj, "scenario_id").map(str::to_string),
+                    trace_id: str_field(obj, "trace_id").map(str::to_string),
+                    root_package: str_field(obj, "root_package").map(str::to_string),
+                    root_uid: u32_field(obj, "root_uid"),
+                    root_pid: u32_field(obj, "root_pid"),
+                });
+            }
+            ingest_scope(&mut snapshot, obj);
+            if matches!(kind, "binder" | "binder_call") {
+                if binder_records.len() >= MAX_REPORT_GROUPS {
+                    bail!("report exceeds Binder record bound");
+                }
+                binder_records.push(obj.clone());
+            } else {
+                ingest_event(&mut snapshot, obj, attribution);
+            }
             ensure_snapshot_bounds(&snapshot)?;
-            continue;
-        }
-        snapshot.parsed_events = snapshot.parsed_events.saturating_add(1);
-        if !recognized_event_valid(kind, obj) {
-            snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
-            continue;
-        }
-        if unusable_raw_binder_identity(kind, obj) {
-            snapshot.unusable_binder_identity_records =
-                snapshot.unusable_binder_identity_records.saturating_add(1);
-            if obj.contains_key("scenario_id") || obj.contains_key("trace_id") {
-                snapshot.scenario_unusable_binder_identity_records = snapshot
-                    .scenario_unusable_binder_identity_records
-                    .saturating_add(1);
+            Ok(())
+        },
+    )?;
+    let mut attribution = attribution.clone();
+    if let Some(services) = attribution.services.as_mut() {
+        services.bind_capture(&normalized)?;
+    }
+    for record in &binder_records {
+        if let (Some(map), Some(service), Some(pid), Some(node)) = (
+            attribution.services.as_ref(),
+            str_field(record, "service"),
+            u32_field(record, "callee_pid"),
+            i32_field(record, "target_node"),
+        ) {
+            if map.is_exact(pid)
+                && str_field(record, "attribution_confidence") == Some("exact")
+                && map.lookup(pid, node).is_some_and(|label| label != service)
+            {
+                bail!("conflicting exact Binder labels for {pid}/{node}");
             }
         }
-        if kind == "marker" {
-            snapshot.markers.push(crate::capture_normalize::Marker {
-                ts_ns: u64_field(obj, "ts_ns"),
-                name: str_field(obj, "name").unwrap_or_default().to_string(),
-                phase: str_field(obj, "phase").map(str::to_string),
-                scenario_id: str_field(obj, "scenario_id").map(str::to_string),
-                trace_id: str_field(obj, "trace_id").map(str::to_string),
-                root_package: str_field(obj, "root_package").map(str::to_string),
-                root_uid: u32_field(obj, "root_uid"),
-                root_pid: u32_field(obj, "root_pid"),
-            });
+        ingest_event(&mut snapshot, record, &attribution);
+    }
+    ensure_snapshot_bounds(&snapshot)?;
+    if let Some(map) = &attribution.services {
+        for binder in &mut normalized.binders {
+            if let Some(service) = binder
+                .target_node
+                .and_then(|node| i32::try_from(node).ok())
+                .and_then(|node| map.lookup(binder.callee_pid, node))
+            {
+                if map.is_exact(binder.callee_pid) {
+                    binder.service = Some(service.into());
+                    binder.attribution_confidence =
+                        Some("exact; reviewed capture-bound map".into());
+                }
+            }
         }
-        ingest_scope(&mut snapshot, obj);
-        ingest_event(&mut snapshot, obj, attribution);
-        ensure_snapshot_bounds(&snapshot)?;
+    }
+    snapshot.scenario_contract = normalized.scenario_contract.clone();
+    snapshot.scenario_error = normalized.scenario_error.clone();
+    snapshot.normalized = normalized;
+    if subject.is_some() && selected_traces.is_empty() {
+        bail!("capture has no resolved scenarios for requested subject");
     }
     Ok(snapshot)
 }
@@ -439,6 +534,9 @@ fn ensure_snapshot_bounds(snapshot: &Snapshot) -> Result<()> {
 fn recognized_event_valid(kind: &str, obj: &serde_json::Map<String, Value>) -> bool {
     let nonzero = |key| u64_field(obj, key).is_some_and(|value| value > 0);
     match kind {
+        "subject_unavailable" | "subject_resolution" | "task_exit" => {
+            crate::capture_normalize::valid_ignorable_record(kind, obj)
+        }
         "syscall" => nonzero("pid") && syscall_name(obj).is_some(),
         "binder" => {
             nonzero("pid")
@@ -599,6 +697,34 @@ fn render_markdown(
         opts.title.as_deref().unwrap_or("Neutron Boundary Report"),
     ));
     out.push_str("\n\n");
+    let passport = crate::capture_view::CapturePassport::from_capture(&snapshot.normalized);
+    out.push_str(&format!(
+        "Transport health: **{}**. Claims: **{}**.\n\n",
+        markdown_text(&passport.transport_health),
+        if passport.bounded_claims_eligible {
+            "bounded observations only"
+        } else {
+            "positive observations only; absence is nonconclusive"
+        }
+    ));
+    for restriction in &passport.restrictions {
+        out.push_str(&format!("- {}\n", markdown_text(restriction)));
+    }
+    out.push('\n');
+    out.push_str(&crate::capture_view::narrative(
+        &snapshot.normalized,
+        opts.subject.as_ref(),
+    ));
+    out.push_str("## Capture passport\n\n<pre>\n");
+    out.push_str(
+        &passport
+            .render_text()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;"),
+    );
+    out.push_str("</pre>\n\n");
+    out.push_str(&format!("View: subject={}, top={} per section. Package labels are annotations, not capture filters.\n\n", markdown_text(&opts.subject.as_ref().map_or("all".into(), |s| s.id())), opts.top));
     render_health(&mut out, snapshot);
     render_scope(&mut out, snapshot);
     render_count_section(&mut out, "Top Syscalls", &snapshot.syscalls, opts.top);
@@ -632,7 +758,11 @@ fn render_markdown(
         let scenarios_match = snapshot_scenario_contract(snapshot)
             .zip(snapshot_scenario_contract(baseline))
             .is_some_and(|(current, baseline)| current.scenarios == baseline.scenarios);
-        if snapshot_health_is_complete(snapshot)
+        if crate::capture_view::CapturePassport::from_capture(&snapshot.normalized)
+            .bounded_claims_eligible
+            && crate::capture_view::CapturePassport::from_capture(&baseline.normalized)
+                .bounded_claims_eligible
+            && snapshot_health_is_complete(snapshot)
             && snapshot_health_is_complete(baseline)
             && scopes_match
             && scenarios_match
@@ -651,14 +781,7 @@ fn render_markdown(
 fn snapshot_scenario_contract(
     snapshot: &Snapshot,
 ) -> Option<crate::capture_normalize::ScenarioContract> {
-    let contract = crate::capture_normalize::validated_marker_contract(&snapshot.markers).ok()?;
-    snapshot
-        .scenario_event_bindings
-        .iter()
-        .all(|(scenario_id, trace_id)| {
-            contract.trace_ids.get(scenario_id).map(String::as_str) == Some(trace_id.as_str())
-        })
-        .then_some(contract)
+    snapshot.scenario_contract.clone()
 }
 
 fn snapshot_capture_scope(snapshot: &Snapshot) -> Option<crate::health::CaptureScope> {
@@ -773,6 +896,9 @@ fn render_health(out: &mut String, snapshot: &Snapshot) {
             snapshot.health_records
         ));
     }
+    if let Some(normalized) = &snapshot.normalized.health {
+        status = &normalized.status;
+    }
     if status != "complete" {
         out.push_str("**WARNING:** capture health is not clean");
         out.push_str(&format!("; status is `{status}`"));
@@ -817,6 +943,12 @@ fn render_health(out: &mut String, snapshot: &Snapshot) {
 fn render_scope(out: &mut String, snapshot: &Snapshot) {
     out.push_str("## Traced Scope\n\n");
     render_inline_set(out, "Packages", &snapshot.packages);
+    let subjects = snapshot
+        .markers
+        .iter()
+        .filter_map(|marker| marker.subject.as_ref().map(|subject| subject.selector.id()))
+        .collect();
+    render_inline_set(out, "Subjects", &subjects);
     render_inline_counts(out, "PIDs", &snapshot.pids, 12);
     render_inline_counts(out, "UIDs", &snapshot.uids, 12);
     render_inline_counts(out, "Comms", &snapshot.comms, 12);
@@ -947,9 +1079,14 @@ struct BinderTemplateEntry {
     service: String,
     observed_codes: BTreeMap<String, u64>,
     status_counts: BTreeMap<String, u64>,
+    candidates: BTreeSet<String>,
+    source_records: Vec<usize>,
+    review_status: String,
 }
 
-pub fn render_binder_template_from_reader<R: BufRead>(mut reader: R) -> Result<String> {
+pub fn render_binder_template_from_reader<R: BufRead>(reader: R) -> Result<String> {
+    let mut reader = crate::capture_input::DigestReader::new(reader);
+    let mut capture_identity = Value::Null;
     let mut out: BTreeMap<String, BTreeMap<String, BinderTemplateEntry>> = BTreeMap::new();
     let mut record = Vec::new();
     let mut record_number = 1usize;
@@ -979,7 +1116,10 @@ pub fn render_binder_template_from_reader<R: BufRead>(mut reader: R) -> Result<S
         let Some(obj) = value.as_object() else {
             continue;
         };
-        if str_field(obj, "type") != Some("binder_call") || obj.contains_key("service") {
+        if str_field(obj, "type") == Some("capture_health") {
+            capture_identity = serde_json::json!({"boot_id": obj.get("boot_id"), "fingerprint": obj.get("fingerprint")});
+        }
+        if str_field(obj, "type") != Some("binder_call") {
             continue;
         }
         let Some(pid) = u32_field(obj, "callee_pid") else {
@@ -993,6 +1133,22 @@ pub fn render_binder_template_from_reader<R: BufRead>(mut reader: R) -> Result<S
             .or_default()
             .entry(node.to_string())
             .or_default();
+        entry.review_status =
+            "unreviewed; labels are candidates until independently verified".into();
+        if entry.source_records.len() < 16 {
+            entry.source_records.push(current_record);
+        }
+        if let Some(service) = str_field(obj, "service") {
+            entry.candidates.insert(service.into());
+        }
+        if let Some(candidates) = obj.get("service_candidates").and_then(Value::as_array) {
+            entry.candidates.extend(
+                candidates
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
         if let Some(code) = u32_field(obj, "code") {
             *entry.observed_codes.entry(code.to_string()).or_insert(0) += 1;
         }
@@ -1008,6 +1164,7 @@ pub fn render_binder_template_from_reader<R: BufRead>(mut reader: R) -> Result<S
                         1usize
                             .saturating_add(entry.observed_codes.len())
                             .saturating_add(entry.status_counts.len())
+                            .saturating_add(entry.candidates.len())
                     })
                     .sum::<usize>()
             })
@@ -1016,7 +1173,11 @@ pub fn render_binder_template_from_reader<R: BufRead>(mut reader: R) -> Result<S
             bail!("binder template exceeds {MAX_REPORT_GROUPS} aggregate groups");
         }
     }
-    let mut json = serde_json::to_string_pretty(&out).context("serializing binder template")?;
+    let mut json = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": "neutron.binder-review/v1", "capture_sha256": reader.sha256(),
+        "capture_identity": capture_identity, "endpoints": out,
+        "instructions": "Review conflicts and verify each endpoint. Export neutron.binder-services/v1 with context and services; this unreviewed template is not an exact map."
+    })).context("serializing binder template")?;
     json.push('\n');
     Ok(json)
 }

@@ -129,8 +129,8 @@ object (`neutron.bpf.elf`).
 1. Same PID filter as enter.
 2. Look up `INFLIGHT[pid_tgid]` to recover args, data, stack IDs from the
    matching enter event.
-3. Stash the enter `timestamp_ns` into the exit event's `args[5]` so
-   userspace can compute latency.
+3. Preserve all six arguments and copy the enter timestamp into
+   `enter_timestamp_ns`; userspace computes latency from that separate field.
 4. Set `ret` from the exit tracepoint context.
 5. Reserve + fill + submit a new ring slot.
 6. Delete the `INFLIGHT` entry.
@@ -145,8 +145,8 @@ side. `data[128]` is unused for binder events.
 
 ### `trace_binder_transaction_received` (tracepoint/binder/binder_transaction_received)
 
-Loaded only with `--binder`; best-effort attach (a missing tracepoint is
-logged but does not abort the run). Synthetic `syscall_nr = -4`. Reads
+Both Binder tracepoints are mandatory when `--binder` is selected; an
+unavailable attachment aborts the run. Synthetic `syscall_nr = -4`. Reads
 the kernel-assigned `debug_id` from the tracepoint payload into
 `ptr_hint`. Carries no other useful fields — callee `pid` / `tid` come
 from `bpf_get_current_pid_tgid()`. Userspace pairs caller and callee by
@@ -162,7 +162,8 @@ dying task's `comm` from the tracepoint payload (more reliable than
 `exit_signal` — the tracepoint payload doesn't expose them, and reading
 `task_struct->exit_code` via BTF is deferred. Userspace logcat /
 tombstone watchers fill in the signal info when available; otherwise
-the event is a "this PID died at this time" marker.
+the event establishes only that this task exited. ABI 3 userspace retains group
+admission until proc reconciliation confirms whole-process death.
 
 ## Aya Loader (`src/main.rs`)
 
@@ -308,7 +309,10 @@ synthesised `type:"binder_call"` JSON line with `status:"completed"`.
 On a `process_exit` with `classification=crash`, the tracker drains
 every in-flight entry whose `callee_pid` matches the dying PID and
 emits each as `status:"callee_crashed"`. Default cap is 1024 in-flight
-transactions; LRU eviction silently drops the oldest entry on overflow.
+transactions. LRU eviction and unmatched receives are counted and degrade
+capture health. `completed` is the legacy spelling for **dequeued**;
+`queue_latency_us` (legacy `latency_us`) measures send-to-dequeue, never
+handler completion or round-trip time.
 
 ### `LogcatReader` and `TombstoneWatcher`
 
@@ -365,7 +369,7 @@ and 6 reserved bytes. Later event semantics did not bump the struct.
 |--------------|---------------------|-----------------------------------------------------------------|
 | `-1`         | `binder` (caller)   | `args[0..5]` = to_proc/code/flags/to_thread/reply/target_node; `ptr_hint` = debug_id |
 | `-2`         | `fd_snapshot`       | Not emitted via the BPF wire; constructed userspace-side from poller channel |
-| `-3`         | `process_exit`      | `args[0]` = exit_code, `args[1]` = exit_signal, `args[2]` = ExitSource enum |
+| `-3`         | `task_exit` (ABI 3) | `args[0..2]` = unavailable zero status, `args[2]` = ExitSource enum; userspace reconciles process death |
 | `-4`         | `binder_received`   | `ptr_hint` = debug_id (matched against nr=-1 entries)           |
 
 ### `data[128]` union semantics
@@ -462,3 +466,51 @@ config.
   catalog evidence exists. A bounded offline KeyMint plugin can decode one
   complete harness shape; version-independent arbitrary Parcel unmarshalling
   remains out of scope.
+
+
+### ABI 3 task exits and process lifetime
+
+The packed event remains 257 bytes with the historical `pid` = process,
+`tgid` = thread naming. ABI major 3 changes synthetic nr=-3 to **task exit**:
+the kernel removes thread-local inflight/context state but retains process
+admission. Userspace emits `task_exit` and reconciles `/proc/PID/stat` before
+process teardown: a zombie leader with multiple threads remains alive;
+disappearance, changed starttime, or a single zombie/dead task ends that
+incarnation. Permission/parse errors remain unknown and affect health.
+Queued ring records are drained before confirmed death can stop a PID trace.
+The source supplies no exit status: zero fields classify as `unknown`.
+Old ABI objects are rejected before loading. Runtime qualification is still
+required on each supported Android kernel.
+
+FD and symbol caches are invalidated on changed/unavailable starttime and
+confirmed death. Exec invalidates descriptor bindings; observed fcntl
+F_DUPFD/F_DUPFD_CLOEXEC and close_range transitions are tracked. FD JSON
+names the binding source and marks cache enrichment best-effort. A captured
+path or a proc readlink is not independent proof of a successful operation.
+
+Scenario lifecycle validation is shared by bundle verification, normalization,
+reports, and scenario aggregation. Missing generations, reused trace IDs,
+changed roots, and tagged records outside the ordered interval cannot support
+conclusions. Legacy positive rendering remains available with warnings.
+Graph v2 separates process membership from causal parent edges and preserves
+unknown confidence. Unknown causal edges are not traversed by surface
+reachability. See [the system workflow](guides/system-subjects.md).
+
+## Observability projections and lifecycle artifacts (1.6)
+
+The capture normalizer can feed record consumers during its bounded parse. Report
+and summary aggregation use this path, so their passports share health, scope and
+ordered scenario validation with graph and diff. DigestReader hashes consumed bytes,
+including line endings, without reopening the input. Trace/span references map to
+bounded input record numbers. Report additionally caps retained Binder enrichment
+records and narrative output. Summary memory now includes the bounded normalized
+capture as well as groups and exemplars.
+
+Live run manifests admit paired readiness.json and teardown.json artifacts and
+validate their lifecycle state, producer/filter/subject binding and shutdown count.
+Abrupt or unsuccessful finalization cannot publish a seal. Confirmed userspace
+process death does not increment the raw BPF event count a second time.
+
+Reviewed Binder maps distinguish capture binding from live boot/build/starttime
+binding. Legacy maps stay candidates in maintained enrichment/report workflows.
+These checks establish attribution provenance, not the truth of a reviewer's label.

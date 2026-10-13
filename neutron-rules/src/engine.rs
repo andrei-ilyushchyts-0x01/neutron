@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::condition::match_target;
 use crate::event::Event;
-use crate::finding::{Aggregates, EventSnapshot, Finding};
+use crate::finding::{Aggregates, EventSnapshot, Finding, FindingScope};
 use crate::loader::LoaderError;
 use crate::rule::{AggregateMode, Rule, MAX_EVIDENCE_PER_FINDING};
 use crate::window::SlidingWindow;
@@ -26,6 +26,7 @@ const MAX_DISTINCT_TRACKED: usize = 1024;
 /// Composite key per active finding.
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct StateKey {
+    scope: FindingScope,
     rule_idx: usize,
     pid: u32,
     target: String, // empty for non-PerTarget rules
@@ -33,6 +34,7 @@ struct StateKey {
 
 /// Mutable per-(rule, pid[, target]) state.
 struct ActiveState {
+    scope: FindingScope,
     first_ns: u64,
     last_ns: u64,
     count: u32,
@@ -81,6 +83,10 @@ pub struct RuleEngine {
     /// Cap on `Finding::raw_window` length per state. `0` disables raw-line
     /// capture entirely. Sprint-2 PR 4.
     raw_window_cap: usize,
+    scope: FindingScope,
+    process_starttimes: HashMap<u32, u64>,
+    state_cap: usize,
+    dropped_state_events: u64,
 }
 
 impl RuleEngine {
@@ -94,7 +100,52 @@ impl RuleEngine {
             states: HashMap::new(),
             pending: Vec::new(),
             raw_window_cap: DEFAULT_RAW_WINDOW_CAP,
+            scope: FindingScope::default(),
+            process_starttimes: HashMap::new(),
+            state_cap: 16_384,
+            dropped_state_events: 0,
         })
+    }
+
+    /// Finish the previous scope without recompiling rules. Call only after
+    /// accepting a boundary, and drain before emitting its end marker.
+    pub fn set_scope(&mut self, scope: FindingScope) {
+        self.finish_states(None);
+        self.scope = scope;
+    }
+
+    pub fn set_process_incarnation(&mut self, pid: u32, starttime: Option<u64>) {
+        if starttime.is_none() || self.process_starttimes.get(&pid).copied() != starttime {
+            self.finish_process(pid);
+        }
+        if let Some(starttime) = starttime {
+            self.process_starttimes.insert(pid, starttime);
+        }
+    }
+
+    pub fn finish_process(&mut self, pid: u32) {
+        self.finish_states(Some(pid));
+        self.process_starttimes.remove(&pid);
+    }
+
+    pub fn set_state_cap(&mut self, cap: usize) {
+        self.state_cap = cap;
+    }
+    pub fn dropped_state_events(&self) -> u64 {
+        self.dropped_state_events
+    }
+
+    fn finish_states(&mut self, pid: Option<u32>) {
+        self.states.retain(|key, state| {
+            if pid.is_some_and(|pid| key.pid != pid) {
+                return true;
+            }
+            if state.emitted && state.count > 1 {
+                self.pending
+                    .push(build_finding(&self.rules[key.rule_idx], key.pid, state));
+            }
+            false
+        });
     }
 
     /// Set the per-finding raw_window cap. `0` disables raw-line capture.
@@ -125,6 +176,19 @@ impl RuleEngine {
     /// Hot path: evaluate all rules against `ev`. May stage one or more
     /// findings into the pending buffer.
     pub fn feed(&mut self, ev: &Event<'_>) {
+        // Untagged auxiliary observations keep their own scope; observation
+        // during a scenario alone is not proof of causal membership.
+        let raw = ev.raw_json();
+        let mut scope = if ev.scenario_id == self.scope.scenario_id.as_deref()
+            && raw.get("trace_id").and_then(|v| v.as_str()) == self.scope.trace_id.as_deref()
+            && raw.get("generation").map_or(true, |value| {
+                value.as_u64() == self.scope.generation.map(u64::from)
+            }) {
+            self.scope.clone()
+        } else {
+            FindingScope::default()
+        };
+        scope.process_starttime = self.process_starttimes.get(&ev.pid).copied();
         // Iterate rules by index so we can take a stable key without re-borrow.
         for (idx, rule) in self.rules.iter().enumerate() {
             if !rule.conditions.iter().all(|c| c.matches(ev)) {
@@ -138,10 +202,16 @@ impl RuleEngine {
             };
 
             let key = StateKey {
+                scope: scope.clone(),
                 rule_idx: idx,
                 pid: ev.pid,
                 target: target_str.clone(),
             };
+
+            if !self.states.contains_key(&key) && self.states.len() >= self.state_cap {
+                self.dropped_state_events = self.dropped_state_events.saturating_add(1);
+                continue;
+            }
 
             // Make a snapshot before mutating state (cheap, bounded by max evidence).
             let snap_target = if target_str.is_empty() {
@@ -157,6 +227,7 @@ impl RuleEngine {
                     .as_ref()
                     .map(|f| SlidingWindow::new(f.window_ms));
                 ActiveState {
+                    scope: scope.clone(),
                     first_ns: ev.ts_ns,
                     last_ns: ev.ts_ns,
                     count: 0,
@@ -302,6 +373,7 @@ impl RuleEngine {
 fn build_finding(rule: &Rule, pid: u32, state: &ActiveState) -> Finding {
     let period_ms = state.window.as_ref().and_then(|w| w.period_ms());
     Finding {
+        scope: state.scope.clone(),
         rule_id: rule.id.clone(),
         rule_name: rule.name.clone(),
         severity: rule.severity,

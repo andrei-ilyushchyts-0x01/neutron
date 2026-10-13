@@ -57,7 +57,7 @@ fn syscall_enter_and_exit_merge_into_one_exit_span() {
 }
 
 #[test]
-fn binder_enrichment_without_relation_does_not_overwrite_inferred_evidence() {
+fn binder_enrichment_without_relation_preserves_uncertainty() {
     let input = r#"
 {"type":"binder","ts_ns":10,"pid":100,"comm":"app","to_proc":200,"target_node":7,"code":1,"debug_id":11,"trace_id":"trace-a","scenario_id":"camera","span_id":"binder-1","parent_span_id":"root-1","depth":1,"causal_relation":"inferred"}
 {"type":"binder_call","ts_ns":10,"debug_id":11,"caller_pid":100,"caller_comm":"app","callee_pid":200,"target_node":7,"code":1,"service":"camera/default","method":"connect","attribution_confidence":"candidate","latency_us":5,"status":"completed","trace_id":"trace-a","scenario_id":"camera","span_id":"binder-1","parent_span_id":"root-1"}
@@ -75,7 +75,7 @@ fn binder_enrichment_without_relation_does_not_overwrite_inferred_evidence() {
     assert_eq!(binder.scenario_id.as_deref(), Some("camera"));
     assert_eq!(binder.parent_span_id.as_deref(), Some("root-1"));
     assert_eq!(binder.depth, Some(1));
-    assert_eq!(binder.relation, CausalRelation::Inferred);
+    assert_eq!(binder.relation, CausalRelation::Unknown);
 }
 
 #[test]

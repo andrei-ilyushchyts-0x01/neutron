@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrei-ilyushchyts-0x01/neutron/schemas/neutron.evidence-report-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "integrity",
+    "authenticity",
+    "observer_privilege",
+    "declared_attacker_capability",
+    "observations"
+  ],
+  "properties": {
+    "schema": {
+      "const": "neutron.evidence-report/v1"
+    },
+    "integrity": {
+      "const": "verified"
+    },
+    "authenticity": {
+      "const": "not_verified"
+    },
+    "observer_privilege": {
+      "type": "string"
+    },
+    "declared_attacker_capability": {
+      "type": "string"
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "neutron.external-evidence-v1.schema.json"
+          },
+          {
+            "$ref": "neutron.external-evidence-v2.schema.json"
+          }
+        ]
+      }
+    }
+  }
+}

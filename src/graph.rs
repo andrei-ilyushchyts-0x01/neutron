@@ -13,6 +13,9 @@ use crate::capture_normalize::{
 
 #[derive(Parser, Debug)]
 pub struct GraphArgs {
+    /// Select scenarios for the exact native/system subject.
+    #[arg(long, conflicts_with = "root_package")]
+    pub subject: Option<crate::subject::SubjectSelector>,
     /// Path to the NDJSON capture (`-` for stdin).
     pub capture: String,
 
@@ -35,6 +38,7 @@ pub struct GraphArgs {
 
 #[derive(Clone, Debug, Default)]
 pub struct GraphOptions {
+    pub subject: Option<crate::subject::SubjectSelector>,
     pub root_package: Option<String>,
     pub collapse_syscalls: bool,
 }
@@ -42,6 +46,7 @@ pub struct GraphOptions {
 pub fn run(args: GraphArgs) -> Result<()> {
     let reader = crate::summarize::open_capture(&args.capture)?;
     let options = GraphOptions {
+        subject: args.subject,
         root_package: args.root_package,
         collapse_syscalls: args.collapse_syscalls,
     };
@@ -60,6 +65,7 @@ pub fn run(args: GraphArgs) -> Result<()> {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Edge {
+    kind: &'static str,
     from: String,
     to: String,
     relation: Relation,
@@ -67,6 +73,8 @@ struct Edge {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct GraphDocument {
+    pub passport: crate::capture_view::CapturePassport,
+    pub view: serde_json::Value,
     pub schema: String,
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
@@ -90,6 +98,8 @@ pub struct GraphNode {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct GraphEdge {
+    pub evidence_basis: String,
+    pub kind: String,
     pub from: String,
     pub to: String,
     pub relation: String,
@@ -97,8 +107,9 @@ pub struct GraphEdge {
 
 fn build_graph_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Result<GraphDocument> {
     let capture = normalize_capture(reader)?;
+    let passport = crate::capture_view::CapturePassport::from_capture(&capture);
     let has_causal = capture.has_causal;
-    let selected_traces: BTreeSet<String> = capture
+    let mut selected_traces: BTreeSet<String> = capture
         .trace_packages
         .iter()
         .filter(|(_, package)| {
@@ -109,6 +120,27 @@ fn build_graph_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Res
         })
         .map(|(trace, _)| trace.clone())
         .collect();
+    if let Some(subject) = &options.subject {
+        selected_traces = capture
+            .markers
+            .iter()
+            .filter(|marker| {
+                subject.matches_capture(
+                    marker.subject.as_ref(),
+                    marker.root_package.as_deref(),
+                    marker.root_uid,
+                    marker.root_pid,
+                )
+            })
+            .filter_map(|marker| marker.trace_id.clone())
+            .collect();
+        if selected_traces.is_empty() {
+            anyhow::bail!(
+                "capture has no resolved scenarios for subject {}",
+                subject.id()
+            );
+        }
+    }
     let selected = |trace: Option<&str>, span: Option<&str>, root_package: Option<&str>| {
         if !has_causal {
             return true;
@@ -116,8 +148,11 @@ fn build_graph_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Res
         let (Some(trace), Some(_)) = (trace, span) else {
             return false;
         };
-        options.root_package.is_none()
-            || root_package == options.root_package.as_deref()
+        (options.subject.is_none() && options.root_package.is_none())
+            || options
+                .root_package
+                .as_deref()
+                .is_some_and(|root| root_package == Some(root))
             || selected_traces.contains(trace)
     };
     let binders: Vec<&BinderSpan> = capture
@@ -261,53 +296,64 @@ fn build_graph_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Res
     }
 
     let mut edges = BTreeSet::<Edge>::new();
-    for (binder, node) in binders.iter().zip(&binder_ids) {
-        let parent = parent_node(
-            &span_nodes,
-            binder.trace_id.as_deref(),
-            binder.parent_span_id.as_deref(),
-        )
-        .unwrap_or_else(|| process_id(binder.caller_pid));
+    let parents = binders
+        .iter()
+        .zip(&binder_ids)
+        .map(|(event, node)| {
+            (
+                event.trace_id.as_deref(),
+                event.parent_span_id.as_deref(),
+                event.caller_pid,
+                node,
+                event.relation,
+            )
+        })
+        .chain(syscalls.iter().zip(&syscall_ids).map(|(event, node)| {
+            (
+                event.trace_id.as_deref(),
+                event.parent_span_id.as_deref(),
+                event.pid,
+                node,
+                event.relation,
+            )
+        }))
+        .chain(exits.iter().zip(&exit_ids).map(|(event, node)| {
+            (
+                event.trace_id.as_deref(),
+                event.parent_span_id.as_deref(),
+                event.pid,
+                node,
+                event.relation,
+            )
+        }));
+    let mut missing_parent = false;
+    for (trace, parent_span, pid, node, relation) in parents {
+        let parent = parent_node(&span_nodes, trace, parent_span);
+        missing_parent |= parent_span.is_some() && parent.is_none();
         edges.insert(Edge {
-            from: parent,
+            kind: if parent.is_some() {
+                "causal_parent"
+            } else {
+                "process_membership"
+            },
+            from: parent.unwrap_or_else(|| process_id(pid)),
             to: node.clone(),
-            relation: binder.relation,
+            relation: if parent_span.is_none() {
+                Relation::Exact
+            } else {
+                relation
+            },
         });
+    }
+    for (binder, node) in binders.iter().zip(&binder_ids) {
         if binder.callee_pid != 0 {
             edges.insert(Edge {
                 from: node.clone(),
                 to: process_id(binder.callee_pid),
-                // Binder delivery proves the callee even if parent attribution
-                // is only process-inferred.
+                kind: "binder_target",
                 relation: Relation::Exact,
             });
         }
-    }
-    for (syscall, node) in syscalls.iter().zip(&syscall_ids) {
-        let parent = parent_node(
-            &span_nodes,
-            syscall.trace_id.as_deref(),
-            syscall.parent_span_id.as_deref(),
-        )
-        .unwrap_or_else(|| process_id(syscall.pid));
-        edges.insert(Edge {
-            from: parent,
-            to: node.clone(),
-            relation: syscall.relation,
-        });
-    }
-    for (exit, node) in exits.iter().zip(&exit_ids) {
-        let parent = parent_node(
-            &span_nodes,
-            exit.trace_id.as_deref(),
-            exit.parent_span_id.as_deref(),
-        )
-        .unwrap_or_else(|| process_id(exit.pid));
-        edges.insert(Edge {
-            from: parent,
-            to: node.clone(),
-            relation: exit.relation,
-        });
     }
 
     let mut warnings: Vec<_> = capture
@@ -315,21 +361,40 @@ fn build_graph_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Res
         .into_iter()
         .map(|warning| format!("{warning}."))
         .collect();
+    if missing_parent {
+        warnings.push(
+            "a referenced parent span is absent; its edge shows process membership only.".into(),
+        );
+    }
     if !has_causal {
         warnings
             .push("capture has no causal metadata; syscall edges are process-level only.".into());
     }
     Ok(GraphDocument {
-        schema: "neutron.causal-graph/v1".into(),
+        schema: "neutron.causal-graph/v3".into(),
+        passport,
+        view: serde_json::json!({"subject": options.subject.as_ref().map(|s| s.id()), "root_package": options.root_package, "collapse_syscalls": options.collapse_syscalls}),
         nodes: nodes.into_values().collect(),
         edges: edges
             .into_iter()
             .map(|edge| GraphEdge {
+                evidence_basis: match (edge.kind, edge.relation) {
+                    ("process_membership", _) => "event process identity; not a causal dependency",
+                    ("binder_target", _) => "observed Binder recipient; not method completion",
+                    (_, Relation::Exact) => "producer recorded an exact parent span",
+                    (_, Relation::Inferred) => {
+                        "producer process/follow context; asynchronous causation is unproven"
+                    }
+                    (_, Relation::Unknown) => "causal metadata missing or unknown",
+                }
+                .into(),
+                kind: edge.kind.into(),
                 from: edge.from,
                 to: edge.to,
                 relation: match edge.relation {
                     Relation::Exact => "exact",
                     Relation::Inferred => "inferred",
+                    Relation::Unknown => "unknown",
                 }
                 .into(),
             })
@@ -347,7 +412,19 @@ pub fn render_json_from_reader<R: BufRead>(reader: R, options: &GraphOptions) ->
 pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions) -> Result<String> {
     let graph = build_graph_from_reader(reader, options)?;
     let mut output = String::from("flowchart TD\n");
-    for warning in graph.warnings {
+    output.push_str(&format!(
+        "  capture_passport[\"{}\"]\n",
+        escape_label(&graph.passport.render_text())
+    ));
+    output.push_str(&format!(
+        "  view_options[\"View: {}\"]\n",
+        escape_label(&graph.view.to_string())
+    ));
+    for (index, warning) in graph.warnings.into_iter().enumerate() {
+        output.push_str(&format!(
+            "  capture_warning_{index}[\"{}\"]\n",
+            escape_label(&warning)
+        ));
         output.push_str(&format!("  %% WARNING: {warning}\n"));
     }
     for node in graph.nodes {
@@ -367,7 +444,10 @@ pub fn render_mermaid_from_reader<R: BufRead>(reader: R, options: &GraphOptions)
         if edge.relation == "exact" {
             output.push_str(&format!("  {} --> {}\n", edge.from, edge.to));
         } else {
-            output.push_str(&format!("  {} -. inferred .-> {}\n", edge.from, edge.to));
+            output.push_str(&format!(
+                "  {} -. {} .-> {}\n",
+                edge.from, edge.relation, edge.to
+            ));
         }
     }
     Ok(output)

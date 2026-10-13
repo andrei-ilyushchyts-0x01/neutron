@@ -8,6 +8,8 @@ pub mod build_info;
 pub mod capture;
 pub(crate) mod capture_input;
 pub mod capture_normalize;
+pub(crate) mod capture_validation;
+pub mod capture_view;
 pub mod causal;
 pub mod cli;
 pub mod decode;
@@ -27,6 +29,8 @@ pub mod native;
 pub mod predicate;
 #[doc(hidden)]
 pub mod private_output;
+#[doc(hidden)]
+pub mod process_state;
 pub mod recipes;
 pub mod report;
 pub mod research;
@@ -35,6 +39,7 @@ pub mod run_manifest;
 pub mod sampler;
 pub mod selinux;
 pub mod sources;
+pub mod subject;
 pub mod summarize;
 pub mod surface;
 pub mod symbolize;

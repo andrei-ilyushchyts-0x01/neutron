@@ -201,6 +201,7 @@ mod tests {
 
     fn make_finding(evidence: Vec<EventSnapshot>) -> Finding {
         Finding {
+            scope: Default::default(),
             rule_id: "T1_test".into(),
             rule_name: "test".into(),
             severity: Severity::Low,

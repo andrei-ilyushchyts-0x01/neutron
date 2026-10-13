@@ -143,7 +143,7 @@ Summary table:
 | R001   | resource_exhaustion  | FD table > 90% of `RLIMIT_NOFILE` (FD-graph poller)     | high     |
 | R002   | resource_exhaustion  | DMA-heap allocation burst (50+ in 5 s)                  | medium   |
 | R003   | crash                | Process killed by fatal signal (SEGV/ABRT/BUS/ILL/FPE/SYS) | critical |
-| R004   | crash                | Binder callee crashed mid-transaction                   | high     |
+| R004   | crash                | Callee crash correlated with pending Binder delivery                   | high     |
 | R005   | resource_exhaustion  | KGSL/Mali ioctl failure burst                           | medium   |
 | R006   | resource_exhaustion  | DMA/dmabuf ioctl churn                                  | medium   |
 | R007   | ipc                  | Mali TLStream/JIT ioctl marker                          | low      |
@@ -203,3 +203,17 @@ Findings v2 additionally carry two optional blocks:
 
 Both blocks are additive and omitted from the JSON when empty; older
 consumers continue to parse without changes.
+
+
+`completed` on a Binder event means the transaction was dequeued. The v2
+`delivery_phase=dequeued` and `queue_latency_us` fields state that meaning
+explicitly; `latency_us` remains the same interval as a 1.x compatibility
+alias. R004 correlates a crash before dequeue with a pending delivery. It
+does not establish that an AIDL handler executed or caused the crash.
+
+Finding scope fields (`scenario_id`, `trace_id`, `generation`,
+`process_starttime`) identify independent aggregation lifetimes. Deduplicate
+using these fields as well as rule, PID, and target. Accepted scenario
+boundaries and process incarnation changes flush state; rejected markers do
+not reset it. The total state cap is reported through incomplete health.
+Legacy unmarked use continues aggregating across a run within an incarnation.

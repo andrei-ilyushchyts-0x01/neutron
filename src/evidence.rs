@@ -28,8 +28,10 @@ const MAX_BUNDLE_DEPTH: usize = 32;
 pub enum EvidenceCommand {
     /// Verify every artifact listed by a run bundle without following links.
     Verify(VerifyArgs),
+    /// Report verified external observations, identities, and observer privileges as JSON.
+    Report(VerifyArgs),
     /// Copy a bounded external result into a run bundle as typed evidence.
-    Import(ImportArgs),
+    Import(Box<ImportArgs>),
 }
 
 #[derive(Args, Debug)]
@@ -60,6 +62,9 @@ pub struct ImportArgs {
     /// Required for app behavioral claims.
     #[arg(long)]
     pub probe_identity: Option<PathBuf>,
+    /// Discriminated android_app/native_process identity (external evidence v2).
+    #[arg(long, conflicts_with = "probe_identity")]
+    pub stimulus_identity: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "unknown")]
     pub health_status: EvidenceHealth,
 }
@@ -124,6 +129,51 @@ pub struct ExternalProbeRuntimeIdentity {
     pub granted_permissions: Vec<String>,
 }
 
+/// A collector assertion, never a Neutron measurement or app-privilege proof.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    content = "identity",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExternalStimulusIdentity {
+    AndroidApp(ExternalProbeRuntimeIdentity),
+    NativeProcess(NativeProcessRuntimeIdentity),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeProcessRuntimeIdentity {
+    pub schema: String,
+    pub device_boot_id: String,
+    pub pid: u32,
+    pub starttime: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub executable_path: String,
+    pub binary_sha256: String,
+    pub build_id: Option<String>,
+    pub selinux_domain: String,
+    pub effective_capabilities: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeObservation {
+    schema: String,
+    identity: NativeProcessRuntimeIdentity,
+    claim_scope: ExternalClaimScope,
+    attempts: Vec<NativeAttempt>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeAttempt {
+    identity: NativeProcessRuntimeIdentity,
+    outcome: String,
+}
+
 impl FromStr for ExternalClaimScope {
     type Err = String;
 
@@ -152,17 +202,34 @@ pub struct ExternalEvidence {
     pub health_status: EvidenceHealth,
     pub claim_scope: Option<ExternalClaimScope>,
     pub probe_identity: Option<ExternalProbeRuntimeIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stimulus_identity: Option<ExternalStimulusIdentity>,
 }
 
 pub fn run(command: EvidenceCommand) -> Result<()> {
     match command {
         EvidenceCommand::Verify(args) => verify(&args.run_dir),
-        EvidenceCommand::Import(args) => import(args),
+        EvidenceCommand::Report(args) => {
+            let (_, manifest, observations) = verify_bundle(&args.run_dir)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema": "neutron.evidence-report/v1",
+                    "integrity": "verified",
+                    "authenticity": "not_verified",
+                    "observer_privilege": manifest.research_model.observer_privilege,
+                    "declared_attacker_capability": manifest.research_model.attacker_capability,
+                    "observations": observations,
+                }))?
+            );
+            Ok(())
+        }
+        EvidenceCommand::Import(args) => import(*args),
     }
 }
 
 pub fn verify(run_dir: &Path) -> Result<()> {
-    let verified = verify_bundle(run_dir)?;
+    let (verified, _, _) = verify_bundle(run_dir)?;
     println!(
         "{}",
         serde_json::to_string(&json!({
@@ -176,7 +243,9 @@ pub fn verify(run_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_bundle(run_dir: &Path) -> Result<u64> {
+fn verify_bundle(
+    run_dir: &Path,
+) -> Result<(u64, crate::run_manifest::RunManifest, Vec<ExternalEvidence>)> {
     verify_directory(run_dir)?;
     let manifest_path = run_dir.join("manifest.json");
     let manifest = read_regular_beneath(run_dir, Path::new("manifest.json"), MAX_MANIFEST_BYTES)?;
@@ -232,8 +301,8 @@ fn verify_bundle(run_dir: &Path) -> Result<u64> {
             bail!("SHA256SUMS does not cover artifact: {relative_text}");
         }
     }
-    verify_external_evidence(run_dir)?;
-    Ok(verified)
+    let annotations = verify_external_evidence(run_dir)?;
+    Ok((verified, manifest, annotations))
 }
 
 fn import(args: ImportArgs) -> Result<()> {
@@ -268,11 +337,27 @@ fn import(args: ImportArgs) -> Result<()> {
         }
         None => None,
     };
-    if claim_requires_probe_identity(args.claim) && probe_identity.is_none() {
+    let stimulus_identity = args
+        .stimulus_identity
+        .as_deref()
+        .map(|path| -> Result<ExternalStimulusIdentity> {
+            let identity =
+                serde_json::from_slice(&read_regular(path, Some(MAX_PROBE_IDENTITY_BYTES))?)?;
+            validate_stimulus_identity(&args.run_dir, &identity, args.claim_scope.as_ref())?;
+            Ok(identity)
+        })
+        .transpose()?;
+    if claim_requires_probe_identity(args.claim)
+        && probe_identity.is_none()
+        && stimulus_identity.is_none()
+    {
         bail!("behavioral app evidence requires --probe-identity");
     }
 
     let artifact = read_regular(&args.input, Some(MAX_IMPORTED_ARTIFACT_BYTES))?;
+    if let Some(ExternalStimulusIdentity::NativeProcess(identity)) = &stimulus_identity {
+        validate_native_observation(&artifact, identity, args.claim_scope.as_ref())?;
+    }
     let artifact_sha256 = hash_bytes(&artifact);
     let external_dir = args.run_dir.join("external-evidence");
     ensure_private_directory(&external_dir)?;
@@ -283,7 +368,12 @@ fn import(args: ImportArgs) -> Result<()> {
     require_missing_import_destination(&artifact_path)?;
     require_missing_import_destination(&annotation_path)?;
     let annotation = ExternalEvidence {
-        schema: "neutron.external-evidence/v1".into(),
+        schema: if stimulus_identity.is_some() {
+            "neutron.external-evidence/v2"
+        } else {
+            "neutron.external-evidence/v1"
+        }
+        .into(),
         id: args.id,
         subject_id: args.subject_id,
         measured_by: "external_probe".into(),
@@ -294,6 +384,7 @@ fn import(args: ImportArgs) -> Result<()> {
         health_status: args.health_status,
         claim_scope: args.claim_scope,
         probe_identity,
+        stimulus_identity,
     };
     let mut artifact_created = false;
     let mut annotation_created = false;
@@ -317,10 +408,11 @@ fn import(args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
-fn verify_external_evidence(run_dir: &Path) -> Result<()> {
+fn verify_external_evidence(run_dir: &Path) -> Result<Vec<ExternalEvidence>> {
+    let mut annotations = Vec::new();
     let external_dir = run_dir.join("external-evidence");
     match fs::symlink_metadata(&external_dir) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(annotations),
         Err(error) => return Err(error).context("inspecting external-evidence"),
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             bail!("external-evidence must be a real directory")
@@ -407,10 +499,22 @@ fn verify_external_evidence(run_dir: &Path) -> Result<()> {
             MAX_ANNOTATION_BYTES,
         )?)
         .with_context(|| format!("parsing {}", path.display()))?;
-        if annotation.schema != "neutron.external-evidence/v1"
-            || annotation.measured_by != "external_probe"
+        if !matches!(
+            annotation.schema.as_str(),
+            "neutron.external-evidence/v1" | "neutron.external-evidence/v2"
+        ) || annotation.measured_by != "external_probe"
         {
             bail!("invalid external evidence contract in {}", path.display());
+        }
+        if (annotation.schema == "neutron.external-evidence/v1"
+            && annotation.stimulus_identity.is_some())
+            || (annotation.schema == "neutron.external-evidence/v2"
+                && (annotation.stimulus_identity.is_none() || annotation.probe_identity.is_some()))
+        {
+            bail!("external evidence revision and stimulus variant disagree");
+        }
+        if let Some(identity) = &annotation.stimulus_identity {
+            validate_stimulus_identity(run_dir, identity, annotation.claim_scope.as_ref())?;
         }
         validate_id(&annotation.id)?;
         validate_label("imported-from", &annotation.imported_from)?;
@@ -434,6 +538,7 @@ fn verify_external_evidence(run_dir: &Path) -> Result<()> {
         }
         if claim_requires_probe_identity(annotation.claim_type)
             && annotation.probe_identity.is_none()
+            && annotation.stimulus_identity.is_none()
         {
             bail!("behavioral app evidence requires a probe_identity");
         }
@@ -442,6 +547,16 @@ fn verify_external_evidence(run_dir: &Path) -> Result<()> {
             bail!("external evidence annotation filename does not match its id");
         }
         let expected_artifact = format!("external-evidence/{}.artifact", annotation.id);
+        if let Some(ExternalStimulusIdentity::NativeProcess(identity)) =
+            &annotation.stimulus_identity
+        {
+            let bytes = read_regular_beneath(
+                run_dir,
+                Path::new(&expected_artifact),
+                MAX_IMPORTED_ARTIFACT_BYTES,
+            )?;
+            validate_native_observation(&bytes, identity, annotation.claim_scope.as_ref())?;
+        }
         if annotation.artifact_path != expected_artifact {
             bail!("external evidence artifact path does not match its id");
         }
@@ -467,11 +582,12 @@ fn verify_external_evidence(run_dir: &Path) -> Result<()> {
                 path.display()
             );
         }
+        annotations.push(annotation);
     }
     if attributed_files != actual_files {
         bail!("external-evidence contains orphan or unattributed files");
     }
-    Ok(())
+    Ok(annotations)
 }
 
 pub fn refresh_checksums(run_dir: &Path) -> Result<()> {
@@ -805,6 +921,97 @@ fn claim_requires_probe_identity(claim: ClaimType) -> bool {
     )
 }
 
+fn validate_stimulus_identity(
+    run_dir: &Path,
+    identity: &ExternalStimulusIdentity,
+    scope: Option<&ExternalClaimScope>,
+) -> Result<()> {
+    match identity {
+        ExternalStimulusIdentity::AndroidApp(identity) => {
+            validate_probe_runtime_identity(identity)?;
+            verify_probe_identity_matches_run(run_dir, identity)
+        }
+        ExternalStimulusIdentity::NativeProcess(identity) => {
+            validate_native_identity(identity)?;
+            let scope = scope.context("native stimulus requires a bounded claim_scope")?;
+            let caller = if identity.uid == 0 {
+                "native_root"
+            } else if identity.uid == 2000 {
+                "native_shell"
+            } else {
+                "native_process"
+            };
+            if scope.caller != caller {
+                bail!("native stimulus caller must be {caller}; native evidence cannot support an ordinary-app claim");
+            }
+            let manifest: crate::run_manifest::RunManifest = serde_json::from_slice(
+                &read_regular_beneath(run_dir, Path::new("manifest.json"), MAX_MANIFEST_BYTES)?,
+            )?;
+            if manifest.device.boot_id.as_deref() != Some(identity.device_boot_id.as_str()) {
+                bail!("native identity boot does not match run manifest");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_native_identity(identity: &NativeProcessRuntimeIdentity) -> Result<()> {
+    if identity.schema != "neutron.native-process-runtime/v1"
+        || !is_lower_uuid(&identity.device_boot_id)
+        || identity.pid == 0
+        || identity.starttime == 0
+    {
+        bail!("invalid native schema, boot, or process incarnation");
+    }
+    validate_label("native executable", &identity.executable_path)?;
+    if !identity.executable_path.starts_with('/') {
+        bail!("native executable must be absolute");
+    }
+    validate_lower_hex("native binary_sha256", &identity.binary_sha256, 64)?;
+    if let Some(build_id) = &identity.build_id {
+        if build_id.is_empty() || build_id.len() > 128 || build_id.len() % 2 != 0 {
+            bail!("invalid native build ID");
+        }
+        validate_lower_hex("native build_id", build_id, build_id.len())?;
+    }
+    validate_label("native SELinux domain", &identity.selinux_domain)?;
+    if !identity.selinux_domain.starts_with("u:r:")
+        || identity.selinux_domain.split(':').count() < 4
+    {
+        bail!("native identity needs a complete SELinux process context");
+    }
+    validate_lower_hex(
+        "native effective_capabilities",
+        &identity.effective_capabilities,
+        16,
+    )?;
+    Ok(())
+}
+
+fn validate_native_observation(
+    bytes: &[u8],
+    identity: &NativeProcessRuntimeIdentity,
+    scope: Option<&ExternalClaimScope>,
+) -> Result<()> {
+    let observation: NativeObservation = serde_json::from_slice(bytes)
+        .context("native artifact must be a typed bounded observation")?;
+    let scope = scope.context("native observation has no bounded claim_scope")?;
+    if observation.schema != "neutron.native-stimulus-observation/v1"
+        || &observation.identity != identity
+        || &observation.claim_scope != scope
+        || observation.attempts.len() != scope.attempt_count as usize
+    {
+        bail!("native artifact identity/procedure/attempt bound differs from annotation");
+    }
+    for attempt in observation.attempts {
+        if &attempt.identity != identity {
+            bail!("native attempt boot/incarnation/binary identity changed");
+        }
+        validate_label("native attempt outcome", &attempt.outcome)?;
+    }
+    Ok(())
+}
+
 fn validate_probe_runtime_identity(identity: &ExternalProbeRuntimeIdentity) -> Result<()> {
     if identity.schema != "neutron.external-probe-runtime/v1" {
         bail!("probe identity schema must be neutron.external-probe-runtime/v1");
@@ -940,4 +1147,72 @@ fn verify_subject_if_coverage_present(run_dir: &Path, subject_id: &str) -> Resul
         bail!("subject-id is not present in surface.coverage.json");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn native_attempts_cannot_change_identity_or_borrow_an_app_caller() {
+        let identity: NativeProcessRuntimeIdentity = serde_json::from_value(json!({
+            "schema":"neutron.native-process-runtime/v1",
+            "device_boot_id":"12345678-1234-1234-1234-123456789abc",
+            "pid":42,"starttime":100,"uid":0,"gid":0,
+            "executable_path":"/private/probe","binary_sha256":"a".repeat(64),
+            "build_id":null,"selinux_domain":"u:r:su:s0",
+            "effective_capabilities":"0000000000000000"
+        }))
+        .unwrap();
+        let scope = ExternalClaimScope {
+            procedure: "bounded_lookup".into(),
+            caller: "native_root".into(),
+            attempt_count: 1,
+        };
+        validate_native_identity(&identity).unwrap();
+        let original = json!({"schema":"neutron.native-stimulus-observation/v1",
+            "identity":identity,"claim_scope":scope,
+            "attempts":[{"identity":identity,"outcome":"lookup_observed"}]});
+        validate_native_observation(
+            &serde_json::to_vec(&original).unwrap(),
+            &identity,
+            Some(&scope),
+        )
+        .unwrap();
+        for (field, value) in [
+            (
+                "device_boot_id",
+                json!("87654321-1234-1234-1234-123456789abc"),
+            ),
+            ("starttime", json!(200)),
+            ("binary_sha256", json!("b".repeat(64))),
+            ("selinux_domain", json!("u:r:shell:s0")),
+            ("uid", json!(2000)),
+            ("effective_capabilities", json!("0000000000000001")),
+        ] {
+            let mut changed = original.clone();
+            changed["attempts"][0]["identity"][field] = value;
+            assert!(
+                validate_native_observation(
+                    &serde_json::to_vec(&changed).unwrap(),
+                    &identity,
+                    Some(&scope)
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        let mut app_scope = scope.clone();
+        app_scope.caller = "ordinary_installed_app".into();
+        let result = validate_stimulus_identity(
+            Path::new("/nonexistent"),
+            &ExternalStimulusIdentity::NativeProcess(identity),
+            Some(&app_scope),
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("ordinary-app"));
+        assert!(serde_json::from_value::<ExternalStimulusIdentity>(json!({
+            "kind":"android_app","identity":original["identity"]
+        }))
+        .is_err());
+    }
 }

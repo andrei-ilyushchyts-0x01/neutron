@@ -57,8 +57,11 @@ pub enum SurfaceCommand {
 }
 
 #[derive(Args, Debug)]
-#[command(group(ArgGroup::new("from").args(["from_package", "from_uid"]).multiple(false)))]
+#[command(group(ArgGroup::new("from").args(["from_package", "from_uid", "from_subject"]).multiple(false)))]
 pub struct SurfaceScanArgs {
+    /// Bounded native/system subject, e.g. exe:/system/bin/keystore2.
+    #[arg(long, group = "from", requires = "observe", conflicts_with = "capture")]
+    pub from_subject: Option<RootSelector>,
     /// Import a causal NDJSON capture after static collection (`-` for stdin).
     #[arg(long, conflicts_with = "observe")]
     pub capture: Option<String>,
@@ -101,8 +104,10 @@ pub struct SurfaceExplainArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(group(ArgGroup::new("from").required(true).args(["from_package", "from_uid"]).multiple(false)))]
+#[command(group(ArgGroup::new("from").required(true).args(["from_package", "from_uid", "from_subject"]).multiple(false)))]
 pub struct SurfaceReachableArgs {
+    #[arg(long, group = "from")]
+    pub from_subject: Option<RootSelector>,
     #[arg(long, group = "from")]
     pub from_package: Option<String>,
     #[arg(long, group = "from")]
@@ -310,6 +315,12 @@ pub struct Evidence {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CaptureRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_admissions: Vec<crate::subject::ResolvedSubject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<crate::subject::ResolvedSubject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_pid: Option<u32>,
     pub id: String,
     pub trace_id: String,
     pub scenario_id: String,
@@ -324,20 +335,7 @@ pub struct CaptureRecord {
     pub health: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RootSelector {
-    Package(String),
-    Uid(u32),
-}
-
-impl RootSelector {
-    fn id(&self) -> String {
-        match self {
-            Self::Package(package) => format!("package:{package}"),
-            Self::Uid(uid) => format!("uid:{uid}"),
-        }
-    }
-}
+pub use crate::subject::SubjectSelector as RootSelector;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReachableResult {
@@ -425,9 +423,10 @@ pub fn run(command: SurfaceCommand) -> Result<()> {
         }
         SurfaceCommand::Reachable(args) => {
             let snapshot = read_snapshot(&args.io.input)?;
-            let selector = match (args.from_package, args.from_uid) {
-                (Some(package), None) => RootSelector::Package(package),
-                (None, Some(uid)) => RootSelector::Uid(uid),
+            let selector = match (args.from_package, args.from_uid, args.from_subject) {
+                (Some(package), None, None) => RootSelector::Package(package),
+                (None, Some(uid), None) => RootSelector::Uid(uid),
+                (None, None, Some(subject)) => subject,
                 _ => bail!("reachable requires exactly one --from-package or --from-uid"),
             };
             let result = reachable(&snapshot, &selector)?;
@@ -439,9 +438,10 @@ pub fn run(command: SurfaceCommand) -> Result<()> {
 
 fn run_scan(args: SurfaceScanArgs) -> Result<()> {
     let observed_capture = if let Some(duration) = args.observe.as_deref() {
-        let selector = match (args.from_package, args.from_uid) {
-            (Some(package), None) => RootSelector::Package(package),
-            (None, Some(uid)) => RootSelector::Uid(uid),
+        let selector = match (args.from_package, args.from_uid, args.from_subject) {
+            (Some(package), None, None) => RootSelector::Package(package),
+            (None, Some(uid), None) => RootSelector::Uid(uid),
+            (None, None, Some(subject)) => subject,
             _ => bail!("--observe requires exactly one --from-package or --from-uid"),
         };
         Some(observe(parse_duration(duration)?, &selector)?)
@@ -1443,6 +1443,9 @@ fn make_relation(
 
 #[derive(Clone, Debug, Default)]
 struct TraceRoot {
+    subject_admissions: Vec<crate::subject::ResolvedSubject>,
+    subject: Option<crate::subject::ResolvedSubject>,
+    pid: Option<u32>,
     scenario_id: String,
     package: Option<String>,
     uid: Option<u32>,
@@ -1499,6 +1502,8 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             continue;
         };
         let root = roots.entry(trace_id.clone()).or_default();
+        root.subject = marker.subject.clone().or(root.subject.clone());
+        root.pid = marker.root_pid.or(root.pid);
         if marker.phase.as_deref() == Some("start") || root.scenario_id.is_empty() {
             root.scenario_id = marker
                 .scenario_id
@@ -1510,6 +1515,19 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
         }
         if marker.root_uid.is_some() {
             root.uid = marker.root_uid;
+        }
+    }
+    for (trace_id, admissions) in &capture.subject_admissions {
+        if let Some(root) = roots.get_mut(trace_id) {
+            root.subject_admissions = admissions
+                .iter()
+                .filter(|admission| {
+                    root.subject
+                        .as_ref()
+                        .is_some_and(|subject| subject.selector == admission.selector)
+                })
+                .cloned()
+                .collect();
         }
     }
     for binder in &capture.binders {
@@ -1573,6 +1591,9 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             root.scenario_id.clone()
         };
         snapshot.captures.push(CaptureRecord {
+            subject_admissions: root.subject_admissions.clone(),
+            subject: root.subject.clone(),
+            root_pid: root.pid,
             id: format!("capture:{trace_id}:{scenario_id}"),
             trace_id: trace_id.clone(),
             scenario_id,
@@ -1615,7 +1636,21 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             merge_confidence,
             binder.ts_ns,
         );
-        if let Some(root_id) = root_id(&root) {
+        let is_root_caller = root.subject.as_ref().map_or_else(
+            || {
+                root.pid.map_or(
+                    binder.depth.is_some_and(|depth| depth <= 1) && binder.reply != Some(true),
+                    |pid| pid == binder.caller_pid,
+                )
+            },
+            |subject| {
+                std::iter::once(subject)
+                    .chain(&root.subject_admissions)
+                    .flat_map(|subject| &subject.roots)
+                    .any(|process| process.pid == binder.caller_pid)
+            },
+        );
+        if let Some(root_id) = root_id(&root).filter(|_| is_root_caller) {
             snapshot.relations.push(make_relation(
                 "root_process",
                 &root_id,
@@ -1756,6 +1791,13 @@ pub fn import_capture<R: BufRead>(snapshot: &mut SurfaceSnapshot, reader: R) -> 
             "ioctl" => "ioctl",
             _ if syscall.ioctl_cmd.is_some() => "ioctl",
             _ => continue,
+        };
+        // A refreshed FD hint still has a proc/event race. Legacy hints have no
+        // freshness proof either; neither can supply exact resource attribution.
+        let process_confidence = if access_type == "open" && syscall.fd_binding_source.is_none() {
+            process_confidence
+        } else {
+            "candidate".to_string()
         };
         let Some(device_id) = syscall
             .fd_path
@@ -1986,6 +2028,7 @@ fn relation_name(relation: crate::capture_normalize::CausalRelation) -> &'static
     match relation {
         crate::capture_normalize::CausalRelation::Exact => "exact",
         crate::capture_normalize::CausalRelation::Inferred => "inferred",
+        crate::capture_normalize::CausalRelation::Unknown => "unknown",
     }
 }
 
@@ -2272,10 +2315,14 @@ fn resource_suffix(syscall: &crate::capture_normalize::SyscallSpan) -> String {
 }
 
 fn root_id(root: &TraceRoot) -> Option<String> {
+    if let Some(subject) = &root.subject {
+        return Some(subject.selector.id());
+    }
     root.package
         .as_ref()
         .map(|package| format!("package:{package}"))
         .or_else(|| root.uid.map(|uid| format!("uid:{uid}")))
+        .or_else(|| root.pid.map(|pid| format!("pid:{pid}")))
 }
 
 fn capture_process(
@@ -2469,18 +2516,17 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
     let matching_captures: Vec<_> = snapshot
         .captures
         .iter()
-        .filter(|capture| match selector {
-            RootSelector::Package(package) => capture.root_package.as_deref() == Some(package),
-            RootSelector::Uid(uid) => capture.root_uid == Some(*uid),
+        .filter(|capture| {
+            selector.matches_capture(
+                capture.subject.as_ref(),
+                capture.root_package.as_deref(),
+                capture.root_uid,
+                capture.root_pid,
+            )
         })
         .collect();
-    let trace_ids: BTreeSet<String> = snapshot
-        .captures
+    let trace_ids: BTreeSet<String> = matching_captures
         .iter()
-        .filter(|capture| match selector {
-            RootSelector::Package(package) => capture.root_package.as_deref() == Some(package),
-            RootSelector::Uid(uid) => capture.root_uid == Some(*uid),
-        })
         .map(|capture| capture.trace_id.clone())
         .collect();
     let causal: Vec<Relation> = snapshot
@@ -2512,7 +2558,12 @@ pub fn reachable(snapshot: &SurfaceSnapshot, selector: &RootSelector) -> Result<
     loop {
         let before = nodes.len();
         for relation in &causal {
-            if nodes.contains(&relation.from) {
+            if nodes.contains(&relation.from)
+                && matches!(
+                    relation.causal_relation.as_deref(),
+                    Some("exact" | "inferred")
+                )
+            {
                 nodes.insert(relation.to.clone());
             }
         }
@@ -2929,6 +2980,9 @@ where
         }
         RootSelector::Uid(uid) => {
             command.args(["--root-uid", &uid.to_string()]);
+        }
+        subject => {
+            command.args(["--subject", &subject.id()]);
         }
     }
     command

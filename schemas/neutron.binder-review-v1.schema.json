@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Unreviewed Binder endpoint evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "capture_sha256",
+    "capture_identity",
+    "endpoints",
+    "instructions"
+  ],
+  "properties": {
+    "schema": {
+      "const": "neutron.binder-review/v1"
+    },
+    "capture_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "capture_identity": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "boot_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "endpoints": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "service",
+            "observed_codes",
+            "status_counts",
+            "candidates",
+            "source_records",
+            "review_status"
+          ],
+          "properties": {
+            "service": {
+              "const": ""
+            },
+            "observed_codes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "status_counts": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "candidates": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string"
+              }
+            },
+            "source_records": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "review_status": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "instructions": {
+      "type": "string"
+    }
+  }
+}

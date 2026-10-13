@@ -281,8 +281,9 @@ parse failures make the snapshot `degraded`.
 
 Run live observation in one host job and repeatedly trigger a KeyMint
 operation while that job is active. The command has no external readiness
-signal: static collection precedes the child trace, so a fixed sleep is only a
-heuristic. This example assumes the probe performs the operation from
+signal: observation precedes static collection, which revalidates process
+identity after the child trace. A fixed sleep is only a heuristic; use the
+marker control socket to establish a bounded scenario. This example assumes the probe performs the operation from
 `.KeyMintSmokeActivity`:
 
 ```bash
@@ -414,3 +415,47 @@ test "$(jq length /tmp/neutron-bpf-before.json)" = \
 The device does not ship `bpftool` by default. A changed total can also mean
 another system component loaded/unloaded BPF during the window, so repeat on an
 idle device before diagnosing a neutron leak.
+
+Native/system subject workflows and the pending ABI 3 qualification gate are
+documented in [Native and system subjects](../guides/system-subjects.md). Existing
+firmware qualification rows above retain their original scope.
+
+
+## October 2026 ABI 3 validation
+
+On 2026-10-13, an authorized rooted Pixel 8 Pro running Android 17
+`google/husky/husky:17/CP3A.260905.009/16091614:user/release-keys`, kernel
+`6.1.162-android14-11-g2ec90535fa34-ab15810641`, exercised the 1.6 development
+payload with ABI 3. Device identity, payload hashes, doctor JSON and raw captures
+are retained privately; they are not repository fixtures.
+
+- Both stackless and stack-enabled doctor smoke passed layout/ABI validation, load/attach, exact sentinel
+  delivery, per-CPU health and cleanup. Private storage write/sync/remove passed.
+- A paired shell-UID scenario invoked `service check
+  android.system.keystore2.IKeystoreService/default`. Binder and ioctl observations
+  were captured and the five-artifact bundle passed `evidence verify`.
+- That capture reconciled 87 submitted records as 84 received plus 3 discarded at
+  shutdown. Health remained incomplete, so integrity success does not authorize
+  absence claims. This exercise found and fixed double counting of synthetic
+  process-death notifications as ring records.
+- The native `leader-exit` probe recorded the leader task exit, a subsequent
+  worker `openat` of its sentinel, the worker task exit and one confirmed process
+  death with unknown status. Its unmarked capture was correctly refused a bundle
+  seal. This is positive lifecycle evidence, not complete scenario qualification.
+- Device-generated graph v3 preserved exact/inferred distinctions and identified
+  the input by its exact SHA-256. Reviewed Binder maps accepted matching capture
+  identity, rejected a different capture, and rejected duplicate endpoint keys.
+  The review fixture exercised binding rules, not independently verified service
+  semantics; legacy labels remained candidates.
+
+Reproduce in an owned private directory using the commands in
+[Observability](../guides/observability.md), paired control-socket markers, and
+`--root-uid 2000 --follow-binder --match-syscall 29 --raw --no-findings
+--no-logcat --tombstone-dir "" --fdgraph-interval off`. Stop and wait for the
+tracer before verifying; retain both successful and incomplete runs.
+
+This evidence does not qualify handler outcomes, HAL/driver reachability, full
+async delegation, other firmware, source-failure coverage or overhead. Qualify
+an exact final release payload separately. Existing automatic test expectations
+for graph/Binder contracts were deliberately left untouched; compilation and
+manual device checks do not establish that the automatic suite passes.
