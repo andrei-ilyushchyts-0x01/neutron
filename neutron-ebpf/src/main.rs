@@ -1634,6 +1634,8 @@ fn try_binder_received(ctx: &TracePointContext) -> Result<(), ()> {
         let _ = BINDER_TRANSACTION_CONTEXT.remove(&(debug_id as u32));
     }
     let transaction = transaction.filter(|context| active_causal_context_matches(context.process));
+    // A new dequeue ends the prior context even when this transaction was not observed.
+    let _ = THREAD_BINDER_CONTEXT.remove(&pid_tgid);
     if let Some(context) = transaction {
         if context.flags & 1 == 0 {
             let thread = BinderThreadContext {

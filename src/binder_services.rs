@@ -87,6 +87,7 @@ struct ReviewedContext {
     capture_sha256: String,
     boot_id: String,
     fingerprint: String,
+    #[serde(deserialize_with = "deserialize_starttimes")]
     process_starttimes: BTreeMap<u32, u64>,
     review_evidence: String,
 }
@@ -97,6 +98,22 @@ struct ReviewedMap {
     schema: String,
     context: ReviewedContext,
     services: UniqueMap<UniqueMap<String>>,
+}
+
+fn deserialize_starttimes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<u32, u64>, D::Error> {
+    let raw = <UniqueMap<u64> as serde::Deserialize>::deserialize(deserializer)?;
+    let mut result = BTreeMap::new();
+    for (key, starttime) in raw.0 {
+        let pid: u32 = key.parse().map_err(serde::de::Error::custom)?;
+        if pid == 0 || starttime == 0 || result.insert(pid, starttime).is_some() {
+            return Err(serde::de::Error::custom(
+                "invalid or duplicate process incarnation",
+            ));
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -516,6 +533,8 @@ impl BinderServiceMap {
         &mut self,
         capture: &crate::capture_normalize::NormalizedCapture,
     ) -> Result<()> {
+        self.capture_bound = false;
+        self.live_bound = false;
         if let Some(context) = &self.context {
             let health = capture
                 .health
@@ -533,6 +552,8 @@ impl BinderServiceMap {
     }
 
     pub fn bind_live(&mut self) -> Result<()> {
+        self.capture_bound = false;
+        self.live_bound = false;
         if let Some(context) = &self.context {
             let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
             let output =

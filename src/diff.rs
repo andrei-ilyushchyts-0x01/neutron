@@ -369,6 +369,11 @@ pub fn run(args: DiffArgs) -> Result<()> {
     if !baseline_passport.bounded_claims_eligible || !test_passport.bounded_claims_eligible {
         bail!("capture became nonconclusive during aggregation; refusing to emit deltas");
     }
+    if baseline_passport.effective_scope.as_ref() != Some(&baseline_scope)
+        || test_passport.effective_scope.as_ref() != Some(&test_scope)
+    {
+        bail!("capture scope changed during aggregation; refusing to emit deltas");
+    }
     let rows = diff(&baseline, &test);
     let table =
         format!(

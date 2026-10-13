@@ -93,6 +93,8 @@ impl CapturePassport {
 
 #[derive(Debug)]
 struct Step {
+    pid: u32,
+    receiver: Option<u32>,
     trace: String,
     span: String,
     parent: Option<String>,
@@ -100,6 +102,31 @@ struct Step {
     relation: CausalRelation,
     kind: &'static str,
     label: String,
+}
+
+impl Step {
+    fn alternatives(&self, steps: &[Self]) -> String {
+        let candidates: Vec<_> = steps
+            .iter()
+            .filter(|candidate| {
+                candidate.trace == self.trace
+                    && candidate.receiver == Some(self.pid)
+                    && candidate.span != self.span
+                    && Some(candidate.span.as_str()) != self.parent.as_deref()
+                    && candidate
+                        .ts
+                        .zip(self.ts)
+                        .is_some_and(|(delivery, event)| delivery <= event)
+            })
+            .take(8)
+            .map(|candidate| markdown(&candidate.span))
+            .collect();
+        if candidates.is_empty() {
+            "none in this overview".into()
+        } else {
+            candidates.join(", ")
+        }
+    }
 }
 
 /// A bounded overview of recorded causal spans, with references into the hashed input.
@@ -125,7 +152,7 @@ pub(crate) fn narrative(
     let mut steps = Vec::new();
     for span in &capture.binders {
         if let (Some(trace), Some(id)) = (&span.trace_id, &span.span_id) {
-            steps.push(Step { trace: trace.clone(), span: id.clone(), parent: span.parent_span_id.clone(),
+            steps.push(Step { pid: span.caller_pid, receiver: Some(span.callee_pid), trace: trace.clone(), span: id.clone(), parent: span.parent_span_id.clone(),
                 ts: span.ts_ns, relation: span.relation, kind: "Binder",
                 label: format!("PID {} → PID {}, Binder code {}, delivery={}, service={} (attribution={}); dequeue does not prove method completion",
                     span.caller_pid, span.callee_pid, span.code.map_or("unknown".into(), |v| v.to_string()),
@@ -137,6 +164,8 @@ pub(crate) fn narrative(
     for span in &capture.syscalls {
         if let (Some(trace), Some(id)) = (&span.trace_id, &span.span_id) {
             steps.push(Step {
+                pid: span.pid,
+                receiver: None,
                 trace: trace.clone(),
                 span: id.clone(),
                 parent: span.parent_span_id.clone(),
@@ -149,7 +178,9 @@ pub(crate) fn narrative(
                     span.tid,
                     span.name,
                     span.phase,
-                    span.ret.map_or("not observed".into(), |v| v.to_string()),
+                    span.ret
+                        .filter(|_| span.is_exit())
+                        .map_or("not observed".into(), |v| v.to_string()),
                     span.fd_path.as_deref().unwrap_or("unknown"),
                     span.fd_binding_confidence.as_deref().unwrap_or("unknown")
                 ),
@@ -212,17 +243,35 @@ pub(crate) fn narrative(
     }
     best.reverse();
     output.push_str("**Best-supported displayed chain** (within the overview limit; edge confidence is preserved):\n\n");
-    for i in best {
+    if best_rank.is_some_and(|rank| rank.0) {
+        output.push_str("Ancestry is incomplete: a parent is missing from the overview or a cycle was encountered.\n\n");
+    }
+    if best.len() > 64 {
+        output.push_str(
+            "Chain shortened to its first 64 spans; see the raw capture for the remainder.\n\n",
+        );
+    }
+    for &i in best.iter().take(64) {
         let step = &steps[i];
+        let boundary = match step.parent.as_deref() {
+            Some(parent) if !index.contains_key(&(step.trace.as_str(), parent)) => {
+                "; parent outside overview or missing"
+            }
+            _ => "",
+        };
         output.push_str(&format!(
-            "- {} — {:?}; source trace `{}`, span `{}`.\n",
+            "- {} — {:?}{}; source trace `{}`, span `{}`.\n",
             markdown(&step.label),
             step.relation,
+            boundary,
             markdown(&step.trace),
             markdown(&step.span)
         ));
+        if step.relation == CausalRelation::Inferred {
+            output.push_str(&format!("  Process/follow context is a candidate only; queue ownership and unrelated work are unresolved. Other observed same-PID delivery spans (up to 8, not established parents): {}.\n", step.alternatives(&steps)));
+        }
     }
-    output.push_str("\n**Timeline by trace** — capture monotonic nanoseconds; separate traces are not a shared semantic action.\n\n| Timestamp ns | Boundary | Causal evidence | Input records |\n|---|---|---|---|\n");
+    output.push_str("\n**Timeline by trace** — capture monotonic nanoseconds; separate traces are not a shared semantic action.\n\n| Timestamp ns | Boundary | Causal evidence | Input records | Other same-PID deliveries (candidates only, max 8) |\n|---|---|---|---|---|\n");
     for step in steps.iter().take(64) {
         let refs = capture
             .source_records
@@ -232,7 +281,7 @@ pub(crate) fn narrative(
             .as_ref()
             .is_some_and(|parent| !index.contains_key(&(step.trace.as_str(), parent.as_str())));
         output.push_str(&format!(
-            "| {} | {} | {:?}{}; trace {}; span {}; parent {} | {} |\n",
+            "| {} | {} | {:?}{}; trace {}; span {}; parent {} | {} | {} |\n",
             step.ts.map_or("unknown".into(), |v| v.to_string()),
             markdown(&step.label),
             step.relation,
@@ -249,7 +298,12 @@ pub(crate) fn narrative(
                 .take(8)
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
-                .join(", "))
+                .join(", ")),
+            if step.relation == CausalRelation::Inferred {
+                step.alternatives(&steps)
+            } else {
+                "not inferred".into()
+            }
         ));
     }
     output.push_str(&format!("\nShowing {} of {total} causal spans; chain selection examines at most 512. Input record numbers refer to the capture SHA-256 in the passport. Other branches and raw events remain in that capture.\n\n", steps.len().min(64)));

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.6.0] — 2026-10-13
 
+- Preserved unknown producer confidence; cleared stale Binder thread context on
+  unmatched dequeues. Incomplete report chains retain missing-parent notices,
+  bounded length and explicit alternatives for inferred ancestry.
+- Rejected duplicate reviewed process incarnations and invalidated previous map
+  bindings before rebinding; rechecked effective diff scope after aggregation.
+- Separated asset packaging from automatic test execution; normal CI gates
+  remain unchanged. This release is a prerelease while legacy test contracts
+  and the broader device/async qualification matrix remain outstanding.
+
 - Fixed live event reconciliation counting confirmed process death twice, once
   as a kernel task-exit event and again as a synthesized userspace record.
 - Added a shared capture passport to reports, graph v3 and summaries, retaining

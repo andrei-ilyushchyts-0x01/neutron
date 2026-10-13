@@ -74,3 +74,22 @@ caps, TTL, scope filters, dropped events and unavailable sources remain in the
 passport. Exact edges require producer evidence; a nearby syscall in the same
 process is not upgraded to exact. Unobserved or competing queued work stays unknown
 or inferred. The framework does not claim a complete Android execution trace.
+
+
+## Correlation boundaries in 1.6
+
+Unknown or invalid producer relation values stay unknown. Every Binder dequeue
+clears the receiving thread's previous synchronous context before installing a
+matching observed transaction. A missing transaction or one-way dequeue cannot
+inherit an earlier exact parent. Nested callbacks may consequently lose exact
+ancestry when the outer context cannot be reconstructed; they are not guessed.
+
+The report limits both its selected chain and timeline to 64 spans. Missing
+parents stay visible in the selected chain. Inferred chain steps list up to eight
+other observed same-PID delivery spans as review candidates; these are not new
+causal edges and do not prove queue ownership or a matching process incarnation.
+An enter-only syscall has no observed return value.
+
+Reviewed Binder maps reject duplicate process identities, including numeric PID
+aliases. Attempting to rebind a map invalidates its previous exact status before
+checking the new context, so a failed rebind cannot retain old trust.

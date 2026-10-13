@@ -21,9 +21,10 @@ pub const DEFAULT_CONTROL_SOCKET: &str = "/data/local/share/neutron/runtime/neut
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CausalRelation {
-    #[default]
     Exact,
     Inferred,
+    #[default]
+    Unknown,
 }
 
 impl CausalRelation {
@@ -31,6 +32,7 @@ impl CausalRelation {
         match self {
             Self::Exact => "exact",
             Self::Inferred => "inferred",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -38,14 +40,15 @@ impl CausalRelation {
         match self {
             Self::Exact => CAUSAL_RELATION_EXACT,
             Self::Inferred => CAUSAL_RELATION_INFERRED,
+            Self::Unknown => 0,
         }
     }
 
     fn from_wire(value: u8) -> Self {
-        if value == CAUSAL_RELATION_INFERRED {
-            Self::Inferred
-        } else {
-            Self::Exact
+        match value {
+            CAUSAL_RELATION_EXACT => Self::Exact,
+            CAUSAL_RELATION_INFERRED => Self::Inferred,
+            _ => Self::Unknown,
         }
     }
 }

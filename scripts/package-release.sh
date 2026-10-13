@@ -123,7 +123,8 @@ echo "==> Building research probe APK"
 GRADLE_DEPENDENCIES="$DIST/gradle-dependencies.json"
 (
   cd probe-app
-  ./gradlew --no-daemon testDebugUnitTest assembleDebug neutronResolvedDependencies \
+  # Verification is a separate CI gate; packaging only builds and identifies assets.
+  ./gradlew --no-daemon assembleDebug neutronResolvedDependencies \
     -PneutronDependencyOutput="$GRADLE_DEPENDENCIES"
 )
 
