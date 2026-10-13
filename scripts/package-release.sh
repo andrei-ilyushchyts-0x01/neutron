@@ -560,17 +560,27 @@ JAVA_RUNTIME=$(printf '%s\n' "$JAVA_PROPERTIES" | sed -n 's/^ *java\.runtime\.ve
 JAVA_VENDOR=$(printf '%s\n' "$JAVA_PROPERTIES" | sed -n 's/^ *java\.vendor = //p' | head -n 1)
 AAPT2_VERSION=$(aapt2 version 2>&1 | head -n 1)
 APKSIGNER_VERSION=$(apksigner --version 2>&1 | head -n 1)
-RUNNER_IMAGE_OS=${ImageOS:-local-$(uname -s)}
-RUNNER_IMAGE_VERSION=${ImageVersion:-unqualified}
-BUILD_RUNNER_ARCH=${RUNNER_ARCH:-$(uname -m)}
-BUILD_RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-local}
-if [[ "$STRICT_RELEASE" == "true" ]]; then
+if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
   for required in ImageOS ImageVersion RUNNER_ARCH RUNNER_ENVIRONMENT; do
     if [[ -z "${!required:-}" ]]; then
       echo "signed release builds require exact GitHub runner identity in $required" >&2
       exit 1
     fi
   done
+  RUNNER_IMAGE_OS=$ImageOS
+  RUNNER_IMAGE_VERSION=$ImageVersion
+  BUILD_RUNNER_ARCH=$RUNNER_ARCH
+  BUILD_RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT
+else
+  # Local signatures authenticate the builder's measurements, not a GitHub attestation.
+  if [[ ! -r /etc/os-release ]]; then
+    echo "local release provenance requires readable /etc/os-release" >&2
+    exit 1
+  fi
+  RUNNER_IMAGE_OS="local-$(uname -s)"
+  RUNNER_IMAGE_VERSION="$(uname -r):os-release-sha256=$(sha256sum /etc/os-release | cut -d ' ' -f 1)"
+  BUILD_RUNNER_ARCH=$(uname -m)
+  BUILD_RUNNER_ENVIRONMENT=local
 fi
 for value in \
   "$GRADLE_VERSION" "$GRADLE_SHA256" "$AGP_VERSION" \

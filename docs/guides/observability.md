@@ -93,3 +93,12 @@ An enter-only syscall has no observed return value.
 Reviewed Binder maps reject duplicate process identities, including numeric PID
 aliases. Attempting to rebind a map invalidates its previous exact status before
 checking the new context, so a failed rebind cannot retain old trust.
+
+## Release provenance
+
+`scripts/package-release.sh` builds and signs assets; CI runs verification as a
+separate gate. Signed local builds retain approved key and probe-certificate
+checks, record the actual architecture, kernel and OS-release digest, and identify
+their builder as `local`. They do not claim a GitHub Actions attestation. Builds
+inside GitHub Actions still require the exact runner metadata. A signature proves
+artifact origin and integrity; it does not prove passing tests or device support.
