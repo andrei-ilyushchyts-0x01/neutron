@@ -986,7 +986,7 @@ fn capture_can_create_services_from_exact_or_single_candidate_evidence() {
         .health
         .warnings
         .iter()
-        .any(|warning| warning.contains("missing process endpoint")));
+        .any(|warning| warning.contains("invalid required fields")));
 }
 
 #[test]
