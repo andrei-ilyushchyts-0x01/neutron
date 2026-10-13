@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use neutron::binder_services::{
-    parse_lshal, AttributionConfidence, BinderCatalog, BinderMethodMap, BinderServiceMap,
+    parse_lshal, AttributionConfidence, BinderCatalog, BinderMethodMap,
 };
 use neutron::causal::{
     enrich_json, CausalMetadata, CausalRelation, CausalWire, ControlServer, MarkRequest,
@@ -144,7 +144,24 @@ fn service_and_lshal_catalogs_keep_ambiguous_candidates_honest() {
         &vec!["android.hardware.camera.provider@2.7::ICameraProvider/default".to_string()]
     );
 
-    let exact = BinderServiceMap::from_json(r#"{"300":{"7":"verified.camera/default"}}"#).unwrap();
+    let capture = neutron::capture_normalize::normalize_capture(std::io::Cursor::new(
+        r#"{"type":"capture_health","boot_id":"test-boot","fingerprint":"test-build"}"#,
+    ))
+    .unwrap();
+    let mut exact = neutron::binder_services::BinderServiceMap::from_json(
+        &serde_json::json!({
+            "schema": "neutron.binder-services/v1",
+            "context": {
+                "capture_sha256": capture.capture_sha256,
+                "boot_id": "test-boot", "fingerprint": "test-build",
+                "process_starttimes": {}, "review_evidence": "reviewed fixture"
+            },
+            "services": {"300":{"7":"verified.camera/default"}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    exact.bind_capture(&capture).unwrap();
     let methods =
         BinderMethodMap::from_json(r#"{"verified.camera/default":{"1":"connect"}}"#).unwrap();
 
@@ -347,7 +364,7 @@ fn json_graph_is_versioned_and_collapses_repeated_syscalls() {
     .unwrap();
     let graph: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(graph["schema"], "neutron.causal-graph/v2");
+    assert_eq!(graph["schema"], "neutron.causal-graph/v3");
     let syscalls: Vec<_> = graph["nodes"]
         .as_array()
         .unwrap()

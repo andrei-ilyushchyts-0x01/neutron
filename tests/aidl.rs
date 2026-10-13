@@ -5,7 +5,7 @@ use clap::Parser;
 use neutron::aidl::{
     decode_plugin, index_catalog, run_decode, AidlCatalog, DecodeArgs, IndexArgs, ParcelView,
 };
-use neutron::binder_services::{BinderCatalog, BinderMethodMap, BinderServiceMap};
+use neutron::binder_services::{BinderCatalog, BinderMethodMap};
 use neutron::cli::{AidlCommand, Cli, Command};
 use neutron::format::format_binder_call_json_with_attribution;
 use neutron::report::{render_report_from_reader, ReportOptions};
@@ -103,10 +103,24 @@ fn cli_registers_aidl_index_decode_and_trace_catalog() {
 #[test]
 fn exact_descriptor_resolves_catalog_but_candidates_never_guess_method() {
     let aidl = catalog();
-    let exact = BinderServiceMap::from_json(
-        r#"{"300":{"7":"android.hardware.security.keymint.IKeyMintDevice/default"}}"#,
+    let capture = neutron::capture_normalize::normalize_capture(std::io::Cursor::new(
+        r#"{"type":"capture_health","boot_id":"test-boot","fingerprint":"test-build"}"#,
+    ))
+    .unwrap();
+    let mut exact = neutron::binder_services::BinderServiceMap::from_json(
+        &serde_json::json!({
+            "schema": "neutron.binder-services/v1",
+            "context": {
+                "capture_sha256": capture.capture_sha256,
+                "boot_id": "test-boot", "fingerprint": "test-build",
+                "process_starttimes": {}, "review_evidence": "reviewed fixture"
+            },
+            "services": {"300":{"7":"android.hardware.security.keymint.IKeyMintDevice/default"}}
+        })
+        .to_string(),
     )
     .unwrap();
+    exact.bind_capture(&capture).unwrap();
     let legacy = BinderMethodMap::default();
     let mut candidates = BinderCatalog::default();
     candidates.merge_service_list(
@@ -175,10 +189,24 @@ fn exact_descriptor_resolves_catalog_but_candidates_never_guess_method() {
 
 #[test]
 fn conflicting_legacy_method_is_rejected() {
-    let exact = BinderServiceMap::from_json(
-        r#"{"300":{"7":"android.hardware.security.keymint.IKeyMintDevice/default"}}"#,
+    let capture = neutron::capture_normalize::normalize_capture(std::io::Cursor::new(
+        r#"{"type":"capture_health","boot_id":"test-boot","fingerprint":"test-build"}"#,
+    ))
+    .unwrap();
+    let mut exact = neutron::binder_services::BinderServiceMap::from_json(
+        &serde_json::json!({
+            "schema": "neutron.binder-services/v1",
+            "context": {
+                "capture_sha256": capture.capture_sha256,
+                "boot_id": "test-boot", "fingerprint": "test-build",
+                "process_starttimes": {}, "review_evidence": "reviewed fixture"
+            },
+            "services": {"300":{"7":"android.hardware.security.keymint.IKeyMintDevice/default"}}
+        })
+        .to_string(),
     )
     .unwrap();
+    exact.bind_capture(&capture).unwrap();
     let legacy = BinderMethodMap::from_json(
         r#"{"android.hardware.security.keymint.IKeyMintDevice/default":{"1":"deleteKey"}}"#,
     )
@@ -191,7 +219,7 @@ fn conflicting_legacy_method_is_rejected() {
 
 #[test]
 fn report_catalog_resolves_only_exact_service_fields() {
-    let exact = r#"{"type":"binder_call","debug_id":1,"caller_pid":100,"callee_pid":300,"target_node":7,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default"}"#;
+    let exact = r#"{"type":"binder_call","debug_id":1,"caller_pid":100,"callee_pid":300,"target_node":7,"code":1,"attribution_confidence":"exact","service":"android.hardware.security.keymint.IKeyMintDevice/default"}"#;
     let candidate = r#"{"type":"binder_call","debug_id":2,"caller_pid":100,"callee_pid":300,"target_node":8,"code":1,"service":"android.hardware.security.keymint.IKeyMintDevice/default","attribution_confidence":"candidate"}"#;
     let report = render_report_from_reader(
         Cursor::new(format!("{exact}\n{candidate}\n")),
@@ -203,7 +231,7 @@ fn report_catalog_resolves_only_exact_service_fields() {
     )
     .unwrap();
     assert!(report.contains("IKeyMintDevice/default.generateKey"));
-    assert!(report.contains("IKeyMintDevice/default`"));
+    assert!(report.contains("IKeyMintDevice/default [attribution: candidate]"));
 }
 
 fn utf16_token(descriptor: &str) -> Vec<u8> {

@@ -660,10 +660,24 @@ mod binder_call_json_tests {
 
     #[test]
     fn verified_attribution_emits_valid_service_method_json() {
-        let exact = crate::binder_services::BinderServiceMap::from_json(
-            r#"{"200":{"1":"camera/default"}}"#,
+        let capture = crate::capture_normalize::normalize_capture(std::io::Cursor::new(
+            r#"{"type":"capture_health","boot_id":"test-boot","fingerprint":"test-build"}"#,
+        ))
+        .unwrap();
+        let mut exact = crate::binder_services::BinderServiceMap::from_json(
+            &serde_json::json!({
+                "schema": "neutron.binder-services/v1",
+                "context": {
+                    "capture_sha256": capture.capture_sha256,
+                    "boot_id": "test-boot", "fingerprint": "test-build",
+                    "process_starttimes": {}, "review_evidence": "reviewed fixture"
+                },
+                "services": {"200":{"1":"camera/default"}}
+            })
+            .to_string(),
         )
         .unwrap();
+        exact.bind_capture(&capture).unwrap();
         let methods = crate::binder_services::BinderMethodMap::from_json(
             r#"{"camera/default":{"7":"connect"}}"#,
         )

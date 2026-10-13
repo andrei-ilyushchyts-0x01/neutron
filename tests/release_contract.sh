@@ -213,7 +213,7 @@ shipped_release_schemas_are_valid_json() {
 
 ci_runs_for_release_lines_and_assembles_probe() {
     local workflow="$root/.github/workflows/ci.yml"
-    rg -q '(^|[[:space:],\[])dev([[:space:],\]]|$)' "$workflow" &&
+    rg -q '(^|[[:space:],\[])develop([[:space:],\]]|$)' "$workflow" &&
         contains "$workflow" 'release/**' &&
         rg -q '^[[:space:]]*workflow_dispatch:' "$workflow" &&
         contains "$workflow" 'NEUTRON_BUILD_GIT_COMMIT: ${{ github.sha }}' &&

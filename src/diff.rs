@@ -613,7 +613,7 @@ mod tests {
             "{:#}",
             require_complete_capture(Cursor::new(unmarked), "test").unwrap_err()
         )
-        .contains("no paired scenario"));
+        .contains("capture is not conclusive"));
 
         let unfinished = format!(
             "{}\n{}\n{}\n",
@@ -625,7 +625,7 @@ mod tests {
             "{:#}",
             require_complete_capture(Cursor::new(unfinished), "test").unwrap_err()
         )
-        .contains("no matching end"));
+        .contains("capture is not conclusive"));
     }
 
     #[test]
