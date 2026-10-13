@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "neutron",
     disable_version_flag = true,
-    about = "Android kernel-boundary and cross-service causal tracer for authorized security assessment"
+    about = "Android observability CLI for AI agents: syscall and Binder evidence with explicit health, scope and provenance"
 )]
 pub struct Cli {
     /// Print build identity. Combine with --verbose for provenance details.
