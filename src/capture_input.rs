@@ -9,6 +9,45 @@ pub(crate) const MAX_CAPTURE_RECORD_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_CAPTURE_RECORDS: usize = 1_000_000;
 pub(crate) const MAX_CAPTURE_STRING_BYTES: usize = 64 * 1024;
 
+pub(crate) fn valid_binder_record(kind: &str, object: &serde_json::Map<String, Value>) -> bool {
+    let pid = |key| {
+        object
+            .get(key)
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0 && u32::try_from(value).is_ok())
+    };
+    let debug_id = object.get("debug_id").and_then(Value::as_i64);
+    match kind {
+        "binder" => {
+            pid("pid")
+                && debug_id.is_some()
+                && object
+                    .get("to_proc")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|value| u32::try_from(value).is_ok())
+        }
+        "binder_call" => {
+            pid("caller_pid") && pid("callee_pid") && debug_id.is_some_and(|value| value != 0)
+        }
+        "binder_received" => pid("pid") && debug_id.is_some(),
+        _ => false,
+    }
+}
+
+pub(crate) fn unusable_raw_binder_identity(
+    kind: &str,
+    object: &serde_json::Map<String, Value>,
+) -> bool {
+    match kind {
+        "binder" => {
+            object.get("debug_id").and_then(Value::as_i64) == Some(0)
+                || object.get("to_proc").and_then(Value::as_u64) == Some(0)
+        }
+        "binder_received" => object.get("debug_id").and_then(Value::as_i64) == Some(0),
+        _ => false,
+    }
+}
+
 /// Read one newline-delimited record without ever growing `out` beyond the
 /// record limit. The newline itself is consumed but not returned.
 pub(crate) fn read_capture_record<R: BufRead + ?Sized>(

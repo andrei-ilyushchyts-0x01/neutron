@@ -428,7 +428,7 @@ fn collect_snapshot<R: BufRead>(
                 snapshot.malformed_records = snapshot.malformed_records.saturating_add(1);
                 return Ok(());
             }
-            if unusable_raw_binder_identity(kind, obj) {
+            if crate::capture_input::unusable_raw_binder_identity(kind, obj) {
                 snapshot.unusable_binder_identity_records =
                     snapshot.unusable_binder_identity_records.saturating_add(1);
                 if obj.contains_key("scenario_id") || obj.contains_key("trace_id") {
@@ -538,17 +538,9 @@ fn recognized_event_valid(kind: &str, obj: &serde_json::Map<String, Value>) -> b
             crate::capture_normalize::valid_ignorable_record(kind, obj)
         }
         "syscall" => nonzero("pid") && syscall_name(obj).is_some(),
-        "binder" => {
-            nonzero("pid")
-                && u32_field(obj, "to_proc").is_some()
-                && i64_field(obj, "debug_id").is_some()
+        "binder" | "binder_call" | "binder_received" => {
+            crate::capture_input::valid_binder_record(kind, obj)
         }
-        "binder_call" => {
-            nonzero("caller_pid")
-                && nonzero("callee_pid")
-                && i64_field(obj, "debug_id").is_some_and(|value| value != 0)
-        }
-        "binder_received" => nonzero("pid") && i64_field(obj, "debug_id").is_some(),
         "process_exit" | "selinux_denial" | "fd_snapshot" => nonzero("pid"),
         "finding" => str_field(obj, "rule_id").is_some_and(|value| !value.is_empty()),
         "marker" => str_field(obj, "name").is_some_and(|value| !value.is_empty()),
@@ -563,14 +555,6 @@ fn recognized_event_valid(kind: &str, obj: &serde_json::Map<String, Value>) -> b
                 && str_field(obj, "status").is_some()
                 && str_field(obj, "reason").is_some()
         }
-        _ => false,
-    }
-}
-
-fn unusable_raw_binder_identity(kind: &str, obj: &serde_json::Map<String, Value>) -> bool {
-    match kind {
-        "binder" => i64_field(obj, "debug_id") == Some(0) || u32_field(obj, "to_proc") == Some(0),
-        "binder_received" => i64_field(obj, "debug_id") == Some(0),
         _ => false,
     }
 }
@@ -896,8 +880,10 @@ fn render_health(out: &mut String, snapshot: &Snapshot) {
             snapshot.health_records
         ));
     }
-    if let Some(normalized) = &snapshot.normalized.health {
-        status = &normalized.status;
+    if status != "unknown" {
+        if let Some(normalized) = &snapshot.normalized.health {
+            status = &normalized.status;
+        }
     }
     if status != "complete" {
         out.push_str("**WARNING:** capture health is not clean");

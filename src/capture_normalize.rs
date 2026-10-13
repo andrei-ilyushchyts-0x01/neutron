@@ -235,6 +235,8 @@ pub(crate) fn normalize_capture_observing<R: BufRead>(
     let mut malformed_lines = 0_u64;
     let mut invalid_known_records = 0_u64;
     let mut unknown_records = 0_u64;
+    let mut unusable_binder_records = 0_u64;
+    let mut scoped_unusable_binder_records = 0_u64;
     let mut lifecycle = crate::capture_validation::LiveScenarioLifecycle::default();
     let mut health_records = 0_u64;
     let mut final_record_is_health = false;
@@ -328,16 +330,31 @@ pub(crate) fn normalize_capture_observing<R: BufRead>(
         }
 
         match kind {
-            "binder" | "binder_call" => {
+            "binder" | "binder_call" | "binder_received" => {
                 capture.has_causal |= has_causal(object);
-                if !merge_binder(&mut binders, object) {
+                if !crate::capture_input::valid_binder_record(kind, object) {
                     invalid_known_records = invalid_known_records.saturating_add(1);
-                }
-            }
-            "binder_received" => {
-                capture.has_causal |= has_causal(object);
-                if !merge_binder_received(&mut binders, object) {
-                    invalid_known_records = invalid_known_records.saturating_add(1);
+                } else if crate::capture_input::unusable_raw_binder_identity(kind, object) {
+                    unusable_binder_records = unusable_binder_records.saturating_add(1);
+                    if object.contains_key("scenario_id") || object.contains_key("trace_id") {
+                        scoped_unusable_binder_records =
+                            scoped_unusable_binder_records.saturating_add(1);
+                    }
+                    let warning = if kind == "binder" && number_u32(object, "to_proc") == Some(0) {
+                        "ignored Binder span with a missing process endpoint"
+                    } else {
+                        "ignored raw Binder record with an unusable Binder identity"
+                    };
+                    capture.health_warnings.insert(warning.into());
+                } else {
+                    let valid = if kind == "binder_received" {
+                        merge_binder_received(&mut binders, object)
+                    } else {
+                        merge_binder(&mut binders, object)
+                    };
+                    if !valid {
+                        invalid_known_records = invalid_known_records.saturating_add(1);
+                    }
                 }
             }
             "syscall" => {
@@ -427,6 +444,24 @@ pub(crate) fn normalize_capture_observing<R: BufRead>(
                 .insert("ignored syscall span with a missing process endpoint".into());
         } else {
             capture.syscalls.push(syscall);
+        }
+    }
+    let health_scoped_unusable_binders = if capture.scenario_contract.is_some() {
+        scoped_unusable_binder_records
+    } else {
+        unusable_binder_records
+    };
+    if health_scoped_unusable_binders > 0 {
+        if let Some(health) = capture
+            .health
+            .as_mut()
+            .filter(|health| health.status == "complete")
+        {
+            health.status = "unknown".into();
+            health.degraded = true;
+            capture
+                .health_warnings
+                .insert("unusable Binder identity contradicts complete capture health".into());
         }
     }
     if malformed_lines > 0 {

@@ -214,7 +214,8 @@ fn malformed_binder_endpoints_and_oversized_debug_ids_are_ignored() {
     assert!(capture.binders.is_empty());
     assert!(capture
         .health_warnings
-        .contains("ignored Binder span with a missing process endpoint"));
+        .iter()
+        .any(|warning| warning.contains("invalid required fields")));
 }
 
 #[test]

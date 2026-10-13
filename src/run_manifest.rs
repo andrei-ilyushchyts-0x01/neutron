@@ -876,7 +876,7 @@ fn verify_capture_stream(run_dir: &Path, expected_health: &Value) -> Result<()> 
             );
         }
         let scenario_bound = object.contains_key("scenario_id") || object.contains_key("trace_id");
-        if scenario_bound && unusable_raw_binder_identity(kind, object) {
+        if scenario_bound && crate::capture_input::unusable_raw_binder_identity(kind, object) {
             match kind {
                 "binder" => {
                     invalid_binder_caller_records = invalid_binder_caller_records.saturating_add(1);
@@ -957,13 +957,6 @@ fn valid_live_capture_record(kind: &str, object: &serde_json::Map<String, Value>
             .and_then(Value::as_u64)
             .is_some_and(|value| value > 0)
     };
-    let u32_value = |field| {
-        object
-            .get(field)
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .is_some()
-    };
     let text = |field| object.get(field).and_then(Value::as_str);
     let syscall_named = text("name").is_some_and(|value| !value.is_empty())
         || text("syscall").is_some_and(|value| !value.is_empty())
@@ -977,21 +970,8 @@ fn valid_live_capture_record(kind: &str, object: &serde_json::Map<String, Value>
             crate::capture_normalize::valid_ignorable_record(kind, object)
         }
         "syscall" => positive("pid") && syscall_named,
-        "binder" => {
-            positive("pid")
-                && u32_value("to_proc")
-                && object.get("debug_id").and_then(Value::as_i64).is_some()
-        }
-        "binder_call" => {
-            positive("caller_pid")
-                && positive("callee_pid")
-                && object
-                    .get("debug_id")
-                    .and_then(Value::as_i64)
-                    .is_some_and(|value| value != 0)
-        }
-        "binder_received" => {
-            positive("pid") && object.get("debug_id").and_then(Value::as_i64).is_some()
+        "binder" | "binder_call" | "binder_received" => {
+            crate::capture_input::valid_binder_record(kind, object)
         }
         "process_exit" | "selinux_denial" | "fd_snapshot" => positive("pid"),
         "finding" => text("rule_id").is_some_and(|value| !value.is_empty()),
@@ -1020,17 +1000,6 @@ fn valid_live_capture_record(kind: &str, object: &serde_json::Map<String, Value>
                 && text("status").is_some()
                 && text("reason").is_some()
         }
-        _ => false,
-    }
-}
-
-fn unusable_raw_binder_identity(kind: &str, object: &serde_json::Map<String, Value>) -> bool {
-    match kind {
-        "binder" => {
-            object.get("debug_id").and_then(Value::as_i64) == Some(0)
-                || object.get("to_proc").and_then(Value::as_u64) == Some(0)
-        }
-        "binder_received" => object.get("debug_id").and_then(Value::as_i64) == Some(0),
         _ => false,
     }
 }

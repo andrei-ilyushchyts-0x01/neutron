@@ -467,6 +467,7 @@ fn zero_identity_binder_with_complete_health_makes_report_unknown() {
         let md = report(&capture, ReportOptions::default());
 
         assert!(md.contains("status is `unknown`"), "{md}");
+        assert!(md.contains("Transport health: **unknown**."), "{md}");
         assert!(md.contains("unusable Binder identity"), "{md}");
         assert!(md.contains("Absence of evidence is not conclusive"), "{md}");
     }
@@ -484,6 +485,7 @@ fn malformed_synthetic_binder_call_makes_report_health_unknown() {
 
         assert!(md.contains("malformed, invalid, or unknown NDJSON"), "{md}");
         assert!(md.contains("status is `unknown`"), "{md}");
+        assert!(md.contains("Transport health: **unknown**."), "{md}");
     }
 }
 

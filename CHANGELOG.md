@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.6.1] — 2026-10-13
 
+- Unified Binder record validation across capture normalization, report and bundle
+  verification; malformed synthetic records and contradictory raw identities
+  cannot restore complete health or manufacture causal spans.
+
 - Reworked every maintained README for AI-agent discovery, command selection,
   structured observations, recovery and evidence limits; updated package metadata.
 
